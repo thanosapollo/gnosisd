@@ -1,0 +1,128 @@
+#+title: Gnosis Core
+
+Gnosis Core is the local daemon foundation for sharing Gnosis knowledge data
+between Emacs, command-line, and future web clients. The current vertical slice
+indexes Org documents into SQLite through a versioned Unix-socket protocol.
+
+* Ownership and trust boundary
+
+~gnosisd~ is the only process that opens the database. Every client, including
+the ~gnosis~ diagnostic program, uses the socket protocol and never sends SQL.
+The daemon is local-only and single-user. It creates its socket with mode
+~0600~ and enforces mode ~0600~ on SQLite. The protocol does not provide
+authentication and must not be exposed as a remote transport.
+
+One dedicated thread owns the only SQLite connection. Reads and writes pass
+through one bounded queue, and every projection replacement is one short
+transaction. A stale expected revision fails before any rows change. The Tokio
+tasks that serve sockets never own a connection, transaction, or database lock.
+
+The default bounds are:
+
+- 1 MiB request and response frames;
+- 128-byte request IDs;
+- 32 simultaneous connections;
+- one in-flight request per connection;
+- eight queued database operations.
+
+* Running the daemon and client
+
+The host needs stable Rust with Cargo, rustfmt, and Clippy. On NixOS, an
+ephemeral toolchain can run the project without changing the host:
+
+#+begin_src sh
+nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy
+#+end_src
+
+Start the daemon with explicit local paths:
+
+#+begin_src sh
+cargo run --bin gnosisd -- \
+  --socket "$XDG_RUNTIME_DIR/gnosis.sock" \
+  --database "$HOME/.local/share/gnosis/gnosis.sqlite"
+#+end_src
+
+Exercise protocol version 1 through the diagnostic client:
+
+#+begin_src sh
+cargo run --bin gnosis -- --socket "$XDG_RUNTIME_DIR/gnosis.sock" system-info
+printf '#+TITLE: Example\n' | cargo run --bin gnosis -- \
+  --socket "$XDG_RUNTIME_DIR/gnosis.sock" import-org example
+cargo run --bin gnosis -- \
+  --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-document example
+#+end_src
+
+Use ~--if-revision N~ with ~import-org~ for conflict detection. Omitting it
+allows an unconditional create or replacement. Identical content is an
+idempotent no-op and keeps its revision.
+
+* Protocol
+
+Each message is a four-byte big-endian length followed by a UTF-8 JSON object.
+Every request carries protocol version ~1~, an opaque request ID, and one typed
+method:
+
+- ~system.info~
+- ~document.import~
+- ~document.get~
+
+The application protocol exposes opaque string document and node IDs. SQLite
+row identifiers, SQL, paths, dependency errors, and backtraces never enter a
+response. Stable error codes distinguish malformed requests, unsupported
+versions, invalid documents, missing documents, revision conflicts, overload,
+and internal failure.
+
+* Domain and Org projection
+
+The domain has no SQLite, async runtime, JSON, socket, filesystem, or orgize
+types. ~LinkOccurrence~ records ordered textual occurrences and half-open UTF-8
+byte ranges. ~NodeEdge~ records the unique semantic source-to-target relation.
+~ThemaConcept~ separately records a learning association as ~Primary~,
+~Supporting~, or ~Reference~.
+
+The parser preserves the selected live Gnosis compatibility contract for file
+and heading IDs, inherited tags, indexed ancestors, hierarchical title paths,
+link ownership, unresolved targets, and the SHA-1 compatibility digest. New
+content identity uses SHA-256. Run the shared-semantic parity checks with:
+
+#+begin_src sh
+tools/check-org-parity.sh tests/fixtures/org/basic.org
+tools/check-org-parity.sh tests/fixtures/org/no-file-id.org
+tools/check-org-parity.sh tests/fixtures/org/duplicate-links.org
+tools/check-org-parity.sh tests/fixtures/org/unicode.org
+tools/check-org-parity.sh tests/fixtures/org/compatibility.org
+#+end_src
+
+Two checked-domain corrections are deliberate. The current Elisp aggregate
+function errors on an unowned top-level link when no file ID exists; Rust
+ignores that unowned link. Current Elisp also emits an ID-bearing heading with a
+blank title; Rust rejects it. Byte spans and SHA-256 are Rust-only fields.
+
+* Database and backups
+
+The database path is supplied to ~gnosisd~; there is no implicit shared path.
+Foreign keys and strict tables protect projections, link occurrences, semantic
+edges, themata, and thema-to-concept associations. Stop the daemon cleanly
+with SIGINT or SIGTERM before copying the database for backup. Online backup
+and restore commands are not part of this slice. Startup uses an atomic
+~SOCKET.startup-lock~ directory while checking and replacing a stale socket. If
+a process is killed during that short startup window, inspect and remove the
+abandoned lock directory before restarting.
+
+* Current exclusions
+
+This foundation does not migrate scheduling or review history, integrate the
+Emacs client, expose TCP, add authentication or TLS, discover or watch files,
+support Markdown, compute embeddings, or synchronize multiple daemons.
+
+* Validation
+
+#+begin_src sh
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+#+end_src
+
+The project is licensed under GPL-3.0-or-later. See [[file:LICENSE][LICENSE]].
