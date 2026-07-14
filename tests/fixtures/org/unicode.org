@@ -1,0 +1,11 @@
+:PROPERTIES:
+:ID: unicode-root
+:END:
+#+TITLE: Γνῶσις
+#+FILETAGS: :ελληνικά:
+
+* 知識 :学習:
+:PROPERTIES:
+:ID: knowledge-id
+:END:
+Σύνδεση [[id:unicode-root][πίσω]].

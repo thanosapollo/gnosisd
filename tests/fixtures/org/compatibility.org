@@ -1,0 +1,29 @@
+:PROPERTIES:
+:ID: compatibility-root
+:END:
+#+TODO: NEXT | DONE
+#+TYP_TODO: IDEA | ARCHIVED
+#+TITLE: Compatibility
+
+#+begin_src org
+:PROPERTIES:
+:ID: fake-root
+:END:
+Source [[id:same-id][Same]].
+#+end_src
+
+* NEXT Active
+:PROPERTIES:
+:ID: active-id
+:END:
+Plain id:plain-id and angle <id:angle-id> and [[id:same-id][Same]].
+
+* IDEA Concept
+:PROPERTIES:
+:ID: concept-id
+:END:
+
+* COMMENT Hidden
+:PROPERTIES:
+:ID: hidden-id
+:END:

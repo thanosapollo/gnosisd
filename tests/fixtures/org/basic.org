@@ -1,0 +1,19 @@
+:PROPERTIES:
+:ID: root-id
+:END:
+#+TITLE: Learn [[id:emacs-id][Emacs]]
+#+FILETAGS: :learning:editor:
+
+Root link: [[id:missing-id][Missing target]].
+
+* Lisp :language:
+:PROPERTIES:
+:ID: lisp-id
+:END:
+
+* Container without ID :container:
+** Elisp :editor:
+:PROPERTIES:
+:ID: elisp-id
+:END:
+See [[id:lisp-id][Lisp]] and [[id:missing-id]].

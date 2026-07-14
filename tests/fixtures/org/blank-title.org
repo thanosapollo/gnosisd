@@ -1,0 +1,6 @@
+#+TITLE: Valid document
+
+*
+:PROPERTIES:
+:ID: blank-id
+:END:

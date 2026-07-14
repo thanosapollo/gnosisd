@@ -1,0 +1,11 @@
+#+TITLE: No Root ID
+#+FILETAGS: :notes:
+
+Unowned [[id:ignored-id][Ignored]].
+
+* Container :container:
+** Child :child:
+:PROPERTIES:
+:ID: child-id
+:END:
+Owned [[id:target-id][Target]].

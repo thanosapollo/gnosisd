@@ -1,0 +1,6 @@
+:PROPERTIES:
+:ID: duplicate-root
+:END:
+#+TITLE: Duplicate links
+
+See [[id:target-id][first]] and [[id:target-id][second]].

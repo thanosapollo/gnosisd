@@ -1,0 +1,31 @@
+{
+  "title": "Γνῶσις",
+  "file_node_id": "unicode-root",
+  "file_tags": ["ελληνικά"],
+  "nodes": [
+    {
+      "id": "unicode-root",
+      "title": "Γνῶσις",
+      "title_path": ["Γνῶσις"],
+      "tags": ["ελληνικά"],
+      "parent_id": null,
+      "level": 0
+    },
+    {
+      "id": "knowledge-id",
+      "title": "知識",
+      "title_path": ["Γνῶσις", "知識"],
+      "tags": ["ελληνικά", "学習"],
+      "parent_id": "unicode-root",
+      "level": 1
+    }
+  ],
+  "link_occurrences": [
+    {"owner": "knowledge-id", "target": "unicode-root", "start": 162, "end": 191}
+  ],
+  "semantic_edges": [
+    {"source": "knowledge-id", "target": "unicode-root"}
+  ],
+  "compatibility_sha1": "afb1980550d0bebf81c3d8a05b11deb457ec56e2",
+  "content_sha256": "508b67e37b5a5143756e4021968d13f172c374e7bf5c0645e7fd10babbd9aaa8"
+}

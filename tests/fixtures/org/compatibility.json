@@ -1,0 +1,53 @@
+{
+  "title": "Compatibility",
+  "file_node_id": "compatibility-root",
+  "file_tags": [],
+  "nodes": [
+    {
+      "id": "compatibility-root",
+      "title": "Compatibility",
+      "title_path": ["Compatibility"],
+      "tags": [],
+      "parent_id": null,
+      "level": 0
+    },
+    {
+      "id": "active-id",
+      "title": "Active",
+      "title_path": ["Compatibility", "Active"],
+      "tags": [],
+      "parent_id": "compatibility-root",
+      "level": 1
+    },
+    {
+      "id": "concept-id",
+      "title": "Concept",
+      "title_path": ["Compatibility", "Concept"],
+      "tags": [],
+      "parent_id": "compatibility-root",
+      "level": 1
+    },
+    {
+      "id": "hidden-id",
+      "title": "Hidden",
+      "title_path": ["Compatibility", "Hidden"],
+      "tags": [],
+      "parent_id": "compatibility-root",
+      "level": 1
+    }
+  ],
+  "link_occurrences": [
+    {"owner": "compatibility-root", "target": "same-id", "start": 172, "end": 192},
+    {"owner": "active-id", "target": "plain-id", "start": 259, "end": 270},
+    {"owner": "active-id", "target": "angle-id", "start": 281, "end": 294},
+    {"owner": "active-id", "target": "same-id", "start": 299, "end": 319}
+  ],
+  "semantic_edges": [
+    {"source": "compatibility-root", "target": "same-id"},
+    {"source": "active-id", "target": "plain-id"},
+    {"source": "active-id", "target": "angle-id"},
+    {"source": "active-id", "target": "same-id"}
+  ],
+  "compatibility_sha1": "66041e1cb4b08a9d7bdc35147499dfa0a4c45570",
+  "content_sha256": "3f71c26ebb051cff25eb9d72d165fa4d54740b75757b3afdcf4449108f56631c"
+}

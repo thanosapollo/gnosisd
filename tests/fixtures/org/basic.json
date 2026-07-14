@@ -1,0 +1,45 @@
+{
+  "title": "Learn Emacs",
+  "file_node_id": "root-id",
+  "file_tags": ["learning", "editor"],
+  "nodes": [
+    {
+      "id": "root-id",
+      "title": "Learn Emacs",
+      "title_path": ["Learn Emacs"],
+      "tags": ["learning", "editor"],
+      "parent_id": null,
+      "level": 0
+    },
+    {
+      "id": "lisp-id",
+      "title": "Lisp",
+      "title_path": ["Learn Emacs", "Lisp"],
+      "tags": ["learning", "editor", "language"],
+      "parent_id": "root-id",
+      "level": 1
+    },
+    {
+      "id": "elisp-id",
+      "title": "Elisp",
+      "title_path": ["Learn Emacs", "Elisp"],
+      "tags": ["learning", "editor", "container"],
+      "parent_id": "root-id",
+      "level": 2
+    }
+  ],
+  "link_occurrences": [
+    {"owner": "root-id", "target": "emacs-id", "start": 47, "end": 69},
+    {"owner": "root-id", "target": "missing-id", "start": 112, "end": 145},
+    {"owner": "elisp-id", "target": "lisp-id", "start": 289, "end": 309},
+    {"owner": "elisp-id", "target": "missing-id", "start": 314, "end": 331}
+  ],
+  "semantic_edges": [
+    {"source": "root-id", "target": "emacs-id"},
+    {"source": "root-id", "target": "missing-id"},
+    {"source": "elisp-id", "target": "lisp-id"},
+    {"source": "elisp-id", "target": "missing-id"}
+  ],
+  "compatibility_sha1": "e8924b82b70b2793e4626adcadd5ccd8a5668347",
+  "content_sha256": "0ac96950b838c5801c173e72b62e3973f916ba276763904d98bdc7aa584ce163"
+}

@@ -1,0 +1,8 @@
+:PROPERTIES:
+:ID: root-id
+:END:
+
+* Valid heading
+:PROPERTIES:
+:ID: heading-id
+:END:

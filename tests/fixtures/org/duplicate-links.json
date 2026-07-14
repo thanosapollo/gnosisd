@@ -1,0 +1,24 @@
+{
+  "title": "Duplicate links",
+  "file_node_id": "duplicate-root",
+  "file_tags": [],
+  "nodes": [
+    {
+      "id": "duplicate-root",
+      "title": "Duplicate links",
+      "title_path": ["Duplicate links"],
+      "tags": [],
+      "parent_id": null,
+      "level": 0
+    }
+  ],
+  "link_occurrences": [
+    {"owner": "duplicate-root", "target": "target-id", "start": 69, "end": 92},
+    {"owner": "duplicate-root", "target": "target-id", "start": 97, "end": 121}
+  ],
+  "semantic_edges": [
+    {"source": "duplicate-root", "target": "target-id"}
+  ],
+  "compatibility_sha1": "5c0b04c74d97956404b1330d9d2332e86937692e",
+  "content_sha256": "26bbe7cd4dc108ea8c736f11d7d7da4220c21654860fe3de09e46a7e7894995e"
+}
