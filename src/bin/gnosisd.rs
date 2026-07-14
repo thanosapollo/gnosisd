@@ -1,4 +1,4 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 use gnosis_core::{
@@ -17,8 +17,15 @@ struct Cli {
     migrate_legacy: Option<PathBuf>,
     #[arg(long, value_name = "PATH", requires_all = ["migrate_legacy", "blob_root"])]
     notes_root: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", requires_all = ["migrate_legacy", "notes_root"])]
+    #[arg(long, value_name = "PATH")]
     blob_root: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        default_value = "127.0.0.1:7842",
+        conflicts_with = "migrate_legacy"
+    )]
+    http_listen: SocketAddr,
 }
 
 #[tokio::main]
@@ -45,7 +52,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let socket = cli.socket.ok_or("socket is required when serving")?;
-    let server = DaemonServer::bind(DaemonConfig::new(socket, cli.database)).await?;
+    let mut config = DaemonConfig::new(socket, cli.database);
+    config.http_addr = Some(cli.http_listen);
+    if let Some(blob_root) = cli.blob_root {
+        config.blob_path = blob_root;
+    }
+    let server = DaemonServer::bind(config).await?;
     server.run(shutdown_signal()).await?;
     Ok(())
 }

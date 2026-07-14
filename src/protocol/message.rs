@@ -55,6 +55,21 @@ pub enum Request {
         limit: u16,
         after: Option<String>,
     },
+    #[serde(rename = "admin.device_create")]
+    DeviceCreate { name: String, scopes: Vec<String> },
+    #[serde(rename = "admin.device_list")]
+    DeviceList {},
+    #[serde(rename = "admin.device_revoke")]
+    DeviceRevoke { device_id: String },
+    #[serde(rename = "admin.backup_create")]
+    BackupCreate { destination: String },
+    #[serde(rename = "admin.backup_verify")]
+    BackupVerify { path: String },
+    #[serde(rename = "admin.backup_restore_validate")]
+    BackupRestoreValidate {
+        path: String,
+        temporary_directory: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -102,6 +117,62 @@ pub enum ResponseResult {
     Thema(ThemaView),
     DueThemata(Vec<DueThemaView>),
     DuePage(DuePageView),
+    DeviceCreated(DeviceCreatedView),
+    Devices(Vec<DeviceView>),
+    Device(DeviceView),
+    Backup(BackupView),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackupView {
+    pub path: String,
+    pub created_at_us: u64,
+    pub database_sha256: String,
+    pub blob_count: u64,
+}
+
+impl From<crate::application::BackupSummary> for BackupView {
+    fn from(summary: crate::application::BackupSummary) -> Self {
+        Self {
+            path: summary.path.to_string_lossy().into_owned(),
+            created_at_us: summary.created_at_us,
+            database_sha256: summary.database_sha256,
+            blob_count: summary.blob_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeviceCreatedView {
+    pub device: DeviceView,
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeviceView {
+    pub device_id: String,
+    pub name: String,
+    pub scopes: Vec<String>,
+    pub created_at_us: u64,
+    pub last_used_at_us: Option<u64>,
+    pub revoked_at_us: Option<u64>,
+}
+
+impl From<crate::application::DeviceRecord> for DeviceView {
+    fn from(device: crate::application::DeviceRecord) -> Self {
+        Self {
+            device_id: device.device_id,
+            name: device.name,
+            scopes: device
+                .scopes
+                .into_iter()
+                .map(|scope| scope.as_str().to_owned())
+                .collect(),
+            created_at_us: device.created_at_us,
+            last_used_at_us: device.last_used_at_us,
+            revoked_at_us: device.revoked_at_us,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,17 +1,16 @@
 use std::{
     fs,
     future::Future,
+    net::SocketAddr,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::mpsc::{self, SyncSender, TrySendError},
-    thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
 use tokio::{
-    net::{UnixListener, UnixStream},
-    sync::{Semaphore, oneshot, watch},
+    net::{TcpListener, UnixListener, UnixStream},
+    sync::{Semaphore, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -20,15 +19,15 @@ use crate::{
     application::{
         ApplicationError, DueCursor, ImportDocument, ImportSummary, LegacyQueryError,
         PreparedImport, QueryDocument, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema,
-        persist_import,
+        ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError, generate_device,
     },
-    domain::{DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     protocol::{
-        DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
-        MessageValidationError, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
-        ResponseEnvelope, ResponseResult, SystemInfo, ThemaView, frame,
+        BackupView, DeviceCreatedView, DeviceView, DocumentView, DuePageView, DueThemaView,
+        ErrorCode, ImportResult, LegacyInfoView, MessageValidationError, PROTOCOL_VERSION,
+        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo,
+        ThemaView, frame,
     },
-    store::{SqliteStore, StoreError, StoredDocument},
+    store::StoreError,
 };
 
 const DEFAULT_MAX_CONNECTIONS: usize = 32;
@@ -41,15 +40,21 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub database_path: PathBuf,
+    pub blob_path: PathBuf,
+    pub http_addr: Option<SocketAddr>,
     pub max_connections: usize,
     pub store_queue_capacity: usize,
 }
 
 impl DaemonConfig {
     pub fn new(socket_path: impl Into<PathBuf>, database_path: impl Into<PathBuf>) -> Self {
+        let database_path = database_path.into();
+        let blob_path = database_path.with_extension("blobs");
         Self {
             socket_path: socket_path.into(),
-            database_path: database_path.into(),
+            database_path,
+            blob_path,
+            http_addr: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             store_queue_capacity: DEFAULT_STORE_QUEUE_CAPACITY,
         }
@@ -58,8 +63,9 @@ impl DaemonConfig {
 
 pub struct DaemonServer {
     listener: UnixListener,
+    http_listener: Option<TcpListener>,
     socket: SocketGuard,
-    actor: StoreActor,
+    service: ServiceRuntime,
     max_connections: usize,
 }
 
@@ -69,32 +75,59 @@ impl DaemonServer {
         let _startup_lock = StartupLock::acquire(&config.socket_path)?;
         prepare_socket(&config.socket_path).await?;
         let listener = UnixListener::bind(&config.socket_path).map_err(ServerError::Socket)?;
+        let http_listener = match config.http_addr {
+            Some(address) => Some(
+                TcpListener::bind(address)
+                    .await
+                    .map_err(ServerError::Http)?,
+            ),
+            None => None,
+        };
         let socket = SocketGuard::new(config.socket_path.clone())?;
         fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
             .map_err(ServerError::Socket)?;
-        let actor = StoreActor::start(config.database_path, config.store_queue_capacity)
-            .await
-            .map_err(ServerError::store)?;
+        let service = ServiceRuntime::start(
+            config.database_path,
+            config.blob_path,
+            config.store_queue_capacity,
+        )
+        .await
+        .map_err(ServerError::store)?;
         Ok(Self {
             listener,
+            http_listener,
             socket,
-            actor,
+            service,
             max_connections: config.max_connections,
         })
+    }
+
+    pub fn http_addr(&self) -> Option<SocketAddr> {
+        self.http_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
     }
 
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<(), ServerError> {
         let Self {
             listener,
+            http_listener,
             socket,
-            actor,
+            service,
             max_connections,
         } = self;
         let state = ServerState {
-            store: actor.handle(),
+            store: service.handle(),
         };
         let semaphore = std::sync::Arc::new(Semaphore::new(max_connections));
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let http_task = http_listener.map(|listener| {
+            tokio::spawn(serve_http(
+                listener,
+                state.store.clone(),
+                shutdown_receiver.clone(),
+            ))
+        });
         let mut handlers = JoinSet::new();
         let accept_error = accept_until_shutdown(
             &listener,
@@ -107,11 +140,27 @@ impl DaemonServer {
         .await;
         let _ = shutdown_sender.send(true);
         while handlers.join_next().await.is_some() {}
+        let http_result = match http_task {
+            Some(task) => task.await.map_err(|_| ServerError::HttpTask)?,
+            None => Ok(()),
+        };
         drop(state);
-        actor.finish().await?;
+        service.finish().await.map_err(ServerError::service)?;
         drop(socket);
-        accept_error
+        accept_error.and(http_result.map_err(ServerError::Http))
     }
+}
+
+async fn serve_http(
+    listener: TcpListener,
+    service: ServiceHandle,
+    mut shutdown: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    axum::serve(listener, crate::http::router(service))
+        .with_graceful_shutdown(async move {
+            while !*shutdown.borrow_and_update() && shutdown.changed().await.is_ok() {}
+        })
+        .await
 }
 
 async fn accept_until_shutdown(
@@ -183,6 +232,15 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
         Request::ReviewDuePage { day, limit, after } => {
             due_themata_page(state, day, limit, after).await
         }
+        Request::DeviceCreate { name, scopes } => create_device(state, name, scopes).await,
+        Request::DeviceList {} => list_devices(state).await,
+        Request::DeviceRevoke { device_id } => revoke_device(state, device_id).await,
+        Request::BackupCreate { destination } => create_backup(state, destination).await,
+        Request::BackupVerify { path } => verify_backup(state, path).await,
+        Request::BackupRestoreValidate {
+            path,
+            temporary_directory,
+        } => validate_restore(state, path, temporary_directory).await,
     };
     match result {
         Ok(result) => bounded_success(id, result),
@@ -210,7 +268,7 @@ async fn get_thema(state: ServerState, thema_id: String) -> Result<ResponseResul
     let query = QueryLegacyThema::new(thema_id).map_err(invalid_legacy_query)?;
     let thema = state
         .store
-        .get_thema(query.thema_id().clone())
+        .get_legacy_thema(query.thema_id().clone())
         .await
         .map_err(actor_error)?
         .ok_or_else(thema_not_found)?;
@@ -324,6 +382,108 @@ async fn get_document(
     )))
 }
 
+async fn create_device(
+    state: ServerState,
+    name: String,
+    scopes: Vec<String>,
+) -> Result<ResponseResult, ProtocolError> {
+    let device = generate_device(name, scopes).map_err(|_| malformed_admin())?;
+    let token = device.token.clone();
+    let record = state
+        .store
+        .create_device(device, now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::DeviceCreated(DeviceCreatedView {
+        device: DeviceView::from(record),
+        token,
+    }))
+}
+
+async fn list_devices(state: ServerState) -> Result<ResponseResult, ProtocolError> {
+    let devices = state.store.devices().await.map_err(actor_error)?;
+    Ok(ResponseResult::Devices(
+        devices.into_iter().map(DeviceView::from).collect(),
+    ))
+}
+
+async fn revoke_device(
+    state: ServerState,
+    device_id: String,
+) -> Result<ResponseResult, ProtocolError> {
+    if device_id.is_empty() {
+        return Err(malformed_admin());
+    }
+    let device = state
+        .store
+        .revoke_device(device_id, now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::Device(DeviceView::from(device)))
+}
+
+async fn create_backup(
+    state: ServerState,
+    destination: String,
+) -> Result<ResponseResult, ProtocolError> {
+    require_path(&destination)?;
+    let created_at_us = u64::try_from(now_us()?).map_err(|_| internal_error())?;
+    let summary = state
+        .store
+        .create_backup(destination.into(), created_at_us)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::Backup(BackupView::from(summary)))
+}
+
+async fn verify_backup(state: ServerState, path: String) -> Result<ResponseResult, ProtocolError> {
+    require_path(&path)?;
+    let summary = state
+        .store
+        .verify_backup(path.into())
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::Backup(BackupView::from(summary)))
+}
+
+async fn validate_restore(
+    state: ServerState,
+    path: String,
+    temporary_directory: String,
+) -> Result<ResponseResult, ProtocolError> {
+    require_path(&path)?;
+    require_path(&temporary_directory)?;
+    let summary = state
+        .store
+        .validate_restore(path.into(), temporary_directory.into())
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::Backup(BackupView::from(summary)))
+}
+
+fn require_path(path: &str) -> Result<(), ProtocolError> {
+    if path.is_empty() || path.contains('\0') {
+        Err(ProtocolError::new(
+            ErrorCode::MalformedRequest,
+            "invalid backup path",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn now_us() -> Result<i64, ProtocolError> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| internal_error())?
+        .as_micros();
+    i64::try_from(micros).map_err(|_| internal_error())
+}
+
+fn malformed_admin() -> ProtocolError {
+    ProtocolError::new(ErrorCode::MalformedRequest, "invalid device operation")
+}
+
 fn validation_response(id: String, error: MessageValidationError) -> ResponseEnvelope {
     let error = match error {
         MessageValidationError::UnsupportedVersion(_) => ProtocolError::new(
@@ -364,259 +524,30 @@ fn internal_error() -> ProtocolError {
     ProtocolError::new(ErrorCode::Internal, "internal daemon failure")
 }
 
-fn actor_error(error: ActorError) -> ProtocolError {
+fn actor_error(error: ServiceError) -> ProtocolError {
     match error {
-        ActorError::Busy => ProtocolError::new(ErrorCode::Busy, "daemon is busy"),
-        ActorError::Application(ApplicationError::Conflict { .. }) => {
+        ServiceError::Busy => ProtocolError::new(ErrorCode::Busy, "daemon is busy"),
+        ServiceError::Application(ApplicationError::Conflict { .. }) => {
             ProtocolError::new(ErrorCode::Conflict, "document revision conflict")
         }
-        ActorError::Stopped | ActorError::Application(_) | ActorError::Store(_) => internal_error(),
+        ServiceError::Store(StoreError::NotFound) => {
+            ProtocolError::new(ErrorCode::NotFound, "resource not found")
+        }
+        ServiceError::Stopped
+        | ServiceError::Corrupt
+        | ServiceError::AssetDigest
+        | ServiceError::Blob(_)
+        | ServiceError::Review(_)
+        | ServiceError::Settings(_)
+        | ServiceError::Backup(_)
+        | ServiceError::Application(_)
+        | ServiceError::Store(_) => internal_error(),
     }
 }
 
 #[derive(Clone)]
 struct ServerState {
-    store: StoreHandle,
-}
-
-enum StoreCommand {
-    Replace {
-        prepared: Box<PreparedImport>,
-        response: oneshot::Sender<Result<ImportSummary, ApplicationError>>,
-    },
-    Get {
-        document_id: crate::domain::DocumentId,
-        response: oneshot::Sender<Result<Option<StoredDocument>, StoreError>>,
-    },
-    LegacyInfo {
-        response: oneshot::Sender<Result<Option<LegacyDatabaseInfo>, StoreError>>,
-    },
-    GetThema {
-        thema_id: ThemaId,
-        response: oneshot::Sender<Result<Option<LegacyThema>, StoreError>>,
-    },
-    DueThemata {
-        query: QueryDueThemata,
-        response: oneshot::Sender<Result<Vec<DueThema>, StoreError>>,
-    },
-    DueThemataPage {
-        query: QueryDueThemataPage,
-        response: oneshot::Sender<Result<Vec<DueThema>, StoreError>>,
-    },
-}
-
-#[derive(Clone)]
-struct StoreHandle {
-    sender: SyncSender<StoreCommand>,
-}
-
-impl StoreHandle {
-    async fn replace(&self, prepared: PreparedImport) -> Result<ImportSummary, ActorError> {
-        let (sender, receiver) = oneshot::channel();
-        enqueue(
-            &self.sender,
-            StoreCommand::Replace {
-                prepared: Box::new(prepared),
-                response: sender,
-            },
-        )?;
-        receiver
-            .await
-            .map_err(|_| ActorError::Stopped)?
-            .map_err(ActorError::Application)
-    }
-
-    async fn get(
-        &self,
-        document_id: crate::domain::DocumentId,
-    ) -> Result<Option<StoredDocument>, ActorError> {
-        let (sender, receiver) = oneshot::channel();
-        enqueue(
-            &self.sender,
-            StoreCommand::Get {
-                document_id,
-                response: sender,
-            },
-        )?;
-        receiver
-            .await
-            .map_err(|_| ActorError::Stopped)?
-            .map_err(ActorError::Store)
-    }
-
-    async fn legacy_info(&self) -> Result<Option<LegacyDatabaseInfo>, ActorError> {
-        let (sender, receiver) = oneshot::channel();
-        enqueue(&self.sender, StoreCommand::LegacyInfo { response: sender })?;
-        receiver
-            .await
-            .map_err(|_| ActorError::Stopped)?
-            .map_err(ActorError::Store)
-    }
-
-    async fn get_thema(&self, thema_id: ThemaId) -> Result<Option<LegacyThema>, ActorError> {
-        let (sender, receiver) = oneshot::channel();
-        enqueue(
-            &self.sender,
-            StoreCommand::GetThema {
-                thema_id,
-                response: sender,
-            },
-        )?;
-        receiver
-            .await
-            .map_err(|_| ActorError::Stopped)?
-            .map_err(ActorError::Store)
-    }
-
-    async fn due_themata(&self, query: QueryDueThemata) -> Result<Vec<DueThema>, ActorError> {
-        let (sender, receiver) = oneshot::channel();
-        enqueue(
-            &self.sender,
-            StoreCommand::DueThemata {
-                query,
-                response: sender,
-            },
-        )?;
-        receiver
-            .await
-            .map_err(|_| ActorError::Stopped)?
-            .map_err(ActorError::Store)
-    }
-
-    async fn due_themata_page(
-        &self,
-        query: QueryDueThemataPage,
-    ) -> Result<Vec<DueThema>, ActorError> {
-        let (sender, receiver) = oneshot::channel();
-        enqueue(
-            &self.sender,
-            StoreCommand::DueThemataPage {
-                query,
-                response: sender,
-            },
-        )?;
-        receiver
-            .await
-            .map_err(|_| ActorError::Stopped)?
-            .map_err(ActorError::Store)
-    }
-}
-
-struct StoreActor {
-    handle: StoreHandle,
-    join: thread::JoinHandle<()>,
-}
-
-impl StoreActor {
-    async fn start(path: PathBuf, capacity: usize) -> Result<Self, ActorStartError> {
-        tokio::task::spawn_blocking(move || Self::start_blocking(path, capacity))
-            .await
-            .map_err(|_| ActorStartError::Stopped)?
-    }
-
-    fn start_blocking(path: PathBuf, capacity: usize) -> Result<Self, ActorStartError> {
-        let (sender, receiver) = mpsc::sync_channel(capacity);
-        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
-        let join = thread::Builder::new()
-            .name("gnosis-sqlite".into())
-            .spawn(move || store_actor(path, receiver, ready_sender))
-            .map_err(ActorStartError::Thread)?;
-        ready_receiver
-            .recv()
-            .map_err(|_| ActorStartError::Stopped)?
-            .map_err(ActorStartError::Store)?;
-        Ok(Self {
-            handle: StoreHandle { sender },
-            join,
-        })
-    }
-
-    fn handle(&self) -> StoreHandle {
-        self.handle.clone()
-    }
-
-    async fn finish(self) -> Result<(), ServerError> {
-        drop(self.handle);
-        tokio::task::spawn_blocking(move || self.join.join())
-            .await
-            .map_err(|_| ServerError::ActorStopped)?
-            .map_err(|_| ServerError::ActorStopped)
-    }
-}
-
-fn store_actor(
-    path: PathBuf,
-    receiver: mpsc::Receiver<StoreCommand>,
-    ready: SyncSender<Result<(), StoreError>>,
-) {
-    let mut store = match SqliteStore::open(path) {
-        Ok(store) => store,
-        Err(error) => {
-            let _ = ready.send(Err(error));
-            return;
-        }
-    };
-    if ready.send(Ok(())).is_err() {
-        return;
-    }
-    for command in receiver {
-        run_store_command(&mut store, command);
-    }
-}
-
-fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
-    match command {
-        StoreCommand::Replace { prepared, response } => {
-            let result = persist_import(store, &prepared);
-            let _ = response.send(result);
-        }
-        StoreCommand::Get {
-            document_id,
-            response,
-        } => {
-            let _ = response.send(store.get_document(&document_id));
-        }
-        StoreCommand::LegacyInfo { response } => {
-            let _ = response.send(store.legacy_database_info());
-        }
-        StoreCommand::GetThema { thema_id, response } => {
-            let _ = response.send(store.get_legacy_thema(&thema_id));
-        }
-        StoreCommand::DueThemata { query, response } => {
-            let _ = response.send(store.due_legacy_themata(query.day(), query.limit()));
-        }
-        StoreCommand::DueThemataPage { query, response } => {
-            let after = query.after().map(|cursor| {
-                (
-                    cursor.reviewed(),
-                    cursor.next_review_day(),
-                    cursor.thema_id(),
-                )
-            });
-            let limit = query.limit() + 1;
-            let _ = response.send(store.due_legacy_themata_page(query.day(), limit, after));
-        }
-    }
-}
-
-fn enqueue(sender: &SyncSender<StoreCommand>, command: StoreCommand) -> Result<(), ActorError> {
-    match sender.try_send(command) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(ActorError::Busy),
-        Err(TrySendError::Disconnected(_)) => Err(ActorError::Stopped),
-    }
-}
-
-#[derive(Debug, Error)]
-enum ActorError {
-    #[error("store queue is full")]
-    Busy,
-    #[error("store actor stopped")]
-    Stopped,
-    #[error("store operation failed")]
-    Store(#[source] StoreError),
-    #[error("application operation failed")]
-    Application(#[source] ApplicationError),
+    store: ServiceHandle,
 }
 
 async fn prepare_socket(path: &Path) -> Result<(), ServerError> {
@@ -743,6 +674,9 @@ impl Drop for SocketGuard {
 fn validate_config(config: &DaemonConfig) -> Result<(), ServerError> {
     if !(3..=MAX_CONNECTIONS).contains(&config.max_connections)
         || !(1..=MAX_STORE_QUEUE_CAPACITY).contains(&config.store_queue_capacity)
+        || config
+            .http_addr
+            .is_some_and(|address| !address.ip().is_loopback())
     {
         Err(ServerError::InvalidConfig)
     } else {
@@ -764,8 +698,14 @@ pub enum ServerError {
     StartupLocked,
     #[error("socket operation failed")]
     Socket(#[source] std::io::Error),
+    #[error("HTTP listener failed")]
+    Http(#[source] std::io::Error),
+    #[error("HTTP server task stopped unexpectedly")]
+    HttpTask,
     #[error("database initialization failed")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("blob storage initialization failed")]
+    Blob(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("could not start database owner thread")]
     ActorStart(#[source] std::io::Error),
     #[error("database owner thread stopped unexpectedly")]
@@ -773,52 +713,38 @@ pub enum ServerError {
 }
 
 impl ServerError {
-    fn store(error: ActorStartError) -> Self {
+    fn store(error: ServiceStartError) -> Self {
         match error {
-            ActorStartError::Store(error) => Self::Store(Box::new(error)),
-            ActorStartError::Thread(error) => Self::ActorStart(error),
-            ActorStartError::Stopped => Self::ActorStopped,
+            ServiceStartError::Store(error) => Self::Store(Box::new(error)),
+            ServiceStartError::Blob(error) => Self::Blob(Box::new(error)),
+            ServiceStartError::Thread(error) => Self::ActorStart(error),
+            ServiceStartError::Stopped => Self::ActorStopped,
         }
     }
-}
 
-#[derive(Debug)]
-enum ActorStartError {
-    Store(StoreError),
-    Thread(std::io::Error),
-    Stopped,
+    fn service(_error: ServiceError) -> Self {
+        Self::ActorStopped
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::net::UnixListener as StdUnixListener, sync::mpsc};
+    use std::{fs, os::unix::net::UnixListener as StdUnixListener};
 
-    use tokio::sync::oneshot;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        ActorError, ServerError, ServerState, StartupLock, StoreCommand, StoreHandle,
-        bounded_success, dispatch, enqueue, remove_observed_socket,
+        DaemonConfig, ServerError, StartupLock, bounded_success, remove_observed_socket,
+        validate_config,
     };
     use crate::{
-        application::ImportDocument,
-        domain::DocumentId,
-        protocol::{
-            DueThemaView, ErrorCode, Request, RequestEnvelope, ResponseOutcome, ResponseResult,
-        },
+        application::ServiceError,
+        protocol::{DueThemaView, ErrorCode, ResponseOutcome, ResponseResult},
     };
-
-    #[test]
-    fn full_store_queue_reports_busy() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        let command = get_command("first");
-        enqueue(&sender, command).unwrap();
-        let error = enqueue(&sender, get_command("second")).unwrap_err();
-        assert!(matches!(error, ActorError::Busy));
-    }
 
     #[test]
     fn busy_actor_error_becomes_stable_protocol_error() {
-        let error = super::actor_error(ActorError::Busy);
+        let error = super::actor_error(ServiceError::Busy);
         assert_eq!(error.code, crate::protocol::ErrorCode::Busy);
         assert_eq!(error.message, "daemon is busy");
     }
@@ -842,30 +768,6 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::Internal);
         assert_eq!(error.message, "response exceeds protocol limit");
-    }
-
-    #[tokio::test]
-    async fn full_store_queue_returns_busy_to_application_request() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        enqueue(&sender, get_command("queued")).unwrap();
-        let state = ServerState {
-            store: StoreHandle { sender },
-        };
-        let response = dispatch(
-            RequestEnvelope {
-                version: 1,
-                id: "busy-request".into(),
-                request: Request::DocumentGet {
-                    document_id: "document".into(),
-                },
-            },
-            state,
-        )
-        .await;
-        let ResponseOutcome::Failure { error } = response.outcome else {
-            panic!("full queue unexpectedly accepted request");
-        };
-        assert_eq!(error.code, ErrorCode::Busy);
     }
 
     #[test]
@@ -892,39 +794,42 @@ mod tests {
         assert!(StartupLock::acquire(&socket).is_ok());
     }
 
-    #[tokio::test]
-    async fn accepted_write_finishes_after_response_is_dropped() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("drain.sqlite");
-        let actor = super::StoreActor::start(path.clone(), 1).await.unwrap();
-        let handle = actor.handle();
-        let prepared = ImportDocument::new("document", "#+TITLE: Drained\n".into(), None)
-            .unwrap()
-            .prepare()
-            .unwrap();
-        let (response, receiver) = oneshot::channel();
-        enqueue(
-            &handle.sender,
-            StoreCommand::Replace {
-                prepared: Box::new(prepared),
-                response,
-            },
-        )
-        .unwrap();
-        drop(receiver);
-        drop(handle);
-        actor.finish().await.unwrap();
-
-        let store = crate::store::SqliteStore::open(path).unwrap();
-        let id = DocumentId::new("document").unwrap();
-        assert!(store.get_document(&id).unwrap().is_some());
+    #[test]
+    fn http_listener_must_remain_on_loopback() {
+        let mut config = DaemonConfig::new("socket", "database");
+        config.http_addr = Some("127.0.0.1:7842".parse().unwrap());
+        assert!(validate_config(&config).is_ok());
+        config.http_addr = Some("0.0.0.0:7842".parse().unwrap());
+        assert!(matches!(
+            validate_config(&config),
+            Err(ServerError::InvalidConfig)
+        ));
     }
 
-    fn get_command(id: &str) -> StoreCommand {
-        let (response, _) = oneshot::channel();
-        StoreCommand::Get {
-            document_id: DocumentId::new(id).unwrap(),
-            response,
-        }
+    #[tokio::test]
+    async fn daemon_serves_http_health_on_its_loopback_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = DaemonConfig::new(
+            directory.path().join("gnosis.sock"),
+            directory.path().join("gnosis.sqlite"),
+        );
+        config.http_addr = Some("127.0.0.1:0".parse().unwrap());
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        let address = server.http_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = stopped.await;
+        }));
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.ends_with("{\"status\":\"ok\"}"));
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
     }
 }

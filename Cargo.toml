@@ -6,7 +6,12 @@ license = "GPL-3.0-or-later"
 description = "Local daemon core for Gnosis knowledge and learning clients"
 
 [dependencies]
+axum = "0.8"
+base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10"
+getrandom = "0.3"
 orgize = "0.9"
 regex = "1"
 rusqlite = { version = "0.37", features = ["backup", "bundled"] }
@@ -16,6 +21,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]

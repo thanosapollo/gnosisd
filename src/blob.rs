@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -39,6 +40,7 @@ impl BlobStore {
         let path = self.blob_path(&sha256)?;
         let parent = path.parent().ok_or(BlobError::InvalidDigest)?;
         fs::create_dir_all(parent)?;
+        sync_directory(&self.root)?;
         let temporary = self.temporary_path(&sha256)?;
         write_private_file(&temporary, bytes)?;
         match fs::hard_link(&temporary, &path) {
@@ -51,12 +53,62 @@ impl BlobStore {
                 return Err(error.into());
             }
         }
+        sync_directory(parent)?;
         fs::remove_file(&temporary)?;
+        sync_directory(&self.root)?;
         Ok(BlobMeta {
             sha256,
             size_bytes: bytes.len() as u64,
             media_type: media_type.to_owned(),
         })
+    }
+
+    pub(crate) fn read(&self, digest: &str) -> Result<Vec<u8>, BlobError> {
+        let path = self.blob_path(digest)?;
+        let bytes = fs::read(path)?;
+        verify_bytes(&bytes, digest)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn verify(&self, digest: &str, size: u64) -> Result<(), BlobError> {
+        verify_file(&self.blob_path(digest)?, digest, size)
+    }
+
+    pub(crate) fn copy_to(&self, digest: &str, size: u64, root: &Path) -> Result<(), BlobError> {
+        let source = self.blob_path(digest)?;
+        self.verify(digest, size)?;
+        let target = root.join(&digest[..2]).join(digest);
+        let parent = target.parent().ok_or(BlobError::InvalidDigest)?;
+        fs::create_dir_all(parent)?;
+        sync_directory(root)?;
+        fs::copy(source, &target)?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        File::open(&target)?.sync_all()?;
+        sync_directory(parent)?;
+        Ok(())
+    }
+
+    pub(crate) fn recover(&self, expected: &[(String, u64)]) -> Result<(), BlobError> {
+        let expected = expected.iter().cloned().collect::<BTreeMap<_, _>>();
+        let mut found = BTreeSet::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(BlobError::Corrupt)?;
+            if name.starts_with(".tmp-") && entry.file_type()?.is_file() {
+                fs::remove_file(path)?;
+                continue;
+            }
+            recover_prefix(&path, name, &expected, &mut found)?;
+        }
+        for (digest, size) in expected {
+            if !found.contains(&digest) {
+                return Err(BlobError::Corrupt);
+            }
+            self.verify(&digest, size)?;
+        }
+        Ok(())
     }
 
     fn blob_path(&self, digest: &str) -> Result<PathBuf, BlobError> {
@@ -75,6 +127,47 @@ impl BlobStore {
             &digest[..12]
         )))
     }
+}
+
+fn sync_directory(path: &Path) -> Result<(), BlobError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn recover_prefix(
+    path: &Path,
+    prefix: &str,
+    expected: &BTreeMap<String, u64>,
+    found: &mut BTreeSet<String>,
+) -> Result<(), BlobError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if prefix.len() != 2
+        || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !metadata.file_type().is_dir()
+    {
+        return Err(BlobError::Corrupt);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let digest = entry
+            .file_name()
+            .to_str()
+            .ok_or(BlobError::Corrupt)?
+            .to_owned();
+        validate_digest(&digest)?;
+        if &digest[..2] != prefix || !entry.file_type()?.is_file() {
+            return Err(BlobError::Corrupt);
+        }
+        if expected.contains_key(&digest) {
+            found.insert(digest);
+        } else {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    if fs::read_dir(path)?.next().is_none() {
+        fs::remove_dir(path)?;
+    }
+    Ok(())
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), BlobError> {
@@ -124,6 +217,15 @@ fn verify_file(path: &Path, digest: &str, size: u64) -> Result<(), BlobError> {
     }
 }
 
+fn verify_bytes(bytes: &[u8], digest: &str) -> Result<(), BlobError> {
+    validate_digest(digest)?;
+    if format!("{:x}", Sha256::digest(bytes)) == digest {
+        Ok(())
+    } else {
+        Err(BlobError::Corrupt)
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum BlobError {
     #[error("blob root is not a directory")]
@@ -155,5 +257,17 @@ mod tests {
             .join(&first.sha256[..2])
             .join(&first.sha256);
         assert_eq!(std::fs::read(path).unwrap(), b"same");
+    }
+
+    #[test]
+    fn startup_recovery_removes_unreferenced_and_interrupted_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("blobs");
+        let store = BlobStore::open(&root).unwrap();
+        let blob = store.put(b"orphan", "text/plain").unwrap();
+        std::fs::write(root.join(".tmp-interrupted"), b"partial").unwrap();
+        store.recover(&[]).unwrap();
+        assert!(!root.join(&blob.sha256[..2]).exists());
+        assert!(!root.join(".tmp-interrupted").exists());
     }
 }

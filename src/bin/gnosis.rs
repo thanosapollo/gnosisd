@@ -2,6 +2,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use gnosis_core::protocol::{
     ClientError, ErrorCode, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
@@ -46,6 +47,45 @@ enum Command {
         #[arg(long)]
         after: Option<String>,
     },
+    DeviceCreate {
+        name: String,
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+    },
+    DeviceList,
+    DeviceRevoke {
+        device_id: String,
+    },
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BackupCommand {
+    Create {
+        #[arg(required_unless_present = "directory", conflicts_with = "directory")]
+        destination: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        directory: Option<PathBuf>,
+    },
+    Verify {
+        path: PathBuf,
+    },
+    RestoreValidate {
+        path: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        temporary_directory: PathBuf,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -58,6 +98,8 @@ enum CliError {
     Encode(#[source] serde_json::Error),
     #[error("could not write daemon response")]
     WriteOutput(#[source] io::Error),
+    #[error("backup path is not valid UTF-8")]
+    Path,
 }
 
 #[tokio::main]
@@ -106,7 +148,53 @@ fn command_request(command: Command) -> Result<Request, CliError> {
         Command::GetThema { thema_id } => Ok(Request::ThemaGet { thema_id }),
         Command::DueThemata { day, limit } => Ok(Request::ReviewDue { day, limit }),
         Command::DuePage { day, limit, after } => Ok(Request::ReviewDuePage { day, limit, after }),
+        Command::DeviceCreate { name, scopes } => Ok(Request::DeviceCreate { name, scopes }),
+        Command::DeviceList => Ok(Request::DeviceList {}),
+        Command::DeviceRevoke { device_id } => Ok(Request::DeviceRevoke { device_id }),
+        Command::Admin { command } => admin_request(command),
     }
+}
+
+fn admin_request(command: AdminCommand) -> Result<Request, CliError> {
+    match command {
+        AdminCommand::Backup { command } => match command {
+            BackupCommand::Create {
+                destination,
+                directory,
+            } => Ok(Request::BackupCreate {
+                destination: utf8_path(backup_destination(destination, directory)?)?,
+            }),
+            BackupCommand::Verify { path } => Ok(Request::BackupVerify {
+                path: utf8_path(path)?,
+            }),
+            BackupCommand::RestoreValidate {
+                path,
+                temporary_directory,
+            } => Ok(Request::BackupRestoreValidate {
+                path: utf8_path(path)?,
+                temporary_directory: utf8_path(temporary_directory)?,
+            }),
+        },
+    }
+}
+
+fn backup_destination(
+    destination: Option<PathBuf>,
+    directory: Option<PathBuf>,
+) -> Result<PathBuf, CliError> {
+    match (destination, directory) {
+        (Some(path), None) => Ok(path),
+        (None, Some(directory)) => {
+            Ok(directory.join(format!("gnosis-{}", Utc::now().format("%Y%m%dT%H%M%SZ"))))
+        }
+        _ => Err(CliError::Path),
+    }
+}
+
+fn utf8_path(path: PathBuf) -> Result<String, CliError> {
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| CliError::Path)
 }
 
 fn read_org() -> Result<String, CliError> {
@@ -126,6 +214,10 @@ fn write_result(result: &ResponseResult) -> Result<(), CliError> {
         ResponseResult::Thema(value) => write_json(value),
         ResponseResult::DueThemata(value) => write_json(value),
         ResponseResult::DuePage(value) => write_json(value),
+        ResponseResult::DeviceCreated(value) => write_json(value),
+        ResponseResult::Devices(value) => write_json(value),
+        ResponseResult::Device(value) => write_json(value),
+        ResponseResult::Backup(value) => write_json(value),
     }
 }
 

@@ -3,7 +3,9 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use thiserror::Error;
 
 use crate::domain::{
@@ -12,18 +14,36 @@ use crate::domain::{
     TitlePath,
 };
 use crate::{
-    application::{PreparedAsset, PreparedNote},
+    application::{
+        AssetHead, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
+        NewDevice, NodeRecord, PreparedAsset, PreparedNote, PreparedThema, SettingsInput,
+        SettingsRecord, TagRule, ThemaRecord, parse_stored_scopes, path_key, stored_scopes,
+        stored_thema_content, validate_org_path,
+    },
     blob::BlobMeta,
 };
 
+mod review;
+
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_initial.sql");
 const SERVER_MIGRATION: &str = include_str!("migrations/0002_server.sql");
-const SCHEMA_VERSION: u32 = 2;
+const REMOTE_REVIEW_MIGRATION: &str = include_str!("migrations/0003_remote_review.sql");
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
-    #[error("document revision conflict: expected {expected}, current revision is {actual:?}")]
+    #[error("revision conflict: expected {expected}, current revision is {actual:?}")]
     Conflict { expected: u64, actual: Option<u64> },
+    #[error("resource was not found")]
+    NotFound,
+    #[error("another review session is active")]
+    ActiveReviewSession,
+    #[error("review attempt is stale")]
+    StaleAttempt,
+    #[error("review operation is invalid in the current state")]
+    InvalidReviewState,
+    #[error("document path changes require a rename operation")]
+    PathChange,
     #[error("document projection is invalid: {reason}")]
     InvalidProjection { reason: &'static str },
     #[error("stored document contains invalid {field}")]
@@ -157,14 +177,22 @@ impl SqliteStore {
             .map_err(StoreError::storage)?;
         let current = load_document(&transaction, &prepared.document_id)?;
         check_revision(prepared.expected_revision, current.as_ref())?;
+        if current.is_some()
+            && document_path(&transaction, &prepared.document_id)? != prepared.logical_path
+        {
+            return Err(StoreError::PathChange);
+        }
         check_path_available(&transaction, prepared)?;
+        let current_active = load_document_head(&transaction, &prepared.document_id)?
+            .is_some_and(|head| head.active);
         if current.as_ref().is_some_and(|stored| {
             stored.projection() == &prepared.projection
                 && document_path(&transaction, &prepared.document_id)
                     .ok()
                     .as_deref()
                     == Some(prepared.logical_path.as_str())
-        }) {
+        }) && current_active
+        {
             transaction.commit().map_err(StoreError::storage)?;
             return current.ok_or(StoreError::CorruptData { field: "document" });
         }
@@ -218,30 +246,46 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::storage)?;
-        let current: Option<(String, i64)> = transaction
+        let collides: bool = transaction
             .query_row(
-                "SELECT blob_sha256, revision FROM managed_asset WHERE asset_path = ?1",
+                "SELECT EXISTS(
+                     SELECT 1 FROM managed_asset
+                     WHERE path_key = ?1 AND asset_path <> ?2
+                 )",
+                params![prepared.path_key, prepared.logical_path],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::storage)?;
+        if collides {
+            return Err(StoreError::InvalidProjection {
+                reason: "asset path collides by case",
+            });
+        }
+        let current: Option<(String, i64, bool)> = transaction
+            .query_row(
+                "SELECT blob_sha256, revision, active
+                 FROM managed_asset WHERE asset_path = ?1",
                 [&prepared.logical_path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(StoreError::storage)?;
         check_expected_number(
             prepared.expected_revision,
-            current.as_ref().map(|(_, revision)| *revision),
+            current.as_ref().map(|(_, revision, _)| *revision),
         )?;
         if current
             .as_ref()
-            .is_some_and(|(digest, _)| digest == &blob.sha256)
+            .is_some_and(|(digest, _, active)| digest == &blob.sha256 && *active)
         {
             transaction.commit().map_err(StoreError::storage)?;
             return current
-                .and_then(|(_, revision)| u64::try_from(revision).ok())
+                .and_then(|(_, revision, _)| u64::try_from(revision).ok())
                 .ok_or(StoreError::CorruptData {
                     field: "asset revision",
                 });
         }
-        let revision = next_number(current.as_ref().map(|(_, revision)| *revision))?;
+        let revision = next_number(current.as_ref().map(|(_, revision, _)| *revision))?;
         insert_blob(&transaction, blob, created_at_us)?;
         transaction
             .execute(
@@ -302,11 +346,9 @@ impl SqliteStore {
         Ok(revision)
     }
 
-    pub(crate) fn rewrite_thema_asset(
+    pub(crate) fn rewrite_imported_thema_content(
         &mut self,
-        thema_id: &str,
-        old_reference: &str,
-        asset_path: &str,
+        record: &ThemaRecord,
     ) -> Result<(), StoreError> {
         let transaction = self
             .connection
@@ -314,18 +356,44 @@ impl SqliteStore {
             .map_err(StoreError::storage)?;
         transaction
             .execute(
-                "UPDATE thema SET review_image = ?3
-                 WHERE thema_id = ?1 AND review_image = ?2",
-                params![thema_id, old_reference, asset_path],
+                "UPDATE thema SET keimenon = ?2, hypothesis_json = ?3,
+                     answer_json = ?4, parathema = ?5, review_image = ?6,
+                     content_sha256 = ?7
+                 WHERE thema_id = ?1",
+                params![
+                    record.thema_id,
+                    record.content.keimenon,
+                    serde_json::to_string(&record.content.hypothesis)
+                        .map_err(StoreError::storage)?,
+                    serde_json::to_string(&record.content.answer).map_err(StoreError::storage)?,
+                    record.content.parathema,
+                    record.content.review_image,
+                    record.content_sha256,
+                ],
             )
             .map_err(StoreError::storage)?;
         transaction
             .execute(
-                "INSERT OR IGNORE INTO thema_asset(thema_id, asset_path, role)
-                 VALUES (?1, ?2, 'review_image')",
-                params![thema_id, asset_path],
+                "DELETE FROM thema_asset WHERE thema_id = ?1",
+                [&record.thema_id],
             )
             .map_err(StoreError::storage)?;
+        let mut insert = transaction
+            .prepare_cached(
+                "INSERT INTO thema_asset(thema_id, asset_path, role) VALUES (?1, ?2, ?3)",
+            )
+            .map_err(StoreError::storage)?;
+        for asset_path in &record.asset_paths {
+            let role = if record.content.review_image.as_deref() == Some(asset_path) {
+                "review_image"
+            } else {
+                "content"
+            };
+            insert
+                .execute(params![record.thema_id, asset_path, role])
+                .map_err(StoreError::storage)?;
+        }
+        drop(insert);
         transaction.commit().map_err(StoreError::storage)
     }
 
@@ -343,6 +411,704 @@ impl SqliteStore {
             )
             .map_err(StoreError::storage)?;
         Ok(())
+    }
+
+    pub(crate) fn document_head(
+        &self,
+        document_id: &DocumentId,
+    ) -> Result<Option<DocumentHead>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT document_id, logical_path, revision, head_blob_sha256, active
+                 FROM document WHERE document_id = ?1",
+                [document_id.as_str()],
+                document_head_row,
+            )
+            .optional()
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn document_revisions(
+        &self,
+        document_id: &DocumentId,
+        after: u64,
+        limit: u16,
+    ) -> Result<Vec<DocumentRevision>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT document_id, revision, logical_path, blob_sha256, operation,
+                        created_at_us, author_device_id
+                 FROM document_revision
+                 WHERE document_id = ?1 AND revision > ?2
+                 ORDER BY revision LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        statement
+            .query_map(
+                params![
+                    document_id.as_str(),
+                    u64_to_i64(after, "document revision")?,
+                    i64::from(limit)
+                ],
+                document_revision_row,
+            )
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn document_revision(
+        &self,
+        document_id: &DocumentId,
+        revision: u64,
+    ) -> Result<Option<DocumentRevision>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT document_id, revision, logical_path, blob_sha256, operation,
+                        created_at_us, author_device_id
+                 FROM document_revision WHERE document_id = ?1 AND revision = ?2",
+                params![
+                    document_id.as_str(),
+                    u64_to_i64(revision, "document revision")?
+                ],
+                document_revision_row,
+            )
+            .optional()
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn rename_document(
+        &mut self,
+        document_id: &DocumentId,
+        logical_path: &str,
+        expected_revision: u64,
+        updated_at_us: i64,
+        author_device_id: Option<&str>,
+    ) -> Result<DocumentHead, StoreError> {
+        validate_org_path(logical_path).map_err(|_| StoreError::InvalidProjection {
+            reason: "logical path is invalid",
+        })?;
+        let transaction = self.write_transaction()?;
+        let current = load_document_head(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
+        check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+        check_document_path(&transaction, document_id, logical_path)?;
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData {
+                field: "document revision",
+            })?;
+        update_document_path(
+            &transaction,
+            document_id,
+            logical_path,
+            revision,
+            updated_at_us,
+        )?;
+        insert_document_history(
+            &transaction,
+            document_id,
+            logical_path,
+            current.blob_sha256.as_deref(),
+            revision,
+            "rename",
+            updated_at_us,
+            author_device_id,
+        )?;
+        insert_content_change(
+            &transaction,
+            "document",
+            document_id.as_str(),
+            revision,
+            "rename",
+            updated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(DocumentHead {
+            logical_path: logical_path.to_owned(),
+            revision,
+            ..current
+        })
+    }
+
+    pub(crate) fn tombstone_document(
+        &mut self,
+        document_id: &DocumentId,
+        expected_revision: u64,
+        updated_at_us: i64,
+        author_device_id: Option<&str>,
+    ) -> Result<DocumentHead, StoreError> {
+        let transaction = self.write_transaction()?;
+        let current = load_document_head(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
+        check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData {
+                field: "document revision",
+            })?;
+        transaction
+            .execute(
+                "UPDATE document SET active = 0, head_blob_sha256 = NULL,
+                     revision = ?2, updated_at_us = ?3 WHERE document_id = ?1",
+                params![
+                    document_id.as_str(),
+                    u64_to_i64(revision, "document revision")?,
+                    updated_at_us
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        transaction
+            .execute(
+                "UPDATE node SET active = 0 WHERE document_id = ?1",
+                [document_id.as_str()],
+            )
+            .map_err(StoreError::storage)?;
+        insert_document_history(
+            &transaction,
+            document_id,
+            &current.logical_path,
+            None,
+            revision,
+            "tombstone",
+            updated_at_us,
+            author_device_id,
+        )?;
+        insert_content_change(
+            &transaction,
+            "document",
+            document_id.as_str(),
+            revision,
+            "tombstone",
+            updated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(DocumentHead {
+            revision,
+            blob_sha256: None,
+            active: false,
+            ..current
+        })
+    }
+
+    pub(crate) fn asset_head(&self, path: &str) -> Result<Option<AssetHead>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT asset.asset_path, asset.revision, asset.blob_sha256,
+                        blob.media_type, asset.active
+                 FROM managed_asset AS asset
+                 JOIN blob ON blob.content_sha256 = asset.blob_sha256
+                 WHERE asset.asset_path = ?1",
+                [path],
+                asset_head_row,
+            )
+            .optional()
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn tombstone_asset(
+        &mut self,
+        asset_path: &str,
+        expected_revision: u64,
+        updated_at_us: i64,
+        author_device_id: Option<&str>,
+    ) -> Result<AssetHead, StoreError> {
+        let transaction = self.write_transaction()?;
+        let current = load_asset_head(&transaction, asset_path)?.ok_or(StoreError::NotFound)?;
+        check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+        let revision = current
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData {
+                field: "asset revision",
+            })?;
+        transaction
+            .execute(
+                "UPDATE managed_asset SET active = 0, revision = ?2, updated_at_us = ?3
+             WHERE asset_path = ?1",
+                params![
+                    asset_path,
+                    u64_to_i64(revision, "asset revision")?,
+                    updated_at_us
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        transaction
+            .execute(
+                "INSERT INTO asset_revision(
+                 asset_path, revision, blob_sha256, operation, created_at_us, author_device_id
+             ) VALUES (?1, ?2, NULL, 'tombstone', ?3, ?4)",
+                params![
+                    asset_path,
+                    u64_to_i64(revision, "asset revision")?,
+                    updated_at_us,
+                    author_device_id
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        insert_content_change(
+            &transaction,
+            "asset",
+            asset_path,
+            revision,
+            "tombstone",
+            updated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(AssetHead {
+            revision,
+            blob_sha256: None,
+            media_type: None,
+            active: false,
+            ..current
+        })
+    }
+
+    pub(crate) fn content_changes(
+        &self,
+        after: u64,
+        limit: u16,
+    ) -> Result<Vec<ContentChange>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT cursor, entity_kind, entity_id, revision, operation, created_at_us
+             FROM content_change WHERE cursor > ?1 ORDER BY cursor LIMIT ?2",
+            )
+            .map_err(StoreError::storage)?;
+        let rows = statement
+            .query_map(
+                params![u64_to_i64(after, "content cursor")?, i64::from(limit)],
+                content_change_row,
+            )
+            .map_err(StoreError::storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn latest_content_cursor(&self) -> Result<u64, StoreError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT coalesce(max(cursor), 0) FROM content_change",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::storage)?;
+        u64::try_from(value).map_err(|_| StoreError::CorruptData {
+            field: "content cursor",
+        })
+    }
+
+    pub(crate) fn backup_database(&self, path: &Path) -> Result<(), StoreError> {
+        self.connection
+            .backup(rusqlite::MAIN_DB, path, None)
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn referenced_blobs(&self) -> Result<Vec<(String, u64)>, StoreError> {
+        load_blob_rows(&self.connection)
+    }
+
+    pub(crate) fn verify_database_file(path: &Path) -> Result<Vec<(String, u64)>, StoreError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(StoreError::storage)?;
+        let version = schema_version(&connection)?;
+        if version != SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion {
+                found: version,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        let integrity: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(StoreError::storage)?;
+        let foreign_key_failure: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::storage)?;
+        if integrity != "ok" || foreign_key_failure {
+            return Err(StoreError::CorruptData {
+                field: "backup integrity",
+            });
+        }
+        load_blob_rows(&connection)
+    }
+
+    pub(crate) fn settings(&self) -> Result<SettingsRecord, StoreError> {
+        load_settings(&self.connection)
+    }
+
+    pub(crate) fn update_settings(
+        &mut self,
+        input: &SettingsInput,
+        expected_revision: u64,
+        updated_at_us: i64,
+    ) -> Result<SettingsRecord, StoreError> {
+        let transaction = self.write_transaction()?;
+        let current = transaction
+            .query_row("SELECT revision FROM settings WHERE id = 1", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(StoreError::storage)?;
+        check_expected_number(Some(expected_revision), Some(current))?;
+        let revision = next_number(Some(current))?;
+        transaction
+            .execute(
+                "UPDATE settings SET revision = ?1, timezone = ?2,
+                     day_boundary_hour = ?3, scheduler_version = ?4,
+                     scheduler_json = ?5, updated_at_us = ?6 WHERE id = 1",
+                params![
+                    u64_to_i64(revision, "settings revision")?,
+                    input.timezone,
+                    i64::from(input.day_boundary_hour),
+                    i64::from(input.scheduler.scheduler_version),
+                    serde_json::to_string(&input.scheduler).map_err(StoreError::storage)?,
+                    updated_at_us,
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        transaction
+            .execute("DELETE FROM tag_rule", [])
+            .map_err(StoreError::storage)?;
+        {
+            let mut insert = transaction
+                .prepare_cached("INSERT INTO tag_rule(tag, parameters_json) VALUES (?1, ?2)")
+                .map_err(StoreError::storage)?;
+            for (tag, rule) in &input.tag_rules {
+                insert
+                    .execute(params![
+                        tag,
+                        serde_json::to_string(rule).map_err(StoreError::storage)?
+                    ])
+                    .map_err(StoreError::storage)?;
+            }
+        }
+        insert_content_change(
+            &transaction,
+            "settings",
+            "canonical",
+            revision,
+            "update",
+            updated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        load_settings(&self.connection)
+    }
+
+    pub(crate) fn put_thema(
+        &mut self,
+        prepared: &PreparedThema,
+        initial_review_day: u32,
+        updated_at_us: i64,
+    ) -> Result<ThemaRecord, StoreError> {
+        let transaction = self.write_transaction()?;
+        let current = thema_revision(&transaction, prepared.thema_id.as_str())?;
+        check_expected_number(prepared.expected_revision, current)?;
+        validate_thema_associations(&transaction, prepared)?;
+        if thema_is_unchanged(&transaction, prepared)? {
+            transaction.commit().map_err(StoreError::storage)?;
+            return load_thema(&self.connection, prepared.thema_id.as_str())?
+                .ok_or(StoreError::NotFound);
+        }
+        let revision = next_number(current)?;
+        upsert_thema_row(&transaction, prepared, revision, updated_at_us)?;
+        replace_thema_associations(&transaction, prepared)?;
+        insert_initial_review_state(&transaction, prepared, initial_review_day)?;
+        insert_content_change(
+            &transaction,
+            "thema",
+            prepared.thema_id.as_str(),
+            revision,
+            if current.is_some() {
+                "update"
+            } else {
+                "create"
+            },
+            updated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        load_thema(&self.connection, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn get_thema(&self, thema_id: &str) -> Result<Option<ThemaRecord>, StoreError> {
+        load_thema(&self.connection, thema_id)
+    }
+
+    pub(crate) fn set_thema_archived(
+        &mut self,
+        thema_id: &str,
+        expected_revision: u64,
+        archived: bool,
+        updated_at_us: i64,
+    ) -> Result<ThemaRecord, StoreError> {
+        let transaction = self.write_transaction()?;
+        let current = thema_revision(&transaction, thema_id)?.ok_or(StoreError::NotFound)?;
+        check_expected_number(Some(expected_revision), Some(current))?;
+        let revision = next_number(Some(current))?;
+        transaction
+            .execute(
+                "UPDATE thema SET revision = ?2, archived_at_us = ?3, updated_at_us = ?4
+             WHERE thema_id = ?1",
+                params![
+                    thema_id,
+                    u64_to_i64(revision, "thema revision")?,
+                    archived.then_some(updated_at_us),
+                    updated_at_us
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        insert_content_change(
+            &transaction,
+            "thema",
+            thema_id,
+            revision,
+            if archived { "archive" } else { "unarchive" },
+            updated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        load_thema(&self.connection, thema_id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn search_themata(
+        &self,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<Vec<ThemaRecord>, StoreError> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT thema.thema_id FROM thema
+             LEFT JOIN thema_tag ON thema_tag.thema_id = thema.thema_id
+             WHERE thema.thema_id > coalesce(?2, '')
+               AND (lower(thema.keimenon) LIKE ?1 OR lower(thema_tag.tag) LIKE ?1)
+             ORDER BY thema.thema_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        let ids = statement
+            .query_map(params![pattern, after, i64::from(limit)], |row| row.get(0))
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(StoreError::storage)?;
+        ids.into_iter()
+            .map(|id| load_thema(&self.connection, &id)?.ok_or(StoreError::NotFound))
+            .collect()
+    }
+
+    pub(crate) fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
+        load_node(&self.connection, node_id)
+    }
+
+    pub(crate) fn search_nodes(
+        &self,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT node_id FROM (
+                     SELECT DISTINCT node.node_id FROM node
+                     LEFT JOIN node_tag ON node_tag.document_id = node.document_id
+                                            AND node_tag.node_id = node.node_id
+                     WHERE lower(node.title) LIKE ?1 OR lower(node_tag.tag) LIKE ?1
+                     UNION
+                     SELECT retired.node_id FROM retired_node AS retired
+                     WHERE NOT EXISTS(SELECT 1 FROM node WHERE node_id = retired.node_id)
+                       AND (lower(retired.title) LIKE ?1 OR EXISTS(
+                           SELECT 1 FROM json_each(retired.tags_json)
+                           WHERE lower(value) LIKE ?1
+                       ))
+                 ) WHERE node_id > coalesce(?2, '')
+                 ORDER BY node_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        let ids = statement
+            .query_map(params![pattern, after, i64::from(limit)], |row| row.get(0))
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(StoreError::storage)?;
+        ids.into_iter()
+            .map(|id| load_node(&self.connection, &id)?.ok_or(StoreError::NotFound))
+            .collect()
+    }
+
+    pub(crate) fn graph_nodes(
+        &self,
+        node_id: &str,
+        inbound: bool,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        let (selected, compared) = if inbound {
+            ("source_id", "target_id")
+        } else {
+            ("target_id", "source_id")
+        };
+        let historical = !load_node(&self.connection, node_id)?
+            .ok_or(StoreError::NotFound)?
+            .active;
+        let edges = if historical {
+            "(SELECT source_id, target_id FROM node_edge
+               UNION SELECT source_id, target_id FROM retired_node_edge)"
+        } else {
+            "node_edge"
+        };
+        let query = format!(
+            "SELECT DISTINCT {selected} FROM {edges}
+             WHERE {compared} = ?1 AND {selected} > coalesce(?2, '')
+             ORDER BY {selected} LIMIT ?3"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(StoreError::storage)?;
+        let ids = statement
+            .query_map(params![node_id, after, i64::from(limit)], |row| row.get(0))
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(StoreError::storage)?;
+        ids.into_iter()
+            .map(|id| load_node(&self.connection, &id)?.ok_or(StoreError::NotFound))
+            .collect()
+    }
+
+    pub(crate) fn create_device(
+        &mut self,
+        device: &NewDevice,
+        created_at_us: i64,
+    ) -> Result<DeviceRecord, StoreError> {
+        let scopes = stored_scopes(&device.scopes).map_err(StoreError::storage)?;
+        let transaction = self.write_transaction()?;
+        transaction
+            .execute(
+                "INSERT INTO device(
+                 device_id, name, token_digest, scopes_json, created_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    device.device_id,
+                    device.name,
+                    device.token_digest,
+                    scopes,
+                    created_at_us
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        insert_audit(
+            &transaction,
+            Some(&device.device_id),
+            "device.create",
+            "device",
+            Some(&device.device_id),
+            created_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        self.device(&device.device_id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn devices(&self) -> Result<Vec<DeviceRecord>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT device_id, name, scopes_json, created_at_us,
+                    last_used_at_us, revoked_at_us
+             FROM device ORDER BY created_at_us, device_id",
+            )
+            .map_err(StoreError::storage)?;
+        let rows = statement
+            .query_map([], device_record_row)
+            .map_err(StoreError::storage)?;
+        rows.map(|row| materialize_device(row.map_err(StoreError::storage)?))
+            .collect()
+    }
+
+    pub(crate) fn revoke_device(
+        &mut self,
+        device_id: &str,
+        revoked_at_us: i64,
+    ) -> Result<DeviceRecord, StoreError> {
+        let transaction = self.write_transaction()?;
+        let changed = transaction
+            .execute(
+                "UPDATE device SET revoked_at_us = coalesce(revoked_at_us, ?2)
+             WHERE device_id = ?1",
+                params![device_id, revoked_at_us],
+            )
+            .map_err(StoreError::storage)?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        insert_audit(
+            &transaction,
+            Some(device_id),
+            "device.revoke",
+            "device",
+            Some(device_id),
+            revoked_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        self.device(device_id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn authenticate(
+        &mut self,
+        digest: &str,
+        used_at_us: i64,
+    ) -> Result<Option<DevicePrincipal>, StoreError> {
+        let transaction = self.write_transaction()?;
+        let principal = transaction
+            .query_row(
+                "SELECT device_id, scopes_json FROM device
+             WHERE token_digest = ?1 AND revoked_at_us IS NULL",
+                [digest],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::storage)?;
+        let Some((device_id, scopes)) = principal else {
+            transaction.commit().map_err(StoreError::storage)?;
+            return Ok(None);
+        };
+        transaction
+            .execute(
+                "UPDATE device SET last_used_at_us = ?2 WHERE device_id = ?1",
+                params![device_id, used_at_us],
+            )
+            .map_err(StoreError::storage)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(Some(DevicePrincipal {
+            device_id,
+            scopes: parse_stored_scopes(&scopes).map_err(StoreError::storage)?,
+        }))
+    }
+
+    fn device(&self, device_id: &str) -> Result<Option<DeviceRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT device_id, name, scopes_json, created_at_us,
+                    last_used_at_us, revoked_at_us
+             FROM device WHERE device_id = ?1",
+                [device_id],
+                device_record_row,
+            )
+            .optional()
+            .map_err(StoreError::storage)?
+            .map(materialize_device)
+            .transpose()
+    }
+
+    fn write_transaction(&mut self) -> Result<Transaction<'_>, StoreError> {
+        self.connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::storage)
     }
 
     fn replace(
@@ -376,6 +1142,682 @@ impl SqliteStore {
     }
 }
 
+fn document_head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentHead> {
+    Ok(DocumentHead {
+        document_id: row.get(0)?,
+        logical_path: row.get(1)?,
+        revision: row_u64(row, 2)?,
+        blob_sha256: row.get(3)?,
+        active: row.get::<_, i64>(4)? != 0,
+    })
+}
+
+fn document_revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentRevision> {
+    Ok(DocumentRevision {
+        document_id: row.get(0)?,
+        revision: row_u64(row, 1)?,
+        logical_path: row.get(2)?,
+        blob_sha256: row.get(3)?,
+        operation: row.get(4)?,
+        created_at_us: row_u64(row, 5)?,
+        author_device_id: row.get(6)?,
+    })
+}
+
+fn asset_head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetHead> {
+    Ok(AssetHead {
+        logical_path: row.get(0)?,
+        revision: row_u64(row, 1)?,
+        blob_sha256: row.get(2)?,
+        media_type: row.get(3)?,
+        active: row.get::<_, i64>(4)? != 0,
+    })
+}
+
+fn content_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentChange> {
+    Ok(ContentChange {
+        cursor: row_u64(row, 0)?,
+        entity_kind: row.get(1)?,
+        entity_id: row.get(2)?,
+        revision: row_u64(row, 3)?,
+        operation: row.get(4)?,
+        created_at_us: row_u64(row, 5)?,
+    })
+}
+
+fn load_settings(connection: &Connection) -> Result<SettingsRecord, StoreError> {
+    let (revision, timezone, boundary, version, scheduler): (i64, String, i64, i64, String) =
+        connection
+            .query_row(
+                "SELECT revision, timezone, day_boundary_hour, scheduler_version,
+                        scheduler_json FROM settings WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::storage)?;
+    let mut scheduler: crate::application::ParametersSnapshot =
+        serde_json::from_str(&scheduler).map_err(StoreError::storage)?;
+    scheduler.scheduler_version = u32::try_from(version).map_err(|_| StoreError::CorruptData {
+        field: "scheduler version",
+    })?;
+    let mut statement = connection
+        .prepare("SELECT tag, parameters_json FROM tag_rule ORDER BY tag")
+        .map_err(StoreError::storage)?;
+    let tag_rules = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StoreError::storage)?
+        .map(|row| {
+            let (tag, json) = row.map_err(StoreError::storage)?;
+            let rule = serde_json::from_str::<TagRule>(&json).map_err(StoreError::storage)?;
+            Ok((tag, rule))
+        })
+        .collect::<Result<_, StoreError>>()?;
+    Ok(SettingsRecord {
+        revision: u64::try_from(revision).map_err(|_| StoreError::CorruptData {
+            field: "settings revision",
+        })?,
+        timezone,
+        day_boundary_hour: u8::try_from(boundary).map_err(|_| StoreError::CorruptData {
+            field: "day boundary",
+        })?,
+        scheduler,
+        tag_rules,
+    })
+}
+
+fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT content_sha256, size_bytes FROM blob ORDER BY content_sha256")
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map([], |row| {
+            let digest = row.get::<_, String>(0)?;
+            let size = row.get::<_, i64>(1)?;
+            let size = u64::try_from(size).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            Ok((digest, size))
+        })
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
+}
+
+fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+fn load_document_head(
+    connection: &Connection,
+    document_id: &DocumentId,
+) -> Result<Option<DocumentHead>, StoreError> {
+    connection
+        .query_row(
+            "SELECT document_id, logical_path, revision, head_blob_sha256, active
+             FROM document WHERE document_id = ?1",
+            [document_id.as_str()],
+            document_head_row,
+        )
+        .optional()
+        .map_err(StoreError::storage)
+}
+
+fn check_document_path(
+    connection: &Connection,
+    document_id: &DocumentId,
+    logical_path: &str,
+) -> Result<(), StoreError> {
+    let owner = connection
+        .query_row(
+            "SELECT document_id FROM document WHERE path_key = ?1 AND active = 1",
+            [path_key(logical_path)],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    if owner
+        .as_deref()
+        .is_none_or(|owner| owner == document_id.as_str())
+    {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidProjection {
+            reason: "logical path collides with another document",
+        })
+    }
+}
+
+fn update_document_path(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    logical_path: &str,
+    revision: u64,
+    updated_at_us: i64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "UPDATE document SET logical_path = ?2, path_key = ?3,
+                 revision = ?4, updated_at_us = ?5 WHERE document_id = ?1",
+            params![
+                document_id.as_str(),
+                logical_path,
+                path_key(logical_path),
+                u64_to_i64(revision, "document revision")?,
+                updated_at_us,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_document_history(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    logical_path: &str,
+    blob_sha256: Option<&str>,
+    revision: u64,
+    operation: &str,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO document_revision(
+                 document_id, revision, logical_path, blob_sha256, operation,
+                 created_at_us, author_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                document_id.as_str(),
+                u64_to_i64(revision, "document revision")?,
+                logical_path,
+                blob_sha256,
+                operation,
+                created_at_us,
+                author_device_id,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn load_asset_head(
+    connection: &Connection,
+    asset_path: &str,
+) -> Result<Option<AssetHead>, StoreError> {
+    connection
+        .query_row(
+            "SELECT asset.asset_path, asset.revision, asset.blob_sha256,
+                    blob.media_type, asset.active
+             FROM managed_asset AS asset
+             JOIN blob ON blob.content_sha256 = asset.blob_sha256
+             WHERE asset.asset_path = ?1",
+            [asset_path],
+            asset_head_row,
+        )
+        .optional()
+        .map_err(StoreError::storage)
+}
+
+fn thema_revision(connection: &Connection, thema_id: &str) -> Result<Option<i64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT revision FROM thema WHERE thema_id = ?1",
+            [thema_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::storage)
+}
+
+fn validate_thema_associations(
+    connection: &Connection,
+    prepared: &PreparedThema,
+) -> Result<(), StoreError> {
+    for node_id in &prepared.node_ids {
+        require_active(connection, "node", "node_id", node_id.as_str())?;
+    }
+    for asset_path in &prepared.asset_paths {
+        require_active(connection, "managed_asset", "asset_path", asset_path)?;
+    }
+    Ok(())
+}
+
+fn require_active(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    value: &str,
+) -> Result<(), StoreError> {
+    let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1 AND active = 1)");
+    let exists: bool = connection
+        .query_row(&query, [value], |row| row.get(0))
+        .map_err(StoreError::storage)?;
+    if exists {
+        Ok(())
+    } else {
+        Err(StoreError::NotFound)
+    }
+}
+
+fn thema_is_unchanged(
+    connection: &Connection,
+    prepared: &PreparedThema,
+) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT content_sha256 = ?2 AND archived_at_us IS NULL
+             FROM thema WHERE thema_id = ?1",
+            params![prepared.thema_id.as_str(), prepared.content_sha256],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .map_err(StoreError::storage)
+}
+
+fn upsert_thema_row(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+    revision: u64,
+    updated_at_us: i64,
+) -> Result<(), StoreError> {
+    let content = &prepared.content;
+    transaction
+        .execute(
+            "INSERT INTO thema(
+             thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
+             source_guid, parathema, review_image, content_sha256,
+             created_at_us, updated_at_us
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+         ON CONFLICT(thema_id) DO UPDATE SET
+             revision = excluded.revision, kind = excluded.kind,
+             keimenon = excluded.keimenon, hypothesis_json = excluded.hypothesis_json,
+             answer_json = excluded.answer_json, source_guid = excluded.source_guid,
+             parathema = excluded.parathema, review_image = excluded.review_image,
+             content_sha256 = excluded.content_sha256, archived_at_us = NULL,
+             updated_at_us = excluded.updated_at_us",
+            params![
+                prepared.thema_id.as_str(),
+                u64_to_i64(revision, "thema revision")?,
+                content.kind.as_str(),
+                content.keimenon,
+                serde_json::to_string(&content.hypothesis).map_err(StoreError::storage)?,
+                serde_json::to_string(&content.answer).map_err(StoreError::storage)?,
+                content.source_guid,
+                content.parathema,
+                content.review_image,
+                prepared.content_sha256,
+                updated_at_us,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn replace_thema_associations(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+) -> Result<(), StoreError> {
+    for table in ["thema_tag", "thema_node_link", "thema_asset"] {
+        transaction
+            .execute(
+                &format!("DELETE FROM {table} WHERE thema_id = ?1"),
+                [prepared.thema_id.as_str()],
+            )
+            .map_err(StoreError::storage)?;
+    }
+    insert_thema_tags(transaction, prepared)?;
+    insert_thema_nodes(transaction, prepared)?;
+    insert_thema_assets(transaction, prepared)
+}
+
+fn insert_thema_tags(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+) -> Result<(), StoreError> {
+    let mut insert = transaction
+        .prepare_cached("INSERT INTO thema_tag(thema_id, tag) VALUES (?1, ?2)")
+        .map_err(StoreError::storage)?;
+    for tag in &prepared.tags {
+        insert
+            .execute(params![prepared.thema_id.as_str(), tag])
+            .map_err(StoreError::storage)?;
+    }
+    Ok(())
+}
+
+fn insert_thema_nodes(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+) -> Result<(), StoreError> {
+    let mut insert = transaction
+        .prepare_cached("INSERT INTO thema_node_link(thema_id, node_id) VALUES (?1, ?2)")
+        .map_err(StoreError::storage)?;
+    for node_id in &prepared.node_ids {
+        insert
+            .execute(params![prepared.thema_id.as_str(), node_id.as_str()])
+            .map_err(StoreError::storage)?;
+    }
+    Ok(())
+}
+
+fn insert_thema_assets(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+) -> Result<(), StoreError> {
+    let mut insert = transaction
+        .prepare_cached("INSERT INTO thema_asset(thema_id, asset_path, role) VALUES (?1, ?2, ?3)")
+        .map_err(StoreError::storage)?;
+    for asset_path in &prepared.asset_paths {
+        let role = if prepared.content.review_image.as_deref() == Some(asset_path) {
+            "review_image"
+        } else {
+            "content"
+        };
+        insert
+            .execute(params![prepared.thema_id.as_str(), asset_path, role])
+            .map_err(StoreError::storage)?;
+    }
+    Ok(())
+}
+
+fn insert_initial_review_state(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+    initial_review_day: u32,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO review_state VALUES (
+             ?1, 0, 0, 0, 0, NULL, NULL, ?2, NULL, 0, 0, 0, 0, 0,
+             0.35, 0.30, 1.3
+         )",
+            params![prepared.thema_id.as_str(), i64::from(initial_review_day)],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn load_thema(connection: &Connection, thema_id: &str) -> Result<Option<ThemaRecord>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
+                source_guid, parathema, review_image, content_sha256,
+                archived_at_us IS NOT NULL
+         FROM thema WHERE thema_id = ?1",
+            [thema_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, bool>(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    row.map(|row| materialize_thema_record(connection, row))
+        .transpose()
+}
+
+type ThemaRecordRow = (
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    bool,
+);
+
+fn materialize_thema_record(
+    connection: &Connection,
+    row: ThemaRecordRow,
+) -> Result<ThemaRecord, StoreError> {
+    let (
+        id,
+        revision,
+        kind,
+        keimenon,
+        hypothesis,
+        answer,
+        source,
+        context,
+        image,
+        digest,
+        archived,
+    ) = row;
+    let content = stored_thema_content(
+        &kind,
+        keimenon,
+        serde_json::from_str(&hypothesis).map_err(StoreError::storage)?,
+        serde_json::from_str(&answer).map_err(StoreError::storage)?,
+        source,
+        context,
+        image,
+    )
+    .map_err(|_| StoreError::CorruptData {
+        field: "thema content",
+    })?;
+    Ok(ThemaRecord {
+        tags: query_strings(
+            connection,
+            "SELECT tag FROM thema_tag WHERE thema_id = ?1 ORDER BY tag",
+            &id,
+        )?,
+        node_ids: query_strings(
+            connection,
+            "SELECT node_id FROM thema_node_link WHERE thema_id = ?1 ORDER BY node_id",
+            &id,
+        )?,
+        asset_paths: query_strings(
+            connection,
+            "SELECT asset_path FROM thema_asset WHERE thema_id = ?1 ORDER BY asset_path",
+            &id,
+        )?,
+        thema_id: id,
+        revision: to_u64(revision, "thema revision")?,
+        content,
+        content_sha256: digest,
+        archived,
+    })
+}
+
+fn load_node(connection: &Connection, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
+    if let Some(node) = load_current_node(connection, node_id)? {
+        return Ok(Some(node));
+    }
+    load_retired_node(connection, node_id)
+}
+
+fn load_current_node(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<Option<NodeRecord>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT node.node_id, node.document_id, document.logical_path, node.title,
+                node.title_path_json, node.level, node.active
+         FROM node JOIN document ON document.document_id = node.document_id
+         WHERE node.node_id = ?1",
+            [node_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    row.map(|row| materialize_current_node(connection, row))
+        .transpose()
+}
+
+fn materialize_current_node(
+    connection: &Connection,
+    row: (String, String, String, String, String, i64, bool),
+) -> Result<NodeRecord, StoreError> {
+    let (id, document_id, path, title, title_path, level, active) = row;
+    Ok(NodeRecord {
+        tags: query_node_tags(connection, &document_id, &id)?,
+        thema_ids: linked_themata(connection, &id)?,
+        node_id: id,
+        document_id,
+        logical_path: path,
+        title,
+        title_path: serde_json::from_str(&title_path).map_err(StoreError::storage)?,
+        level: to_u32(level, "node level")?,
+        active,
+    })
+}
+
+fn load_retired_node(
+    connection: &Connection,
+    node_id: &str,
+) -> Result<Option<NodeRecord>, StoreError> {
+    connection
+        .query_row(
+            "SELECT node_id, document_id, logical_path, title, title_path_json,
+                tags_json, level FROM retired_node WHERE node_id = ?1",
+            [node_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .map(|(id, document_id, path, title, title_path, tags, level)| {
+            Ok(NodeRecord {
+                thema_ids: linked_themata(connection, &id)?,
+                node_id: id,
+                document_id,
+                logical_path: path,
+                title,
+                title_path: serde_json::from_str(&title_path).map_err(StoreError::storage)?,
+                tags: serde_json::from_str(&tags).map_err(StoreError::storage)?,
+                level: to_u32(level, "node level")?,
+                active: false,
+            })
+        })
+        .transpose()
+}
+
+fn query_node_tags(
+    connection: &Connection,
+    document_id: &str,
+    node_id: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT tag FROM node_tag WHERE document_id = ?1 AND node_id = ?2 ORDER BY ordinal",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map(params![document_id, node_id], |row| row.get(0))
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
+}
+
+fn linked_themata(connection: &Connection, node_id: &str) -> Result<Vec<String>, StoreError> {
+    query_strings(
+        connection,
+        "SELECT thema_id FROM thema_node_link WHERE node_id = ?1 ORDER BY thema_id",
+        node_id,
+    )
+}
+
+type DeviceRow = (String, String, String, i64, Option<i64>, Option<i64>);
+
+fn device_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn materialize_device(row: DeviceRow) -> Result<DeviceRecord, StoreError> {
+    Ok(DeviceRecord {
+        device_id: row.0,
+        name: row.1,
+        scopes: parse_stored_scopes(&row.2).map_err(StoreError::storage)?,
+        created_at_us: to_u64(row.3, "device created timestamp")?,
+        last_used_at_us: optional_u64(row.4, "device used timestamp")?,
+        revoked_at_us: optional_u64(row.5, "device revoked timestamp")?,
+    })
+}
+
+fn insert_audit(
+    transaction: &Transaction<'_>,
+    device_id: Option<&str>,
+    action: &str,
+    resource_kind: &str,
+    resource_id: Option<&str>,
+    created_at_us: i64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO audit_event(
+             device_id, action, resource_kind, resource_id, created_at_us
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![device_id, action, resource_kind, resource_id, created_at_us],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FailPoint {
     None,
@@ -399,6 +1841,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if found < 2 {
         connection
             .execute_batch(SERVER_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
+    if found < 3 {
+        connection
+            .execute_batch(REMOTE_REVIEW_MIGRATION)
             .map_err(StoreError::storage)?;
     }
     Ok(())
@@ -1117,6 +2564,18 @@ fn retire_removed_nodes(
                 ],
             )
             .map_err(StoreError::storage)?;
+        transaction
+            .execute(
+                "INSERT INTO retired_node_edge(
+                     document_id, source_id, target_id, retired_at_revision
+                 )
+                 SELECT document_id, source_id, target_id, ?2 FROM node_edge
+                 WHERE source_id = ?1 OR target_id = ?1
+                 ON CONFLICT(document_id, source_id, target_id) DO UPDATE SET
+                     retired_at_revision = excluded.retired_at_revision",
+                params![node_id, u64_to_i64(revision, "retired revision")?],
+            )
+            .map_err(StoreError::storage)?;
     }
     Ok(())
 }
@@ -1441,7 +2900,10 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{FailPoint, SqliteStore, StoreError};
+    use super::{
+        FailPoint, INITIAL_MIGRATION, SERVER_MIGRATION, SqliteStore, StoreError, migrate,
+        schema_version,
+    };
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
         SourceSpan, TitlePath,
@@ -1566,7 +3028,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            2
+            3
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1574,8 +3036,35 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            2
+            3
         );
+    }
+
+    #[test]
+    fn upgrades_an_existing_schema_v2_database() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(SERVER_MIGRATION).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), 2);
+
+        migrate(&connection).unwrap();
+
+        assert_eq!(schema_version(&connection).unwrap(), 3);
+        for (table, column) in [
+            ("retired_node_edge", "source_id"),
+            ("review_attempt", "thema_revision"),
+            ("review_attempt", "parameters_json"),
+            ("review_attempt", "fuzz_sample"),
+        ] {
+            let present: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                    [table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}.{column}");
+        }
     }
 
     #[test]

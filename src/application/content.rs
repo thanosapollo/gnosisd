@@ -1,4 +1,4 @@
-use std::{path::Path, sync::LazyLock};
+use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -6,12 +6,18 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    domain::{DocumentId, DocumentProjection},
+    domain::{
+        DocumentId, DocumentProjection, NodeId, ThemaContent, ThemaContentError, ThemaId, ThemaKind,
+    },
     parser::org::{OrgParseError, parse_org},
 };
 
 static FILE_LINK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[\[file:([^]\n]+)").expect("file-link regex is valid"));
+    LazyLock::new(|| Regex::new(r"\[{1,2}file:([^]\n]+)").expect("file-link regex is valid"));
+static PLAIN_FILE_LINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[[:space:](])file:([^[:space:]\[\]<>\n]+)")
+        .expect("plain file-link regex is valid")
+});
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedNote {
@@ -30,6 +36,248 @@ pub(crate) struct PreparedAsset {
     pub(crate) path_key: String,
     pub(crate) original_name: String,
     pub(crate) expected_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedThema {
+    pub(crate) thema_id: ThemaId,
+    pub(crate) content: ThemaContent,
+    pub(crate) tags: Vec<String>,
+    pub(crate) node_ids: Vec<NodeId>,
+    pub(crate) asset_paths: Vec<String>,
+    pub(crate) content_sha256: String,
+    pub(crate) expected_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContentChange {
+    pub(crate) cursor: u64,
+    pub(crate) entity_kind: String,
+    pub(crate) entity_id: String,
+    pub(crate) revision: u64,
+    pub(crate) operation: String,
+    pub(crate) created_at_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DocumentHead {
+    pub(crate) document_id: String,
+    pub(crate) logical_path: String,
+    pub(crate) revision: u64,
+    pub(crate) blob_sha256: Option<String>,
+    pub(crate) active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DocumentRevision {
+    pub(crate) document_id: String,
+    pub(crate) revision: u64,
+    pub(crate) logical_path: String,
+    pub(crate) blob_sha256: Option<String>,
+    pub(crate) operation: String,
+    pub(crate) created_at_us: u64,
+    pub(crate) author_device_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AssetHead {
+    pub(crate) logical_path: String,
+    pub(crate) revision: u64,
+    pub(crate) blob_sha256: Option<String>,
+    pub(crate) media_type: Option<String>,
+    pub(crate) active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThemaRecord {
+    pub(crate) thema_id: String,
+    pub(crate) revision: u64,
+    pub(crate) content: ThemaContent,
+    pub(crate) content_sha256: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) node_ids: Vec<String>,
+    pub(crate) asset_paths: Vec<String>,
+    pub(crate) archived: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NodeRecord {
+    pub(crate) node_id: String,
+    pub(crate) document_id: String,
+    pub(crate) logical_path: String,
+    pub(crate) title: String,
+    pub(crate) title_path: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) level: u32,
+    pub(crate) active: bool,
+    pub(crate) thema_ids: Vec<String>,
+}
+
+pub(crate) fn prepare_thema(
+    thema_id: Option<String>,
+    content: ThemaContent,
+    tags: Vec<String>,
+    node_ids: Vec<String>,
+    asset_paths: Vec<String>,
+    expected_revision: Option<u64>,
+) -> Result<PreparedThema, ContentError> {
+    let content = content.validate()?;
+    let tags = validated_tags(tags)?;
+    let node_ids = validated_nodes(node_ids)?;
+    let asset_paths = validated_assets(asset_paths)?;
+    validate_thema_references(&content, &asset_paths)?;
+    let thema_id = ThemaId::new(thema_id.unwrap_or_else(|| Uuid::now_v7().to_string()))
+        .map_err(|_| ContentError::ThemaId)?;
+    let content_sha256 = thema_digest(&content, &tags, &node_ids, &asset_paths)?;
+    Ok(PreparedThema {
+        thema_id,
+        content,
+        tags,
+        node_ids,
+        asset_paths,
+        content_sha256,
+        expected_revision,
+    })
+}
+
+pub(crate) fn thema_content(
+    kind: &str,
+    keimenon: String,
+    hypothesis: Vec<Option<String>>,
+    answer: Vec<String>,
+    source_guid: Option<String>,
+    parathema: Option<String>,
+    review_image: Option<String>,
+) -> Result<ThemaContent, ContentError> {
+    Ok(ThemaContent {
+        kind: ThemaKind::parse(kind)?,
+        keimenon,
+        hypothesis,
+        answer,
+        source_guid,
+        parathema,
+        review_image,
+    }
+    .validate()?)
+}
+
+pub(crate) fn stored_thema_content(
+    kind: &str,
+    keimenon: String,
+    hypothesis: Vec<Option<String>>,
+    answer: Vec<String>,
+    source_guid: Option<String>,
+    parathema: Option<String>,
+    review_image: Option<String>,
+) -> Result<ThemaContent, ContentError> {
+    if answer.is_empty() {
+        return Err(ContentError::Thema(ThemaContentError::Blank));
+    }
+    Ok(ThemaContent {
+        kind: ThemaKind::parse(kind)?,
+        keimenon,
+        hypothesis,
+        answer,
+        source_guid,
+        parathema,
+        review_image,
+    })
+}
+
+fn validated_tags(values: Vec<String>) -> Result<Vec<String>, ContentError> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(ContentError::Tag);
+    }
+    Ok(values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+fn validated_nodes(values: Vec<String>) -> Result<Vec<NodeId>, ContentError> {
+    values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|value| NodeId::new(value).map_err(|_| ContentError::NodeId))
+        .collect()
+}
+
+fn validated_assets(values: Vec<String>) -> Result<Vec<String>, ContentError> {
+    values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|value| {
+            validate_asset_path(&value)?;
+            Ok(value)
+        })
+        .collect()
+}
+
+fn validate_thema_references(
+    content: &ThemaContent,
+    asset_paths: &[String],
+) -> Result<(), ContentError> {
+    let text = std::iter::once(content.keimenon.as_str())
+        .chain(content.hypothesis.iter().filter_map(Option::as_deref))
+        .chain(content.answer.iter().map(String::as_str))
+        .chain(content.parathema.as_deref());
+    for value in text {
+        for expression in file_link_expressions() {
+            for captures in expression.captures_iter(value) {
+                let target = captures.get(1).ok_or(ContentError::Path)?.as_str();
+                validate_thema_asset_reference(
+                    target.split("::").next().ok_or(ContentError::Path)?,
+                    asset_paths,
+                )?;
+            }
+        }
+    }
+    if let Some(reference) = content.review_image.as_deref() {
+        validate_thema_asset_reference(reference, asset_paths)?;
+    }
+    Ok(())
+}
+
+fn validate_thema_asset_reference(
+    reference: &str,
+    asset_paths: &[String],
+) -> Result<(), ContentError> {
+    if external_reference(reference) {
+        return Ok(());
+    }
+    validate_asset_path(reference)?;
+    if asset_paths
+        .binary_search_by(|path| path.as_str().cmp(reference))
+        .is_err()
+    {
+        return Err(ContentError::UnmanagedAsset);
+    }
+    Ok(())
+}
+
+fn thema_digest(
+    content: &ThemaContent,
+    tags: &[String],
+    nodes: &[NodeId],
+    assets: &[String],
+) -> Result<String, ContentError> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "answer": content.answer,
+        "assets": assets,
+        "hypothesis": content.hypothesis,
+        "keimenon": content.keimenon,
+        "kind": content.kind.as_str(),
+        "nodes": nodes.iter().map(NodeId::as_str).collect::<Vec<_>>(),
+        "parathema": content.parathema,
+        "review_image": content.review_image,
+        "source_guid": content.source_guid,
+        "tags": tags,
+    }))
+    .map_err(|_| ContentError::Serialization)?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 pub(crate) fn prepare_asset(
@@ -134,16 +382,22 @@ pub(crate) fn path_key(value: &str) -> String {
 
 fn validate_file_links(document_path: &str, org: &str) -> Result<(), ContentError> {
     let _ = document_path;
-    for captures in FILE_LINK.captures_iter(org) {
-        let target = captures.get(1).ok_or(ContentError::Path)?.as_str();
-        let target = target.split("::").next().ok_or(ContentError::Path)?;
-        validate_reference(target)?;
+    for expression in file_link_expressions() {
+        for captures in expression.captures_iter(org) {
+            let target = captures.get(1).ok_or(ContentError::Path)?.as_str();
+            let target = target.split("::").next().ok_or(ContentError::Path)?;
+            validate_reference(target)?;
+        }
     }
     Ok(())
 }
 
+pub(crate) fn file_link_expressions() -> [&'static Regex; 2] {
+    [&FILE_LINK, &PLAIN_FILE_LINK]
+}
+
 fn validate_reference(target: &str) -> Result<(), ContentError> {
-    if target.starts_with("http://") || target.starts_with("https://") {
+    if external_reference(target) {
         return Ok(());
     }
     validate_logical_path(target)?;
@@ -155,6 +409,10 @@ fn validate_reference(target: &str) -> Result<(), ContentError> {
     } else {
         Err(ContentError::UnsupportedType)
     }
+}
+
+fn external_reference(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 pub(crate) fn supported_asset(value: &str) -> bool {
@@ -173,25 +431,42 @@ pub(crate) fn supported_asset(value: &str) -> bool {
 pub(crate) enum ContentError {
     #[error("invalid document ID")]
     DocumentId,
+    #[error("invalid thema ID")]
+    ThemaId,
+    #[error("invalid node ID")]
+    NodeId,
+    #[error("invalid tag")]
+    Tag,
     #[error("logical path is invalid")]
     Path,
     #[error("file type is not supported")]
     UnsupportedType,
+    #[error("thema content references an asset that is not attached")]
+    UnmanagedAsset,
     #[error("invalid Org document")]
     Org(#[from] OrgParseError),
     #[error("Org parser rejected the document")]
     OrgParser,
+    #[error("thema content is invalid")]
+    Thema(#[from] ThemaContentError),
+    #[error("content serialization failed")]
+    Serialization,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentError, canonical_asset_path, prepare_note, validate_asset_path};
+    use super::{
+        ContentError, canonical_asset_path, prepare_note, prepare_thema, thema_content,
+        validate_asset_path,
+    };
 
     #[test]
     fn rejects_escaping_absolute_and_unsupported_links() {
         for target in ["../outside.png", "/etc/passwd", "image.bmp"] {
-            let org = format!("#+TITLE: Test\n[[file:{target}]]\n");
-            assert!(prepare_note(None, "notes/test.org".into(), org, None).is_err());
+            for link in [format!("[[file:{target}]]"), format!("file:{target}")] {
+                let org = format!("#+TITLE: Test\n{link}\n");
+                assert!(prepare_note(None, "notes/test.org".into(), org, None).is_err());
+            }
         }
     }
 
@@ -209,5 +484,40 @@ mod tests {
     fn canonical_assets_require_lowercase_sha256() {
         let error = validate_asset_path(&format!("assets/{}/x.png", "A".repeat(64))).unwrap_err();
         assert_eq!(error, ContentError::UnsupportedType);
+    }
+
+    #[test]
+    fn thema_file_links_must_name_attached_managed_assets() {
+        let asset = canonical_asset_path(&"b".repeat(64), "scan.png").unwrap();
+        let content = thema_content(
+            "basic",
+            format!("Question [[file:{asset}]]"),
+            vec![],
+            vec!["Answer".into()],
+            None,
+            None,
+            Some(asset.clone()),
+        )
+        .unwrap();
+        assert!(prepare_thema(None, content.clone(), vec![], vec![], vec![asset], None).is_ok());
+        assert_eq!(
+            prepare_thema(None, content, vec![], vec![], vec![], None).unwrap_err(),
+            ContentError::UnmanagedAsset
+        );
+    }
+
+    #[test]
+    fn thema_external_references_remain_external() {
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![],
+            vec!["Answer".into()],
+            None,
+            None,
+            Some("https://example.test/image.png".into()),
+        )
+        .unwrap();
+        assert!(prepare_thema(None, content, vec![], vec![], vec![], None).is_ok());
     }
 }

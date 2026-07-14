@@ -1,5 +1,6 @@
 use std::{
     fs,
+    os::unix::ffi::OsStrExt,
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
     process::Command,
@@ -56,6 +57,89 @@ fn refuses_to_replace_an_existing_target() {
 
     assert!(matches!(error, LegacyMigrationError::TargetExists));
     assert_eq!(fs::read(&target).unwrap(), b"keep me");
+}
+
+#[test]
+fn recovers_an_interrupted_server_publication_before_retrying() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    let notes = directory.path().join("Notes");
+    let blobs = directory.path().join("blobs");
+    create_legacy_database(&source, 9);
+    fs::create_dir(&notes).unwrap();
+    fs::create_dir(&blobs).unwrap();
+    fs::write(blobs.join("orphan"), b"partial").unwrap();
+    fs::create_dir(directory.path().join(".blobs.migrating")).unwrap();
+    fs::write(
+        directory.path().join(".gnosis.sqlite.migrating"),
+        b"partial",
+    )
+    .unwrap();
+    write_publication_marker(&target, &blobs);
+
+    migrate_legacy_server(&source, &target, &notes, &blobs).unwrap();
+
+    assert!(target.exists());
+    assert!(blobs.is_dir());
+    assert!(!directory.path().join(".gnosis.sqlite.publishing").exists());
+    assert!(!directory.path().join(".gnosis.sqlite.migrating").exists());
+    assert!(!directory.path().join(".blobs.migrating").exists());
+}
+
+#[test]
+fn completed_publication_recovery_removes_only_staging_artifacts() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    let notes = directory.path().join("Notes");
+    let blobs = directory.path().join("blobs");
+    create_legacy_database(&source, 9);
+    fs::create_dir(&notes).unwrap();
+    migrate_legacy_server(&source, &target, &notes, &blobs).unwrap();
+    fs::create_dir(directory.path().join(".blobs.migrating")).unwrap();
+    fs::write(
+        directory.path().join(".gnosis.sqlite.migrating"),
+        b"duplicate",
+    )
+    .unwrap();
+    write_publication_marker(&target, &blobs);
+
+    let error = migrate_legacy_server(&source, &target, &notes, &blobs).unwrap_err();
+
+    assert!(matches!(error, LegacyMigrationError::TargetExists));
+    assert!(target.is_file());
+    assert!(blobs.is_dir());
+    assert!(!directory.path().join(".gnosis.sqlite.publishing").exists());
+    assert!(!directory.path().join(".gnosis.sqlite.migrating").exists());
+    assert!(!directory.path().join(".blobs.migrating").exists());
+}
+
+#[test]
+fn interrupted_publication_rejects_a_different_blob_target() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    let notes = directory.path().join("Notes");
+    let original_blobs = directory.path().join("original-blobs");
+    let different_blobs = directory.path().join("different-blobs");
+    create_legacy_database(&source, 9);
+    fs::create_dir(&notes).unwrap();
+    fs::create_dir(&original_blobs).unwrap();
+    fs::write(original_blobs.join("partial"), b"partial").unwrap();
+    fs::create_dir(&different_blobs).unwrap();
+    fs::write(different_blobs.join("keep"), b"keep me").unwrap();
+    write_publication_marker(&target, &original_blobs);
+
+    let error = migrate_legacy_server(&source, &target, &notes, &different_blobs).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LegacyMigrationError::PublicationTargetMismatch
+    ));
+    assert_eq!(fs::read(different_blobs.join("keep")).unwrap(), b"keep me");
+    assert!(original_blobs.join("partial").exists());
+    assert!(directory.path().join(".gnosis.sqlite.publishing").exists());
 }
 
 #[test]
@@ -401,7 +485,7 @@ fn assert_source_is_unchanged(path: &Path) {
 
 fn assert_target_is_normalized(path: &Path) {
     let connection = Connection::open(path).unwrap();
-    assert_eq!(user_version(&connection), 2);
+    assert_eq!(user_version(&connection), 3);
     assert_eq!(table_count(&connection, "themata"), 0);
     assert_eq!(table_count(&connection, "node_tag"), 1);
     assert_eq!(table_count(&connection, "thema"), 1);
@@ -465,6 +549,81 @@ fn imports_notes_and_rewrites_assets_before_atomic_publish() {
         ),
         1
     );
+}
+
+#[test]
+fn rewrites_legacy_thema_assets_into_managed_content() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    let notes = directory.path().join("Notes");
+    let blobs = directory.path().join("blobs");
+    fs::create_dir(&notes).unwrap();
+    fs::write(notes.join("note.org"), "#+TITLE: Note\n").unwrap();
+    fs::create_dir(directory.path().join("images")).unwrap();
+    fs::write(directory.path().join("images/scan.png"), b"scan").unwrap();
+    create_legacy_database(&source, 9);
+    let connection = Connection::open(&source).unwrap();
+    connection
+        .execute(
+            "UPDATE themata SET keimenon = ?1 WHERE id = 7",
+            [r#""Question [file:scan.png]""#],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE extras SET review_image = ?1 WHERE id = 7",
+            [r#""scan.png""#],
+        )
+        .unwrap();
+    drop(connection);
+
+    migrate_legacy_server(&source, &target, &notes, &blobs).unwrap();
+
+    let connection = Connection::open(&target).unwrap();
+    let (keimenon, review_image): (String, String) = connection
+        .query_row(
+            "SELECT keimenon, review_image FROM thema WHERE thema_id = '7'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(keimenon.contains("[file:assets/"));
+    assert!(review_image.starts_with("assets/"));
+    assert!(!keimenon.contains("[file:scan.png]"));
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM thema_asset"), 1);
+}
+
+#[test]
+fn server_migration_preserves_historical_blank_cloze_entries() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    let notes = directory.path().join("Notes");
+    let blobs = directory.path().join("blobs");
+    fs::create_dir(&notes).unwrap();
+    create_legacy_database(&source, 9);
+    Connection::open(&source)
+        .unwrap()
+        .execute(
+            "UPDATE themata SET hypothesis = '(nil \"\")', answer = '(\"Answer\" \"\")' \
+             WHERE id = 7",
+            [],
+        )
+        .unwrap();
+
+    migrate_legacy_server(&source, &target, &notes, &blobs).unwrap();
+
+    let connection = Connection::open(&target).unwrap();
+    let (hypothesis, answer): (String, String) = connection
+        .query_row(
+            "SELECT hypothesis_json, answer_json FROM thema WHERE thema_id = '7'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(hypothesis, r#"[null,""]"#);
+    assert_eq!(answer, r#"["Answer",""]"#);
 }
 
 #[test]
@@ -534,6 +693,25 @@ fn assert_invalid_notes_import(root: &Path, notes: &Path) {
     assert!(matches!(error, LegacyMigrationError::InvalidNotesTree));
     assert!(!target.exists());
     assert!(!blobs.exists());
+}
+
+fn write_publication_marker(database_target: &Path, blob_target: &Path) {
+    let database_target = canonical_destination(database_target);
+    let blob_target = canonical_destination(blob_target);
+    let mut contents = b"gnosis-publication-v1\0".to_vec();
+    for path in [&database_target, &blob_target] {
+        let bytes = path.as_os_str().as_bytes();
+        contents.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        contents.extend_from_slice(bytes);
+    }
+    let marker = database_target.with_file_name(".gnosis.sqlite.publishing");
+    fs::write(marker, contents).unwrap();
+}
+
+fn canonical_destination(path: &Path) -> std::path::PathBuf {
+    fs::canonicalize(path.parent().unwrap())
+        .unwrap()
+        .join(path.file_name().unwrap())
 }
 
 fn user_version(connection: &Connection) -> u32 {

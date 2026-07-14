@@ -3,13 +3,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{self, Read},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    io::{self, Read, Write},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use regex::Regex;
 use rusqlite::{
     Connection, OpenFlags, Transaction, TransactionBehavior, params, params_from_iter,
     types::{Value as SqlValue, ValueRef},
@@ -93,6 +95,8 @@ pub enum LegacyMigrationError {
     TargetExists,
     #[error("migration staging database already exists")]
     StagingExists,
+    #[error("interrupted publication belongs to different targets")]
+    PublicationTargetMismatch,
     #[error("legacy database schema version {found} is unsupported")]
     UnsupportedSourceSchema { found: u32 },
     #[error("legacy database schema is incomplete")]
@@ -170,6 +174,9 @@ fn migrate_legacy(
     content: Option<(&Path, &Path)>,
 ) -> Result<LegacyMigrationSummary, LegacyMigrationError> {
     let paths = MigrationPaths::new(source_path, target_path)?;
+    if let Some((_, blob_root)) = content {
+        recover_interrupted_publication(&paths, blob_root)?;
+    }
     paths.require_available()?;
     reject_emacs_lease(&paths.source)?;
     let source_metadata = fs::metadata(&paths.source)?;
@@ -968,22 +975,28 @@ fn import_content_snapshot(
         "notes",
         imported_at_us,
     )?;
+    let mut imported_asset_paths = asset_map.values().cloned().collect::<BTreeSet<_>>();
     let legacy_assets = source_database
         .parent()
         .ok_or(LegacyMigrationError::InvalidSource)?
         .join("images");
-    if legacy_assets.is_dir() {
+    let legacy_map = if legacy_assets.is_dir() {
         let legacy_files = collect_asset_files(&legacy_assets)?;
-        let legacy_map = import_tree_assets(
+        import_tree_assets(
             &mut store,
             &blob_store,
             &legacy_assets,
             &legacy_files,
             "legacy-images",
             imported_at_us,
-        )?;
-        normalize_thema_assets(source, &mut store, &legacy_assets, &legacy_map)?;
-        asset_map.extend(legacy_map);
+        )?
+    } else {
+        BTreeMap::new()
+    };
+    normalize_thema_assets(source, &mut store, &legacy_assets, &legacy_map)?;
+    imported_asset_paths.extend(legacy_map.values().cloned());
+    for (source_path, asset_path) in legacy_map {
+        asset_map.entry(source_path).or_insert(asset_path);
     }
     let note_paths = validated_note_paths(&notes_root, &files.org)?;
     for path in &files.org {
@@ -999,7 +1012,7 @@ fn import_content_snapshot(
     }
     Ok(ContentImport {
         note_count: files.org.len() as u64,
-        asset_count: asset_map.values().collect::<BTreeSet<_>>().len() as u64,
+        asset_count: imported_asset_paths.len() as u64,
         blobs,
     })
 }
@@ -1032,12 +1045,7 @@ fn collect_files(
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
-            if path.extension().is_some_and(|extension| extension == "org")
-                || supported_asset(path.to_string_lossy().as_ref())
-            {
-                return Err(LegacyMigrationError::InvalidNotesTree);
-            }
-            continue;
+            return Err(LegacyMigrationError::InvalidNotesTree);
         }
         if metadata.is_dir() {
             collect_files(root, &path, org, assets)?;
@@ -1131,31 +1139,123 @@ fn normalize_thema_assets(
     root: &Path,
     mapping: &BTreeMap<String, String>,
 ) -> Result<(), LegacyMigrationError> {
-    let mut statement = source.prepare(
-        "SELECT thema.id, extras.review_image
-         FROM themata AS thema JOIN extras ON extras.id = thema.id
-         WHERE extras.review_image IS NOT NULL",
-    )?;
+    let mut statement = source.prepare("SELECT id FROM themata ORDER BY id")?;
     let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
         let id = row.get::<_, i64>(0)?.to_string();
-        let stored: String = row.get(1)?;
-        let Some(reference) = decode_optional(Some(stored), "review image")? else {
-            continue;
-        };
-        if reference.is_empty() {
-            continue;
+        let mut record = store
+            .get_thema(&id)
+            .map_err(|_| LegacyMigrationError::Storage)?
+            .ok_or(LegacyMigrationError::SourceIntegrity)?;
+        let mut assets = record.asset_paths.iter().cloned().collect::<BTreeSet<_>>();
+        let mut changed =
+            rewrite_thema_text(&mut record.content.keimenon, root, mapping, &mut assets)?;
+        for value in record.content.hypothesis.iter_mut().flatten() {
+            changed |= rewrite_thema_text(value, root, mapping, &mut assets)?;
         }
-        validate_logical_path(&reference).map_err(|_| LegacyMigrationError::InvalidNotesTree)?;
-        let relative = relative_utf8(root, &root.join(&reference))?;
-        let asset_path = mapping
-            .get(&relative)
-            .ok_or(LegacyMigrationError::InvalidNotesTree)?;
-        store
-            .rewrite_thema_asset(&id, &reference, asset_path)
-            .map_err(|_| LegacyMigrationError::Storage)?;
+        for value in &mut record.content.answer {
+            changed |= rewrite_thema_text(value, root, mapping, &mut assets)?;
+        }
+        if let Some(value) = record.content.parathema.as_mut() {
+            changed |= rewrite_thema_text(value, root, mapping, &mut assets)?;
+        }
+        if let Some(reference) = record.content.review_image.as_mut()
+            && !reference.is_empty()
+            && !external_reference(reference)
+        {
+            let asset_path = mapped_legacy_asset(root, reference, mapping)?.to_owned();
+            changed |= *reference != asset_path;
+            *reference = asset_path.clone();
+            assets.insert(asset_path);
+        }
+        if changed {
+            record.asset_paths = assets.into_iter().collect();
+            record.content_sha256 = migrated_thema_digest(&record)?;
+            store
+                .rewrite_imported_thema_content(&record)
+                .map_err(|_| LegacyMigrationError::Storage)?;
+        }
     }
     Ok(())
+}
+
+fn rewrite_thema_text(
+    value: &mut String,
+    root: &Path,
+    mapping: &BTreeMap<String, String>,
+    assets: &mut BTreeSet<String>,
+) -> Result<bool, LegacyMigrationError> {
+    let mut replacements = Vec::new();
+    for expression in crate::application::file_link_expressions() {
+        for captures in expression.captures_iter(value.as_str()) {
+            let capture = captures
+                .get(1)
+                .ok_or(LegacyMigrationError::InvalidNotesTree)?;
+            let (target, search) = capture
+                .as_str()
+                .split_once("::")
+                .map_or((capture.as_str(), ""), |(target, search)| (target, search));
+            if external_reference(target) {
+                continue;
+            }
+            let asset_path = mapped_legacy_asset(root, target, mapping)?.to_owned();
+            assets.insert(asset_path.clone());
+            let replacement = if search.is_empty() {
+                asset_path
+            } else {
+                format!("{asset_path}::{search}")
+            };
+            replacements.push((capture.start(), capture.end(), replacement));
+        }
+    }
+    let changed = !replacements.is_empty();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        value.replace_range(start..end, &replacement);
+    }
+    Ok(changed)
+}
+
+fn mapped_legacy_asset<'a>(
+    root: &Path,
+    reference: &str,
+    mapping: &'a BTreeMap<String, String>,
+) -> Result<&'a String, LegacyMigrationError> {
+    let root = fs::canonicalize(root).map_err(|_| LegacyMigrationError::InvalidNotesTree)?;
+    let candidate = if Path::new(reference).is_absolute() {
+        fs::canonicalize(reference).map_err(|_| LegacyMigrationError::InvalidNotesTree)?
+    } else {
+        let reference = reference.strip_prefix("images/").unwrap_or(reference);
+        let normalized = normalize_reference(Path::new(""), reference)?;
+        fs::canonicalize(root.join(normalized))
+            .map_err(|_| LegacyMigrationError::InvalidNotesTree)?
+    };
+    let relative = relative_utf8(&root, &candidate)?;
+    mapping
+        .get(&relative)
+        .ok_or(LegacyMigrationError::InvalidNotesTree)
+}
+
+fn migrated_thema_digest(
+    record: &crate::application::ThemaRecord,
+) -> Result<String, LegacyMigrationError> {
+    let content = &record.content;
+    let canonical = serde_json::to_vec(&json!({
+        "answer": content.answer,
+        "assets": record.asset_paths,
+        "hypothesis": content.hypothesis,
+        "keimenon": content.keimenon,
+        "kind": content.kind.as_str(),
+        "nodes": record.node_ids,
+        "parathema": content.parathema,
+        "review_image": content.review_image,
+        "source_guid": content.source_guid,
+        "tags": record.tags,
+    }))?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
+fn external_reference(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
 }
 
 fn import_note(
@@ -1191,37 +1291,34 @@ fn rewrite_file_links(
     note_paths: &BTreeMap<String, String>,
     asset_map: &BTreeMap<String, String>,
 ) -> Result<String, LegacyMigrationError> {
-    let expression =
-        Regex::new(r"\[\[file:([^]\n]+)").map_err(|_| LegacyMigrationError::InvalidNotesTree)?;
     let parent = Path::new(document_path)
         .parent()
         .unwrap_or_else(|| Path::new(""));
     let mut replacements = Vec::new();
-    for captures in expression.captures_iter(org) {
-        let capture = captures
-            .get(1)
-            .ok_or(LegacyMigrationError::InvalidNotesTree)?;
-        let (target, search) = capture
-            .as_str()
-            .split_once("::")
-            .map_or((capture.as_str(), ""), |(target, search)| (target, search));
-        if target.starts_with("http://") || target.starts_with("https://") {
-            continue;
+    for expression in crate::application::file_link_expressions() {
+        for captures in expression.captures_iter(org) {
+            let capture = captures
+                .get(1)
+                .ok_or(LegacyMigrationError::InvalidNotesTree)?;
+            let (target, search) = capture
+                .as_str()
+                .split_once("::")
+                .map_or((capture.as_str(), ""), |(target, search)| (target, search));
+            if target.starts_with("http://") || target.starts_with("https://") {
+                continue;
+            }
+            let resolved = normalize_reference(parent, target)?;
+            let replacement = note_paths
+                .get(&resolved)
+                .or_else(|| asset_map.get(&resolved))
+                .ok_or(LegacyMigrationError::InvalidNotesTree)?;
+            let replacement = if search.is_empty() {
+                replacement.clone()
+            } else {
+                format!("{replacement}::{search}")
+            };
+            replacements.push((capture.start(), capture.end(), replacement));
         }
-        let resolved = normalize_reference(parent, target)?;
-        let replacement = if let Some(logical) = note_paths.get(&resolved) {
-            logical.clone()
-        } else if let Some(asset) = asset_map.get(&resolved) {
-            asset.clone()
-        } else {
-            return Err(LegacyMigrationError::InvalidNotesTree);
-        };
-        let replacement = if search.is_empty() {
-            replacement
-        } else {
-            format!("{replacement}::{search}")
-        };
-        replacements.push((capture.start(), capture.end(), replacement));
     }
     let mut rewritten = org.to_owned();
     for (start, end, replacement) in replacements.into_iter().rev() {
@@ -1307,6 +1404,7 @@ impl StagingBlobDirectory {
 
     fn publish(&mut self) -> Result<(), LegacyMigrationError> {
         fs::rename(&self.staging, &self.target)?;
+        sync_parent_directory(&self.target)?;
         self.published = true;
         Ok(())
     }
@@ -1326,14 +1424,146 @@ fn publish_snapshot(
     content: Option<&mut ContentImport>,
 ) -> Result<(), LegacyMigrationError> {
     if let Some(content) = content {
+        let mut publication = PublicationMarker::create(target, &content.blobs.target)?;
         content.blobs.publish()?;
         if let Err(error) = database.publish(target) {
-            let _ = fs::remove_dir_all(&content.blobs.target);
+            preserve_publication_if_target_exists(&mut publication, target);
             return Err(error);
         }
+        publication.complete()?;
         return Ok(());
     }
     database.publish(target)
+}
+
+struct PublicationMarker {
+    path: PathBuf,
+    blob_target: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl PublicationMarker {
+    fn create(database_target: &Path, blob_target: &Path) -> Result<Self, LegacyMigrationError> {
+        let path = publication_marker_path(database_target)?;
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        marker.write_all(&publication_marker_contents(database_target, blob_target))?;
+        marker.sync_all()?;
+        sync_parent_directory(&path)?;
+        Ok(Self {
+            path,
+            blob_target: blob_target.to_owned(),
+            cleanup_on_drop: true,
+        })
+    }
+
+    fn complete(&mut self) -> Result<(), LegacyMigrationError> {
+        self.cleanup_on_drop = false;
+        fs::remove_file(&self.path)?;
+        sync_parent_directory(&self.path)
+    }
+
+    fn preserve(&mut self) {
+        self.cleanup_on_drop = false;
+    }
+}
+
+impl Drop for PublicationMarker {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = remove_directory_if_exists(&self.blob_target);
+            let _ = fs::remove_file(&self.path);
+            let _ = sync_parent_directory(&self.path);
+        }
+    }
+}
+
+fn preserve_publication_if_target_exists(publication: &mut PublicationMarker, target: &Path) {
+    if !matches!(exists_without_following(target), Ok(false)) {
+        publication.preserve();
+    }
+}
+
+fn recover_interrupted_publication(
+    paths: &MigrationPaths,
+    blob_root: &Path,
+) -> Result<(), LegacyMigrationError> {
+    let marker = publication_marker_path(&paths.target)?;
+    if !exists_without_following(&marker)? {
+        return Ok(());
+    }
+    if !fs::symlink_metadata(&marker)?.file_type().is_file() {
+        return Err(LegacyMigrationError::StagingExists);
+    }
+    let blob_target = canonical_destination(blob_root)?;
+    if fs::read(&marker)? != publication_marker_contents(&paths.target, &blob_target) {
+        return Err(LegacyMigrationError::PublicationTargetMismatch);
+    }
+    let blob_staging = staging_path(&blob_target)?;
+    if exists_without_following(&paths.target)? {
+        remove_directory_if_exists(&blob_staging)?;
+        remove_file_if_exists(&paths.staging)?;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            remove_file_if_exists(&sidecar_path(&paths.staging, suffix))?;
+        }
+        fs::remove_file(&marker)?;
+        sync_parent_directory(&marker)?;
+        return Ok(());
+    }
+    remove_directory_if_exists(&blob_target)?;
+    remove_directory_if_exists(&blob_staging)?;
+    remove_file_if_exists(&paths.staging)?;
+    for suffix in ["-journal", "-wal", "-shm"] {
+        remove_file_if_exists(&sidecar_path(&paths.staging, suffix))?;
+    }
+    fs::remove_file(&marker)?;
+    sync_parent_directory(&marker)
+}
+
+fn publication_marker_path(database_target: &Path) -> Result<PathBuf, LegacyMigrationError> {
+    let name = database_target
+        .file_name()
+        .ok_or(LegacyMigrationError::SameDatabase)?
+        .to_string_lossy();
+    Ok(database_target.with_file_name(format!(".{name}.publishing")))
+}
+
+fn publication_marker_contents(database_target: &Path, blob_target: &Path) -> Vec<u8> {
+    let mut contents = b"gnosis-publication-v1\0".to_vec();
+    for path in [database_target, blob_target] {
+        let bytes = path.as_os_str().as_bytes();
+        contents.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+        contents.extend_from_slice(bytes);
+    }
+    contents
+}
+
+fn remove_directory_if_exists(path: &Path) -> Result<(), LegacyMigrationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => return Err(LegacyMigrationError::TargetExists),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    sync_parent_directory(path)
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), LegacyMigrationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path)?,
+        Ok(_) => return Err(LegacyMigrationError::StagingExists),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    sync_parent_directory(path)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), LegacyMigrationError> {
+    File::open(path.parent().ok_or(LegacyMigrationError::SameDatabase)?)?.sync_all()?;
+    Ok(())
 }
 
 fn now_us() -> Result<i64, LegacyMigrationError> {
@@ -1431,10 +1661,9 @@ impl StagingDatabase {
             }
             Err(error) => return Err(error.into()),
         }
-        if let Err(error) = fs::remove_file(&self.path) {
-            let _ = fs::remove_file(target);
-            return Err(error.into());
-        }
+        sync_parent_directory(target)?;
+        fs::remove_file(&self.path)?;
+        sync_parent_directory(target)?;
         self.published = true;
         Ok(())
     }
@@ -1455,4 +1684,26 @@ fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn publication_failure_preserves_blobs_when_database_target_exists() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blobs = directory.path().join("blobs");
+        fs::create_dir(&blobs).unwrap();
+        let mut publication = PublicationMarker::create(&database, &blobs).unwrap();
+        fs::write(&database, b"committed").unwrap();
+
+        preserve_publication_if_target_exists(&mut publication, &database);
+        drop(publication);
+
+        assert!(blobs.exists());
+        assert!(publication_marker_path(&database).unwrap().exists());
+    }
 }
