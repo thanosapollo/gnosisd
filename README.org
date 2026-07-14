@@ -1,8 +1,9 @@
 #+title: Gnosis Core
 
-Gnosis Core is the local daemon foundation for sharing Gnosis knowledge data
-between Emacs, command-line, and future web clients. The current vertical slice
-indexes Org documents into SQLite through a versioned Unix-socket protocol.
+Gnosis Core is the source of truth for Gnosis knowledge and learning data.  It
+serves the ~gnosis~ Emacs frontend, command-line, and future clients through a
+versioned local protocol.  The Emacs package keeps its established UI and is
+not a separate product named emacs-gnosis.
 
 * Ownership and trust boundary
 
@@ -112,7 +113,9 @@ blank title; Rust rejects it. Byte spans and SHA-256 are Rust-only fields.
 
 * Database and backups
 
-The database path is supplied to ~gnosisd~; there is no implicit shared path.
+The database path is supplied to ~gnosisd~.  The deployed Gnosis instance uses
+=~/.local/share/gnosis/gnosis.sqlite= with its socket at
+=${XDG_RUNTIME_DIR}/gnosis/gnosis.sock=.
 Foreign keys and strict tables protect projections, link occurrences, semantic
 edges, themata, and thema-to-concept associations. Stop the daemon cleanly
 with SIGINT or SIGTERM before copying the database for backup. Online backup
@@ -141,13 +144,15 @@ document projection schema is added alongside it.
 The daemon exposes the imported snapshot read-only. ~legacy-info~ reports its
 source and row counts, ~due-themata~ returns a bounded deterministic queue, and
 ~get-thema~ returns one thema with its extras, tags, links, and complete review
-state. Review answers still belong to the legacy Emacs implementation.
+state.  The Emacs frontend calls these methods through ~gnosis-core.el~ without
+changing its established buffers or keymaps.  Review answers remain on the
+legacy compatibility path until the daemon exposes one atomic review command.
 
 * Current exclusions
 
-This foundation does not write legacy scheduling or review history, integrate
-the Emacs client, expose TCP, add authentication or TLS, discover or watch
-files, support Markdown, compute embeddings, or synchronize multiple daemons.
+This foundation does not yet write legacy scheduling or review history, expose
+TCP, add authentication or TLS, discover or watch files, support Markdown,
+compute embeddings, or synchronize multiple daemons.
 
 * Validation
 

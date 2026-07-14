@@ -2,9 +2,17 @@
 
 Keep this file current as the project develops.
 
-Gnosis Core decouples computation and storage from the separate `gnosis` Emacs
-frontend so it can serve Emacs, command-line, and future web clients. The
-frontend behavior is the compatibility contract.
+Gnosis Core is the source of truth for Gnosis storage and shared domain
+behavior. It serves the `gnosis` Emacs frontend, command-line, and future web
+clients. The separate `gnosis` package is the Emacs frontend, not a separate
+product named emacs-gnosis. Its established UI and behavior are the
+compatibility contract for the migration. Coordinated frontend changes are
+expected when a core operation lands.
+
+The deployed daemon exclusively owns
+`~/.local/share/gnosis/gnosis.sqlite`. The Emacs frontend connects through
+`$XDG_RUNTIME_DIR/gnosis/gnosis.sock`; it must never open the core database
+directly.
 
 ## Architecture
 
@@ -41,8 +49,10 @@ Socket startup uses an atomic `.startup-lock` directory to serialize stale
 cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
 SIGTERM both enter graceful shutdown.
 
-Review writes, Emacs integration, remote transport, authentication, and
-synchronization remain out of scope for this foundation.
+Emacs integration and the migration of complete frontend operations are active
+work. Review writes remain unavailable until their scheduling, immutable event,
+and atomic state-transition contract is explicit. Remote transport,
+authentication, and synchronization remain out of scope.
 
 ## Commands
 
