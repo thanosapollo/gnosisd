@@ -41,11 +41,11 @@ authentication, and synchronization remain out of scope for this foundation.
 
 ## Commands
 
-The ambient host may not have Cargo on `PATH`. Enter an ephemeral toolchain on
-NixOS when needed:
+The ambient host may not have Cargo on `PATH`. Enter the pinned development
+environment when needed:
 
 ```sh
-nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy
+nix develop
 ```
 
 Focused checks:
@@ -64,6 +64,7 @@ cargo test --test daemon_protocol
 Required handoff gates:
 
 ```sh
+nix flake check
 cargo fmt --all -- --check
 cargo check --all-targets
 cargo test --all-targets

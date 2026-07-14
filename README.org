@@ -27,11 +27,17 @@ The default bounds are:
 
 * Running the daemon and client
 
-The host needs stable Rust with Cargo, rustfmt, and Clippy. On NixOS, an
-ephemeral toolchain can run the project without changing the host:
+Enter the pinned development environment for Rust, Cargo, rustfmt, Clippy, and
+rust-analyzer:
 
 #+begin_src sh
-nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#rustfmt nixpkgs#clippy
+nix develop
+#+end_src
+
+Build the release package without entering the development shell:
+
+#+begin_src sh
+nix build
 #+end_src
 
 Start the daemon with explicit local paths:
@@ -118,6 +124,7 @@ support Markdown, compute embeddings, or synchronize multiple daemons.
 * Validation
 
 #+begin_src sh
+nix flake check
 cargo fmt --all -- --check
 cargo check --all-targets
 cargo test --all-targets
