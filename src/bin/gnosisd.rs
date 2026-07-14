@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::Parser;
 use gnosis_core::{
-    migration::{LegacyMigrationSummary, migrate_legacy_database},
+    migration::{LegacyMigrationSummary, migrate_legacy_database, migrate_legacy_server},
     protocol::{DaemonConfig, DaemonServer},
 };
 
@@ -15,6 +15,10 @@ struct Cli {
     database: PathBuf,
     #[arg(long, value_name = "PATH", conflicts_with = "socket")]
     migrate_legacy: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", requires_all = ["migrate_legacy", "blob_root"])]
+    notes_root: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", requires_all = ["migrate_legacy", "notes_root"])]
+    blob_root: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -30,7 +34,13 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(source) = cli.migrate_legacy {
-        let summary = migrate_legacy_database(source, cli.database)?;
+        let summary = match (cli.notes_root, cli.blob_root) {
+            (Some(notes), Some(blobs)) => {
+                migrate_legacy_server(source, cli.database, notes, blobs)?
+            }
+            (None, None) => migrate_legacy_database(source, cli.database)?,
+            _ => return Err("--notes-root and --blob-root must be used together".into()),
+        };
         print_migration_summary(summary);
         return Ok(());
     }
@@ -41,12 +51,23 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_migration_summary(summary: LegacyMigrationSummary) {
-    println!(
-        "migrated legacy schema v{}: {} tables, {} rows",
-        summary.source_schema_version(),
-        summary.legacy_table_count(),
-        summary.legacy_row_count()
-    );
+    if summary.note_count() == 0 && summary.asset_count() == 0 {
+        println!(
+            "migrated legacy schema v{}: {} tables, {} rows",
+            summary.source_schema_version(),
+            summary.legacy_table_count(),
+            summary.legacy_row_count()
+        );
+    } else {
+        println!(
+            "migrated legacy schema v{}: {} tables, {} rows, {} notes, {} assets",
+            summary.source_schema_version(),
+            summary.legacy_table_count(),
+            summary.legacy_row_count(),
+            summary.note_count(),
+            summary.asset_count()
+        );
+    }
 }
 
 async fn shutdown_signal() {

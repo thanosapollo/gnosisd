@@ -2,12 +2,12 @@ use std::borrow::Cow;
 
 use super::StoreError;
 
-pub(super) fn string(value: &str, field: &'static str) -> Result<String, StoreError> {
+pub(crate) fn string(value: &str, field: &'static str) -> Result<String, StoreError> {
     serde_json::from_str(json_compatible(value).as_ref())
         .map_err(|_| StoreError::CorruptData { field })
 }
 
-pub(super) fn optional_string(
+pub(crate) fn optional_string(
     value: Option<&str>,
     field: &'static str,
 ) -> Result<Option<String>, StoreError> {
@@ -17,14 +17,14 @@ pub(super) fn optional_string(
     }
 }
 
-pub(super) fn string_list(value: &str, field: &'static str) -> Result<Vec<String>, StoreError> {
+pub(crate) fn string_list(value: &str, field: &'static str) -> Result<Vec<String>, StoreError> {
     optional_string_list(value, field)?
         .into_iter()
         .map(|value| value.ok_or(StoreError::CorruptData { field }))
         .collect()
 }
 
-pub(super) fn optional_string_list(
+pub(crate) fn optional_string_list(
     value: &str,
     field: &'static str,
 ) -> Result<Vec<Option<String>>, StoreError> {

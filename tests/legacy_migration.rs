@@ -1,6 +1,13 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    fs,
+    os::unix::fs::{PermissionsExt, symlink},
+    path::Path,
+    process::Command,
+};
 
-use gnosis_core::migration::{LegacyMigrationError, migrate_legacy_database};
+use gnosis_core::migration::{
+    LegacyMigrationError, migrate_legacy_database, migrate_legacy_server,
+};
 use gnosis_core::protocol::{
     DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseOutcome,
     ResponseResult, request,
@@ -15,6 +22,8 @@ fn migrates_v9_snapshot_without_changing_source() {
     let source = directory.path().join("legacy.db");
     let target = directory.path().join("gnosis.sqlite");
     create_legacy_database(&source, 9);
+    let source_bytes = fs::read(&source).unwrap();
+    let source_mtime = fs::metadata(&source).unwrap().modified().unwrap();
 
     let summary = migrate_legacy_database(&source, &target).unwrap();
 
@@ -22,7 +31,12 @@ fn migrates_v9_snapshot_without_changing_source() {
     assert_eq!(summary.legacy_table_count(), 7);
     assert_eq!(summary.legacy_row_count(), 7);
     assert_source_is_unchanged(&source);
-    assert_target_contains_both_schemas(&target);
+    assert_eq!(fs::read(&source).unwrap(), source_bytes);
+    assert_eq!(
+        fs::metadata(&source).unwrap().modified().unwrap(),
+        source_mtime
+    );
+    assert_target_is_normalized(&target);
     assert_eq!(
         fs::metadata(&target).unwrap().permissions().mode() & 0o777,
         0o600
@@ -120,7 +134,7 @@ fn daemon_cli_reports_completed_offline_migration() {
         "migrated legacy schema v9: 7 tables, 7 rows\n"
     );
     assert!(output.stderr.is_empty());
-    assert_target_contains_both_schemas(&target);
+    assert_target_is_normalized(&target);
 }
 
 #[tokio::test]
@@ -385,21 +399,19 @@ fn assert_source_is_unchanged(path: &Path) {
     assert_eq!(table_count(&connection, "document"), 0);
 }
 
-fn assert_target_contains_both_schemas(path: &Path) {
+fn assert_target_is_normalized(path: &Path) {
     let connection = Connection::open(path).unwrap();
-    assert_eq!(user_version(&connection), 1);
-    assert_eq!(table_count(&connection, "themata"), 1);
-    assert_eq!(table_count(&connection, "legacy_node_tag"), 1);
+    assert_eq!(user_version(&connection), 2);
+    assert_eq!(table_count(&connection, "themata"), 0);
     assert_eq!(table_count(&connection, "node_tag"), 1);
-    assert_eq!(table_count(&connection, "document"), 1);
-    assert_eq!(table_count(&connection, "legacy_source"), 1);
-    assert_eq!(scalar(&connection, "SELECT count(*) FROM themata"), 1);
+    assert_eq!(table_count(&connection, "thema"), 1);
+    assert_eq!(table_count(&connection, "import_manifest"), 1);
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM thema"), 1);
     assert_eq!(
-        scalar(&connection, "SELECT count(*) FROM legacy_node_tag"),
-        1
-    );
-    assert_eq!(
-        scalar(&connection, "SELECT schema_version FROM legacy_source"),
+        scalar(
+            &connection,
+            "SELECT source_schema_version FROM import_manifest"
+        ),
         9
     );
     assert_eq!(
@@ -409,6 +421,119 @@ fn assert_target_contains_both_schemas(path: &Path) {
         ),
         1
     );
+}
+
+#[test]
+fn imports_notes_and_rewrites_assets_before_atomic_publish() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    let notes = directory.path().join("Notes");
+    let blobs = directory.path().join("blobs");
+    fs::create_dir(&notes).unwrap();
+    fs::create_dir(notes.join("Pictures")).unwrap();
+    fs::write(notes.join("Pictures/image.png"), b"image").unwrap();
+    fs::write(
+        notes.join("note.org"),
+        "#+TITLE: Note\n[[file:Pictures/image.png]]\n",
+    )
+    .unwrap();
+    create_legacy_database(&source, 9);
+
+    let summary = migrate_legacy_server(&source, &target, &notes, &blobs).unwrap();
+
+    assert_eq!(summary.note_count(), 1);
+    assert_eq!(summary.asset_count(), 1);
+    let connection = Connection::open(&target).unwrap();
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM document_revision"),
+        1
+    );
+    assert_eq!(scalar(&connection, "SELECT count(*) FROM managed_asset"), 1);
+    let digest: String = connection
+        .query_row("SELECT head_blob_sha256 FROM document", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let content = fs::read_to_string(blobs.join(&digest[..2]).join(digest)).unwrap();
+    assert!(content.contains("file:assets/"));
+    assert!(!content.contains("Pictures/"));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM import_path_rewrite WHERE reason = 'asset_normalization'"
+        ),
+        1
+    );
+}
+
+#[test]
+fn rejects_case_colliding_note_paths() {
+    let directory = tempdir().unwrap();
+    let notes = directory.path().join("Notes");
+    fs::create_dir(&notes).unwrap();
+    fs::write(notes.join("Topic.org"), "#+TITLE: One\n").unwrap();
+    fs::write(notes.join("topic.org"), "#+TITLE: Two\n").unwrap();
+
+    assert_invalid_notes_import(directory.path(), &notes);
+}
+
+#[test]
+fn rejects_escaping_note_links_and_relevant_symlinks() {
+    let directory = tempdir().unwrap();
+    let notes = directory.path().join("Notes");
+    fs::create_dir(&notes).unwrap();
+    fs::write(
+        notes.join("note.org"),
+        "#+TITLE: Note\n[[file:../outside.org]]\n",
+    )
+    .unwrap();
+    assert_invalid_notes_import(directory.path(), &notes);
+
+    fs::remove_file(notes.join("note.org")).unwrap();
+    fs::write(directory.path().join("outside.org"), "#+TITLE: Outside\n").unwrap();
+    symlink(
+        directory.path().join("outside.org"),
+        notes.join("linked.org"),
+    )
+    .unwrap();
+    assert_invalid_notes_import(directory.path(), &notes);
+}
+
+#[test]
+fn rejects_malformed_emacsql_without_publishing_targets() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    create_legacy_database(&source, 9);
+    Connection::open(&source)
+        .unwrap()
+        .execute("UPDATE themata SET answer = '(\"unterminated)'", [])
+        .unwrap();
+
+    let error = migrate_legacy_database(&source, &target).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LegacyMigrationError::InvalidLegacyValue { field: "answer" }
+    ));
+    assert!(!target.exists());
+    assert!(!directory.path().join(".gnosis.sqlite.migrating").exists());
+}
+
+fn assert_invalid_notes_import(root: &Path, notes: &Path) {
+    let source = root.join("legacy.db");
+    let target = root.join("gnosis.sqlite");
+    let blobs = root.join("blobs");
+    if !source.exists() {
+        create_legacy_database(&source, 9);
+    }
+
+    let error = migrate_legacy_server(&source, &target, notes, &blobs).unwrap_err();
+
+    assert!(matches!(error, LegacyMigrationError::InvalidNotesTree));
+    assert!(!target.exists());
+    assert!(!blobs.exists());
 }
 
 fn user_version(connection: &Connection) -> u32 {

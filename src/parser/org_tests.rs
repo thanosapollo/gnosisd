@@ -133,6 +133,22 @@ fn ignores_drawer_text_in_literal_blocks() {
 }
 
 #[test]
+fn accepts_empty_quote_blocks_without_changing_source_offsets() {
+    let input = concat!(
+        ":PROPERTIES:\n:ID: root\n:END:\n#+TITLE: Quotes\n\n",
+        "#+BEGIN_QUOTE\n\n#+END_QUOTE\n",
+        "See [[id:target]].\n",
+    );
+    let projection = parse_org(input).expect("document must parse");
+    let occurrence = projection.link_occurrences().first().unwrap();
+
+    assert_eq!(
+        input.get(occurrence.span().start()..occurrence.span().end()),
+        Some("[[id:target]]")
+    );
+}
+
+#[test]
 fn does_not_take_file_id_from_a_later_drawer() {
     let input = concat!(
         ":PROPERTIES:\n:OWNER: someone\n:END:\n#+TITLE: No root\n\n",

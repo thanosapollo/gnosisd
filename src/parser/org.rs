@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{borrow::Cow, fmt};
 
 use orgize::{
     Event, Org, ParseConfig,
@@ -52,7 +52,8 @@ struct ProjectionBuilder<'a> {
 
 pub fn parse_org(input: &str) -> Result<DocumentProjection, OrgParseError> {
     let config = parse_config(input);
-    let org = Org::parse_custom(input, &config);
+    let parser_input = neutralize_empty_quote_blocks(input);
+    let org = Org::parse_custom(parser_input.as_ref(), &config);
     let title = document_title(&org)?;
     let file_tags = document_tags(&org);
     let file_node_id = file_id(input, &org).map(NodeId::new).transpose()?;
@@ -65,6 +66,41 @@ pub fn parse_org(input: &str) -> Result<DocumentProjection, OrgParseError> {
     }
 
     builder.finish(title, file_node_id, file_tags)
+}
+
+fn neutralize_empty_quote_blocks(input: &str) -> Cow<'_, str> {
+    let mut output = input.to_owned();
+    let lines = input.split_inclusive('\n').collect::<Vec<_>>();
+    let mut offset = 0;
+    let mut begin = None;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("#+begin_quote") {
+            begin = Some((offset, offset + line.len()));
+        } else if trimmed.eq_ignore_ascii_case("#+end_quote") {
+            if let Some((start, body_start)) = begin.take()
+                && input[body_start..offset].trim().is_empty()
+            {
+                neutralize_marker(&mut output, start, body_start);
+                neutralize_marker(&mut output, offset, offset + line.len());
+            }
+        } else if begin.is_some() && !trimmed.is_empty() {
+            begin = None;
+        }
+        offset += line.len();
+    }
+    if output == input {
+        Cow::Borrowed(input)
+    } else {
+        Cow::Owned(output)
+    }
+}
+
+fn neutralize_marker(input: &mut String, start: usize, end: usize) {
+    if let Some(index) = input[start..end].find('+') {
+        let index = start + index;
+        input.replace_range(index..index + 1, " ");
+    }
 }
 
 impl<'a> ProjectionBuilder<'a> {
