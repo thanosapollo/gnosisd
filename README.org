@@ -148,10 +148,11 @@ source and row counts, and ~get-thema~ returns one thema with its extras, tags,
 links, and complete review state. ~due-themata~ keeps the original bounded
 queue interface. ~due-page~ returns ~items~ plus an opaque ~next~ cursor so a
 frontend can read the complete queue in deterministic order. Pass that value
-back with ~--after CURSOR~ until ~next~ is null. The Emacs frontend calls these
-methods through ~gnosis-core.el~ without changing its established buffers or
-keymaps. Review answers remain on the legacy compatibility path until the
-daemon exposes one atomic review command.
+back with ~--after CURSOR~ until ~next~ is null. Hypothesis arrays preserve
+absent legacy hints as JSON null values. The Emacs frontend calls these methods
+through ~gnosis-core.el~ without changing its established buffers or keymaps.
+Review answers remain on the legacy compatibility path until the daemon
+exposes one atomic review command.
 
 * Current exclusions
 

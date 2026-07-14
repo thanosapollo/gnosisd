@@ -375,7 +375,7 @@ fn materialize_legacy_thema(
         id,
         kind: legacy_value::string(&row.kind, "legacy thema type")?,
         keimenon: legacy_value::string(&row.keimenon, "legacy keimenon")?,
-        hypothesis: legacy_value::string_list(&row.hypothesis, "legacy hypothesis")?,
+        hypothesis: legacy_value::optional_string_list(&row.hypothesis, "legacy hypothesis")?,
         answer: legacy_value::string_list(&row.answer, "legacy answer")?,
         source_guid: legacy_value::optional_string(
             row.source_guid.as_deref(),
@@ -532,7 +532,7 @@ fn materialize_due_thema(
         id: legacy_thema_id(id)?,
         kind: legacy_value::string(&kind, "legacy thema type")?,
         keimenon: legacy_value::string(&keimenon, "legacy keimenon")?,
-        hypothesis: legacy_value::string_list(&hypothesis, "legacy hypothesis")?,
+        hypothesis: legacy_value::optional_string_list(&hypothesis, "legacy hypothesis")?,
         answer: legacy_value::string_list(&answer, "legacy answer")?,
         next_review_day: to_u32(next_review_day, "legacy next review day")?,
         review_count: to_u64(review_count, "legacy review count")?,

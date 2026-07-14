@@ -176,8 +176,8 @@ async fn assert_legacy_thema(socket: &Path) {
     };
     assert_eq!(thema.id, "7");
     assert_eq!(thema.kind, "cloze");
-    assert_eq!(thema.keimenon, "Question");
-    assert_eq!(thema.hypothesis, ["Hint"]);
+    assert_eq!(thema.keimenon, "Question\ncontinued");
+    assert_eq!(thema.hypothesis, [None]);
     assert_eq!(thema.answer, ["Answer"]);
     assert_eq!(thema.source_guid.as_deref(), Some("source-7"));
     assert_eq!(thema.parathema.as_deref(), Some("Context"));
@@ -204,7 +204,8 @@ async fn assert_due_queue(socket: &Path) {
     assert_eq!(themata[0].id, "8");
     assert_eq!(themata[1].id, "10");
     assert_eq!(themata[2].id, "7");
-    assert_eq!(themata[2].hypothesis, ["Hint"]);
+    assert_eq!(themata[2].keimenon, "Question\ncontinued");
+    assert_eq!(themata[2].hypothesis, [None]);
     assert_eq!(themata[2].answer, ["Answer"]);
     assert_eq!(themata[2].review_count, 12);
 }
@@ -340,7 +341,8 @@ fn create_legacy_database(path: &Path, version: u32) {
                 SELECT RAISE(ABORT, 'themata are immutable');
             END;
             INSERT INTO themata VALUES (
-                7, '"cloze"', '"Question"', '("Hint")', '("Answer")', '"source-7"', NULL
+                7, '"cloze"', '"Question
+continued"', '(nil)', '("Answer")', '"source-7"', NULL
             );
             INSERT INTO nodes VALUES ('node-1', 'notes.org', 'Node', '1');
             INSERT INTO node_tag VALUES ('node-1', 'medicine');
