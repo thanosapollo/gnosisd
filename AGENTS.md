@@ -17,6 +17,11 @@ frontend behavior is the compatibility contract.
 - `src/store` is the only SQLite adapter. One daemon-owned thread holds the
   connection and handles both reads and atomic writes through a bounded queue.
   SQLite files are mode `0600`.
+- `src/migration.rs` owns the offline schema-v9 snapshot path. It must never
+  modify or replace the source database, and it publishes only a fully checked
+  target.
+- Legacy themata and scheduling state are exposed through a read-only adapter.
+  Keep review mutations out until their compatibility contract is explicit.
 - `src/protocol` owns the versioned wire DTOs, framing, Unix-socket server, and
   client. Public fields use opaque string IDs, never SQLite row IDs.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
@@ -36,8 +41,8 @@ Socket startup uses an atomic `.startup-lock` directory to serialize stale
 cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
 SIGTERM both enter graceful shutdown.
 
-Scheduler migration, review history, Emacs integration, remote transport,
-authentication, and synchronization remain out of scope for this foundation.
+Review writes, Emacs integration, remote transport, authentication, and
+synchronization remain out of scope for this foundation.
 
 ## Commands
 
@@ -56,6 +61,7 @@ cargo test --lib parser::org_tests
 cargo test --test org_parser
 cargo test --lib store::sqlite::tests
 cargo test --test sqlite_store
+cargo test --test legacy_migration
 cargo test application
 cargo test protocol
 cargo test --test daemon_protocol

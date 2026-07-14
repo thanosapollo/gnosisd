@@ -31,11 +31,11 @@ async fn org_projection_is_available_only_through_versioned_protocol() {
         },
     )
     .await;
-    let ResponseOutcome::Success {
-        result: ResponseResult::DocumentImported(result),
-    } = imported
-    else {
+    let ResponseOutcome::Success { result } = imported else {
         panic!("fixture import failed");
+    };
+    let ResponseResult::DocumentImported(result) = *result else {
+        panic!("unexpected import response");
     };
     assert_eq!((result.node_count, result.occurrence_count), (3, 4));
 
@@ -47,11 +47,11 @@ async fn org_projection_is_available_only_through_versioned_protocol() {
         },
     )
     .await;
-    let ResponseOutcome::Success {
-        result: ResponseResult::Document(document),
-    } = document
-    else {
+    let ResponseOutcome::Success { result } = document else {
         panic!("fixture query failed");
+    };
+    let ResponseResult::Document(document) = *result else {
+        panic!("unexpected document response");
     };
     assert_eq!(document.title, "Learn Emacs");
     assert_eq!(document.file_node_id.as_deref(), Some("root-id"));

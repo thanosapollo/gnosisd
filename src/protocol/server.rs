@@ -18,13 +18,14 @@ use tokio::{
 
 use crate::{
     application::{
-        ApplicationError, ImportDocument, ImportSummary, PreparedImport, QueryDocument,
-        persist_import,
+        ApplicationError, ImportDocument, ImportSummary, LegacyQueryError, PreparedImport,
+        QueryDocument, QueryDueThemata, QueryLegacyThema, persist_import,
     },
+    domain::{DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     protocol::{
-        DocumentView, ErrorCode, ImportResult, MessageValidationError, PROTOCOL_VERSION,
-        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo,
-        frame,
+        DocumentView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
+        MessageValidationError, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
+        ResponseEnvelope, ResponseResult, SystemInfo, ThemaView, frame,
     },
     store::{SqliteStore, StoreError, StoredDocument},
 };
@@ -175,11 +176,53 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
             expected_revision,
         } => import_document(state, document_id, org, expected_revision).await,
         Request::DocumentGet { document_id } => get_document(state, document_id).await,
+        Request::LegacyInfo {} => legacy_info(state).await,
+        Request::ThemaGet { thema_id } => get_thema(state, thema_id).await,
+        Request::ReviewDue { day, limit } => due_themata(state, day, limit).await,
     };
     match result {
-        Ok(result) => ResponseEnvelope::success(id, result),
+        Ok(result) => bounded_success(id, result),
         Err(error) => ResponseEnvelope::error(id, error),
     }
+}
+
+fn bounded_success(id: String, result: ResponseResult) -> ResponseEnvelope {
+    let response = ResponseEnvelope::success(id.clone(), result);
+    match serde_json::to_vec(&response) {
+        Ok(bytes) if bytes.len() <= crate::protocol::MAX_FRAME_SIZE => response,
+        _ => ResponseEnvelope::error(
+            id,
+            ProtocolError::new(ErrorCode::Internal, "response exceeds protocol limit"),
+        ),
+    }
+}
+
+async fn legacy_info(state: ServerState) -> Result<ResponseResult, ProtocolError> {
+    let info = state.store.legacy_info().await.map_err(actor_error)?;
+    Ok(ResponseResult::LegacyInfo(LegacyInfoView::from(info)))
+}
+
+async fn get_thema(state: ServerState, thema_id: String) -> Result<ResponseResult, ProtocolError> {
+    let query = QueryLegacyThema::new(thema_id).map_err(invalid_legacy_query)?;
+    let thema = state
+        .store
+        .get_thema(query.thema_id().clone())
+        .await
+        .map_err(actor_error)?
+        .ok_or_else(thema_not_found)?;
+    Ok(ResponseResult::Thema(ThemaView::from(thema)))
+}
+
+async fn due_themata(
+    state: ServerState,
+    day: u32,
+    limit: u16,
+) -> Result<ResponseResult, ProtocolError> {
+    let query = QueryDueThemata::new(day, limit).map_err(invalid_legacy_query)?;
+    let themata = state.store.due_themata(query).await.map_err(actor_error)?;
+    Ok(ResponseResult::DueThemata(
+        themata.into_iter().map(DueThemaView::from).collect(),
+    ))
 }
 
 async fn import_document(
@@ -280,6 +323,14 @@ fn not_found() -> ProtocolError {
     ProtocolError::new(ErrorCode::NotFound, "document not found")
 }
 
+fn thema_not_found() -> ProtocolError {
+    ProtocolError::new(ErrorCode::NotFound, "thema not found")
+}
+
+fn invalid_legacy_query(_error: LegacyQueryError) -> ProtocolError {
+    ProtocolError::new(ErrorCode::MalformedRequest, "invalid legacy query")
+}
+
 fn internal_error() -> ProtocolError {
     ProtocolError::new(ErrorCode::Internal, "internal daemon failure")
 }
@@ -307,6 +358,17 @@ enum StoreCommand {
     Get {
         document_id: crate::domain::DocumentId,
         response: oneshot::Sender<Result<Option<StoredDocument>, StoreError>>,
+    },
+    LegacyInfo {
+        response: oneshot::Sender<Result<Option<LegacyDatabaseInfo>, StoreError>>,
+    },
+    GetThema {
+        thema_id: ThemaId,
+        response: oneshot::Sender<Result<Option<LegacyThema>, StoreError>>,
+    },
+    DueThemata {
+        query: QueryDueThemata,
+        response: oneshot::Sender<Result<Vec<DueThema>, StoreError>>,
     },
 }
 
@@ -340,6 +402,45 @@ impl StoreHandle {
             &self.sender,
             StoreCommand::Get {
                 document_id,
+                response: sender,
+            },
+        )?;
+        receiver
+            .await
+            .map_err(|_| ActorError::Stopped)?
+            .map_err(ActorError::Store)
+    }
+
+    async fn legacy_info(&self) -> Result<Option<LegacyDatabaseInfo>, ActorError> {
+        let (sender, receiver) = oneshot::channel();
+        enqueue(&self.sender, StoreCommand::LegacyInfo { response: sender })?;
+        receiver
+            .await
+            .map_err(|_| ActorError::Stopped)?
+            .map_err(ActorError::Store)
+    }
+
+    async fn get_thema(&self, thema_id: ThemaId) -> Result<Option<LegacyThema>, ActorError> {
+        let (sender, receiver) = oneshot::channel();
+        enqueue(
+            &self.sender,
+            StoreCommand::GetThema {
+                thema_id,
+                response: sender,
+            },
+        )?;
+        receiver
+            .await
+            .map_err(|_| ActorError::Stopped)?
+            .map_err(ActorError::Store)
+    }
+
+    async fn due_themata(&self, query: QueryDueThemata) -> Result<Vec<DueThema>, ActorError> {
+        let (sender, receiver) = oneshot::channel();
+        enqueue(
+            &self.sender,
+            StoreCommand::DueThemata {
+                query,
                 response: sender,
             },
         )?;
@@ -423,6 +524,15 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
             response,
         } => {
             let _ = response.send(store.get_document(&document_id));
+        }
+        StoreCommand::LegacyInfo { response } => {
+            let _ = response.send(store.legacy_database_info());
+        }
+        StoreCommand::GetThema { thema_id, response } => {
+            let _ = response.send(store.get_legacy_thema(&thema_id));
+        }
+        StoreCommand::DueThemata { query, response } => {
+            let _ = response.send(store.due_legacy_themata(query.day(), query.limit()));
         }
     }
 }
@@ -624,13 +734,15 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        ActorError, ServerError, ServerState, StartupLock, StoreCommand, StoreHandle, dispatch,
-        enqueue, remove_observed_socket,
+        ActorError, ServerError, ServerState, StartupLock, StoreCommand, StoreHandle,
+        bounded_success, dispatch, enqueue, remove_observed_socket,
     };
     use crate::{
         application::ImportDocument,
         domain::DocumentId,
-        protocol::{ErrorCode, Request, RequestEnvelope, ResponseOutcome},
+        protocol::{
+            DueThemaView, ErrorCode, Request, RequestEnvelope, ResponseOutcome, ResponseResult,
+        },
     };
 
     #[test]
@@ -647,6 +759,27 @@ mod tests {
         let error = super::actor_error(ActorError::Busy);
         assert_eq!(error.code, crate::protocol::ErrorCode::Busy);
         assert_eq!(error.message, "daemon is busy");
+    }
+
+    #[test]
+    fn oversized_success_becomes_stable_protocol_error() {
+        let response = bounded_success(
+            "large-response".into(),
+            ResponseResult::DueThemata(vec![DueThemaView {
+                id: "thema".into(),
+                kind: "basic".into(),
+                keimenon: "x".repeat(crate::protocol::MAX_FRAME_SIZE),
+                hypothesis: Vec::new(),
+                answer: Vec::new(),
+                next_review_day: 20260714,
+                review_count: 0,
+            }]),
+        );
+        let ResponseOutcome::Failure { error } = response.outcome else {
+            panic!("oversized response was accepted");
+        };
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert_eq!(error.message, "response exceeds protocol limit");
     }
 
     #[tokio::test]

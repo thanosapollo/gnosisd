@@ -56,6 +56,9 @@ printf '#+TITLE: Example\n' | cargo run --bin gnosis -- \
   --socket "$XDG_RUNTIME_DIR/gnosis.sock" import-org example
 cargo run --bin gnosis -- \
   --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-document example
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" legacy-info
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" due-themata 20260714 --limit 20
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-thema THEMA_ID
 #+end_src
 
 Use ~--if-revision N~ with ~import-org~ for conflict detection. Omitting it
@@ -71,6 +74,9 @@ method:
 - ~system.info~
 - ~document.import~
 - ~document.get~
+- ~legacy.info~
+- ~thema.get~
+- ~review.due~
 
 The application protocol exposes opaque string document and node IDs. SQLite
 row identifiers, SQL, paths, dependency errors, and backtraces never enter a
@@ -115,11 +121,33 @@ and restore commands are not part of this slice. Startup uses an atomic
 a process is killed during that short startup window, inspect and remove the
 abandoned lock directory before restarting.
 
+** Legacy Emacs snapshot
+
+Close Emacs before taking the final migration snapshot, then create a fresh
+daemon database without changing the source database:
+
+#+begin_src sh
+gnosisd \
+  --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
+  --migrate-legacy "$HOME/.config/emacs/gnosis/gnosis.db"
+#+end_src
+
+The offline migration accepts schema-v9 databases, refuses an existing target
+or active Emacs lease, and publishes only after SQLite integrity, foreign-key,
+and row-count checks pass. All legacy tables and rows are preserved. The
+conflicting legacy ~node_tag~ table is stored as ~legacy_node_tag~ while the new
+document projection schema is added alongside it.
+
+The daemon exposes the imported snapshot read-only. ~legacy-info~ reports its
+source and row counts, ~due-themata~ returns a bounded deterministic queue, and
+~get-thema~ returns one thema with its extras, tags, links, and complete review
+state. Review answers still belong to the legacy Emacs implementation.
+
 * Current exclusions
 
-This foundation does not migrate scheduling or review history, integrate the
-Emacs client, expose TCP, add authentication or TLS, discover or watch files,
-support Markdown, compute embeddings, or synchronize multiple daemons.
+This foundation does not write legacy scheduling or review history, integrate
+the Emacs client, expose TCP, add authentication or TLS, discover or watch
+files, support Markdown, compute embeddings, or synchronize multiple daemons.
 
 * Validation
 

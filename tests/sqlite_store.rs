@@ -19,12 +19,10 @@ async fn document_persists_across_daemon_restart_without_client_database_access(
             expected_revision: None,
         })
         .await;
-    assert!(matches!(
-        response,
-        ResponseOutcome::Success {
-            result: ResponseResult::DocumentImported(_)
-        }
-    ));
+    let ResponseOutcome::Success { result } = response else {
+        panic!("document import failed");
+    };
+    assert!(matches!(*result, ResponseResult::DocumentImported(_)));
     first.stop().await;
 
     let second = RunningDaemon::start(directory.path().join("second.sock"), database).await;
@@ -33,11 +31,11 @@ async fn document_persists_across_daemon_restart_without_client_database_access(
             document_id: "persistent".into(),
         })
         .await;
-    let ResponseOutcome::Success {
-        result: ResponseResult::Document(document),
-    } = response
-    else {
+    let ResponseOutcome::Success { result } = response else {
         panic!("persisted document was not returned after restart");
+    };
+    let ResponseResult::Document(document) = *result else {
+        panic!("unexpected document response");
     };
     assert_eq!(document.revision, 1);
     assert_eq!(document.title, "Persistent");

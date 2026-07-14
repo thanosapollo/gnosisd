@@ -93,9 +93,10 @@ async fn concurrent_stale_writes_are_serialized_and_atomic() {
     let mut conflicts = 0;
     for client in clients {
         match client.await.unwrap().outcome {
-            ResponseOutcome::Success {
-                result: ResponseResult::DocumentImported(result),
-            } => {
+            ResponseOutcome::Success { result } => {
+                let ResponseResult::DocumentImported(result) = *result else {
+                    panic!("unexpected success response");
+                };
                 assert_eq!(result.revision, 2);
                 imported += 1;
             }
@@ -104,7 +105,6 @@ async fn concurrent_stale_writes_are_serialized_and_atomic() {
                 assert!(!error.message.contains("database is locked"));
                 conflicts += 1;
             }
-            other => panic!("unexpected response: {other:?}"),
         }
     }
     assert_eq!((imported, conflicts), (1, 2));
@@ -373,11 +373,11 @@ fn deeply_nested_org() -> String {
 }
 
 fn assert_imported(response: ResponseEnvelope, revision: u64) {
-    let ResponseOutcome::Success {
-        result: ResponseResult::DocumentImported(result),
-    } = response.outcome
-    else {
+    let ResponseOutcome::Success { result } = response.outcome else {
         panic!("import failed: {:?}", response.outcome);
+    };
+    let ResponseResult::DocumentImported(result) = *result else {
+        panic!("unexpected import response");
     };
     assert_eq!(result.revision, revision);
     assert_eq!(result.node_count, 1);
@@ -386,11 +386,11 @@ fn assert_imported(response: ResponseEnvelope, revision: u64) {
 }
 
 fn assert_document(response: ResponseEnvelope, index: usize, revision: u64) {
-    let ResponseOutcome::Success {
-        result: ResponseResult::Document(document),
-    } = response.outcome
-    else {
+    let ResponseOutcome::Success { result } = response.outcome else {
         panic!("query failed: {:?}", response.outcome);
+    };
+    let ResponseResult::Document(document) = *result else {
+        panic!("unexpected document response");
     };
     assert_eq!(document.document_id, format!("doc-{index}"));
     assert_eq!(document.revision, revision);
@@ -398,11 +398,11 @@ fn assert_document(response: ResponseEnvelope, index: usize, revision: u64) {
 }
 
 fn assert_document_revision(response: ResponseEnvelope, revision: u64) {
-    let ResponseOutcome::Success {
-        result: ResponseResult::Document(document),
-    } = response.outcome
-    else {
+    let ResponseOutcome::Success { result } = response.outcome else {
         panic!("query failed: {:?}", response.outcome);
+    };
+    let ResponseResult::Document(document) = *result else {
+        panic!("unexpected document response");
     };
     assert_eq!(document.revision, revision);
     assert_eq!(document.nodes.len(), 1);

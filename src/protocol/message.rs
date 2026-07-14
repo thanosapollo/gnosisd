@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{DocumentId, DocumentProjection};
+use crate::domain::{
+    DocumentId, DocumentProjection, DueThema, LegacyDatabaseInfo, LegacyReviewState, LegacyThema,
+};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
@@ -41,9 +43,15 @@ pub enum Request {
     },
     #[serde(rename = "document.get")]
     DocumentGet { document_id: String },
+    #[serde(rename = "legacy.info")]
+    LegacyInfo {},
+    #[serde(rename = "thema.get")]
+    ThemaGet { thema_id: String },
+    #[serde(rename = "review.due")]
+    ReviewDue { day: u32, limit: u16 },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
     pub version: u16,
     pub id: String,
@@ -56,7 +64,9 @@ impl ResponseEnvelope {
         Self {
             version: PROTOCOL_VERSION,
             id,
-            outcome: ResponseOutcome::Success { result },
+            outcome: ResponseOutcome::Success {
+                result: Box::new(result),
+            },
         }
     }
 
@@ -69,24 +79,166 @@ impl ResponseEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResponseOutcome {
-    Success { result: ResponseResult },
+    Success { result: Box<ResponseResult> },
     Failure { error: ProtocolError },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ResponseResult {
     SystemInfo(SystemInfo),
     DocumentImported(ImportResult),
     Document(DocumentView),
+    LegacyInfo(LegacyInfoView),
+    Thema(ThemaView),
+    DueThemata(Vec<DueThemaView>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SystemInfo {
     pub protocol_version: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LegacyInfoView {
+    pub imported: bool,
+    pub source_schema_version: Option<u32>,
+    pub legacy_table_count: u64,
+    pub legacy_row_count: u64,
+    pub thema_count: u64,
+    pub active_thema_count: u64,
+    pub review_state_count: u64,
+}
+
+impl From<Option<LegacyDatabaseInfo>> for LegacyInfoView {
+    fn from(info: Option<LegacyDatabaseInfo>) -> Self {
+        let Some(info) = info else {
+            return Self {
+                imported: false,
+                source_schema_version: None,
+                legacy_table_count: 0,
+                legacy_row_count: 0,
+                thema_count: 0,
+                active_thema_count: 0,
+                review_state_count: 0,
+            };
+        };
+        Self {
+            imported: true,
+            source_schema_version: Some(info.source_schema_version),
+            legacy_table_count: info.legacy_table_count,
+            legacy_row_count: info.legacy_row_count,
+            thema_count: info.thema_count,
+            active_thema_count: info.active_thema_count,
+            review_state_count: info.review_state_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ThemaView {
+    pub id: String,
+    pub kind: String,
+    pub keimenon: String,
+    pub hypothesis: Vec<String>,
+    pub answer: Vec<String>,
+    pub source_guid: Option<String>,
+    pub archived_at_us: Option<u64>,
+    pub parathema: Option<String>,
+    pub review_image: Option<String>,
+    pub tags: Vec<String>,
+    pub links: Vec<String>,
+    pub review_state: ReviewStateView,
+}
+
+impl From<LegacyThema> for ThemaView {
+    fn from(thema: LegacyThema) -> Self {
+        Self {
+            id: thema.id.to_string(),
+            kind: thema.kind,
+            keimenon: thema.keimenon,
+            hypothesis: thema.hypothesis,
+            answer: thema.answer,
+            source_guid: thema.source_guid,
+            archived_at_us: thema.archived_at_us,
+            parathema: thema.parathema,
+            review_image: thema.review_image,
+            tags: thema.tags,
+            links: thema.links.into_iter().map(|id| id.to_string()).collect(),
+            review_state: thema.review_state.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ReviewStateView {
+    pub state_revision: u64,
+    pub review_count: u64,
+    pub legacy_review_count: u64,
+    pub legacy_unclassified_count: u64,
+    pub last_reviewed_at_us: Option<u64>,
+    pub last_review_day: Option<u32>,
+    pub next_review_day: u32,
+    pub interval_days: Option<u32>,
+    pub consecutive_successes: u64,
+    pub total_successes: u64,
+    pub consecutive_failures: u64,
+    pub total_failures: u64,
+    pub suspended: bool,
+    pub gnosis_plus: f64,
+    pub gnosis_minus: f64,
+    pub gnosis_synolon: f64,
+}
+
+impl From<LegacyReviewState> for ReviewStateView {
+    fn from(state: LegacyReviewState) -> Self {
+        Self {
+            state_revision: state.state_revision,
+            review_count: state.review_count,
+            legacy_review_count: state.legacy_review_count,
+            legacy_unclassified_count: state.legacy_unclassified_count,
+            last_reviewed_at_us: state.last_reviewed_at_us,
+            last_review_day: state.last_review_day,
+            next_review_day: state.next_review_day,
+            interval_days: state.interval_days,
+            consecutive_successes: state.consecutive_successes,
+            total_successes: state.total_successes,
+            consecutive_failures: state.consecutive_failures,
+            total_failures: state.total_failures,
+            suspended: state.suspended,
+            gnosis_plus: state.gnosis_plus,
+            gnosis_minus: state.gnosis_minus,
+            gnosis_synolon: state.gnosis_synolon,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DueThemaView {
+    pub id: String,
+    pub kind: String,
+    pub keimenon: String,
+    pub hypothesis: Vec<String>,
+    pub answer: Vec<String>,
+    pub next_review_day: u32,
+    pub review_count: u64,
+}
+
+impl From<DueThema> for DueThemaView {
+    fn from(thema: DueThema) -> Self {
+        Self {
+            id: thema.id.to_string(),
+            kind: thema.kind,
+            keimenon: thema.keimenon,
+            hypothesis: thema.hypothesis,
+            answer: thema.answer,
+            next_review_day: thema.next_review_day,
+            review_count: thema.review_count,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

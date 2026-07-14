@@ -22,6 +22,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     SystemInfo,
+    LegacyInfo,
     ImportOrg {
         document_id: String,
         #[arg(long, value_name = "N")]
@@ -29,6 +30,14 @@ enum Command {
     },
     GetDocument {
         document_id: String,
+    },
+    GetThema {
+        thema_id: String,
+    },
+    DueThemata {
+        day: u32,
+        #[arg(long, default_value_t = 20)]
+        limit: u16,
     },
 }
 
@@ -77,6 +86,7 @@ async fn run(cli: Cli) -> Result<(), RunError> {
 fn command_request(command: Command) -> Result<Request, CliError> {
     match command {
         Command::SystemInfo => Ok(Request::SystemInfo {}),
+        Command::LegacyInfo => Ok(Request::LegacyInfo {}),
         Command::ImportOrg {
             document_id,
             if_revision,
@@ -86,6 +96,8 @@ fn command_request(command: Command) -> Result<Request, CliError> {
             expected_revision: if_revision,
         }),
         Command::GetDocument { document_id } => Ok(Request::DocumentGet { document_id }),
+        Command::GetThema { thema_id } => Ok(Request::ThemaGet { thema_id }),
+        Command::DueThemata { day, limit } => Ok(Request::ReviewDue { day, limit }),
     }
 }
 
@@ -102,6 +114,9 @@ fn write_result(result: &ResponseResult) -> Result<(), CliError> {
         ResponseResult::SystemInfo(value) => write_json(value),
         ResponseResult::DocumentImported(value) => write_json(value),
         ResponseResult::Document(value) => write_json(value),
+        ResponseResult::LegacyInfo(value) => write_json(value),
+        ResponseResult::Thema(value) => write_json(value),
+        ResponseResult::DueThemata(value) => write_json(value),
     }
 }
 
