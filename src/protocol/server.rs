@@ -18,12 +18,13 @@ use tokio::{
 
 use crate::{
     application::{
-        ApplicationError, ImportDocument, ImportSummary, LegacyQueryError, PreparedImport,
-        QueryDocument, QueryDueThemata, QueryLegacyThema, persist_import,
+        ApplicationError, DueCursor, ImportDocument, ImportSummary, LegacyQueryError,
+        PreparedImport, QueryDocument, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema,
+        persist_import,
     },
     domain::{DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     protocol::{
-        DocumentView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
+        DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
         MessageValidationError, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
         ResponseEnvelope, ResponseResult, SystemInfo, ThemaView, frame,
     },
@@ -179,6 +180,9 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
         Request::LegacyInfo {} => legacy_info(state).await,
         Request::ThemaGet { thema_id } => get_thema(state, thema_id).await,
         Request::ReviewDue { day, limit } => due_themata(state, day, limit).await,
+        Request::ReviewDuePage { day, limit, after } => {
+            due_themata_page(state, day, limit, after).await
+        }
     };
     match result {
         Ok(result) => bounded_success(id, result),
@@ -223,6 +227,31 @@ async fn due_themata(
     Ok(ResponseResult::DueThemata(
         themata.into_iter().map(DueThemaView::from).collect(),
     ))
+}
+
+async fn due_themata_page(
+    state: ServerState,
+    day: u32,
+    limit: u16,
+    after: Option<String>,
+) -> Result<ResponseResult, ProtocolError> {
+    let query = QueryDueThemataPage::new(day, limit, after).map_err(invalid_legacy_query)?;
+    let mut themata = state
+        .store
+        .due_themata_page(query)
+        .await
+        .map_err(actor_error)?;
+    let next = if themata.len() > usize::from(limit) {
+        themata.truncate(usize::from(limit));
+        Some(
+            DueCursor::after(themata.last().ok_or_else(internal_error)?)
+                .map_err(|_| internal_error())?
+                .encode(),
+        )
+    } else {
+        None
+    };
+    Ok(ResponseResult::DuePage(DuePageView::new(themata, next)))
 }
 
 async fn import_document(
@@ -370,6 +399,10 @@ enum StoreCommand {
         query: QueryDueThemata,
         response: oneshot::Sender<Result<Vec<DueThema>, StoreError>>,
     },
+    DueThemataPage {
+        query: QueryDueThemataPage,
+        response: oneshot::Sender<Result<Vec<DueThema>, StoreError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -440,6 +473,24 @@ impl StoreHandle {
         enqueue(
             &self.sender,
             StoreCommand::DueThemata {
+                query,
+                response: sender,
+            },
+        )?;
+        receiver
+            .await
+            .map_err(|_| ActorError::Stopped)?
+            .map_err(ActorError::Store)
+    }
+
+    async fn due_themata_page(
+        &self,
+        query: QueryDueThemataPage,
+    ) -> Result<Vec<DueThema>, ActorError> {
+        let (sender, receiver) = oneshot::channel();
+        enqueue(
+            &self.sender,
+            StoreCommand::DueThemataPage {
                 query,
                 response: sender,
             },
@@ -533,6 +584,17 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
         }
         StoreCommand::DueThemata { query, response } => {
             let _ = response.send(store.due_legacy_themata(query.day(), query.limit()));
+        }
+        StoreCommand::DueThemataPage { query, response } => {
+            let after = query.after().map(|cursor| {
+                (
+                    cursor.reviewed(),
+                    cursor.next_review_day(),
+                    cursor.thema_id(),
+                )
+            });
+            let limit = query.limit() + 1;
+            let _ = response.send(store.due_legacy_themata_page(query.day(), limit, after));
         }
     }
 }

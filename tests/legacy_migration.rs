@@ -130,6 +130,9 @@ async fn migrated_snapshot_serves_legacy_thema_and_due_queue() {
     let target = directory.path().join("gnosis.sqlite");
     let socket = directory.path().join("gnosis.sock");
     create_legacy_database(&source, 9);
+    insert_due_thema(&source, 8, 0, 20260713);
+    insert_due_thema(&source, 10, 0, 20260713);
+    insert_due_thema(&source, 9, 1, 20260715);
     migrate_legacy_database(&source, &target).unwrap();
 
     let server = DaemonServer::bind(DaemonConfig::new(&socket, &target))
@@ -143,6 +146,7 @@ async fn migrated_snapshot_serves_legacy_thema_and_due_queue() {
     assert_legacy_info(&socket).await;
     assert_legacy_thema(&socket).await;
     assert_due_queue(&socket).await;
+    assert_due_pages(&socket).await;
 
     shutdown_sender.send(()).unwrap();
     task.await.unwrap().unwrap();
@@ -155,8 +159,8 @@ async fn assert_legacy_info(socket: &Path) {
     };
     assert!(info.imported);
     assert_eq!(info.source_schema_version, Some(9));
-    assert_eq!(info.thema_count, 1);
-    assert_eq!(info.review_state_count, 1);
+    assert_eq!(info.thema_count, 4);
+    assert_eq!(info.review_state_count, 4);
 }
 
 async fn assert_legacy_thema(socket: &Path) {
@@ -196,11 +200,60 @@ async fn assert_due_queue(socket: &Path) {
     let ResponseResult::DueThemata(themata) = result else {
         panic!("unexpected due response");
     };
-    assert_eq!(themata.len(), 1);
-    assert_eq!(themata[0].id, "7");
-    assert_eq!(themata[0].hypothesis, ["Hint"]);
-    assert_eq!(themata[0].answer, ["Answer"]);
-    assert_eq!(themata[0].review_count, 12);
+    assert_eq!(themata.len(), 3);
+    assert_eq!(themata[0].id, "8");
+    assert_eq!(themata[1].id, "10");
+    assert_eq!(themata[2].id, "7");
+    assert_eq!(themata[2].hypothesis, ["Hint"]);
+    assert_eq!(themata[2].answer, ["Answer"]);
+    assert_eq!(themata[2].review_count, 12);
+}
+
+async fn assert_due_pages(socket: &Path) {
+    let first = successful_result(
+        socket,
+        Request::ReviewDuePage {
+            day: 20260714,
+            limit: 1,
+            after: None,
+        },
+    )
+    .await;
+    let ResponseResult::DuePage(first) = first else {
+        panic!("unexpected due page response");
+    };
+    assert_eq!(first.items[0].id, "8");
+    let next = first.next.expect("first page must continue");
+
+    let second = successful_result(
+        socket,
+        Request::ReviewDuePage {
+            day: 20260714,
+            limit: 1,
+            after: Some(next),
+        },
+    )
+    .await;
+    let ResponseResult::DuePage(second) = second else {
+        panic!("unexpected due page response");
+    };
+    assert_eq!(second.items[0].id, "10");
+    let next = second.next.expect("second page must continue");
+
+    let third = successful_result(
+        socket,
+        Request::ReviewDuePage {
+            day: 20260714,
+            limit: 1,
+            after: Some(next),
+        },
+    )
+    .await;
+    let ResponseResult::DuePage(third) = third else {
+        panic!("unexpected due page response");
+    };
+    assert_eq!(third.items[0].id, "7");
+    assert_eq!(third.next, None);
 }
 
 async fn successful_result(socket: &Path, request_value: Request) -> ResponseResult {
@@ -301,6 +354,24 @@ fn create_legacy_database(path: &Path, version: u32) {
             PRAGMA user_version = {version};
             "#
         ))
+        .unwrap();
+}
+
+fn insert_due_thema(path: &Path, id: i64, review_count: i64, next_review_day: i64) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO themata VALUES (?1, '\"basic\"', '\"Question\"', 'nil', \
+             '(\"Answer\")', NULL, NULL)",
+            [id],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO review_state VALUES \
+             (?1, 1, ?2, ?2, ?2, NULL, NULL, ?3, NULL, 0, 0, 0, 0, 0, 1.0, 1.0, 1.3)",
+            rusqlite::params![id, review_count, next_review_day],
+        )
         .unwrap();
 }
 

@@ -49,6 +49,12 @@ pub enum Request {
     ThemaGet { thema_id: String },
     #[serde(rename = "review.due")]
     ReviewDue { day: u32, limit: u16 },
+    #[serde(rename = "review.due_page")]
+    ReviewDuePage {
+        day: u32,
+        limit: u16,
+        after: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -95,6 +101,7 @@ pub enum ResponseResult {
     LegacyInfo(LegacyInfoView),
     Thema(ThemaView),
     DueThemata(Vec<DueThemaView>),
+    DuePage(DuePageView),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -237,6 +244,21 @@ impl From<DueThema> for DueThemaView {
             answer: thema.answer,
             next_review_day: thema.next_review_day,
             review_count: thema.review_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DuePageView {
+    pub items: Vec<DueThemaView>,
+    pub next: Option<String>,
+}
+
+impl DuePageView {
+    pub(crate) fn new(items: Vec<DueThema>, next: Option<String>) -> Self {
+        Self {
+            items: items.into_iter().map(DueThemaView::from).collect(),
+            next,
         }
     }
 }
@@ -407,6 +429,24 @@ mod tests {
             serde_json::from_str::<RequestEnvelope>(&json).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn due_page_request_has_stable_wire_shape() {
+        let request = RequestEnvelope {
+            version: 1,
+            id: "due-2".into(),
+            request: Request::ReviewDuePage {
+                day: 20260714,
+                limit: 25,
+                after: Some("0:20260713:8".into()),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["method"], "review.due_page");
+        assert_eq!(value["params"]["day"], 20260714);
+        assert_eq!(value["params"]["limit"], 25);
+        assert_eq!(value["params"]["after"], "0:20260713:8");
     }
 
     #[test]

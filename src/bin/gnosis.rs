@@ -39,6 +39,13 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u16,
     },
+    DuePage {
+        day: u32,
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+        #[arg(long)]
+        after: Option<String>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +105,7 @@ fn command_request(command: Command) -> Result<Request, CliError> {
         Command::GetDocument { document_id } => Ok(Request::DocumentGet { document_id }),
         Command::GetThema { thema_id } => Ok(Request::ThemaGet { thema_id }),
         Command::DueThemata { day, limit } => Ok(Request::ReviewDue { day, limit }),
+        Command::DuePage { day, limit, after } => Ok(Request::ReviewDuePage { day, limit, after }),
     }
 }
 
@@ -117,6 +125,7 @@ fn write_result(result: &ResponseResult) -> Result<(), CliError> {
         ResponseResult::LegacyInfo(value) => write_json(value),
         ResponseResult::Thema(value) => write_json(value),
         ResponseResult::DueThemata(value) => write_json(value),
+        ResponseResult::DuePage(value) => write_json(value),
     }
 }
 

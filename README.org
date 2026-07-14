@@ -59,6 +59,7 @@ cargo run --bin gnosis -- \
   --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-document example
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" legacy-info
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" due-themata 20260714 --limit 20
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" due-page 20260714 --limit 100
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-thema THEMA_ID
 #+end_src
 
@@ -78,6 +79,7 @@ method:
 - ~legacy.info~
 - ~thema.get~
 - ~review.due~
+- ~review.due_page~
 
 The application protocol exposes opaque string document and node IDs. SQLite
 row identifiers, SQL, paths, dependency errors, and backtraces never enter a
@@ -142,11 +144,14 @@ conflicting legacy ~node_tag~ table is stored as ~legacy_node_tag~ while the new
 document projection schema is added alongside it.
 
 The daemon exposes the imported snapshot read-only. ~legacy-info~ reports its
-source and row counts, ~due-themata~ returns a bounded deterministic queue, and
-~get-thema~ returns one thema with its extras, tags, links, and complete review
-state.  The Emacs frontend calls these methods through ~gnosis-core.el~ without
-changing its established buffers or keymaps.  Review answers remain on the
-legacy compatibility path until the daemon exposes one atomic review command.
+source and row counts, and ~get-thema~ returns one thema with its extras, tags,
+links, and complete review state. ~due-themata~ keeps the original bounded
+queue interface. ~due-page~ returns ~items~ plus an opaque ~next~ cursor so a
+frontend can read the complete queue in deterministic order. Pass that value
+back with ~--after CURSOR~ until ~next~ is null. The Emacs frontend calls these
+methods through ~gnosis-core.el~ without changing its established buffers or
+keymaps. Review answers remain on the legacy compatibility path until the
+daemon exposes one atomic review command.
 
 * Current exclusions
 

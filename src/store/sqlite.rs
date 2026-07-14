@@ -115,7 +115,16 @@ impl SqliteStore {
         day: u32,
         limit: u16,
     ) -> Result<Vec<DueThema>, StoreError> {
-        load_due_legacy_themata(&self.connection, day, limit)
+        load_due_legacy_themata(&self.connection, day, limit, None)
+    }
+
+    pub(crate) fn due_legacy_themata_page(
+        &self,
+        day: u32,
+        limit: u16,
+        after: Option<(bool, u32, i64)>,
+    ) -> Result<Vec<DueThema>, StoreError> {
+        load_due_legacy_themata(&self.connection, day, limit, after)
     }
 
     pub(crate) fn replace_document(
@@ -454,6 +463,7 @@ fn load_due_legacy_themata(
     connection: &Connection,
     day: u32,
     limit: u16,
+    after: Option<(bool, u32, i64)>,
 ) -> Result<Vec<DueThema>, StoreError> {
     if !table_exists(connection, "legacy_source")? {
         return Ok(Vec::new());
@@ -461,8 +471,26 @@ fn load_due_legacy_themata(
     let mut statement = connection
         .prepare(LEGACY_DUE_QUERY)
         .map_err(StoreError::storage)?;
+    let (reviewed, after_day, thema_id) = after
+        .map(|(reviewed, day, thema_id)| {
+            (
+                Some(i64::from(reviewed)),
+                Some(i64::from(day)),
+                Some(thema_id),
+            )
+        })
+        .unwrap_or((None, None, None));
     let rows = statement
-        .query_map(params![i64::from(day), i64::from(limit)], due_thema_row)
+        .query_map(
+            params![
+                i64::from(day),
+                reviewed,
+                after_day,
+                thema_id,
+                i64::from(limit)
+            ],
+            due_thema_row,
+        )
         .map_err(StoreError::storage)?;
     rows.map(|row| materialize_due_thema(row.map_err(StoreError::storage)?))
         .collect()
@@ -474,8 +502,13 @@ const LEGACY_DUE_QUERY: &str = "SELECT thema.id, thema.type, thema.keimenon, the
      JOIN themata AS thema ON thema.id = state.thema_id \
      WHERE thema.archived_at_us IS NULL AND state.suspended = 0 \
      AND state.next_review_day <= ?1 \
+     AND (?2 IS NULL \
+          OR (state.review_count > 0) > ?2 \
+          OR ((state.review_count > 0) = ?2 AND state.next_review_day > ?3) \
+          OR ((state.review_count > 0) = ?2 AND state.next_review_day = ?3 \
+              AND state.thema_id > ?4)) \
      ORDER BY (state.review_count > 0), state.next_review_day, state.thema_id \
-     LIMIT ?2";
+     LIMIT ?5";
 
 fn due_thema_row(
     row: &rusqlite::Row<'_>,
