@@ -850,7 +850,7 @@ impl ServiceHandle {
         received_at_us: u64,
     ) -> Result<OfflineContentResult, ServiceError> {
         let prepared = match prepare_offline_document(&operation) {
-            Ok(note) => PreparedContentOperation::Ready(Box::new(note)),
+            Ok(note) => PreparedContentOperation::Ready(note.map(Box::new)),
             Err(reason) => PreparedContentOperation::Conflict(reason),
         };
         request(&self.sender, |response| {
@@ -1013,7 +1013,7 @@ impl ServiceRuntime {
 type StoreResult<T> = Result<T, StoreError>;
 
 enum PreparedContentOperation {
-    Ready(Box<PreparedNote>),
+    Ready(Option<Box<PreparedNote>>),
     Conflict(OfflineContentConflictReason),
 }
 
@@ -1376,7 +1376,7 @@ struct ContentCommand<'a> {
     canonical_payload: &'a str,
     device_id: Option<&'a str>,
     received_at_us: u64,
-    preparation: Result<&'a PreparedNote, OfflineContentConflictReason>,
+    preparation: Result<Option<&'a PreparedNote>, OfflineContentConflictReason>,
 }
 
 fn reconcile_content_command(
@@ -1392,9 +1392,14 @@ fn reconcile_content_command(
         command.preparation,
     )?;
     let blob = if needs_blob {
-        let note = command.preparation.map_err(|_| StoreError::CorruptData {
-            field: "content preparation",
-        })?;
+        let note = command
+            .preparation
+            .map_err(|_| StoreError::CorruptData {
+                field: "content preparation",
+            })?
+            .ok_or(StoreError::CorruptData {
+                field: "content preparation",
+            })?;
         Some(
             blobs
                 .put(note.org.as_bytes(), "text/org; charset=utf-8")
@@ -1830,7 +1835,7 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             response,
         } => {
             let preparation = match &prepared {
-                PreparedContentOperation::Ready(note) => Ok(note.as_ref()),
+                PreparedContentOperation::Ready(note) => Ok(note.as_deref()),
                 PreparedContentOperation::Conflict(reason) => Err(*reason),
             };
             let result = reconcile_content_command(

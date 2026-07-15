@@ -1,4 +1,4 @@
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
@@ -7,13 +7,15 @@ use thiserror::Error;
 
 use crate::application::{
     ContentBase, ContentReconciliationStatus, OfflineAnswerError, OfflineAnswerInput,
-    OfflineContentConflictReason, OfflineContentOperation, OfflineReviewOperation,
-    OfflineReviewResult, ReconciliationStatus, ReviewPackView, ReviewSessionMode,
-    prepare_offline_operation,
+    OfflineContentConflictReason, OfflineContentMutation, OfflineContentOperation,
+    OfflineReviewOperation, OfflineReviewResult, ReconciliationStatus, ReviewPackView,
+    ReviewSessionMode, path_key, prepare_offline_operation, validate_org_path,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("replica/0001_initial.sql");
 const OFFLINE_CONTENT_SCHEMA: &str = include_str!("replica/0002_offline_content.sql");
+const OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA: &str =
+    include_str!("replica/0003_offline_document_lifecycle.sql");
 const FIRST_REQUEST: &str = "";
 
 pub(crate) struct LocalReplicaStore {
@@ -146,6 +148,8 @@ pub(crate) enum LocalReplicaError {
     Result,
     #[error("offline content operation no longer matches the replica state")]
     Content,
+    #[error("offline content path is already owned by another document")]
+    PathConflict,
 }
 
 impl LocalReplicaStore {
@@ -180,8 +184,11 @@ impl LocalReplicaStore {
         }
         transaction
             .execute(
-                "UPDATE replica_identity SET observed_server_id = ?1 WHERE id = 1",
-                [server_id],
+                "UPDATE replica_identity SET observed_server_id = ?1,
+                     offline_document_lifecycle = CASE WHEN ?2 = 1 THEN 0
+                         ELSE offline_document_lifecycle END
+                 WHERE id = 1",
+                params![server_id, i64::from(changed)],
             )
             .map_err(LocalReplicaError::Storage)?;
         let sequence = u64_to_i64(next_device_sequence)?;
@@ -201,6 +208,30 @@ impl LocalReplicaStore {
                 )
                 .map_err(LocalReplicaError::Storage)?;
         }
+        transaction.commit().map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn install_content_capabilities(
+        &mut self,
+        server_id: &str,
+    ) -> Result<(), LocalReplicaError> {
+        let transaction = self.immediate()?;
+        let observed = transaction
+            .query_row(
+                "SELECT observed_server_id FROM replica_identity WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        if observed.as_deref() != Some(server_id) {
+            return Err(LocalReplicaError::SyncOrder);
+        }
+        transaction
+            .execute(
+                "UPDATE replica_identity SET offline_document_lifecycle = 1 WHERE id = 1",
+                [],
+            )
+            .map_err(LocalReplicaError::Storage)?;
         transaction.commit().map_err(LocalReplicaError::Storage)
     }
 
@@ -524,7 +555,7 @@ impl LocalReplicaStore {
             return Err(LocalReplicaError::Content);
         }
         let cursor = context.2.ok_or(LocalReplicaError::Content)?;
-        let base = working_content_base(&self.connection, document_id)?;
+        let base = working_content_base(&self.connection, &server_id, document_id)?;
         if matches!(
             &base,
             ContentBase::Revision {
@@ -796,6 +827,35 @@ impl LocalReplicaStore {
             .transpose()
     }
 
+    pub(crate) fn document_id_for_path(
+        &self,
+        logical_path: &str,
+    ) -> Result<Option<String>, LocalReplicaError> {
+        validate_org_path(logical_path).map_err(|_| LocalReplicaError::Content)?;
+        let (active, observed) = replica_servers(&self.connection)?;
+        if active != observed {
+            return Err(LocalReplicaError::SyncOrder);
+        }
+        let Some(server_id) = active else {
+            return Ok(None);
+        };
+        let documents = working_documents(&self.connection, &server_id)?;
+        let wanted = path_key(logical_path);
+        let mut found = None;
+        for (document_id, document) in documents {
+            let Some(path) = document.logical_path else {
+                continue;
+            };
+            if path_key(&path) != wanted {
+                continue;
+            }
+            if found.replace(document_id).is_some() {
+                return Err(LocalReplicaError::PathConflict);
+            }
+        }
+        Ok(found)
+    }
+
     #[cfg(test)]
     pub(crate) fn counts(&self) -> Result<(u64, u64, u64), LocalReplicaError> {
         let projections = count(&self.connection, "replica_projection")?;
@@ -854,11 +914,22 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
             transaction
                 .execute_batch(OFFLINE_CONTENT_SCHEMA)
                 .map_err(LocalReplicaError::Storage)?;
+            transaction
+                .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
         }
-        1 => transaction
-            .execute_batch(OFFLINE_CONTENT_SCHEMA)
+        1 => {
+            transaction
+                .execute_batch(OFFLINE_CONTENT_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
+            transaction
+                .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
+        }
+        2 => transaction
+            .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
             .map_err(LocalReplicaError::Storage)?,
-        2 => {}
+        3 => {}
         _ => return Err(LocalReplicaError::Schema),
     }
     let stored = transaction
@@ -904,9 +975,9 @@ fn sync_singleton_exists(transaction: &Transaction<'_>) -> Result<bool, LocalRep
 }
 
 fn replica_servers(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
 ) -> Result<(Option<String>, Option<String>), LocalReplicaError> {
-    transaction
+    connection
         .query_row(
             "SELECT server_id, observed_server_id FROM replica_identity WHERE id = 1",
             [],
@@ -1545,13 +1616,14 @@ fn current_content_base(
 
 fn working_content_base(
     connection: &Connection,
+    server_id: &str,
     document_id: &str,
 ) -> Result<ContentBase, LocalReplicaError> {
-    if let Some(base) = latest_chained_content_base(connection, document_id, false)? {
+    if let Some(base) = latest_chained_content_base(connection, server_id, document_id, false)? {
         return Ok(base);
     }
     let canonical = current_content_base(connection, document_id)?;
-    let accepted = latest_chained_content_base(connection, document_id, true)?;
+    let accepted = latest_chained_content_base(connection, server_id, document_id, true)?;
     Ok(accepted
         .filter(|base| content_base_revision(base) > content_base_revision(&canonical))
         .unwrap_or(canonical))
@@ -1559,21 +1631,23 @@ fn working_content_base(
 
 fn latest_chained_content_base(
     connection: &Connection,
+    server_id: &str,
     document_id: &str,
     accepted: bool,
 ) -> Result<Option<ContentBase>, LocalReplicaError> {
     connection
         .query_row(
-            "SELECT content.base_kind, content.base_revision, content.content_sha256,
+            "SELECT content.mutation, content.base_kind, content.base_revision,
+                    content.content_sha256, content.base_content_sha256,
                     content.operation_id
              FROM replica_device_operation AS device
              JOIN replica_content_operation AS content USING(operation_id)
              LEFT JOIN replica_content_result AS result USING(operation_id)
-             WHERE content.document_id = ?1
-               AND ((?2 = 0 AND result.operation_id IS NULL)
-                    OR (?2 = 1 AND result.status = 'accepted'))
+             WHERE device.server_id = ?1 AND content.document_id = ?2
+               AND ((?3 = 0 AND result.operation_id IS NULL)
+                    OR (?3 = 1 AND result.status = 'accepted'))
              ORDER BY device.device_sequence DESC LIMIT 1",
-            params![document_id, i64::from(accepted)],
+            params![server_id, document_id, i64::from(accepted)],
             chained_content_base_row,
         )
         .optional()
@@ -1581,17 +1655,23 @@ fn latest_chained_content_base(
 }
 
 fn chained_content_base_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentBase> {
-    let revision = match row.get::<_, String>(0)?.as_str() {
+    let revision = match row.get::<_, String>(1)?.as_str() {
         "absent" => 1,
-        "revision" => row_u64(row, 1)?
+        "revision" => row_u64(row, 2)?
             .checked_add(1)
-            .ok_or(rusqlite::Error::IntegralValueOutOfRange(1, i64::MAX))?,
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(2, i64::MAX))?,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let digest = match row.get::<_, String>(0)?.as_str() {
+        "put_document" => row.get(3)?,
+        "rename_document" => row.get(4)?,
+        "tombstone_document" => None,
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(ContentBase::Revision {
         revision,
-        content_sha256: Some(row.get(2)?),
-        predecessor_operation_id: Some(row.get(3)?),
+        content_sha256: digest,
+        predecessor_operation_id: Some(row.get(5)?),
     })
 }
 
@@ -1608,6 +1688,157 @@ fn replica_document_digest(payload: &str) -> Result<Option<String>, LocalReplica
         }
     }
     Ok(None)
+}
+
+fn replica_document_path(payload: &str) -> Result<String, LocalReplicaError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| LocalReplicaError::Corrupt)?;
+    value
+        .pointer("/projection/logical_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or(LocalReplicaError::Corrupt)
+}
+
+struct WorkingDocument {
+    revision: u64,
+    logical_path: Option<String>,
+}
+
+fn working_documents(
+    connection: &Connection,
+    server_id: &str,
+) -> Result<BTreeMap<String, WorkingDocument>, LocalReplicaError> {
+    let mut documents = canonical_documents(connection)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT content.document_id, content.mutation, content.logical_path,
+                    content.base_kind, content.base_revision
+             FROM replica_device_operation AS device
+             JOIN replica_content_operation AS content USING(operation_id)
+             LEFT JOIN replica_content_result AS result USING(operation_id)
+             WHERE device.server_id = ?1
+               AND (result.operation_id IS NULL OR result.status = 'accepted')
+             ORDER BY device.device_sequence",
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let rows = statement
+        .query_map([server_id], working_document_operation_row)
+        .map_err(LocalReplicaError::Storage)?;
+    for row in rows {
+        apply_working_document(&mut documents, row.map_err(LocalReplicaError::Storage)?)?;
+    }
+    Ok(documents)
+}
+
+fn canonical_documents(
+    connection: &Connection,
+) -> Result<BTreeMap<String, WorkingDocument>, LocalReplicaError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT entity_id, revision, tombstone, payload_json FROM replica_projection
+             WHERE entity_kind = 'document' ORDER BY entity_id",
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row_u64(row, 1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(LocalReplicaError::Storage)?;
+    let mut documents = BTreeMap::new();
+    for row in rows {
+        let (document_id, revision, tombstone, payload) =
+            row.map_err(LocalReplicaError::Storage)?;
+        let logical_path = (!tombstone)
+            .then(|| replica_document_path(&payload))
+            .transpose()?;
+        documents.insert(
+            document_id,
+            WorkingDocument {
+                revision,
+                logical_path,
+            },
+        );
+    }
+    Ok(documents)
+}
+
+struct WorkingDocumentOperation {
+    document_id: String,
+    mutation: String,
+    logical_path: Option<String>,
+    revision: u64,
+}
+
+fn working_document_operation_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkingDocumentOperation> {
+    let revision = match row.get::<_, String>(3)?.as_str() {
+        "absent" => 1,
+        "revision" => row_u64(row, 4)?
+            .checked_add(1)
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(4, i64::MAX))?,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(WorkingDocumentOperation {
+        document_id: row.get(0)?,
+        mutation: row.get(1)?,
+        logical_path: row.get(2)?,
+        revision,
+    })
+}
+
+fn apply_working_document(
+    documents: &mut BTreeMap<String, WorkingDocument>,
+    operation: WorkingDocumentOperation,
+) -> Result<(), LocalReplicaError> {
+    let current = documents
+        .entry(operation.document_id)
+        .or_insert(WorkingDocument {
+            revision: 0,
+            logical_path: None,
+        });
+    if operation.revision <= current.revision {
+        return Ok(());
+    }
+    current.logical_path = match operation.mutation.as_str() {
+        "put_document" | "rename_document" => {
+            Some(operation.logical_path.ok_or(LocalReplicaError::Corrupt)?)
+        }
+        "tombstone_document" => None,
+        _ => return Err(LocalReplicaError::Corrupt),
+    };
+    current.revision = operation.revision;
+    Ok(())
+}
+
+fn require_working_path_available(
+    connection: &Connection,
+    server_id: &str,
+    operation: &OfflineContentOperation,
+) -> Result<(), LocalReplicaError> {
+    let Some(logical_path) = operation.logical_path() else {
+        return Ok(());
+    };
+    let wanted = path_key(logical_path);
+    let occupied =
+        working_documents(connection, server_id)?
+            .into_iter()
+            .any(|(document_id, document)| {
+                document_id != operation.document_id()
+                    && document
+                        .logical_path
+                        .is_some_and(|path| path_key(&path) == wanted)
+            });
+    if occupied {
+        Err(LocalReplicaError::PathConflict)
+    } else {
+        Ok(())
+    }
 }
 
 const fn content_base_revision(base: &ContentBase) -> u64 {
@@ -1645,7 +1876,8 @@ fn require_content_context(
     let context = transaction
         .query_row(
             "SELECT identity.device_id, identity.server_id, identity.observed_server_id,
-                    sync.cursor, sync.snapshot_id, sync.next_device_sequence
+                    sync.cursor, sync.snapshot_id, sync.next_device_sequence,
+                    identity.offline_document_lifecycle
              FROM replica_identity AS identity
              JOIN replica_sync AS sync ON sync.id = identity.id WHERE identity.id = 1",
             [],
@@ -1657,6 +1889,7 @@ fn require_content_context(
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row_u64(row, 5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             },
         )
@@ -1667,8 +1900,12 @@ fn require_content_context(
         && context.3.as_deref() == Some(cursor)
         && context.4.is_none()
         && context.5 == operation.device_sequence;
-    let base = working_content_base(transaction, operation.document_id())?;
-    if context_matches && &base == operation.base() {
+    let server_id = context.1.as_deref().ok_or(LocalReplicaError::Content)?;
+    let base = working_content_base(transaction, server_id, operation.document_id())?;
+    let capability_matches =
+        matches!(&operation.mutation, OfflineContentMutation::Put { .. }) || context.6 == 1;
+    if context_matches && capability_matches && &base == operation.base() {
+        require_working_path_available(transaction, server_id, operation)?;
         Ok(())
     } else {
         Err(LocalReplicaError::Content)
@@ -1709,13 +1946,16 @@ fn insert_local_content_operation(
     transaction
         .execute(
             "INSERT INTO replica_content_operation(
-                 operation_id, document_id, content_sha256, base_kind, base_revision,
-                 base_content_sha256, predecessor_operation_id, operation_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 operation_id, document_id, mutation, logical_path, content_sha256,
+                 base_kind, base_revision, base_content_sha256,
+                 predecessor_operation_id, operation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 operation.operation_id,
                 operation.document_id(),
-                operation.content_sha256(),
+                operation.mutation_kind(),
+                operation.logical_path(),
+                operation.submitted_content_sha256(),
                 base_kind,
                 base_revision,
                 base_digest,
@@ -1975,9 +2215,21 @@ pub(crate) fn canonical_json_sha256(value: &Value) -> Result<String, LocalReplic
 mod tests {
     use rusqlite::{Connection, params};
     use serde_json::Value;
+    use sha2::{Digest as _, Sha256};
 
-    use super::{INITIAL_SCHEMA, LocalReplicaStore};
-    use crate::{application::OfflineReviewOperation, protocol::decode_review_pack};
+    use super::{INITIAL_SCHEMA, LocalReplicaStore, OFFLINE_CONTENT_SCHEMA};
+    use crate::{
+        application::{
+            AuthoritativeDocument, ContentBase, ContentReconciliationStatus,
+            OfflineContentMutation, OfflineContentOperation, OfflineContentResult,
+            OfflineReviewOperation,
+        },
+        client_replica::LocalReplica,
+        protocol::{
+            canonical_content_operation, decode_review_pack, encode_cursor,
+            offline_content_result_json,
+        },
+    };
 
     #[test]
     fn v1_upgrade_preserves_pending_review_operations_in_the_device_ledger() {
@@ -2036,5 +2288,219 @@ mod tests {
         let pending = store.next_pending_operation().unwrap().unwrap();
         assert_eq!(pending.operation, operation);
         assert_eq!(store.status().unwrap().next_device_sequence, 2);
+    }
+
+    #[test]
+    fn v2_upgrade_preserves_content_results_and_autoincrement_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replica.sqlite");
+        let server_id = "0".repeat(32);
+        let token = "1".repeat(32);
+        let cursor = encode_cursor(&server_id, 0, &token).unwrap();
+        let first_org = "#+title: First\n";
+        let first_digest = format!("{:x}", Sha256::digest(first_org.as_bytes()));
+        let first = OfflineContentOperation {
+            operation_id: "operation".into(),
+            device_id: "device".into(),
+            device_sequence: 1,
+            cursor_server_id: server_id.clone(),
+            cursor: 0,
+            cursor_token: token.clone(),
+            authored_at_us: 1,
+            mutation: OfflineContentMutation::Put {
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                content_sha256: first_digest.clone(),
+                org: first_org.into(),
+                base: ContentBase::Absent,
+            },
+        };
+        let first_json = canonical_content_operation(&first).unwrap();
+        let result_json = serde_json::to_string(
+            &offline_content_result_json(&OfflineContentResult {
+                operation_id: first.operation_id.clone(),
+                format_version: 1,
+                status: ContentReconciliationStatus::Accepted,
+                conflict_reason: None,
+                authoritative: Some(AuthoritativeDocument {
+                    document_id: "document".into(),
+                    logical_path: "note.org".into(),
+                    revision: 1,
+                    content_sha256: Some(first_digest.clone()),
+                    active: true,
+                }),
+                cursor: 0,
+                cursor_server_id: server_id.clone(),
+                cursor_token: token.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let pending_org = "#+title: Pending\n";
+        let pending_digest = format!("{:x}", Sha256::digest(pending_org.as_bytes()));
+        let pending = OfflineContentOperation {
+            operation_id: "pending".into(),
+            device_id: "device".into(),
+            device_sequence: 2,
+            cursor_server_id: server_id.clone(),
+            cursor: 0,
+            cursor_token: token.clone(),
+            authored_at_us: 2,
+            mutation: OfflineContentMutation::Put {
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                content_sha256: pending_digest.clone(),
+                org: pending_org.into(),
+                base: ContentBase::Revision {
+                    revision: 1,
+                    content_sha256: Some(first_digest.clone()),
+                    predecessor_operation_id: Some(first.operation_id.clone()),
+                },
+            },
+        };
+        let pending_json = canonical_content_operation(&pending).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(INITIAL_SCHEMA).unwrap();
+        connection.execute_batch(OFFLINE_CONTENT_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_identity(id, device_id, server_id, observed_server_id)
+                 VALUES (1, 'device', ?1, ?1)",
+                [&server_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_sync(id, cursor, next_device_sequence)
+                 VALUES (1, ?1, 3)",
+                [&cursor],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_device_operation
+                 VALUES ('operation', ?1, 1, 'content', ?2)",
+                params![server_id, first_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_content_operation VALUES (
+                     'operation', 'document', ?1, 'absent', NULL, NULL, NULL,
+                     ?2
+                 )",
+                params![first_digest, first_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_content_result(
+                     result_sequence, operation_id, status, conflict_reason, result_json
+                 ) VALUES (7, 'operation', 'accepted', NULL, ?1)",
+                [&result_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_device_operation
+                 VALUES ('pending', ?1, 2, 'content', ?2)",
+                params![server_id, pending_json],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_content_operation VALUES (
+                     'pending', 'document', ?1, 'revision', 1, ?2, 'operation',
+                     ?3
+                 )",
+                params![pending_digest, first_digest, pending_json],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = LocalReplicaStore::open(&path, "device").unwrap();
+        let preserved: (String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT operation.mutation, operation.operation_json, result.result_json
+                 FROM replica_content_operation AS operation
+                 JOIN replica_content_result AS result USING(operation_id)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "put_document".into(),
+                first_json.clone(),
+                result_json.clone()
+            )
+        );
+        let violations: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        assert_eq!(
+            store
+                .next_pending_content_operation()
+                .unwrap()
+                .unwrap()
+                .canonical_payload,
+            pending_json
+        );
+        drop(store);
+
+        let replica = LocalReplica::open(&path, "device").unwrap();
+        assert_eq!(
+            replica.next_content_upload().unwrap().unwrap().operation_id,
+            "pending"
+        );
+        let results = replica.content_results(None, 10).unwrap();
+        assert_eq!(results.items.len(), 1);
+        assert_eq!(results.items[0].operation_id, "operation");
+        drop(replica);
+
+        let store = LocalReplicaStore::open(&path, "device").unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO replica_device_operation
+                 VALUES ('operation-2', ?1, 3, 'content', 'operation-json-2')",
+                [&server_id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO replica_content_operation VALUES (
+                     'operation-2', 'document-2', 'put_document', 'document-2.org',
+                     ?1, 'absent', NULL, NULL, NULL, 'operation-json-2'
+                 )",
+                ["b".repeat(64)],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO replica_content_result(
+                     operation_id, status, conflict_reason, result_json
+                 ) VALUES ('operation-2', 'accepted', NULL, 'result-json-2')",
+                [],
+            )
+            .unwrap();
+        let sequence: i64 = store
+            .connection
+            .query_row(
+                "SELECT result_sequence FROM replica_content_result
+                 WHERE operation_id = 'operation-2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sequence, 8);
     }
 }

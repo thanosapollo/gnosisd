@@ -17,7 +17,8 @@ pub use message::{
 };
 pub(crate) use offline_content::{
     DecodedOfflineContentResult, OfflineContentSubmission, OfflineContentWireError,
-    canonical_content_operation, decode_offline_content_result, offline_content_result_json,
+    canonical_content_operation, decode_offline_content_capabilities,
+    decode_offline_content_result, offline_content_capabilities_json, offline_content_result_json,
 };
 pub(crate) use offline_review::canonical_offline_operation;
 pub(crate) use offline_review::{

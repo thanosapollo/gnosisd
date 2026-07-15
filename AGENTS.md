@@ -67,12 +67,22 @@ explicit, and review or content state must never use last-write-wins.
 Offline review v1 submissions remain accepted; v2 pack and result envelopes
 return durable replica cursors.
 Review and content operations share one contiguous per-device sequence. Offline
-document puts retain their complete submitted Org revision and receive an
-immutable accepted or conflict result. Invalid, stale, or expired-cursor puts
-must leave the canonical document head and index unchanged.
-Queued puts bind every revision to its captured content digest. Downloaded bases
-must predate the captured cursor; predicted bases require an accepted predecessor
-operation. A numeric revision alone must never authorize an offline write.
+document puts retain their complete submitted Org revision. Renames and
+tombstones retain their captured base. Every mutation receives an immutable
+accepted or conflict result. Invalid, stale, or expired-cursor mutations must
+leave the canonical document head and index unchanged.
+Lifecycle operations may be queued only after the replica installs the
+server-bound content capability. Keep that negotiation separate from the
+strict v1 sync-state response so old clients remain compatible. Replica path
+lookup overlays the active server's accepted and pending content chain, and
+supplies stable document IDs for frontends whose Org files have no file ID.
+Reject a locally known path collision before enqueue so optimistic lookup never
+turns an expected conflict into apparent replica corruption.
+Queued document mutations bind every revision to its captured content digest.
+Downloaded bases must predate the captured cursor; predicted bases require an
+accepted predecessor operation. A numeric revision alone must never authorize
+an offline write. A queued or accepted tombstone closes its local operation
+chain until a newer active canonical projection is downloaded.
 
 ## Commands
 

@@ -4,8 +4,9 @@ use sha2::{Digest as _, Sha256};
 use super::{
     DeviceOperationInsert, SqliteStore, StoreError, advance_device_sequence,
     current_content_cursor, insert_device_operation, load_document_head,
-    load_document_replica_revision, replace_note_in, replayed_device_operation,
-    replica_cursor_token, require_device_sequence, server_id, u64_to_i64, validate_replica_cursor,
+    load_document_replica_revision, rename_document_in, replace_note_in, replayed_device_operation,
+    replica_cursor_token, require_device_sequence, server_id, tombstone_document_in, u64_to_i64,
+    validate_replica_cursor,
 };
 use crate::{
     application::{
@@ -24,7 +25,7 @@ impl SqliteStore {
         operation: &OfflineContentOperation,
         canonical_payload: &str,
         actor_device_id: Option<&str>,
-        prepared: Result<&PreparedNote, OfflineContentConflictReason>,
+        prepared: Result<Option<&PreparedNote>, OfflineContentConflictReason>,
     ) -> Result<bool, StoreError> {
         if format_version != 1 {
             return Err(StoreError::InvalidReviewState);
@@ -46,7 +47,8 @@ impl SqliteStore {
             &operation.device_id,
             operation.device_sequence,
         )?;
-        Ok(content_conflict_reason(&transaction, operation, &prepared)?.is_none())
+        Ok(operation.submitted_content_sha256().is_some()
+            && content_conflict_reason(&transaction, operation, &prepared)?.is_none())
     }
 
     pub(crate) fn reconcile_content_operation(
@@ -56,7 +58,7 @@ impl SqliteStore {
         canonical_payload: &str,
         actor_device_id: Option<&str>,
         received_at_us: u64,
-        prepared: Result<(&PreparedNote, Option<&BlobMeta>), OfflineContentConflictReason>,
+        prepared: Result<(Option<&PreparedNote>, Option<&BlobMeta>), OfflineContentConflictReason>,
     ) -> Result<OfflineContentResult, StoreError> {
         if format_version != 1 {
             return Err(StoreError::InvalidReviewState);
@@ -174,11 +176,12 @@ fn insert_content_operation(
                  operation_id, document_id, content_sha256, mutation, base_kind, base_revision,
                  base_content_sha256, predecessor_operation_id, cursor_server_id,
                  cursor, cursor_token, authored_at_us
-             ) VALUES (?1, ?2, ?3, 'put_document', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 operation.operation_id,
                 operation.document_id(),
-                operation.content_sha256(),
+                operation.submitted_content_sha256(),
+                operation.mutation_kind(),
                 base_kind,
                 base_revision,
                 base_digest,
@@ -198,7 +201,7 @@ fn reconcile_new_content(
     format_version: u32,
     operation: &OfflineContentOperation,
     received_at_us: u64,
-    prepared: Result<(&PreparedNote, Option<&BlobMeta>), OfflineContentConflictReason>,
+    prepared: Result<(Option<&PreparedNote>, Option<&BlobMeta>), OfflineContentConflictReason>,
 ) -> Result<OfflineContentResult, StoreError> {
     let parsed = prepared
         .as_ref()
@@ -211,29 +214,89 @@ fn reconcile_new_content(
     let (prepared, blob) = prepared.map_err(|_| StoreError::CorruptData {
         field: "content preparation",
     })?;
-    let blob = blob.ok_or(StoreError::CorruptData {
-        field: "content blob preparation",
-    })?;
     let expected = match operation.base() {
         ContentBase::Absent => None,
         ContentBase::Revision { revision, .. } => Some(*revision),
     };
+    apply_content_mutation(
+        transaction,
+        operation,
+        prepared,
+        blob,
+        expected,
+        received_at_us,
+    )?;
+    content_result(transaction, format_version, operation, None)
+}
+
+fn apply_content_mutation(
+    transaction: &Transaction<'_>,
+    operation: &OfflineContentOperation,
+    prepared: Option<&PreparedNote>,
+    blob: Option<&BlobMeta>,
+    expected_revision: Option<u64>,
+    received_at_us: u64,
+) -> Result<(), StoreError> {
+    let timestamp = u64_to_i64(received_at_us, "content reconciliation timestamp")?;
+    match &operation.mutation {
+        OfflineContentMutation::Put { .. } => apply_document_put(
+            transaction,
+            operation,
+            prepared,
+            blob,
+            expected_revision,
+            timestamp,
+        ),
+        OfflineContentMutation::Rename { logical_path, .. } => rename_document_in(
+            transaction,
+            &document_id(operation)?,
+            logical_path,
+            expected_revision.ok_or(StoreError::InvalidReviewState)?,
+            timestamp,
+            Some(&operation.device_id),
+        )
+        .map(|_| ()),
+        OfflineContentMutation::Tombstone { .. } => tombstone_document_in(
+            transaction,
+            &document_id(operation)?,
+            expected_revision.ok_or(StoreError::InvalidReviewState)?,
+            timestamp,
+            Some(&operation.device_id),
+        )
+        .map(|_| ()),
+    }
+}
+
+fn apply_document_put(
+    transaction: &Transaction<'_>,
+    operation: &OfflineContentOperation,
+    prepared: Option<&PreparedNote>,
+    blob: Option<&BlobMeta>,
+    expected_revision: Option<u64>,
+    timestamp: i64,
+) -> Result<(), StoreError> {
+    let prepared = prepared.ok_or(StoreError::CorruptData {
+        field: "content preparation",
+    })?;
+    let blob = blob.ok_or(StoreError::CorruptData {
+        field: "content blob preparation",
+    })?;
     replace_note_in(
         transaction,
         prepared,
         blob,
-        expected,
-        u64_to_i64(received_at_us, "content reconciliation timestamp")?,
+        expected_revision,
+        timestamp,
         Some(&operation.device_id),
         false,
-    )?;
-    content_result(transaction, format_version, operation, None)
+    )
+    .map(|_| ())
 }
 
 fn content_conflict_reason(
     transaction: &Transaction<'_>,
     operation: &OfflineContentOperation,
-    prepared: &Result<&PreparedNote, OfflineContentConflictReason>,
+    prepared: &Result<Option<&PreparedNote>, OfflineContentConflictReason>,
 ) -> Result<Option<OfflineContentConflictReason>, StoreError> {
     match validate_replica_cursor(
         transaction,
@@ -258,10 +321,36 @@ fn content_conflict_reason(
     let prepared = prepared.as_ref().map_err(|_| StoreError::CorruptData {
         field: "content preparation",
     })?;
-    if path_conflict(operation, head.as_ref()).is_some() {
-        return Ok(Some(OfflineContentConflictReason::PathConflict));
-    }
-    match super::check_path_available(transaction, prepared) {
+    mutation_conflict_reason(transaction, operation, head.as_ref(), *prepared)
+}
+
+fn mutation_conflict_reason(
+    transaction: &Transaction<'_>,
+    operation: &OfflineContentOperation,
+    head: Option<&crate::application::DocumentHead>,
+    prepared: Option<&PreparedNote>,
+) -> Result<Option<OfflineContentConflictReason>, StoreError> {
+    let available = match &operation.mutation {
+        OfflineContentMutation::Put { logical_path, .. } => {
+            if head.is_some_and(|head| head.logical_path != *logical_path) {
+                return Ok(Some(OfflineContentConflictReason::PathConflict));
+            }
+            super::check_path_available(
+                transaction,
+                prepared.ok_or(StoreError::CorruptData {
+                    field: "content preparation",
+                })?,
+            )
+        }
+        OfflineContentMutation::Rename { logical_path, .. } => {
+            if head.is_none_or(|head| head.blob_sha256.is_none()) {
+                return Ok(Some(OfflineContentConflictReason::InvalidContent));
+            }
+            super::check_document_path(transaction, &document_id(operation)?, logical_path)
+        }
+        OfflineContentMutation::Tombstone { .. } => return Ok(None),
+    };
+    match available {
         Ok(()) => Ok(None),
         Err(StoreError::InvalidProjection { .. }) => {
             Ok(Some(OfflineContentConflictReason::PathConflict))
@@ -384,15 +473,6 @@ fn predecessor_authority_matches(base: &ContentBase, head: &AuthoritativeDocumen
             .is_some_and(|digest| head.content_sha256.as_ref() == Some(digest))
 }
 
-fn path_conflict(
-    operation: &OfflineContentOperation,
-    head: Option<&crate::application::DocumentHead>,
-) -> Option<OfflineContentConflictReason> {
-    let OfflineContentMutation::PutDocument { logical_path, .. } = &operation.mutation;
-    head.is_some_and(|head| head.logical_path != *logical_path)
-        .then_some(OfflineContentConflictReason::PathConflict)
-}
-
 fn document_id(operation: &OfflineContentOperation) -> Result<DocumentId, StoreError> {
     DocumentId::new(operation.document_id().to_owned()).map_err(|_| StoreError::InvalidProjection {
         reason: "invalid document ID",
@@ -428,7 +508,17 @@ fn current_document_projection(
     operation: &OfflineContentOperation,
 ) -> Result<Option<AuthoritativeDocument>, StoreError> {
     let id = document_id(operation)?;
-    load_document_head(connection, &id).map(|head| head.map(AuthoritativeDocument::from))
+    let Some(head) = load_document_head(connection, &id)? else {
+        return Ok(None);
+    };
+    let content_sha256 = current_document_digest(connection, &head)?;
+    Ok(Some(AuthoritativeDocument {
+        document_id: head.document_id,
+        logical_path: head.logical_path,
+        revision: head.revision,
+        content_sha256,
+        active: head.active,
+    }))
 }
 
 fn insert_content_result(
@@ -557,7 +647,7 @@ mod tests {
             prepare_offline_document,
         },
         blob::BlobMeta,
-        domain::DocumentId,
+        domain::{DocumentId, DocumentProjection, DocumentProjectionInput},
     };
 
     fn add_device(store: &mut SqliteStore) -> String {
@@ -584,7 +674,7 @@ mod tests {
             cursor: state.cursor,
             cursor_token: state.cursor_token,
             authored_at_us: sequence + 10,
-            mutation: OfflineContentMutation::PutDocument {
+            mutation: OfflineContentMutation::Put {
                 document_id: "document".into(),
                 logical_path: "note.org".into(),
                 content_sha256: format!("{:x}", Sha256::digest(org.as_bytes())),
@@ -595,15 +685,66 @@ mod tests {
     }
 
     fn blob(operation: &OfflineContentOperation) -> BlobMeta {
-        let OfflineContentMutation::PutDocument {
+        let OfflineContentMutation::Put {
             content_sha256,
             org,
             ..
-        } = &operation.mutation;
+        } = &operation.mutation
+        else {
+            panic!("test operation must contain Org content");
+        };
         BlobMeta {
             sha256: content_sha256.clone(),
             size_bytes: org.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
+        }
+    }
+
+    fn rename_operation(
+        store: &SqliteStore,
+        device_id: &str,
+        operation_id: &str,
+        sequence: u64,
+        logical_path: &str,
+        base: ContentBase,
+    ) -> OfflineContentOperation {
+        let state = store.replica_state(device_id).unwrap();
+        OfflineContentOperation {
+            operation_id: operation_id.into(),
+            device_id: device_id.into(),
+            device_sequence: sequence,
+            cursor_server_id: state.server_id,
+            cursor: state.cursor,
+            cursor_token: state.cursor_token,
+            authored_at_us: sequence + 10,
+            mutation: OfflineContentMutation::Rename {
+                document_id: "document".into(),
+                logical_path: logical_path.into(),
+                base,
+            },
+        }
+    }
+
+    fn tombstone_operation(
+        store: &SqliteStore,
+        device_id: &str,
+        operation_id: &str,
+        sequence: u64,
+        base: ContentBase,
+    ) -> OfflineContentOperation {
+        let state = store.replica_state(device_id).unwrap();
+        OfflineContentOperation {
+            operation_id: operation_id.into(),
+            device_id: device_id.into(),
+            device_sequence: sequence,
+            cursor_server_id: state.server_id,
+            cursor: state.cursor,
+            cursor_token: state.cursor_token,
+            authored_at_us: sequence + 10,
+            mutation: OfflineContentMutation::Tombstone {
+                document_id: "document".into(),
+                base,
+            },
         }
     }
 
@@ -628,7 +769,7 @@ mod tests {
                 "canonical-operation-1",
                 Some(&device_id),
                 100,
-                Ok((&prepared, Some(&blob))),
+                Ok((prepared.as_ref(), Some(&blob))),
             )
             .unwrap();
         assert_eq!(result.status, ContentReconciliationStatus::Accepted);
@@ -648,7 +789,7 @@ mod tests {
                 "canonical-operation-1",
                 Some(&device_id),
                 101,
-                Ok((&prepared, Some(&blob))),
+                Ok((prepared.as_ref(), Some(&blob))),
             )
             .unwrap();
         assert_eq!(replay, result);
@@ -659,10 +800,256 @@ mod tests {
                 "changed-operation",
                 Some(&device_id),
                 102,
-                Ok((&prepared, Some(&blob))),
+                Ok((prepared.as_ref(), Some(&blob))),
             ),
             Err(crate::store::StoreError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn rename_then_tombstone_preserves_history_and_blocks_resurrection() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device_id = add_device(&mut store);
+        let create = operation(
+            &store,
+            &device_id,
+            "create",
+            1,
+            ContentBase::Absent,
+            "#+title: Original\n* Heading\n",
+        );
+        let prepared = prepare_offline_document(&create).unwrap();
+        let create_result = store
+            .reconcile_content_operation(
+                1,
+                &create,
+                "create-payload",
+                Some(&device_id),
+                100,
+                Ok((prepared.as_ref(), Some(&blob(&create)))),
+            )
+            .unwrap();
+        let digest = create_result
+            .authoritative
+            .as_ref()
+            .unwrap()
+            .content_sha256
+            .clone()
+            .unwrap();
+        let rename = rename_operation(
+            &store,
+            &device_id,
+            "rename",
+            2,
+            "renamed.org",
+            ContentBase::Revision {
+                revision: 1,
+                content_sha256: Some(digest.clone()),
+                predecessor_operation_id: Some("create".into()),
+            },
+        );
+        let renamed = store
+            .reconcile_content_operation(
+                1,
+                &rename,
+                "rename-payload",
+                Some(&device_id),
+                101,
+                Ok((None, None)),
+            )
+            .unwrap();
+        assert_eq!(renamed.status, ContentReconciliationStatus::Accepted);
+        assert_eq!(renamed.authoritative.as_ref().unwrap().revision, 2);
+        assert_eq!(
+            renamed.authoritative.as_ref().unwrap().content_sha256,
+            Some(digest.clone())
+        );
+
+        let tombstone = tombstone_operation(
+            &store,
+            &device_id,
+            "tombstone",
+            3,
+            ContentBase::Revision {
+                revision: 2,
+                content_sha256: Some(digest.clone()),
+                predecessor_operation_id: Some("rename".into()),
+            },
+        );
+        let deleted = store
+            .reconcile_content_operation(
+                1,
+                &tombstone,
+                "tombstone-payload",
+                Some(&device_id),
+                102,
+                Ok((None, None)),
+            )
+            .unwrap();
+        assert_eq!(deleted.status, ContentReconciliationStatus::Accepted);
+        assert!(!deleted.authoritative.as_ref().unwrap().active);
+        assert!(
+            deleted
+                .authoritative
+                .as_ref()
+                .unwrap()
+                .content_sha256
+                .is_none()
+        );
+
+        let resurrection = operation(
+            &store,
+            &device_id,
+            "resurrection",
+            4,
+            ContentBase::Revision {
+                revision: 2,
+                content_sha256: Some(digest),
+                predecessor_operation_id: Some("rename".into()),
+            },
+            "#+title: Resurrected\n",
+        );
+        let prepared = prepare_offline_document(&resurrection).unwrap();
+        let rejected = store
+            .reconcile_content_operation(
+                1,
+                &resurrection,
+                "resurrection-payload",
+                Some(&device_id),
+                103,
+                Ok((prepared.as_ref(), Some(&blob(&resurrection)))),
+            )
+            .unwrap();
+        assert_eq!(
+            rejected.conflict_reason,
+            Some(OfflineContentConflictReason::BaseChanged)
+        );
+        let id = DocumentId::new("document").unwrap();
+        let revisions = store.document_revisions(&id, 0, 10).unwrap();
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|revision| revision.operation.as_str())
+                .collect::<Vec<_>>(),
+            ["create", "rename", "tombstone"]
+        );
+        assert!(!store.document_head(&id).unwrap().unwrap().active);
+    }
+
+    #[test]
+    fn rename_path_collision_is_a_durable_conflict() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for (document_id, logical_path) in [("document", "note.org"), ("other", "taken.org")] {
+            let note = prepare_note(
+                Some(document_id.into()),
+                logical_path.into(),
+                format!("#+title: {document_id}\n"),
+                None,
+            )
+            .unwrap();
+            let blob = BlobMeta {
+                sha256: note.blob_sha256.clone(),
+                size_bytes: note.org.len() as u64,
+                media_type: "text/org; charset=utf-8".into(),
+            };
+            store.replace_note(&note, &blob, 1, None).unwrap();
+        }
+        let device_id = add_device(&mut store);
+        let head = store
+            .document_head(&DocumentId::new("document").unwrap())
+            .unwrap()
+            .unwrap();
+        let rename = rename_operation(
+            &store,
+            &device_id,
+            "rename-conflict",
+            1,
+            "taken.org",
+            ContentBase::Revision {
+                revision: head.revision,
+                content_sha256: head.blob_sha256,
+                predecessor_operation_id: None,
+            },
+        );
+        let result = store
+            .reconcile_content_operation(
+                1,
+                &rename,
+                "rename-conflict-payload",
+                Some(&device_id),
+                2,
+                Ok((None, None)),
+            )
+            .unwrap();
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineContentConflictReason::PathConflict)
+        );
+        assert_eq!(result.authoritative.unwrap().logical_path, "note.org");
+        assert_eq!(
+            store
+                .replica_state(&device_id)
+                .unwrap()
+                .next_device_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn projection_only_rename_is_preserved_as_an_invalid_content_conflict() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let projection = DocumentProjection::new(DocumentProjectionInput {
+            title: "Projection".into(),
+            file_node_id: None,
+            file_tags: vec![],
+            nodes: vec![],
+            link_occurrences: vec![],
+            compatibility_sha1: "a".repeat(40),
+            content_sha256: "b".repeat(64),
+        })
+        .unwrap();
+        let id = DocumentId::new("document").unwrap();
+        store.replace_document(&id, &projection, None).unwrap();
+        super::super::backfill_current_replica_history(&store.connection).unwrap();
+        let device_id = add_device(&mut store);
+        let rename = rename_operation(
+            &store,
+            &device_id,
+            "projection-rename",
+            1,
+            "renamed.org",
+            ContentBase::Revision {
+                revision: 1,
+                content_sha256: Some("b".repeat(64)),
+                predecessor_operation_id: None,
+            },
+        );
+        let result = store
+            .reconcile_content_operation(
+                1,
+                &rename,
+                "projection-rename-payload",
+                Some(&device_id),
+                2,
+                Ok((None, None)),
+            )
+            .unwrap();
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineContentConflictReason::InvalidContent)
+        );
+        assert_eq!(
+            result.authoritative.unwrap().content_sha256,
+            Some("b".repeat(64))
+        );
+        assert_eq!(store.document_head(&id).unwrap().unwrap().revision, 1);
+        assert_eq!(
+            store
+                .replica_state(&device_id)
+                .unwrap()
+                .next_device_sequence,
+            2
+        );
     }
 
     #[test]
@@ -742,7 +1129,7 @@ mod tests {
                 "expired-cursor-operation",
                 Some(&device_id),
                 100,
-                Ok((&prepared, Some(&blob))),
+                Ok((prepared.as_ref(), Some(&blob))),
             )
             .unwrap();
         assert_eq!(
@@ -774,7 +1161,7 @@ mod tests {
                 "create-operation",
                 Some(&device_id),
                 100,
-                Ok((&create_prepared, Some(&create_blob))),
+                Ok((create_prepared.as_ref(), Some(&create_blob))),
             )
             .unwrap();
 
@@ -785,7 +1172,7 @@ mod tests {
             2,
             ContentBase::Revision {
                 revision: 1,
-                content_sha256: Some(create.content_sha256().to_owned()),
+                content_sha256: Some(create.submitted_content_sha256().unwrap().to_owned()),
                 predecessor_operation_id: Some(create.operation_id.clone()),
             },
             "#+title: Offline\n* Heading\n",
@@ -816,7 +1203,7 @@ mod tests {
                 "stale-operation",
                 Some(&device_id),
                 200,
-                Ok((&stale_prepared, Some(&stale_blob))),
+                Ok((stale_prepared.as_ref(), Some(&stale_blob))),
             )
             .unwrap();
         assert_eq!(
@@ -869,7 +1256,7 @@ mod tests {
             2,
             ContentBase::Revision {
                 revision: 2,
-                content_sha256: Some(first.content_sha256().to_owned()),
+                content_sha256: Some(first.submitted_content_sha256().unwrap().to_owned()),
                 predecessor_operation_id: Some(first.operation_id.clone()),
             },
             "#+title: Second\n",
@@ -881,7 +1268,7 @@ mod tests {
             3,
             ContentBase::Revision {
                 revision: 2,
-                content_sha256: Some(first.content_sha256().to_owned()),
+                content_sha256: Some(first.submitted_content_sha256().unwrap().to_owned()),
                 predecessor_operation_id: None,
             },
             "#+title: Forged\n",
@@ -904,7 +1291,7 @@ mod tests {
                     &format!("payload-{}", operation.operation_id),
                     Some(&device_id),
                     3 + operation.device_sequence,
-                    Ok((&prepared, Some(&blob(operation)))),
+                    Ok((prepared.as_ref(), Some(&blob(operation)))),
                 )
                 .unwrap();
             assert_eq!(

@@ -14,8 +14,9 @@ use crate::{
     protocol::{
         OfflineContentSubmission, OfflineContentWireError, OfflineReviewWireError,
         ReplicaWireError, canonical_content_operation, canonical_offline_operation,
-        decode_change_page, decode_cursor, decode_offline_content_result, decode_offline_result,
-        decode_replica_state, decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
+        decode_change_page, decode_cursor, decode_offline_content_capabilities,
+        decode_offline_content_result, decode_offline_result, decode_replica_state,
+        decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
     },
     store::{
         ContentResultInstall, DeltaInstall, LocalReplicaError as StoreReplicaError,
@@ -59,6 +60,21 @@ pub struct OfflineDocumentEdit {
     pub document_id: String,
     pub logical_path: String,
     pub org: String,
+    pub authored_at_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineDocumentRename {
+    pub operation_id: String,
+    pub document_id: String,
+    pub logical_path: String,
+    pub authored_at_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineDocumentTombstone {
+    pub operation_id: String,
+    pub document_id: String,
     pub authored_at_us: u64,
 }
 
@@ -262,6 +278,8 @@ pub enum Error {
     ContentWire,
     #[error("offline content operation no longer matches the replica state")]
     Content,
+    #[error("offline content path is already owned by another document")]
+    PathConflict,
     #[error("local replica response is invalid")]
     Response,
 }
@@ -277,6 +295,13 @@ impl LocalReplica {
         let state = decode_replica_state(value)?;
         self.store
             .observe_server(&state.server_id, state.next_device_sequence)?;
+        Ok(())
+    }
+
+    pub fn install_content_capabilities(&mut self, value: Value) -> Result<(), Error> {
+        let capabilities = decode_offline_content_capabilities(value)?;
+        self.store
+            .install_content_capabilities(&capabilities.server_id)?;
         Ok(())
     }
 
@@ -348,6 +373,10 @@ impl LocalReplica {
             .transpose()
     }
 
+    pub fn document_id_for_path(&self, logical_path: &str) -> Result<Option<String>, Error> {
+        Ok(self.store.document_id_for_path(logical_path)?)
+    }
+
     pub fn review_pack(&self, pack_id: &str) -> Result<Option<StoredOfflineReviewPack>, Error> {
         Ok(self
             .store
@@ -394,26 +423,81 @@ impl LocalReplica {
         if let Some(json) = self.store.existing_content_operation(&edit.operation_id)? {
             return replayed_document_edit(&json, &edit);
         }
-        let context = self.store.content_context(&edit.document_id)?;
+        let operation_id = edit.operation_id;
+        let document_id = edit.document_id;
+        let authored_at_us = edit.authored_at_us;
+        self.record_content_mutation(operation_id, document_id.clone(), authored_at_us, |base| {
+            OfflineContentMutation::Put {
+                document_id,
+                logical_path: edit.logical_path,
+                content_sha256: format!("{:x}", Sha256::digest(edit.org.as_bytes())),
+                org: edit.org,
+                base,
+            }
+        })
+    }
+
+    pub fn rename_document(
+        &mut self,
+        rename: OfflineDocumentRename,
+    ) -> Result<RecordedContentOperation, Error> {
+        if let Some(json) = self
+            .store
+            .existing_content_operation(&rename.operation_id)?
+        {
+            return replayed_document_rename(&json, &rename);
+        }
+        let operation_id = rename.operation_id;
+        let document_id = rename.document_id;
+        let authored_at_us = rename.authored_at_us;
+        self.record_content_mutation(operation_id, document_id.clone(), authored_at_us, |base| {
+            OfflineContentMutation::Rename {
+                document_id,
+                logical_path: rename.logical_path,
+                base,
+            }
+        })
+    }
+
+    pub fn tombstone_document(
+        &mut self,
+        tombstone: OfflineDocumentTombstone,
+    ) -> Result<RecordedContentOperation, Error> {
+        if let Some(json) = self
+            .store
+            .existing_content_operation(&tombstone.operation_id)?
+        {
+            return replayed_document_tombstone(&json, &tombstone);
+        }
+        let operation_id = tombstone.operation_id;
+        let document_id = tombstone.document_id;
+        let authored_at_us = tombstone.authored_at_us;
+        self.record_content_mutation(operation_id, document_id.clone(), authored_at_us, |base| {
+            OfflineContentMutation::Tombstone { document_id, base }
+        })
+    }
+
+    fn record_content_mutation(
+        &mut self,
+        operation_id: String,
+        document_id: String,
+        authored_at_us: u64,
+        mutation: impl FnOnce(ContentBase) -> OfflineContentMutation,
+    ) -> Result<RecordedContentOperation, Error> {
+        let context = self.store.content_context(&document_id)?;
         let (server_id, cursor, token) = decode_cursor(&context.cursor)?;
         if server_id != context.server_id {
             return Err(Error::Content);
         }
         let operation = OfflineContentOperation {
-            operation_id: edit.operation_id,
+            operation_id,
             device_id: self.device_id()?,
             device_sequence: context.next_device_sequence,
             cursor_server_id: server_id,
             cursor,
             cursor_token: token,
-            authored_at_us: edit.authored_at_us,
-            mutation: OfflineContentMutation::PutDocument {
-                document_id: edit.document_id,
-                logical_path: edit.logical_path,
-                content_sha256: format!("{:x}", Sha256::digest(edit.org.as_bytes())),
-                org: edit.org,
-                base: context.base,
-            },
+            authored_at_us,
+            mutation: mutation(context.base),
         };
         let canonical_payload = canonical_content_operation(&operation)?;
         self.store
@@ -603,24 +687,37 @@ fn validate_accepted_document(
     operation: &OfflineContentOperation,
     authoritative: &AuthoritativeDocument,
 ) -> Result<(), Error> {
-    let OfflineContentMutation::PutDocument {
-        logical_path,
-        content_sha256,
-        base,
-        ..
-    } = &operation.mutation;
-    let expected_revision = match base {
-        ContentBase::Absent => 1,
-        ContentBase::Revision { revision, .. } => revision.checked_add(1).ok_or(Error::Result)?,
+    let expected_revision = next_content_revision(operation.base())?;
+    let valid = match &operation.mutation {
+        OfflineContentMutation::Put {
+            logical_path,
+            content_sha256,
+            ..
+        } => {
+            authoritative.active
+                && authoritative.logical_path == *logical_path
+                && authoritative.content_sha256.as_ref() == Some(content_sha256)
+        }
+        OfflineContentMutation::Rename {
+            logical_path, base, ..
+        } => {
+            authoritative.active
+                && authoritative.logical_path == *logical_path
+                && authoritative.content_sha256.as_deref() == base.content_sha256()
+        }
+        OfflineContentMutation::Tombstone { .. } => {
+            !authoritative.active && authoritative.content_sha256.is_none()
+        }
     };
-    if authoritative.active
-        && authoritative.revision == expected_revision
-        && authoritative.logical_path == *logical_path
-        && authoritative.content_sha256.as_ref() == Some(content_sha256)
-    {
-        Ok(())
-    } else {
-        Err(Error::Result)
+    (valid && authoritative.revision == expected_revision)
+        .then_some(())
+        .ok_or(Error::Result)
+}
+
+fn next_content_revision(base: &ContentBase) -> Result<u64, Error> {
+    match base {
+        ContentBase::Absent => Ok(1),
+        ContentBase::Revision { revision, .. } => revision.checked_add(1).ok_or(Error::Result),
     }
 }
 
@@ -631,17 +728,84 @@ fn replayed_document_edit(
     let submission: OfflineContentSubmission =
         serde_json::from_str(json).map_err(|_| Error::Response)?;
     let operation = submission.decode()?.operation;
-    let OfflineContentMutation::PutDocument {
+    let OfflineContentMutation::Put {
         document_id,
         logical_path,
         org,
         ..
-    } = &operation.mutation;
+    } = &operation.mutation
+    else {
+        return Err(Error::Content);
+    };
     if operation.operation_id != edit.operation_id
         || document_id != &edit.document_id
         || logical_path != &edit.logical_path
         || org != &edit.org
         || operation.authored_at_us != edit.authored_at_us
+    {
+        return Err(Error::Content);
+    }
+    Ok(RecordedContentOperation {
+        operation_id: operation.operation_id,
+        device_sequence: operation.device_sequence,
+    })
+}
+
+fn replayed_document_rename(
+    json: &str,
+    rename: &OfflineDocumentRename,
+) -> Result<RecordedContentOperation, Error> {
+    let operation = decode_stored_content_operation(json)?;
+    let matches = match &operation.mutation {
+        OfflineContentMutation::Rename {
+            document_id,
+            logical_path,
+            ..
+        } => document_id == &rename.document_id && logical_path == &rename.logical_path,
+        _ => false,
+    };
+    replayed_content_identity(
+        operation,
+        &rename.operation_id,
+        rename.authored_at_us,
+        matches,
+    )
+}
+
+fn replayed_document_tombstone(
+    json: &str,
+    tombstone: &OfflineDocumentTombstone,
+) -> Result<RecordedContentOperation, Error> {
+    let operation = decode_stored_content_operation(json)?;
+    let matches = match &operation.mutation {
+        OfflineContentMutation::Tombstone { document_id, .. } => {
+            document_id == &tombstone.document_id
+        }
+        _ => false,
+    };
+    replayed_content_identity(
+        operation,
+        &tombstone.operation_id,
+        tombstone.authored_at_us,
+        matches,
+    )
+}
+
+fn decode_stored_content_operation(json: &str) -> Result<OfflineContentOperation, Error> {
+    let submission: OfflineContentSubmission =
+        serde_json::from_str(json).map_err(|_| Error::Response)?;
+    Ok(submission.decode()?.operation)
+}
+
+fn replayed_content_identity(
+    operation: OfflineContentOperation,
+    operation_id: &str,
+    authored_at_us: u64,
+    mutation_matches: bool,
+) -> Result<RecordedContentOperation, Error> {
+    if operation.operation_id != operation_id
+        || operation.authored_at_us != authored_at_us
+        || !mutation_matches
     {
         return Err(Error::Content);
     }
@@ -952,6 +1116,7 @@ impl From<StoreReplicaError> for Error {
             StoreReplicaError::Answer(_) => Self::Answer,
             StoreReplicaError::Result => Self::Result,
             StoreReplicaError::Content => Self::Content,
+            StoreReplicaError::PathConflict => Self::PathConflict,
             StoreReplicaError::Storage(_)
             | StoreReplicaError::Io(_)
             | StoreReplicaError::Corrupt
@@ -992,7 +1157,8 @@ mod tests {
 
     use super::{
         Error, LocalReplica, OfflineAnswer, OfflineContentOutcome, OfflineDocumentEdit,
-        OfflineResponse, PendingContentUpload, ReviewConflictReason,
+        OfflineDocumentRename, OfflineDocumentTombstone, OfflineResponse, PendingContentUpload,
+        ReviewConflictReason,
     };
     use crate::{
         application::{
@@ -1003,8 +1169,8 @@ mod tests {
         protocol::{
             OFFLINE_REVIEW_VERSION, OfflineContentSubmission, decode_cursor,
             decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
-            offline_content_result_json, offline_result_json, replica_changes_json,
-            replica_snapshot_json, replica_state_json, review_pack_json,
+            offline_content_capabilities_json, offline_content_result_json, offline_result_json,
+            replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
         },
     };
 
@@ -1347,6 +1513,377 @@ mod tests {
         assert_eq!(
             document.payload["projection"]["projection"]["title"],
             "Third"
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_document_lifecycle_restarts_replays_and_converges_to_tombstone() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("lifecycle-server.sqlite");
+        let blobs = directory.path().join("lifecycle-blobs");
+        let replica_path = directory.path().join("lifecycle-replica.sqlite");
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "offline-lifecycle".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        replica
+            .record_document(OfflineDocumentEdit {
+                operation_id: "create".into(),
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                org: "#+title: Offline\n* Heading\n".into(),
+                authored_at_us: 10,
+            })
+            .unwrap();
+        assert_eq!(
+            replica.document_id_for_path("note.org").unwrap().as_deref(),
+            Some("document")
+        );
+        let rename = OfflineDocumentRename {
+            operation_id: "rename".into(),
+            document_id: "document".into(),
+            logical_path: "renamed.org".into(),
+            authored_at_us: 11,
+        };
+        assert_eq!(
+            replica
+                .rename_document(rename.clone())
+                .unwrap()
+                .device_sequence,
+            2
+        );
+        assert_eq!(replica.rename_document(rename).unwrap().device_sequence, 2);
+        assert_eq!(
+            replica
+                .document_id_for_path("renamed.org")
+                .unwrap()
+                .as_deref(),
+            Some("document")
+        );
+        replica
+            .tombstone_document(OfflineDocumentTombstone {
+                operation_id: "tombstone".into(),
+                document_id: "document".into(),
+                authored_at_us: 12,
+            })
+            .unwrap();
+        assert!(
+            replica
+                .document_id_for_path("renamed.org")
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            replica.record_document(OfflineDocumentEdit {
+                operation_id: "resurrection".into(),
+                document_id: "document".into(),
+                logical_path: "renamed.org".into(),
+                org: "#+title: Resurrected\n".into(),
+                authored_at_us: 13,
+            }),
+            Err(Error::Content)
+        ));
+        drop(replica);
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        for expected in ["create", "rename"] {
+            let upload = replica.next_content_upload().unwrap().unwrap();
+            assert_eq!(upload.operation_id, expected);
+            let result = reconcile_content_upload(&service, &upload, &device_id, 20).await;
+            assert_eq!(result["result"]["status"], "accepted");
+            if expected == "rename" {
+                assert_eq!(
+                    result["result"]["authoritative"]["logical_path"],
+                    "renamed.org"
+                );
+                let mut wrong_digest = result.clone();
+                wrong_digest["result"]["authoritative"]["content_sha256"] = json!("b".repeat(64));
+                assert!(matches!(
+                    replica.record_content_result(wrong_digest),
+                    Err(Error::Result)
+                ));
+            }
+            replica.record_content_result(result).unwrap();
+        }
+        let upload = replica.next_content_upload().unwrap().unwrap();
+        assert_eq!(upload.operation_id, "tombstone");
+        let lost = reconcile_content_upload(&service, &upload, &device_id, 22).await;
+        let replay = reconcile_content_upload(&service, &upload, &device_id, 23).await;
+        assert_eq!(replay, lost);
+        assert_eq!(replay["result"]["authoritative"]["active"], false);
+        let mut false_resurrection = replay.clone();
+        false_resurrection["result"]["authoritative"]["active"] = json!(true);
+        false_resurrection["result"]["authoritative"]["content_sha256"] = json!("a".repeat(64));
+        assert!(matches!(
+            replica.record_content_result(false_resurrection),
+            Err(Error::Result)
+        ));
+        replica.record_content_result(replay).unwrap();
+        assert!(replica.next_content_upload().unwrap().is_none());
+
+        pull_server_changes(&mut replica, &service).await;
+        let document = replica.projection("document", "document").unwrap().unwrap();
+        assert_eq!(document.revision, 3);
+        assert!(document.tombstone);
+        assert!(document.blob_digests.is_empty());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn old_server_tombstone_does_not_block_a_new_server_document() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica_path = directory.path().join("replica.sqlite");
+        let device = generate_device(
+            "offline-server-change".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        let first = ServiceRuntime::start(
+            directory.path().join("first.sqlite"),
+            directory.path().join("first-blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = first.handle();
+        service.create_device(device.clone(), 1).await.unwrap();
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        replica
+            .record_document(OfflineDocumentEdit {
+                operation_id: "old-create".into(),
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                org: "#+title: Old\n".into(),
+                authored_at_us: 2,
+            })
+            .unwrap();
+        replica
+            .tombstone_document(OfflineDocumentTombstone {
+                operation_id: "old-tombstone".into(),
+                document_id: "document".into(),
+                authored_at_us: 3,
+            })
+            .unwrap();
+        for received_at_us in [4, 5] {
+            let upload = replica.next_content_upload().unwrap().unwrap();
+            let result =
+                reconcile_content_upload(&service, &upload, &device_id, received_at_us).await;
+            replica.record_content_result(result).unwrap();
+        }
+        drop(service);
+        first.finish().await.unwrap();
+
+        let second = ServiceRuntime::start(
+            directory.path().join("second.sqlite"),
+            directory.path().join("second-blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = second.handle();
+        service.create_device(device, 1).await.unwrap();
+        let state = service.replica_state(device_id.clone()).await.unwrap();
+        replica
+            .observe_state(replica_state_json(&state).unwrap())
+            .unwrap();
+        install_server_snapshot(&mut replica, &service, &device_id).await;
+        install_missing_blobs(&mut replica, &service).await;
+        let recorded = replica
+            .record_document(OfflineDocumentEdit {
+                operation_id: "new-create".into(),
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                org: "#+title: New\n".into(),
+                authored_at_us: 6,
+            })
+            .unwrap();
+        assert_eq!(recorded.device_sequence, 1);
+        assert!(matches!(
+            replica.tombstone_document(OfflineDocumentTombstone {
+                operation_id: "new-tombstone".into(),
+                document_id: "document".into(),
+                authored_at_us: 7,
+            }),
+            Err(Error::Content)
+        ));
+        replica
+            .install_content_capabilities(
+                offline_content_capabilities_json(&state.server_id).unwrap(),
+            )
+            .unwrap();
+        let upload = replica.next_content_upload().unwrap().unwrap();
+        assert_eq!(
+            upload.submission["operation"]["mutation"]["base"]["kind"],
+            "absent"
+        );
+        let result = reconcile_content_upload(&service, &upload, &device_id, 8).await;
+        assert_eq!(result["result"]["status"], "accepted");
+        drop(service);
+        second.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lifecycle_capability_gates_no_file_id_rename_and_delete_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica_path = directory.path().join("replica.sqlite");
+        let runtime = ServiceRuntime::start(
+            directory.path().join("server.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "lifecycle-capability".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    Some("opaque-document".into()),
+                    "without-file-id.org".into(),
+                    "#+title: No file ID\n* Heading\n".into(),
+                    None,
+                )
+                .unwrap(),
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    Some("other-document".into()),
+                    "taken.org".into(),
+                    "#+title: Taken\n".into(),
+                    None,
+                )
+                .unwrap(),
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = service.replica_state(device_id.clone()).await.unwrap();
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        replica
+            .observe_state(replica_state_json(&state).unwrap())
+            .unwrap();
+        install_server_snapshot(&mut replica, &service, &device_id).await;
+        install_missing_blobs(&mut replica, &service).await;
+        let document_id = replica
+            .document_id_for_path("without-file-id.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document_id, "opaque-document");
+        let rename = OfflineDocumentRename {
+            operation_id: "rename".into(),
+            document_id: document_id.clone(),
+            logical_path: "renamed.org".into(),
+            authored_at_us: 3,
+        };
+        assert!(matches!(
+            replica.rename_document(rename.clone()),
+            Err(Error::Content)
+        ));
+        assert!(replica.next_content_upload().unwrap().is_none());
+        assert!(
+            replica
+                .install_content_capabilities(
+                    offline_content_capabilities_json(&"f".repeat(32)).unwrap()
+                )
+                .is_err()
+        );
+        replica
+            .install_content_capabilities(
+                offline_content_capabilities_json(&state.server_id).unwrap(),
+            )
+            .unwrap();
+        assert!(matches!(
+            replica.rename_document(OfflineDocumentRename {
+                operation_id: "collision".into(),
+                document_id: document_id.clone(),
+                logical_path: "taken.org".into(),
+                authored_at_us: 3,
+            }),
+            Err(Error::PathConflict)
+        ));
+        assert!(replica.next_content_upload().unwrap().is_none());
+        drop(replica);
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        assert_eq!(
+            replica
+                .document_id_for_path("taken.org")
+                .unwrap()
+                .as_deref(),
+            Some("other-document")
+        );
+        assert_eq!(
+            replica
+                .document_id_for_path("without-file-id.org")
+                .unwrap()
+                .as_deref(),
+            Some("opaque-document")
+        );
+        let rename = OfflineDocumentRename {
+            authored_at_us: 4,
+            ..rename
+        };
+        replica.rename_document(rename).unwrap();
+        drop(replica);
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        assert!(
+            replica
+                .document_id_for_path("without-file-id.org")
+                .unwrap()
+                .is_none()
+        );
+        let document_id = replica
+            .document_id_for_path("renamed.org")
+            .unwrap()
+            .unwrap();
+        assert_eq!(document_id, "opaque-document");
+        replica
+            .tombstone_document(OfflineDocumentTombstone {
+                operation_id: "tombstone".into(),
+                document_id,
+                authored_at_us: 5,
+            })
+            .unwrap();
+        for received_at_us in [6, 7] {
+            let upload = replica.next_content_upload().unwrap().unwrap();
+            let result =
+                reconcile_content_upload(&service, &upload, &device_id, received_at_us).await;
+            replica.record_content_result(result).unwrap();
+        }
+        pull_server_changes(&mut replica, &service).await;
+        assert!(
+            replica
+                .document_id_for_path("renamed.org")
+                .unwrap()
+                .is_none()
         );
         drop(service);
         runtime.finish().await.unwrap();
@@ -1850,6 +2387,11 @@ mod tests {
         let state = service.replica_state(device_id.into()).await.unwrap();
         replica
             .observe_state(replica_state_json(&state).unwrap())
+            .unwrap();
+        replica
+            .install_content_capabilities(
+                offline_content_capabilities_json(&state.server_id).unwrap(),
+            )
             .unwrap();
         install_server_snapshot(replica, service, device_id).await;
         install_missing_blobs(replica, service).await;

@@ -1,4 +1,4 @@
-use super::{DocumentHead, PreparedNote, prepare_note};
+use super::{PreparedNote, prepare_note};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContentBase {
@@ -12,11 +12,20 @@ pub(crate) enum ContentBase {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OfflineContentMutation {
-    PutDocument {
+    Put {
         document_id: String,
         logical_path: String,
         content_sha256: String,
         org: String,
+        base: ContentBase,
+    },
+    Rename {
+        document_id: String,
+        logical_path: String,
+        base: ContentBase,
+    },
+    Tombstone {
+        document_id: String,
         base: ContentBase,
     },
 }
@@ -36,19 +45,51 @@ pub(crate) struct OfflineContentOperation {
 impl OfflineContentOperation {
     pub(crate) fn document_id(&self) -> &str {
         match &self.mutation {
-            OfflineContentMutation::PutDocument { document_id, .. } => document_id,
+            OfflineContentMutation::Put { document_id, .. } => document_id,
+            OfflineContentMutation::Rename { document_id, .. } => document_id,
+            OfflineContentMutation::Tombstone { document_id, .. } => document_id,
         }
     }
 
     pub(crate) const fn base(&self) -> &ContentBase {
         match &self.mutation {
-            OfflineContentMutation::PutDocument { base, .. } => base,
+            OfflineContentMutation::Put { base, .. } => base,
+            OfflineContentMutation::Rename { base, .. } => base,
+            OfflineContentMutation::Tombstone { base, .. } => base,
         }
     }
 
-    pub(crate) fn content_sha256(&self) -> &str {
+    pub(crate) const fn mutation_kind(&self) -> &'static str {
         match &self.mutation {
-            OfflineContentMutation::PutDocument { content_sha256, .. } => content_sha256,
+            OfflineContentMutation::Put { .. } => "put_document",
+            OfflineContentMutation::Rename { .. } => "rename_document",
+            OfflineContentMutation::Tombstone { .. } => "tombstone_document",
+        }
+    }
+
+    pub(crate) fn submitted_content_sha256(&self) -> Option<&str> {
+        match &self.mutation {
+            OfflineContentMutation::Put { content_sha256, .. } => Some(content_sha256),
+            OfflineContentMutation::Rename { .. } | OfflineContentMutation::Tombstone { .. } => {
+                None
+            }
+        }
+    }
+
+    pub(crate) fn logical_path(&self) -> Option<&str> {
+        match &self.mutation {
+            OfflineContentMutation::Put { logical_path, .. }
+            | OfflineContentMutation::Rename { logical_path, .. } => Some(logical_path),
+            OfflineContentMutation::Tombstone { .. } => None,
+        }
+    }
+}
+
+impl ContentBase {
+    pub(crate) fn content_sha256(&self) -> Option<&str> {
+        match self {
+            Self::Absent => None,
+            Self::Revision { content_sha256, .. } => content_sha256.as_deref(),
         }
     }
 }
@@ -108,28 +149,19 @@ pub(crate) struct AuthoritativeDocument {
     pub(crate) active: bool,
 }
 
-impl From<DocumentHead> for AuthoritativeDocument {
-    fn from(value: DocumentHead) -> Self {
-        Self {
-            document_id: value.document_id,
-            logical_path: value.logical_path,
-            revision: value.revision,
-            content_sha256: value.blob_sha256,
-            active: value.active,
-        }
-    }
-}
-
 pub(crate) fn prepare_offline_document(
     operation: &OfflineContentOperation,
-) -> Result<PreparedNote, OfflineContentConflictReason> {
-    let OfflineContentMutation::PutDocument {
+) -> Result<Option<PreparedNote>, OfflineContentConflictReason> {
+    let OfflineContentMutation::Put {
         document_id,
         logical_path,
         content_sha256,
         org,
         ..
-    } = &operation.mutation;
+    } = &operation.mutation
+    else {
+        return Ok(None);
+    };
     let prepared = prepare_note(
         Some(document_id.clone()),
         logical_path.clone(),
@@ -140,5 +172,5 @@ pub(crate) fn prepare_offline_document(
     if prepared.blob_sha256 != *content_sha256 {
         return Err(OfflineContentConflictReason::InvalidContent);
     }
-    Ok(prepared)
+    Ok(Some(prepared))
 }

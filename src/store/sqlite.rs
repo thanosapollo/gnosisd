@@ -40,7 +40,9 @@ const REMOTE_REVIEW_MIGRATION: &str = include_str!("migrations/0003_remote_revie
 const OFFLINE_REVIEW_MIGRATION: &str = include_str!("migrations/0004_offline_review.sql");
 const REPLICA_SYNC_MIGRATION: &str = include_str!("migrations/0005_replica_sync.sql");
 const OFFLINE_CONTENT_MIGRATION: &str = include_str!("migrations/0006_offline_content.sql");
-const SCHEMA_VERSION: u32 = 6;
+const OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION: &str =
+    include_str!("migrations/0007_offline_document_lifecycle.sql");
+const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -507,53 +509,16 @@ impl SqliteStore {
             reason: "logical path is invalid",
         })?;
         let transaction = self.write_transaction()?;
-        let current = load_document_head(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
-        let projection = load_document(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
-        check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
-        check_document_path(&transaction, document_id, logical_path)?;
-        let revision = current
-            .revision
-            .checked_add(1)
-            .ok_or(StoreError::CorruptData {
-                field: "document revision",
-            })?;
-        update_document_path(
+        let head = rename_document_in(
             &transaction,
             document_id,
             logical_path,
-            revision,
-            updated_at_us,
-        )?;
-        insert_document_history(
-            &transaction,
-            document_id,
-            logical_path,
-            current.blob_sha256.as_deref(),
-            revision,
-            "rename",
+            expected_revision,
             updated_at_us,
             author_device_id,
         )?;
-        insert_document_projection_history(
-            &transaction,
-            document_id,
-            revision,
-            projection.projection(),
-        )?;
-        insert_content_change(
-            &transaction,
-            "document",
-            document_id.as_str(),
-            revision,
-            "rename",
-            updated_at_us,
-        )?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(DocumentHead {
-            logical_path: logical_path.to_owned(),
-            revision,
-            ..current
-        })
+        Ok(head)
     }
 
     pub(crate) fn tombstone_document(
@@ -564,56 +529,15 @@ impl SqliteStore {
         author_device_id: Option<&str>,
     ) -> Result<DocumentHead, StoreError> {
         let transaction = self.write_transaction()?;
-        let current = load_document_head(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
-        check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
-        let revision = current
-            .revision
-            .checked_add(1)
-            .ok_or(StoreError::CorruptData {
-                field: "document revision",
-            })?;
-        transaction
-            .execute(
-                "UPDATE document SET active = 0, head_blob_sha256 = NULL,
-                     revision = ?2, updated_at_us = ?3 WHERE document_id = ?1",
-                params![
-                    document_id.as_str(),
-                    u64_to_i64(revision, "document revision")?,
-                    updated_at_us
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        transaction
-            .execute(
-                "UPDATE node SET active = 0 WHERE document_id = ?1",
-                [document_id.as_str()],
-            )
-            .map_err(StoreError::storage)?;
-        insert_document_history(
+        let head = tombstone_document_in(
             &transaction,
             document_id,
-            &current.logical_path,
-            None,
-            revision,
-            "tombstone",
+            expected_revision,
             updated_at_us,
             author_device_id,
         )?;
-        insert_content_change(
-            &transaction,
-            "document",
-            document_id.as_str(),
-            revision,
-            "tombstone",
-            updated_at_us,
-        )?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(DocumentHead {
-            revision,
-            blob_sha256: None,
-            active: false,
-            ..current
-        })
+        Ok(head)
     }
 
     pub(crate) fn asset_head(&self, path: &str) -> Result<Option<AssetHead>, StoreError> {
@@ -2174,6 +2098,156 @@ fn load_document_head(
         .map_err(StoreError::storage)
 }
 
+fn rename_document_in(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    logical_path: &str,
+    expected_revision: u64,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<DocumentHead, StoreError> {
+    let current = load_document_head(transaction, document_id)?
+        .filter(|head| head.active)
+        .ok_or(StoreError::NotFound)?;
+    check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+    if current.blob_sha256.is_none() {
+        return Err(StoreError::InvalidProjection {
+            reason: "document source is unavailable",
+        });
+    }
+    let projection = load_document(transaction, document_id)?.ok_or(StoreError::NotFound)?;
+    check_document_path(transaction, document_id, logical_path)?;
+    let revision = next_document_revision(&current)?;
+    update_document_path(
+        transaction,
+        document_id,
+        logical_path,
+        revision,
+        updated_at_us,
+    )?;
+    record_document_rename(
+        transaction,
+        document_id,
+        logical_path,
+        revision,
+        &current,
+        projection.projection(),
+        updated_at_us,
+        author_device_id,
+    )?;
+    Ok(DocumentHead {
+        logical_path: logical_path.to_owned(),
+        revision,
+        ..current
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_document_rename(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    logical_path: &str,
+    revision: u64,
+    current: &DocumentHead,
+    projection: &DocumentProjection,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    insert_document_history(
+        transaction,
+        document_id,
+        logical_path,
+        current.blob_sha256.as_deref(),
+        revision,
+        "rename",
+        updated_at_us,
+        author_device_id,
+    )?;
+    insert_document_projection_history(transaction, document_id, revision, projection)?;
+    insert_content_change(
+        transaction,
+        "document",
+        document_id.as_str(),
+        revision,
+        "rename",
+        updated_at_us,
+    )
+}
+
+fn tombstone_document_in(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    expected_revision: u64,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<DocumentHead, StoreError> {
+    let current = load_document_head(transaction, document_id)?
+        .filter(|head| head.active)
+        .ok_or(StoreError::NotFound)?;
+    check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+    let revision = next_document_revision(&current)?;
+    retire_document(transaction, document_id, revision, updated_at_us)?;
+    insert_document_history(
+        transaction,
+        document_id,
+        &current.logical_path,
+        None,
+        revision,
+        "tombstone",
+        updated_at_us,
+        author_device_id,
+    )?;
+    insert_content_change(
+        transaction,
+        "document",
+        document_id.as_str(),
+        revision,
+        "tombstone",
+        updated_at_us,
+    )?;
+    Ok(DocumentHead {
+        revision,
+        blob_sha256: None,
+        active: false,
+        ..current
+    })
+}
+
+fn retire_document(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    revision: u64,
+    updated_at_us: i64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "UPDATE document SET active = 0, head_blob_sha256 = NULL,
+                 revision = ?2, updated_at_us = ?3 WHERE document_id = ?1",
+            params![
+                document_id.as_str(),
+                u64_to_i64(revision, "document revision")?,
+                updated_at_us
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "UPDATE node SET active = 0 WHERE document_id = ?1",
+            [document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn next_document_revision(current: &DocumentHead) -> Result<u64, StoreError> {
+    current
+        .revision
+        .checked_add(1)
+        .ok_or(StoreError::CorruptData {
+            field: "document revision",
+        })
+}
+
 fn check_document_path(
     connection: &Connection,
     document_id: &DocumentId,
@@ -2869,6 +2943,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if found < 6 {
         connection
             .execute_batch(OFFLINE_CONTENT_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
+    if found < 7 {
+        connection
+            .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION)
             .map_err(StoreError::storage)?;
     }
     Ok(())
@@ -4256,18 +4335,21 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        FailPoint, INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION,
-        REPLICA_SYNC_MIGRATION, SERVER_MIGRATION, SqliteStore, StoreError, migrate, schema_version,
+        FailPoint, INITIAL_MIGRATION, OFFLINE_CONTENT_MIGRATION, OFFLINE_REVIEW_MIGRATION,
+        REMOTE_REVIEW_MIGRATION, REPLICA_SYNC_MIGRATION, SERVER_MIGRATION, SqliteStore, StoreError,
+        migrate, schema_version,
     };
     use crate::application::{
-        OfflineReviewOperation, ReconciliationStatus, ReplicaProjection, SettingsInput,
-        generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
+        AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentMutation,
+        OfflineContentOperation, OfflineReviewOperation, ReconciliationStatus, ReplicaProjection,
+        SettingsInput, generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
         SourceSpan, TitlePath,
     };
+    use crate::protocol::canonical_content_operation;
 
     fn projection(title: &str, digest: &str) -> DocumentProjection {
         let root = NodeId::new("root").unwrap();
@@ -4426,7 +4508,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            6
+            7
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4434,7 +4516,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            6
+            7
         );
     }
 
@@ -4447,7 +4529,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
@@ -4637,7 +4719,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 6);
+        assert_eq!(schema_version(&connection).unwrap(), 7);
         let floor: i64 = connection
             .query_row(
                 "SELECT retained_after_cursor FROM sync_feed_state",
@@ -4771,6 +4853,198 @@ mod tests {
             .unwrap();
         assert_eq!(replay.status, ReconciliationStatus::Conflict);
         assert_eq!(replay.attempt_id, "attempt");
+    }
+
+    #[test]
+    fn upgrades_populated_schema_v6_content_ledger_without_changing_replay() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        for migration in [
+            INITIAL_MIGRATION,
+            SERVER_MIGRATION,
+            REMOTE_REVIEW_MIGRATION,
+            OFFLINE_REVIEW_MIGRATION,
+            REPLICA_SYNC_MIGRATION,
+            OFFLINE_CONTENT_MIGRATION,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        let mut store = SqliteStore { connection };
+        let device = generate_device("Offline".into(), vec!["content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let state = store.replica_state(&device_id).unwrap();
+        let org = "#+title: Preserved\n";
+        let content_sha256 = format!("{:x}", sha2::Sha256::digest(org.as_bytes()));
+        let operation = OfflineContentOperation {
+            operation_id: "operation".into(),
+            device_id: device_id.clone(),
+            device_sequence: 1,
+            cursor_server_id: state.server_id.clone(),
+            cursor: state.cursor,
+            cursor_token: state.cursor_token.clone(),
+            authored_at_us: 2,
+            mutation: OfflineContentMutation::Put {
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                content_sha256: content_sha256.clone(),
+                org: org.into(),
+                base: ContentBase::Absent,
+            },
+        };
+        let payload = canonical_content_operation(&operation).unwrap();
+        let payload_sha256 = format!("{:x}", sha2::Sha256::digest(payload.as_bytes()));
+        let authoritative = serde_json::to_string(&AuthoritativeDocument {
+            document_id: "document".into(),
+            logical_path: "note.org".into(),
+            revision: 1,
+            content_sha256: Some(content_sha256.clone()),
+            active: true,
+        })
+        .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO device_operation VALUES (?1, ?2, 1, 'content', 1, ?3, ?4, 3)",
+                rusqlite::params![operation.operation_id, device_id, payload_sha256, payload],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO offline_content_operation VALUES (
+                     ?1, 'document', ?2, 'put_document', 'absent', NULL, NULL, NULL,
+                     ?3, ?4, ?5, 2
+                 )",
+                rusqlite::params![
+                    operation.operation_id,
+                    content_sha256,
+                    state.server_id,
+                    i64::try_from(state.cursor).unwrap(),
+                    state.cursor_token,
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO offline_content_result VALUES (
+                     ?1, 1, 'accepted', NULL, ?2, ?3, ?4, ?5, 4
+                 )",
+                rusqlite::params![
+                    operation.operation_id,
+                    authoritative,
+                    i64::try_from(state.cursor).unwrap(),
+                    state.server_id,
+                    state.cursor_token,
+                ],
+            )
+            .unwrap();
+        let chained_org = "#+title: Chained\n";
+        let chained_digest = format!("{:x}", sha2::Sha256::digest(chained_org.as_bytes()));
+        let chained = OfflineContentOperation {
+            operation_id: "chained".into(),
+            device_id: device_id.clone(),
+            device_sequence: 2,
+            cursor_server_id: state.server_id.clone(),
+            cursor: state.cursor,
+            cursor_token: state.cursor_token.clone(),
+            authored_at_us: 3,
+            mutation: OfflineContentMutation::Put {
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                content_sha256: chained_digest.clone(),
+                org: chained_org.into(),
+                base: ContentBase::Revision {
+                    revision: 1,
+                    content_sha256: Some(content_sha256),
+                    predecessor_operation_id: Some(operation.operation_id.clone()),
+                },
+            },
+        };
+        let chained_payload = canonical_content_operation(&chained).unwrap();
+        let chained_payload_sha256 =
+            format!("{:x}", sha2::Sha256::digest(chained_payload.as_bytes()));
+        store
+            .connection
+            .execute(
+                "INSERT INTO device_operation VALUES (?1, ?2, 2, 'content', 1, ?3, ?4, 4)",
+                rusqlite::params![
+                    chained.operation_id,
+                    device_id,
+                    chained_payload_sha256,
+                    chained_payload,
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO offline_content_operation VALUES (
+                     ?1, 'document', ?2, 'put_document', 'revision', 1, ?3, ?4,
+                     ?5, ?6, ?7, 3
+                 )",
+                rusqlite::params![
+                    chained.operation_id,
+                    chained_digest,
+                    chained.base().content_sha256(),
+                    operation.operation_id,
+                    state.server_id,
+                    i64::try_from(state.cursor).unwrap(),
+                    state.cursor_token,
+                ],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO offline_content_result VALUES (
+                     ?1, 1, 'conflict', 'base_changed', ?2, ?3, ?4, ?5, 5
+                 )",
+                rusqlite::params![
+                    chained.operation_id,
+                    authoritative,
+                    i64::try_from(state.cursor).unwrap(),
+                    state.server_id,
+                    state.cursor_token,
+                ],
+            )
+            .unwrap();
+
+        migrate(&store.connection).unwrap();
+        assert_eq!(schema_version(&store.connection).unwrap(), 7);
+        let violations: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        let replay = store
+            .reconcile_content_operation(
+                1,
+                &operation,
+                &canonical_content_operation(&operation).unwrap(),
+                Some(&device_id),
+                5,
+                Ok((None, None)),
+            )
+            .unwrap();
+        assert_eq!(replay.status, ContentReconciliationStatus::Accepted);
+        assert_eq!(replay.authoritative.unwrap().revision, 1);
+        let replay = store
+            .reconcile_content_operation(
+                1,
+                &chained,
+                &canonical_content_operation(&chained).unwrap(),
+                Some(&device_id),
+                6,
+                Ok((None, None)),
+            )
+            .unwrap();
+        assert_eq!(replay.status, ContentReconciliationStatus::Conflict);
     }
 
     #[test]

@@ -34,8 +34,9 @@ use crate::{
     protocol::{
         OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
         OfflineReviewWireError, ReplicaWireError, active_review_pack_json, decode_cursor,
-        decode_snapshot_cursor, offline_content_result_json, offline_result_json,
-        replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
+        decode_snapshot_cursor, offline_content_capabilities_json, offline_content_result_json,
+        offline_result_json, replica_changes_json, replica_snapshot_json, replica_state_json,
+        review_pack_json,
     },
     store::StoreError,
 };
@@ -133,6 +134,7 @@ fn data_router() -> Router<HttpState> {
     Router::new()
         .route("/v1/changes", get(changes))
         .route("/v1/sync/state", get(replica_state))
+        .route("/v1/sync/content-capabilities", get(content_capabilities))
         .route("/v1/sync/changes", get(replica_changes))
         .route("/v1/sync/snapshot", get(replica_snapshot))
         .route("/v1/events", get(events))
@@ -291,6 +293,22 @@ async fn replica_state(
         .map_err(ApiError::service)?;
     Ok(Json(
         replica_state_json(&replica).map_err(ApiError::replica_wire)?,
+    ))
+}
+
+async fn content_capabilities(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let replica = state
+        .service
+        .replica_state(principal.device_id)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        offline_content_capabilities_json(&replica.server_id)
+            .map_err(ApiError::offline_content_wire)?,
     ))
 }
 
@@ -1647,6 +1665,7 @@ fn openapi_error_response() -> Value {
 const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/changes", "get"),
     ("/v1/sync/state", "get"),
+    ("/v1/sync/content-capabilities", "get"),
     ("/v1/sync/changes", "get"),
     ("/v1/sync/snapshot", "get"),
     ("/v1/events", "get"),
@@ -1978,6 +1997,21 @@ mod tests {
         assert_eq!(state["version"], 1);
         assert_eq!(state["snapshot_required"], true);
         let server_id = state["server_id"].as_str().unwrap();
+        let capabilities = response_json(
+            app.clone()
+                .oneshot(authorized(
+                    "GET",
+                    "/v1/sync/content-capabilities",
+                    &owner_token,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(capabilities["version"], 1);
+        assert_eq!(capabilities["server_id"], server_id);
+        assert_eq!(capabilities["document_lifecycle"], 1);
 
         let first_request = app.clone().oneshot(authorized(
             "GET",

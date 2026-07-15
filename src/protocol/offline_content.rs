@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub(crate) const OFFLINE_CONTENT_VERSION: u32 = 1;
+const OFFLINE_CONTENT_CAPABILITIES_VERSION: u32 = 1;
 const MAX_OFFLINE_CONTENT_OPERATION_BYTES: usize = 1024 * 1024;
 const MAX_OFFLINE_CONTENT_RESULT_BYTES: usize = 128 * 1024;
 
@@ -37,6 +38,11 @@ pub(crate) struct DecodedOfflineContentResult {
     pub(crate) conflict_reason: Option<OfflineContentConflictReason>,
     pub(crate) authoritative: Option<AuthoritativeDocument>,
     pub(crate) cursor: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedOfflineContentCapabilities {
+    pub(crate) server_id: String,
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +76,37 @@ pub(crate) fn canonical_content_operation(
     let wire = OfflineContentOperationV1::from(operation);
     validate_operation(&wire)?;
     encode_operation(&wire)
+}
+
+pub(crate) fn offline_content_capabilities_json(
+    server_id: &str,
+) -> Result<Value, OfflineContentWireError> {
+    if !is_hex_identity(server_id) {
+        return Err(OfflineContentWireError::Operation);
+    }
+    serde_json::to_value(ContentCapabilitiesV1 {
+        version: OFFLINE_CONTENT_CAPABILITIES_VERSION,
+        server_id: server_id.to_owned(),
+        document_lifecycle: 1,
+    })
+    .map_err(invalid_operation)
+}
+
+pub(crate) fn decode_offline_content_capabilities(
+    value: Value,
+) -> Result<DecodedOfflineContentCapabilities, OfflineContentWireError> {
+    require_size(&value, MAX_OFFLINE_CONTENT_RESULT_BYTES)?;
+    let capabilities: ContentCapabilitiesV1 =
+        serde_json::from_value(value).map_err(invalid_operation)?;
+    if capabilities.version != OFFLINE_CONTENT_CAPABILITIES_VERSION
+        || capabilities.document_lifecycle != 1
+        || !is_hex_identity(&capabilities.server_id)
+    {
+        return Err(OfflineContentWireError::Operation);
+    }
+    Ok(DecodedOfflineContentCapabilities {
+        server_id: capabilities.server_id,
+    })
 }
 
 pub(crate) fn offline_content_result_json(
@@ -147,13 +184,21 @@ fn validate_operation(value: &OfflineContentOperationV1) -> Result<(), OfflineCo
     }
     validate_cursor(&value.cursor)?;
     match &value.mutation {
-        ContentMutationV1::PutDocument {
+        ContentMutationV1::Put {
             document_id,
             logical_path,
             content_sha256,
             org,
             base,
         } => validate_document_put(document_id, logical_path, content_sha256, org, base),
+        ContentMutationV1::Rename {
+            document_id,
+            logical_path,
+            base,
+        } => validate_document_rename(document_id, logical_path, base),
+        ContentMutationV1::Tombstone { document_id, base } => {
+            validate_document_tombstone(document_id, base)
+        }
     }
 }
 
@@ -175,6 +220,41 @@ fn validate_document_put(
         return Err(OfflineContentWireError::Operation);
     }
     Ok(())
+}
+
+fn validate_document_rename(
+    document_id: &str,
+    logical_path: &str,
+    base: &ContentBaseV1,
+) -> Result<(), OfflineContentWireError> {
+    validate_document_identity(document_id)?;
+    if logical_path.len() > 4096 {
+        return Err(OfflineContentWireError::Operation);
+    }
+    validate_org_path(logical_path).map_err(invalid_operation)?;
+    require_revision_base(base)
+}
+
+fn validate_document_tombstone(
+    document_id: &str,
+    base: &ContentBaseV1,
+) -> Result<(), OfflineContentWireError> {
+    validate_document_identity(document_id)?;
+    require_revision_base(base)
+}
+
+fn validate_document_identity(document_id: &str) -> Result<(), OfflineContentWireError> {
+    DocumentId::new(document_id.to_owned())
+        .map(|_| ())
+        .map_err(invalid_operation)
+}
+
+fn require_revision_base(base: &ContentBaseV1) -> Result<(), OfflineContentWireError> {
+    if matches!(base, ContentBaseV1::Revision { .. }) && valid_content_base(base) {
+        Ok(())
+    } else {
+        Err(OfflineContentWireError::Operation)
+    }
 }
 
 fn valid_content_base(base: &ContentBaseV1) -> bool {
@@ -327,6 +407,14 @@ struct VersionedOperationV1<'a> {
     operation: &'a OfflineContentOperationV1,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContentCapabilitiesV1 {
+    version: u32,
+    server_id: String,
+    document_lifecycle: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OfflineContentOperationV1 {
@@ -341,11 +429,23 @@ struct OfflineContentOperationV1 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum ContentMutationV1 {
-    PutDocument {
+    #[serde(rename = "put_document")]
+    Put {
         document_id: String,
         logical_path: String,
         content_sha256: String,
         org: String,
+        base: ContentBaseV1,
+    },
+    #[serde(rename = "rename_document")]
+    Rename {
+        document_id: String,
+        logical_path: String,
+        base: ContentBaseV1,
+    },
+    #[serde(rename = "tombstone_document")]
+    Tombstone {
+        document_id: String,
         base: ContentBaseV1,
     },
 }
@@ -395,17 +495,30 @@ impl From<&OfflineContentOperation> for OfflineContentOperationV1 {
 impl From<ContentMutationV1> for OfflineContentMutation {
     fn from(value: ContentMutationV1) -> Self {
         match value {
-            ContentMutationV1::PutDocument {
+            ContentMutationV1::Put {
                 document_id,
                 logical_path,
                 content_sha256,
                 org,
                 base,
-            } => Self::PutDocument {
+            } => Self::Put {
                 document_id,
                 logical_path,
                 content_sha256,
                 org,
+                base: base.into(),
+            },
+            ContentMutationV1::Rename {
+                document_id,
+                logical_path,
+                base,
+            } => Self::Rename {
+                document_id,
+                logical_path,
+                base: base.into(),
+            },
+            ContentMutationV1::Tombstone { document_id, base } => Self::Tombstone {
+                document_id,
                 base: base.into(),
             },
         }
@@ -415,17 +528,30 @@ impl From<ContentMutationV1> for OfflineContentMutation {
 impl From<&OfflineContentMutation> for ContentMutationV1 {
     fn from(value: &OfflineContentMutation) -> Self {
         match value {
-            OfflineContentMutation::PutDocument {
+            OfflineContentMutation::Put {
                 document_id,
                 logical_path,
                 content_sha256,
                 org,
                 base,
-            } => Self::PutDocument {
+            } => Self::Put {
                 document_id: document_id.clone(),
                 logical_path: logical_path.clone(),
                 content_sha256: content_sha256.clone(),
                 org: org.clone(),
+                base: base.clone().into(),
+            },
+            OfflineContentMutation::Rename {
+                document_id,
+                logical_path,
+                base,
+            } => Self::Rename {
+                document_id: document_id.clone(),
+                logical_path: logical_path.clone(),
+                base: base.clone().into(),
+            },
+            OfflineContentMutation::Tombstone { document_id, base } => Self::Tombstone {
+                document_id: document_id.clone(),
                 base: base.clone().into(),
             },
         }
@@ -488,7 +614,10 @@ mod tests {
     use serde_json::json;
     use sha2::Digest as _;
 
-    use super::{OfflineContentSubmission, OfflineContentWireError, offline_content_result_json};
+    use super::{
+        OfflineContentSubmission, OfflineContentWireError, decode_offline_content_capabilities,
+        offline_content_capabilities_json, offline_content_result_json,
+    };
     use crate::application::{
         AuthoritativeDocument, ContentReconciliationStatus, OfflineContentConflictReason,
         OfflineContentResult,
@@ -634,5 +763,87 @@ mod tests {
             submission.decode(),
             Err(OfflineContentWireError::Operation)
         ));
+    }
+
+    #[test]
+    fn lifecycle_mutations_require_a_captured_revision() {
+        let cursor = "eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsInBvc2l0aW9uIjowLCJ0b2tlbiI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0";
+        for mutation in [
+            json!({
+                "kind": "rename_document",
+                "document_id": "document",
+                "logical_path": "renamed.org",
+                "base": {
+                    "kind": "revision",
+                    "revision": 1,
+                    "content_sha256": "a".repeat(64),
+                    "predecessor_operation_id": null
+                }
+            }),
+            json!({
+                "kind": "tombstone_document",
+                "document_id": "document",
+                "base": {
+                    "kind": "revision",
+                    "revision": 1,
+                    "content_sha256": "a".repeat(64),
+                    "predecessor_operation_id": "predecessor"
+                }
+            }),
+        ] {
+            let submission: OfflineContentSubmission = serde_json::from_value(json!({
+                "version": 1,
+                "operation": {
+                    "operation_id": "operation",
+                    "device_id": "device",
+                    "device_sequence": 1,
+                    "cursor": cursor,
+                    "authored_at_us": 1,
+                    "mutation": mutation
+                }
+            }))
+            .unwrap();
+            assert!(submission.decode().is_ok());
+        }
+
+        let absent: OfflineContentSubmission = serde_json::from_value(json!({
+            "version": 1,
+            "operation": {
+                "operation_id": "operation",
+                "device_id": "device",
+                "device_sequence": 1,
+                "cursor": cursor,
+                "authored_at_us": 1,
+                "mutation": {
+                    "kind": "tombstone_document",
+                    "document_id": "document",
+                    "base": {"kind": "absent"}
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            absent.decode(),
+            Err(OfflineContentWireError::Operation)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_capability_is_explicit_and_server_bound() {
+        let server_id = "a".repeat(32);
+        let value = offline_content_capabilities_json(&server_id).unwrap();
+        assert_eq!(
+            decode_offline_content_capabilities(value)
+                .unwrap()
+                .server_id,
+            server_id
+        );
+        for invalid in [
+            json!({"version":1,"server_id":"bad","document_lifecycle":1}),
+            json!({"version":1,"server_id":"a".repeat(32),"document_lifecycle":0}),
+            json!({"version":1,"server_id":"a".repeat(32),"document_lifecycle":1,"extra":true}),
+        ] {
+            assert!(decode_offline_content_capabilities(invalid).is_err());
+        }
     }
 }
