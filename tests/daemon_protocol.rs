@@ -7,10 +7,13 @@ use std::{
     time::Duration,
 };
 
+use gnosis_core::migration::migrate_legacy_database;
 use gnosis_core::protocol::{
     DaemonConfig, DaemonServer, ErrorCode, PROTOCOL_VERSION, Request, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, ResponseResult, ServerError, request,
+    ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewAnswerInput, ReviewSourceInput,
+    ReviewSourceKindInput, ServerError, request,
 };
+use rusqlite::Connection;
 use tempfile::TempDir;
 use tokio::sync::{Barrier, oneshot};
 
@@ -19,6 +22,29 @@ struct RunningDaemon {
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), gnosis_core::protocol::ServerError>>,
     _directory: TempDir,
+}
+
+struct DaemonProcess {
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), gnosis_core::protocol::ServerError>>,
+}
+
+impl DaemonProcess {
+    async fn start(socket: &Path, database: &Path) -> Self {
+        let server = DaemonServer::bind(DaemonConfig::new(socket, database))
+            .await
+            .unwrap();
+        let (shutdown, receiver) = oneshot::channel();
+        let task = tokio::spawn(server.run(async {
+            let _ = receiver.await;
+        }));
+        Self { shutdown, task }
+    }
+
+    async fn stop(self) {
+        self.shutdown.send(()).unwrap();
+        self.task.await.unwrap().unwrap();
+    }
 }
 
 impl RunningDaemon {
@@ -41,12 +67,421 @@ impl RunningDaemon {
         }
     }
 
+    async fn start_review_fixture() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("legacy.db");
+        let socket = directory.path().join("gnosis.sock");
+        let database = directory.path().join("gnosis.sqlite");
+        create_review_fixture(&source);
+        migrate_legacy_database(&source, &database).unwrap();
+        let server = DaemonServer::bind(DaemonConfig::new(&socket, database))
+            .await
+            .unwrap();
+        let (shutdown, receiver) = oneshot::channel();
+        let task = tokio::spawn(server.run(async {
+            let _ = receiver.await;
+        }));
+        Self {
+            socket,
+            shutdown,
+            task,
+            _directory: directory,
+        }
+    }
+
     async fn stop(self) {
         let socket = self.socket.clone();
         self.shutdown.send(()).unwrap();
         self.task.await.unwrap().unwrap();
         assert!(!socket.exists());
     }
+}
+
+#[tokio::test]
+async fn online_review_commit_is_idempotent_after_lost_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let session = successful_review_result(
+        &socket,
+        "session",
+        Request::ReviewSessionCreate {
+            source: manual_review_source(),
+            target_count: None,
+        },
+    )
+    .await;
+    let ResponseResult::ReviewSession(session) = session else {
+        panic!("unexpected session response");
+    };
+    let attempt = successful_review_result(
+        &socket,
+        "begin",
+        Request::ReviewAttemptBegin {
+            session_id: session.session_id,
+        },
+    )
+    .await;
+    let ResponseResult::ReviewAttempt(attempt) = attempt else {
+        panic!("unexpected attempt response");
+    };
+    assert_eq!(attempt.presentation.answer, ["Answer"]);
+    let attempt_id = attempt.attempt_id;
+    let graded = successful_review_result(
+        &socket,
+        "answer",
+        Request::ReviewAttemptAnswer {
+            attempt_id: attempt_id.clone(),
+            response: ReviewAnswerInput::Text("Answer".into()),
+        },
+    )
+    .await;
+    let ResponseResult::ReviewAttempt(graded) = graded else {
+        panic!("unexpected grade response");
+    };
+    assert_eq!(graded.detected_success, Some(true));
+    for id in ["override-1", "override-2"] {
+        successful_review_result(
+            &socket,
+            id,
+            Request::ReviewAttemptOverride {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await;
+    }
+    for id in ["suspend-1", "suspend-2"] {
+        successful_review_result(
+            &socket,
+            id,
+            Request::ReviewAttemptSuspensionToggle {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await;
+    }
+    let first = successful_review_result(
+        &socket,
+        "commit-1",
+        Request::ReviewAttemptCommit {
+            attempt_id: attempt_id.clone(),
+        },
+    )
+    .await;
+    let retry = successful_review_result(
+        &socket,
+        "commit-2",
+        Request::ReviewAttemptCommit {
+            attempt_id: attempt_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(first, retry);
+    daemon.stop().await;
+    let connection = Connection::open(&database).unwrap();
+    let event_count: u64 = connection
+        .query_row(
+            "SELECT count(*) FROM review_event WHERE attempt_id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let transition_count: u64 = connection
+        .query_row(
+            "SELECT count(*) FROM review_state_revision
+             WHERE thema_id = '7' AND state_revision = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1);
+    assert_eq!(transition_count, 1);
+}
+
+#[tokio::test]
+async fn online_review_session_recovers_and_has_explicit_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let session = successful_review_result(
+        &socket,
+        "create",
+        Request::ReviewSessionCreate {
+            source: manual_review_source(),
+            target_count: None,
+        },
+    )
+    .await;
+    let ResponseResult::ReviewSession(session) = session else {
+        panic!("unexpected session response");
+    };
+    let session_id = session.session_id;
+    successful_review_result(
+        &socket,
+        "begin",
+        Request::ReviewAttemptBegin {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let second = call(
+        &socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "second".into(),
+            request: Request::ReviewSessionCreate {
+                source: manual_review_source(),
+                target_count: None,
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = second.outcome else {
+        panic!("second active session unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    daemon.stop().await;
+
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let active = successful_review_result(&socket, "active", Request::ReviewSessionActive {}).await;
+    let ResponseResult::ActiveReviewSession(active) = active else {
+        panic!("unexpected active-session response");
+    };
+    assert_eq!(active.session.as_ref().unwrap().session_id, session_id);
+    successful_review_result(
+        &socket,
+        "resume-active",
+        Request::ReviewSessionResume {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let quit = successful_review_result(
+        &socket,
+        "quit",
+        Request::ReviewSessionQuit {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let ResponseResult::ReviewSession(quit) = quit else {
+        panic!("unexpected quit response");
+    };
+    assert_eq!(quit.status, "quit");
+    successful_review_result(
+        &socket,
+        "resume-quit",
+        Request::ReviewSessionResume {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+    let aborted =
+        successful_review_result(&socket, "abort", Request::ReviewSessionAbort { session_id })
+            .await;
+    let ResponseResult::ReviewSession(aborted) = aborted else {
+        panic!("unexpected abort response");
+    };
+    assert_eq!(aborted.status, "aborted");
+    let none =
+        successful_review_result(&socket, "active-none", Request::ReviewSessionActive {}).await;
+    let ResponseResult::ActiveReviewSession(none) = none else {
+        panic!("unexpected empty active-session response");
+    };
+    assert_eq!(none.session, None);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn online_review_toggle_retries_are_persistently_idempotent() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let attempt_id = begin_and_answer_review(&socket).await;
+    let first = review_attempt_result(
+        successful_review_result(
+            &socket,
+            "override-retry",
+            Request::ReviewAttemptOverride {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await,
+    );
+    daemon.stop().await;
+
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let retry = review_attempt_result(
+        successful_review_result(
+            &socket,
+            "override-retry",
+            Request::ReviewAttemptOverride {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(retry, first);
+    let intentional_second = review_attempt_result(
+        successful_review_result(
+            &socket,
+            "override-new",
+            Request::ReviewAttemptOverride {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(intentional_second.override_count, first.override_count + 1);
+    assert_ne!(intentional_second.accepted_success, first.accepted_success);
+
+    let suspended = review_attempt_result(
+        successful_review_result(
+            &socket,
+            "suspension-retry",
+            Request::ReviewAttemptSuspensionToggle {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await,
+    );
+    let suspension_retry = review_attempt_result(
+        successful_review_result(
+            &socket,
+            "suspension-retry",
+            Request::ReviewAttemptSuspensionToggle {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(suspension_retry, suspended);
+    let suspension_second = review_attempt_result(
+        successful_review_result(
+            &socket,
+            "suspension-new",
+            Request::ReviewAttemptSuspensionToggle {
+                attempt_id: attempt_id.clone(),
+            },
+        )
+        .await,
+    );
+    assert_ne!(
+        suspension_second.desired_suspended,
+        suspended.desired_suspended
+    );
+
+    let reused = call(
+        &socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "override-retry".into(),
+            request: Request::ReviewAttemptSuspensionToggle { attempt_id },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = reused.outcome else {
+        panic!("request ID reuse with another payload unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn online_review_rejects_a_different_second_answer() {
+    let daemon = RunningDaemon::start_review_fixture().await;
+    let attempt_id = begin_and_answer_review(&daemon.socket).await;
+    let response = call(
+        &daemon.socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "answer-different".into(),
+            request: Request::ReviewAttemptAnswer {
+                attempt_id,
+                response: ReviewAnswerInput::Text("Different".into()),
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = response.outcome else {
+        panic!("different second answer unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn online_review_maps_invalid_answer_shape_to_a_client_error() {
+    let daemon = RunningDaemon::start_review_fixture().await;
+    let attempt_id = begin_review(&daemon.socket).await;
+    let response = call(
+        &daemon.socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "invalid-answer".into(),
+            request: Request::ReviewAttemptAnswer {
+                attempt_id,
+                response: ReviewAnswerInput::Choice("Answer".into()),
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = response.outcome else {
+        panic!("invalid answer shape unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::MalformedRequest);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn online_review_keeps_an_invalid_stored_matcher_internal() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let attempt_id = begin_review(&socket).await;
+    daemon.stop().await;
+    Connection::open(&database)
+        .unwrap()
+        .execute(
+            "UPDATE review_attempt SET matcher_version = 99 WHERE attempt_id = ?1",
+            [&attempt_id],
+        )
+        .unwrap();
+
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let response = call(
+        &socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "invalid-matcher".into(),
+            request: Request::ReviewAttemptAnswer {
+                attempt_id,
+                response: ReviewAnswerInput::Text("Answer".into()),
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = response.outcome else {
+        panic!("invalid stored matcher unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::Internal);
+    daemon.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -327,6 +762,79 @@ async fn call(socket: &Path, envelope: RequestEnvelope) -> ResponseEnvelope {
     request(socket, &envelope).await.unwrap()
 }
 
+async fn successful_review_result(socket: &Path, id: &str, request: Request) -> ResponseResult {
+    let response = call(
+        socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: id.into(),
+            request,
+        },
+    )
+    .await;
+    let ResponseOutcome::Success { result } = response.outcome else {
+        panic!("review request failed: {response:?}");
+    };
+    *result
+}
+
+async fn begin_review(socket: &Path) -> String {
+    let session = successful_review_result(
+        socket,
+        "begin-session",
+        Request::ReviewSessionCreate {
+            source: manual_review_source(),
+            target_count: None,
+        },
+    )
+    .await;
+    let ResponseResult::ReviewSession(session) = session else {
+        panic!("unexpected session response");
+    };
+    let attempt = successful_review_result(
+        socket,
+        "begin-attempt",
+        Request::ReviewAttemptBegin {
+            session_id: session.session_id,
+        },
+    )
+    .await;
+    review_attempt_result(attempt).attempt_id
+}
+
+async fn begin_and_answer_review(socket: &Path) -> String {
+    let attempt_id = begin_review(socket).await;
+    successful_review_result(
+        socket,
+        "answer-attempt",
+        Request::ReviewAttemptAnswer {
+            attempt_id: attempt_id.clone(),
+            response: ReviewAnswerInput::Text("Answer".into()),
+        },
+    )
+    .await;
+    attempt_id
+}
+
+fn review_attempt_result(result: ResponseResult) -> gnosis_core::protocol::LocalReviewAttemptView {
+    let ResponseResult::ReviewAttempt(attempt) = result else {
+        panic!("unexpected review attempt response");
+    };
+    attempt
+}
+
+fn manual_review_source() -> ReviewSourceInput {
+    ReviewSourceInput {
+        kind: ReviewSourceKindInput::Manual,
+        tags: Vec::new(),
+        exclude_tags: Vec::new(),
+        topic_node_id: None,
+        topic_forward_depth: None,
+        topic_backward_depth: None,
+        manual_ids: vec!["7".into()],
+    }
+}
+
 async fn wait_for_daemon(socket: &Path) {
     for attempt in 0..200 {
         let envelope = RequestEnvelope {
@@ -358,6 +866,84 @@ fn org_document(index: usize) -> String {
     format!(
         ":PROPERTIES:\n:ID: root-{index}\n:END:\n#+TITLE: Document {index}\n\nLink [[id:target-{index}]].\n"
     )
+}
+
+fn create_review_fixture(path: &Path) {
+    let connection = Connection::open(path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE themata (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                keimenon TEXT NOT NULL,
+                hypothesis TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                source_guid TEXT,
+                archived_at_us INTEGER
+            );
+            CREATE TABLE nodes (
+                id TEXT PRIMARY KEY,
+                file TEXT NOT NULL,
+                title TEXT NOT NULL,
+                level TEXT NOT NULL
+            );
+            CREATE TABLE node_tag (
+                node_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES nodes(id),
+                UNIQUE (node_id, tag)
+            );
+            CREATE TABLE review_state (
+                thema_id INTEGER PRIMARY KEY,
+                state_revision INTEGER NOT NULL,
+                review_count INTEGER NOT NULL,
+                legacy_review_count INTEGER NOT NULL,
+                legacy_unclassified_count INTEGER NOT NULL,
+                last_reviewed_at_us INTEGER,
+                last_review_day INTEGER,
+                next_review_day INTEGER NOT NULL,
+                interval_days INTEGER,
+                consecutive_successes INTEGER NOT NULL,
+                total_successes INTEGER NOT NULL,
+                consecutive_failures INTEGER NOT NULL,
+                total_failures INTEGER NOT NULL,
+                suspended INTEGER NOT NULL,
+                gnosis_plus REAL NOT NULL,
+                gnosis_minus REAL NOT NULL,
+                gnosis_synolon REAL NOT NULL,
+                FOREIGN KEY (thema_id) REFERENCES themata(id)
+            );
+            CREATE TABLE extras (
+                id INTEGER PRIMARY KEY,
+                parathema TEXT,
+                review_image TEXT,
+                FOREIGN KEY (id) REFERENCES themata(id)
+            );
+            CREATE TABLE thema_tag (
+                thema_id INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                UNIQUE (thema_id, tag),
+                FOREIGN KEY (thema_id) REFERENCES themata(id)
+            );
+            CREATE TABLE thema_links (
+                source TEXT,
+                dest TEXT,
+                UNIQUE (source, dest),
+                FOREIGN KEY (source) REFERENCES themata(id)
+            );
+            INSERT INTO themata VALUES (
+                7, '"basic"', '"Question"', 'nil', '("Answer")', NULL, NULL
+            );
+            INSERT INTO review_state VALUES (
+                7, 1, 0, 0, 0, NULL, NULL, 20260715, NULL,
+                0, 0, 0, 0, 0, 1.0, 1.0, 1.3
+            );
+            PRAGMA user_version = 9;
+            "#,
+        )
+        .unwrap();
 }
 
 fn deeply_nested_org() -> String {

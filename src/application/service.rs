@@ -721,6 +721,27 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn override_local_review_attempt(
+        &self,
+        attempt_id: String,
+        request_id: String,
+        request_sha256: String,
+        operated_at_us: u64,
+    ) -> Result<ReviewAttemptView, ServiceError> {
+        validate_local_review_replay(&request_id, &request_sha256, operated_at_us)?;
+        request(&self.sender, |response| {
+            StoreCommand::OverrideLocalReviewAttempt {
+                attempt_id,
+                request_id,
+                request_sha256,
+                operated_at_us,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn toggle_attempt_suspension(
         &self,
         attempt_id: String,
@@ -730,6 +751,27 @@ impl ServiceHandle {
             StoreCommand::ToggleAttemptSuspension {
                 attempt_id,
                 actor_device_id,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn toggle_local_attempt_suspension(
+        &self,
+        attempt_id: String,
+        request_id: String,
+        request_sha256: String,
+        operated_at_us: u64,
+    ) -> Result<ReviewAttemptView, ServiceError> {
+        validate_local_review_replay(&request_id, &request_sha256, operated_at_us)?;
+        request(&self.sender, |response| {
+            StoreCommand::ToggleLocalAttemptSuspension {
+                attempt_id,
+                request_id,
+                request_sha256,
+                operated_at_us,
                 response,
             }
         })
@@ -1302,9 +1344,23 @@ enum StoreCommand {
         actor_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
+    OverrideLocalReviewAttempt {
+        attempt_id: String,
+        request_id: String,
+        request_sha256: String,
+        operated_at_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
+    },
     ToggleAttemptSuspension {
         attempt_id: String,
         actor_device_id: Option<String>,
+        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
+    },
+    ToggleLocalAttemptSuspension {
+        attempt_id: String,
+        request_id: String,
+        request_sha256: String,
+        operated_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
     CommitReviewAttempt {
@@ -1859,6 +1915,22 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             response,
             store.override_review_attempt(&attempt_id, actor_device_id.as_deref()),
         ),
+        StoreCommand::OverrideLocalReviewAttempt {
+            attempt_id,
+            request_id,
+            request_sha256,
+            operated_at_us,
+            response,
+        } => send(
+            response,
+            store.override_local_review_attempt(
+                &attempt_id,
+                None,
+                &request_id,
+                &request_sha256,
+                operated_at_us,
+            ),
+        ),
         StoreCommand::ToggleAttemptSuspension {
             attempt_id,
             actor_device_id,
@@ -1866,6 +1938,22 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         } => send(
             response,
             store.toggle_attempt_suspension(&attempt_id, actor_device_id.as_deref()),
+        ),
+        StoreCommand::ToggleLocalAttemptSuspension {
+            attempt_id,
+            request_id,
+            request_sha256,
+            operated_at_us,
+            response,
+        } => send(
+            response,
+            store.toggle_local_attempt_suspension(
+                &attempt_id,
+                None,
+                &request_id,
+                &request_sha256,
+                operated_at_us,
+            ),
         ),
         StoreCommand::CommitReviewAttempt {
             attempt_id,
@@ -2048,6 +2136,8 @@ pub(crate) enum ServiceError {
     Corrupt,
     #[error("asset digest does not match its canonical path")]
     AssetDigest,
+    #[error("local review replay identity is invalid")]
+    InvalidReviewReplay,
     #[error("blob metadata is invalid")]
     InvalidBlobMetadata,
     #[error("blob operation failed")]
@@ -2062,6 +2152,22 @@ pub(crate) enum ServiceError {
     Settings(#[source] super::SettingsError),
     #[error("backup operation failed")]
     Backup(#[source] BackupError),
+}
+
+fn validate_local_review_replay(
+    request_id: &str,
+    request_sha256: &str,
+    operated_at_us: u64,
+) -> Result<(), ServiceError> {
+    let valid_digest = request_sha256.len() == 64
+        && request_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if request_id.is_empty() || request_id.len() > 128 || !valid_digest || operated_at_us == 0 {
+        Err(ServiceError::InvalidReviewReplay)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_blob_metadata(bytes: &[u8], media_type: &str) -> Result<(), ServiceError> {
@@ -2598,12 +2704,14 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE offline_asset_evidence;
+                "DROP TABLE local_review_replay;
+                 DROP TABLE offline_asset_evidence;
                  DROP TABLE offline_asset_result;
                  DROP TABLE offline_asset_operation;
                  DROP TABLE staged_blob;
                  DROP TABLE document_revision_asset;
                  DROP TABLE document_asset;
+                 DELETE FROM schema_migration WHERE version = 10;
                  DELETE FROM schema_migration WHERE version = 9;
                  DELETE FROM schema_migration WHERE version = 8;
                  PRAGMA user_version = 7;",

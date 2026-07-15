@@ -322,7 +322,8 @@ impl From<&Transition> for TransitionSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReviewAttemptView {
     pub(crate) attempt_id: String,
     pub(crate) session_id: String,

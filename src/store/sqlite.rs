@@ -46,7 +46,8 @@ const OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION: &str =
 const DOCUMENT_ASSET_INTEGRITY_MIGRATION: &str =
     include_str!("migrations/0008_document_asset_integrity.sql");
 const OFFLINE_ASSET_PUT_MIGRATION: &str = include_str!("migrations/0009_offline_asset_put.sql");
-const SCHEMA_VERSION: u32 = 9;
+const LOCAL_REVIEW_REPLAY_MIGRATION: &str = include_str!("migrations/0010_local_review_replay.sql");
+const SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -60,6 +61,8 @@ pub(crate) enum StoreError {
     StaleAttempt,
     #[error("review operation is invalid in the current state")]
     InvalidReviewState,
+    #[error("review response is invalid for the captured presentation")]
+    InvalidReviewResponse,
     #[error("review operation belongs to another device")]
     ReviewOwnership,
     #[error("operation identity was reused with a different payload")]
@@ -3252,6 +3255,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             .execute_batch(OFFLINE_ASSET_PUT_MIGRATION)
             .map_err(StoreError::storage)?;
     }
+    if found < 10 {
+        connection
+            .execute_batch(LOCAL_REVIEW_REPLAY_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
     Ok(())
 }
 
@@ -4818,7 +4826,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            9
+            10
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4826,7 +4834,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            9
+            10
         );
     }
 

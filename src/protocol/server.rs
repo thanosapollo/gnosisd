@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener, UnixStream},
@@ -22,10 +23,11 @@ use crate::{
         ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError, generate_device,
     },
     protocol::{
-        BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, DocumentView, DuePageView,
-        DueThemaView, ErrorCode, ImportResult, LegacyInfoView, MessageValidationError,
-        PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope, ResponseEnvelope,
-        ResponseResult, SystemInfo, ThemaView, frame,
+        ActiveReviewSessionView, BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView,
+        DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
+        LocalReviewAttemptView, LocalReviewSessionView, MessageValidationError, PROTOCOL_VERSION,
+        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult,
+        ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo, ThemaView, frame,
     },
     store::StoreError,
 };
@@ -216,6 +218,10 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
     if let Err(error) = request.validate() {
         return validation_response(id, error);
     }
+    let request_sha256 = match request_sha256(&request.request) {
+        Ok(value) => value,
+        Err(error) => return ResponseEnvelope::error(id, error),
+    };
     let result = match request.request {
         Request::SystemInfo {} => Ok(ResponseResult::SystemInfo(SystemInfo {
             protocol_version: PROTOCOL_VERSION,
@@ -232,6 +238,38 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
         Request::ReviewDuePage { day, limit, after } => {
             due_themata_page(state, day, limit, after).await
         }
+        Request::ReviewSessionCreate {
+            source,
+            target_count,
+        } => create_review_session(state, source, target_count).await,
+        Request::ReviewSessionActive {} => active_review_session(state).await,
+        Request::ReviewSessionResume { session_id } => {
+            resume_review_session(state, session_id).await
+        }
+        Request::ReviewSessionQuit { session_id } => {
+            stop_review_session(state, session_id, false).await
+        }
+        Request::ReviewSessionAbort { session_id } => {
+            stop_review_session(state, session_id, true).await
+        }
+        Request::ReviewAttemptBegin { session_id } => begin_review_attempt(state, session_id).await,
+        Request::ReviewAttemptAnswer {
+            attempt_id,
+            response,
+        } => answer_review_attempt(state, attempt_id, response).await,
+        Request::ReviewAttemptOverride { attempt_id } => {
+            override_review_attempt(state, attempt_id, id.clone(), request_sha256.clone()).await
+        }
+        Request::ReviewAttemptSuspensionToggle { attempt_id } => {
+            toggle_review_suspension(state, attempt_id, id.clone(), request_sha256.clone()).await
+        }
+        Request::ReviewAttemptCommit { attempt_id } => {
+            commit_review_attempt(state, attempt_id).await
+        }
+        Request::AssetChunk { .. } => Err(ProtocolError::new(
+            ErrorCode::MalformedRequest,
+            "asset chunk method unavailable",
+        )),
         Request::DeviceCreate { name, scopes } => create_device(state, name, scopes).await,
         Request::DeviceList {} => list_devices(state).await,
         Request::DeviceRevoke { device_id } => revoke_device(state, device_id).await,
@@ -311,6 +349,136 @@ async fn due_themata_page(
         None
     };
     Ok(ResponseResult::DuePage(DuePageView::new(themata, next)))
+}
+
+async fn create_review_session(
+    state: ServerState,
+    source: ReviewSourceInput,
+    target_count: Option<u32>,
+) -> Result<ResponseResult, ProtocolError> {
+    let source = source.try_into().map_err(|_| invalid_review())?;
+    let session = state
+        .store
+        .create_review_session(source, target_count, None, review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewSession(LocalReviewSessionView::from(
+        session,
+    )))
+}
+
+async fn active_review_session(state: ServerState) -> Result<ResponseResult, ProtocolError> {
+    let session = state
+        .store
+        .active_review_session(None)
+        .await
+        .map_err(actor_error)?
+        .map(LocalReviewSessionView::from);
+    Ok(ResponseResult::ActiveReviewSession(
+        ActiveReviewSessionView { session },
+    ))
+}
+
+async fn resume_review_session(
+    state: ServerState,
+    session_id: String,
+) -> Result<ResponseResult, ProtocolError> {
+    let session = state
+        .store
+        .resume_review_session(session_id, None)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewSession(LocalReviewSessionView::from(
+        session,
+    )))
+}
+
+async fn stop_review_session(
+    state: ServerState,
+    session_id: String,
+    abort: bool,
+) -> Result<ResponseResult, ProtocolError> {
+    let session = state
+        .store
+        .stop_review_session(session_id, None, abort, review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewSession(LocalReviewSessionView::from(
+        session,
+    )))
+}
+
+async fn begin_review_attempt(
+    state: ServerState,
+    session_id: String,
+) -> Result<ResponseResult, ProtocolError> {
+    let attempt = state
+        .store
+        .begin_review_attempt(session_id, None, review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
+        attempt,
+    )))
+}
+
+async fn answer_review_attempt(
+    state: ServerState,
+    attempt_id: String,
+    response: ReviewAnswerInput,
+) -> Result<ResponseResult, ProtocolError> {
+    let attempt = state
+        .store
+        .grade_review_attempt(attempt_id, None, response.into(), review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
+        attempt,
+    )))
+}
+
+async fn override_review_attempt(
+    state: ServerState,
+    attempt_id: String,
+    request_id: String,
+    request_sha256: String,
+) -> Result<ResponseResult, ProtocolError> {
+    let attempt = state
+        .store
+        .override_local_review_attempt(attempt_id, request_id, request_sha256, review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
+        attempt,
+    )))
+}
+
+async fn toggle_review_suspension(
+    state: ServerState,
+    attempt_id: String,
+    request_id: String,
+    request_sha256: String,
+) -> Result<ResponseResult, ProtocolError> {
+    let attempt = state
+        .store
+        .toggle_local_attempt_suspension(attempt_id, request_id, request_sha256, review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
+        attempt,
+    )))
+}
+
+async fn commit_review_attempt(
+    state: ServerState,
+    attempt_id: String,
+) -> Result<ResponseResult, ProtocolError> {
+    let event_id = state
+        .store
+        .commit_review_attempt(attempt_id, None, review_now_us()?)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewEvent(ReviewEventView { event_id }))
 }
 
 async fn import_document(
@@ -506,6 +674,15 @@ fn now_us() -> Result<i64, ProtocolError> {
     i64::try_from(micros).map_err(|_| internal_error())
 }
 
+fn review_now_us() -> Result<u64, ProtocolError> {
+    u64::try_from(now_us()?).map_err(|_| internal_error())
+}
+
+fn request_sha256(request: &Request) -> Result<String, ProtocolError> {
+    let bytes = serde_json::to_vec(request).map_err(|_| internal_error())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn malformed_admin() -> ProtocolError {
     ProtocolError::new(ErrorCode::MalformedRequest, "invalid device operation")
 }
@@ -518,6 +695,12 @@ fn validation_response(id: String, error: MessageValidationError) -> ResponseEnv
         ),
         MessageValidationError::InvalidRequestId => {
             ProtocolError::new(ErrorCode::MalformedRequest, "invalid request ID")
+        }
+        MessageValidationError::InvalidReviewRequest => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid review request")
+        }
+        MessageValidationError::InvalidAssetChunk => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid asset chunk request")
         }
     };
     ResponseEnvelope::error(id, error)
@@ -546,6 +729,10 @@ fn invalid_legacy_query(_error: LegacyQueryError) -> ProtocolError {
     ProtocolError::new(ErrorCode::MalformedRequest, "invalid legacy query")
 }
 
+fn invalid_review() -> ProtocolError {
+    ProtocolError::new(ErrorCode::MalformedRequest, "invalid review request")
+}
+
 fn internal_error() -> ProtocolError {
     ProtocolError::new(ErrorCode::Internal, "internal daemon failure")
 }
@@ -562,6 +749,20 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         ServiceError::Store(StoreError::NotFound) => {
             ProtocolError::new(ErrorCode::NotFound, "resource not found")
         }
+        ServiceError::Store(StoreError::InvalidReviewResponse) => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid review response")
+        }
+        ServiceError::InvalidReviewReplay => ProtocolError::new(
+            ErrorCode::MalformedRequest,
+            "invalid review replay identity",
+        ),
+        ServiceError::Store(
+            StoreError::ActiveReviewSession
+            | StoreError::StaleAttempt
+            | StoreError::InvalidReviewState
+            | StoreError::ReviewOwnership
+            | StoreError::IdempotencyConflict,
+        ) => ProtocolError::new(ErrorCode::Conflict, "review state conflict"),
         ServiceError::Stopped
         | ServiceError::Corrupt
         | ServiceError::AssetDigest
