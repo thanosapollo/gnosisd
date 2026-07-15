@@ -4654,8 +4654,8 @@ mod tests {
 
     use super::{
         FailPoint, INITIAL_MIGRATION, OFFLINE_CONTENT_MIGRATION, OFFLINE_REVIEW_MIGRATION,
-        REMOTE_REVIEW_MIGRATION, REPLICA_SYNC_MIGRATION, SERVER_MIGRATION, SqliteStore, StoreError,
-        migrate, schema_version,
+        REMOTE_REVIEW_MIGRATION, REPLICA_SYNC_MIGRATION, SCHEMA_VERSION, SERVER_MIGRATION,
+        SqliteStore, StoreError, migrate, schema_version,
     };
     use crate::application::{
         AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentMutation,
@@ -4826,7 +4826,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            10
+            SCHEMA_VERSION
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4834,7 +4834,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            10
+            SCHEMA_VERSION
         );
     }
 
@@ -4847,7 +4847,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
@@ -5037,7 +5037,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 9);
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
         let floor: i64 = connection
             .query_row(
                 "SELECT retained_after_cursor FROM sync_feed_state",
@@ -5332,7 +5332,7 @@ mod tests {
             .unwrap();
 
         migrate(&store.connection).unwrap();
-        assert_eq!(schema_version(&store.connection).unwrap(), 9);
+        assert_eq!(schema_version(&store.connection).unwrap(), SCHEMA_VERSION);
         let violations: i64 = store
             .connection
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
