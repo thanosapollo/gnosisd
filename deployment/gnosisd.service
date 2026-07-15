@@ -1,0 +1,27 @@
+[Unit]
+Description=Gnosis single-user server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=GNOSIS_HTTP_LISTEN=127.0.0.1:7842
+EnvironmentFile=-%h/.config/gnosis/server.env
+ExecStart=%h/.nix-profile/bin/gnosisd --socket %t/gnosis/gnosis.sock --database %h/.local/share/gnosis/gnosis.sqlite --blob-root %h/.local/share/gnosis/blobs --http-listen ${GNOSIS_HTTP_LISTEN}
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=gnosis
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/gnosis %t/gnosis
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

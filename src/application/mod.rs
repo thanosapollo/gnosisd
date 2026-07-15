@@ -13,7 +13,7 @@ pub(crate) use auth::{
     stored_scopes, token_digest,
 };
 pub(crate) use backup::{
-    BackupError, BackupSummary, create_backup, validate_restore, verify_backup,
+    BackupError, BackupSummary, create_backup, prune_backups, validate_restore, verify_backup,
 };
 pub(crate) use content::{
     AssetHead, ContentChange, DocumentHead, DocumentRevision, NodeRecord, PreparedAsset,

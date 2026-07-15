@@ -1,106 +1,144 @@
 #+title: Gnosis Core
 
-Gnosis Core is the source of truth for Gnosis knowledge and learning data.  It
+Gnosis Core is the source of truth for Gnosis knowledge and learning data. It
 serves the ~gnosis~ Emacs frontend, command-line, and future clients through a
-versioned local protocol.  The Emacs package keeps its established UI and is
-not a separate product named emacs-gnosis.
+local administration protocol and an authenticated HTTP API.
 
 * Ownership and trust boundary
 
-~gnosisd~ is the only process that opens the database. Every client, including
-the ~gnosis~ diagnostic program, uses the socket protocol and never sends SQL.
-The daemon is local-only and single-user. It creates its socket with mode
-~0600~ and enforces mode ~0600~ on SQLite. The protocol does not provide
-authentication and must not be exposed as a remote transport.
+~gnosisd~ is the only process that opens the database. Clients use the Unix
+socket or HTTP API and never send SQL. The daemon is single-user and creates
+its socket and SQLite database with mode ~0600~. HTTP binds only to loopback by default. Remote access belongs behind a
+trusted authenticated proxy or private network boundary.
 
-One dedicated thread owns the only SQLite connection. Reads and writes pass
-through one bounded queue, and every projection replacement is one short
-transaction. A stale expected revision fails before any rows change. The Tokio
-tasks that serve sockets never own a connection, transaction, or database lock.
+Every ~/v1~ data endpoint requires a per-device bearer token. Tokens carry
+~read~, ~review~, ~content:write~, ~settings:write~, or ~admin~ scopes. Secrets
+are returned once and SQLite stores only their SHA-256 digests. Device and
+backup administration remains local-socket-only.
+
+One dedicated thread owns the SQLite connection. Reads and writes pass through
+one bounded queue. No transaction, blocking guard, or connection crosses an
+async suspension point. Accepted writes complete even if the client leaves.
 
 The default bounds are:
 
-- 1 MiB request and response frames;
+- 1 MiB frames and HTTP request bodies;
 - 128-byte request IDs;
-- 32 simultaneous connections;
-- one in-flight request per connection;
-- eight queued database operations.
+- 32 simultaneous Unix connections;
+- eight queued database operations;
+- 64 concurrent HTTP requests with 30-second timeouts.
 
-* Running the daemon and client
-
-Enter the pinned development environment for Rust, Cargo, rustfmt, Clippy, and
-rust-analyzer:
+* Build and run
 
 #+begin_src sh
 nix develop
-#+end_src
-
-Build the release package without entering the development shell:
-
-#+begin_src sh
-nix build
-#+end_src
-
-Start the daemon with explicit local paths:
-
-#+begin_src sh
 cargo run --bin gnosisd -- \
-  --socket "$XDG_RUNTIME_DIR/gnosis.sock" \
-  --database "$HOME/.local/share/gnosis/gnosis.sqlite"
+  --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
+  --blob-root "$HOME/.local/share/gnosis/blobs" \
+  --http-listen 127.0.0.1:7842
 #+end_src
 
-Exercise protocol version 1 through the diagnostic client:
+The diagnostic client uses protocol version 1:
 
 #+begin_src sh
-cargo run --bin gnosis -- --socket "$XDG_RUNTIME_DIR/gnosis.sock" system-info
-printf '#+TITLE: Example\n' | cargo run --bin gnosis -- \
-  --socket "$XDG_RUNTIME_DIR/gnosis.sock" import-org example
-cargo run --bin gnosis -- \
-  --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-document example
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" legacy-info
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" due-themata 20260714 --limit 20
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" due-page 20260714 --limit 100
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis.sock" get-thema THEMA_ID
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" legacy-info
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  device-create phone --scope read --scope review
 #+end_src
 
-Use ~--if-revision N~ with ~import-org~ for conflict detection. Omitting it
-allows an unconditional create or replacement. Identical content is an
-idempotent no-op and keeps its revision.
+The Unix message format is a four-byte big-endian length followed by UTF-8
+JSON. It provides local diagnostics, legacy read compatibility, device token
+administration, and online backup commands. Stable errors never expose SQL,
+paths, dependency failures, or backtraces.
 
-* Protocol
+* HTTP API
 
-Each message is a four-byte big-endian length followed by a UTF-8 JSON object.
-Every request carries protocol version ~1~, an opaque request ID, and one typed
-method:
+The ~/v1~ API provides:
 
-- ~system.info~
-- ~document.import~
-- ~document.get~
-- ~legacy.info~
-- ~thema.get~
-- ~review.due~
-- ~review.due_page~
+- optimistic thema create, search, update, archive, and unarchive;
+- revisioned Org documents, renames, tombstones, and historical retrieval;
+- content-addressed managed assets;
+- durable change cursors and cursor-only SSE announcements;
+- node search and paged inbound and outbound graph links;
+- revisioned canonical review settings;
+- one active resumable review session with a persisted ordered queue;
+- captured attempts, grading, override, suspension, and idempotent atomic
+  commit.
 
-The application protocol exposes opaque string document and node IDs. SQLite
-row identifiers, SQL, paths, dependency errors, and backtraces never enter a
-response. Stable error codes distinguish malformed requests, unsupported
-versions, invalid documents, missing documents, revision conflicts, overload,
-and internal failure.
+Mutations use ~If-Match~. A stale revision returns ~412~ with the current
+revision and leaves server state unchanged. The first attempt response hides
+the answer. Grading returns the detected result, revealed answer, matcher
+version, and proposed transition.
 
-* Domain and Org projection
+The checked OpenAPI 3.1 document is available at ~/v1/openapi.json~. CORS is
+disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted network
+boundary.
 
-The domain has no SQLite, async runtime, JSON, socket, filesystem, or orgize
-types. ~LinkOccurrence~ records ordered textual occurrences and half-open UTF-8
-byte ranges. ~NodeEdge~ records the unique semantic source-to-target relation.
-~ThemaConcept~ separately records a learning association as ~Primary~,
-~Supporting~, or ~Reference~.
+* Storage
 
-The parser preserves the selected live Gnosis compatibility contract for file
-and heading IDs, inherited tags, indexed ancestors, hierarchical title paths,
-link ownership, unresolved targets, and the SHA-1 compatibility digest. New
-content identity uses SHA-256. Run the shared-semantic parity checks with:
+Schema v3 stores native themata, tags, node associations, scheduling state,
+exact review history, sessions, attempts, devices, settings, documents, and
+the node graph. Public IDs are opaque text. Imported numeric thema IDs are
+retained and new resources use UUIDv7.
+
+Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
+tracks logical paths, heads, revisions, renames, tombstones, and the monotonic
+change cursor. Paths are relative and case-unique. Only Org files and supported
+files below ~assets/<sha256>/<original-name>~ enter the canonical tree.
+
+Accepted Org revisions are parsed and indexed in the same transaction that
+moves the document head. Invalid Org cannot change the head or node graph.
+Removed nodes remain queryable as inactive historical nodes.
+
+The domain layer contains no SQLite, Tokio, JSON, socket, filesystem, orgize,
+clock, or randomness types. Textual link occurrences, unique semantic graph
+edges, and thema-to-node learning associations remain distinct.
+
+* Legacy cutover
+
+Close the legacy Emacs database before the final snapshot. Import schema v9
+and the Notes tree into new staging targets:
 
 #+begin_src sh
+DATA_DIR="$HOME/.local/share/gnosis"
+LEGACY_DB=/path/to/legacy/gnosis.db
+NOTES_ROOT=/path/to/notes
+gnosisd \
+  --database "$DATA_DIR/gnosis.sqlite" \
+  --blob-root "$DATA_DIR/blobs" \
+  --notes-root "$NOTES_ROOT" \
+  --migrate-legacy "$LEGACY_DB"
+#+end_src
+
+The importer refuses existing targets, active Emacs leases, symlinks, path
+escapes, unsupported files, case collisions, malformed Org, and malformed
+legacy values. It reads the source without modifying or embedding it, records
+its SHA-256 and mtime, validates table counts, integrity, and foreign keys, then
+publishes through a recoverable protocol with the database as the final commit
+point.
+
+In-tree assets are normalized into the shared asset model and managed Org and
+thema references are rewritten. External URLs remain external. Local links
+outside the imported Notes root are rejected.
+
+* Reviews and settings
+
+Matcher version 1 preserves current case, whitespace, quote, and Levenshtein
+behavior for basic and cloze themata. Multiple-choice variants require one
+exact captured choice. Scheduler version 1 is a pure Rust transition with
+captured server time, timezone, day boundary, resolved tag rules, and replayable
+interval fuzz.
+
+Canonical timezone, day boundary, and tag rules are revisioned settings.
+Existing sessions keep their captured settings when canonical settings change.
+
+Check live Elisp parity read-only:
+
+#+begin_src sh
+export GNOSIS_ELISP_DIR=/path/to/gnosis
+tools/check-review-parity.sh
 tools/check-org-parity.sh tests/fixtures/org/basic.org
 tools/check-org-parity.sh tests/fixtures/org/no-file-id.org
 tools/check-org-parity.sh tests/fixtures/org/duplicate-links.org
@@ -108,57 +146,33 @@ tools/check-org-parity.sh tests/fixtures/org/unicode.org
 tools/check-org-parity.sh tests/fixtures/org/compatibility.org
 #+end_src
 
-Two checked-domain corrections are deliberate. The current Elisp aggregate
-function errors on an unowned top-level link when no file ID exists; Rust
-ignores that unowned link. Current Elisp also emits an ID-bearing heading with a
-blank title; Rust rejects it. Byte spans and SHA-256 are Rust-only fields.
+* Backups
 
-* Database and backups
-
-The database path is supplied to ~gnosisd~.  The deployed Gnosis instance uses
-=~/.local/share/gnosis/gnosis.sqlite= with its socket at
-=${XDG_RUNTIME_DIR}/gnosis/gnosis.sock=.
-Foreign keys and strict tables protect projections, link occurrences, semantic
-edges, themata, and thema-to-concept associations. Stop the daemon cleanly
-with SIGINT or SIGTERM before copying the database for backup. Online backup
-and restore commands are not part of this slice. Startup uses an atomic
-~SOCKET.startup-lock~ directory while checking and replacing a stale socket. If
-a process is killed during that short startup window, inspect and remove the
-abandoned lock directory before restarting.
-
-** Legacy Emacs snapshot
-
-Close Emacs before taking the final migration snapshot, then create a fresh
-daemon database without changing the source database:
+Online backup runs through the database owner and includes a consistent SQLite
+snapshot, every referenced blob, and a SHA-256 manifest:
 
 #+begin_src sh
-gnosisd \
-  --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
-  --migrate-legacy "$HOME/.config/emacs/gnosis/gnosis.db"
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  admin backup create --directory "$HOME/.local/share/gnosis/backups"
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  admin backup verify BACKUP_PATH
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 14
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  admin backup restore-validate BACKUP_PATH \
+  --temporary-directory "$HOME/.local/share/gnosis/restore-check"
 #+end_src
 
-The offline migration accepts schema-v9 databases, refuses an existing target
-or active Emacs lease, and publishes only after SQLite integrity, foreign-key,
-and row-count checks pass. All legacy tables and rows are preserved. The
-conflicting legacy ~node_tag~ table is stored as ~legacy_node_tag~ while the new
-document projection schema is added alongside it.
+Restore validation materializes and checks a temporary instance without
+replacing the live server.
 
-The daemon exposes the imported snapshot read-only. ~legacy-info~ reports its
-source and row counts, and ~get-thema~ returns one thema with its extras, tags,
-links, and complete review state. ~due-themata~ keeps the original bounded
-queue interface. ~due-page~ returns ~items~ plus an opaque ~next~ cursor so a
-frontend can read the complete queue in deterministic order. Pass that value
-back with ~--after CURSOR~ until ~next~ is null. Hypothesis arrays preserve
-absent legacy hints as JSON null values. The Emacs frontend calls these methods
-through ~gnosis-core.el~ without changing its established buffers or keymaps.
-Review answers remain on the legacy compatibility path until the daemon
-exposes one atomic review command.
+* Scope
 
-* Current exclusions
+This remains a single-user canonical server. multi-server synchronization, Markdown, embeddings, client filesystem
+watching, Emacs client migration, and mobile development remain out of scope.
 
-This foundation does not yet write legacy scheduling or review history, expose
-TCP, add authentication or TLS, discover or watch files, support Markdown,
-compute embeddings, or synchronize multiple daemons.
+Service installation and migration are covered in
+[[file:docs/deployment.org][docs/deployment.org]].
 
 * Validation
 
@@ -169,6 +183,8 @@ cargo check --all-targets
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo tree --depth 1
+nix build
 #+end_src
 
 The project is licensed under GPL-3.0-or-later. See [[file:LICENSE][LICENSE]].

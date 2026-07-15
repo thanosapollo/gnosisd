@@ -1,0 +1,20 @@
+[Unit]
+Description=Create and retain Gnosis backups
+After=gnosisd.service
+Requires=gnosisd.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=%h/.nix-profile/bin/gnosis --socket %t/gnosis/gnosis.sock admin backup create --directory %h/.local/share/gnosis/backups
+ExecStartPost=%h/.nix-profile/bin/gnosis --socket %t/gnosis/gnosis.sock admin backup prune --directory %h/.local/share/gnosis/backups --keep 14
+TimeoutStartSec=30m
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/gnosis/backups %t/gnosis
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native

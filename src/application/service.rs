@@ -16,8 +16,8 @@ use super::{
     DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, NewDevice,
     NodeRecord, PreparedAsset, PreparedImport, PreparedNote, PreparedThema, QueryDueThemata,
     QueryDueThemataPage, ReviewAttemptView, ReviewSessionView, ReviewSource, SettingsInput,
-    SettingsRecord, ThemaRecord, create_backup, persist_import, token_digest, validate_restore,
-    verify_backup,
+    SettingsRecord, ThemaRecord, create_backup, persist_import, prune_backups, token_digest,
+    validate_restore, verify_backup,
 };
 use crate::{
     blob::{BlobError, BlobStore},
@@ -621,6 +621,20 @@ impl ServiceHandle {
         .map_err(ServiceError::Backup)
     }
 
+    pub(crate) async fn prune_backups(
+        &self,
+        directory: PathBuf,
+        keep: u16,
+    ) -> Result<Vec<PathBuf>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::PruneBackups {
+            directory,
+            keep,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Backup)
+    }
+
     pub(crate) async fn validate_restore(
         &self,
         backup: PathBuf,
@@ -934,6 +948,11 @@ enum StoreCommand {
     VerifyBackup {
         path: PathBuf,
         response: oneshot::Sender<Result<BackupSummary, BackupError>>,
+    },
+    PruneBackups {
+        directory: PathBuf,
+        keep: u16,
+        response: oneshot::Sender<Result<Vec<PathBuf>, BackupError>>,
     },
     ValidateRestore {
         backup: PathBuf,
@@ -1260,6 +1279,11 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
             create_backup(store, &blobs, &destination, created_at_us),
         ),
         StoreCommand::VerifyBackup { path, response } => send(response, verify_backup(&path)),
+        StoreCommand::PruneBackups {
+            directory,
+            keep,
+            response,
+        } => send(response, prune_backups(&directory, keep)),
         StoreCommand::ValidateRestore {
             backup,
             temporary,
@@ -1380,6 +1404,59 @@ mod tests {
             .await
             .unwrap();
         assert!(!restore.exists());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_pruning_keeps_the_newest_verified_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let backups = directory.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let names = [
+            "gnosis-20260713T010000Z",
+            "gnosis-20260714T010000Z",
+            "gnosis-20260715T010000Z",
+        ];
+        for (index, name) in names.iter().enumerate() {
+            service
+                .create_backup(backups.join(name), index as u64)
+                .await
+                .unwrap();
+        }
+
+        let removed = service.prune_backups(backups.clone(), 2).await.unwrap();
+
+        assert_eq!(removed, vec![backups.join(names[0])]);
+        assert!(!backups.join(names[0]).exists());
+        assert!(backups.join(names[1]).exists());
+        assert!(backups.join(names[2]).exists());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_pruning_removes_old_corruption_and_ignores_unrelated_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let backups = directory.path().join("backups");
+        std::fs::create_dir(&backups).unwrap();
+        let corrupt = backups.join("gnosis-20260713T010000Z");
+        std::fs::create_dir(&corrupt).unwrap();
+        std::fs::write(corrupt.join("manifest.json"), b"corrupt").unwrap();
+        let unrelated = backups.join("manual-copy");
+        std::fs::create_dir(&unrelated).unwrap();
+        let newest = backups.join("gnosis-20260715T010000Z");
+        service.create_backup(newest.clone(), 10).await.unwrap();
+
+        let removed = service.prune_backups(backups, 1).await.unwrap();
+
+        assert_eq!(removed, vec![corrupt]);
+        assert!(newest.exists());
+        assert!(unrelated.exists());
         drop(service);
         runtime.finish().await.unwrap();
     }

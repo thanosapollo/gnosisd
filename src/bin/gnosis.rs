@@ -81,6 +81,12 @@ enum BackupCommand {
     Verify {
         path: PathBuf,
     },
+    Prune {
+        #[arg(long, value_name = "PATH")]
+        directory: PathBuf,
+        #[arg(long, default_value_t = 14)]
+        keep: u16,
+    },
     RestoreValidate {
         path: PathBuf,
         #[arg(long, value_name = "PATH")]
@@ -167,6 +173,10 @@ fn admin_request(command: AdminCommand) -> Result<Request, CliError> {
             BackupCommand::Verify { path } => Ok(Request::BackupVerify {
                 path: utf8_path(path)?,
             }),
+            BackupCommand::Prune { directory, keep } => Ok(Request::BackupPrune {
+                directory: utf8_path(directory)?,
+                keep,
+            }),
             BackupCommand::RestoreValidate {
                 path,
                 temporary_directory,
@@ -218,6 +228,7 @@ fn write_result(result: &ResponseResult) -> Result<(), CliError> {
         ResponseResult::Devices(value) => write_json(value),
         ResponseResult::Device(value) => write_json(value),
         ResponseResult::Backup(value) => write_json(value),
+        ResponseResult::BackupsPruned(value) => write_json(value),
     }
 }
 

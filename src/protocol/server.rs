@@ -22,10 +22,10 @@ use crate::{
         ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError, generate_device,
     },
     protocol::{
-        BackupView, DeviceCreatedView, DeviceView, DocumentView, DuePageView, DueThemaView,
-        ErrorCode, ImportResult, LegacyInfoView, MessageValidationError, PROTOCOL_VERSION,
-        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo,
-        ThemaView, frame,
+        BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, DocumentView, DuePageView,
+        DueThemaView, ErrorCode, ImportResult, LegacyInfoView, MessageValidationError,
+        PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope, ResponseEnvelope,
+        ResponseResult, SystemInfo, ThemaView, frame,
     },
     store::StoreError,
 };
@@ -237,6 +237,7 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
         Request::DeviceRevoke { device_id } => revoke_device(state, device_id).await,
         Request::BackupCreate { destination } => create_backup(state, destination).await,
         Request::BackupVerify { path } => verify_backup(state, path).await,
+        Request::BackupPrune { directory, keep } => prune_backups(state, directory, keep).await,
         Request::BackupRestoreValidate {
             path,
             temporary_directory,
@@ -444,6 +445,31 @@ async fn verify_backup(state: ServerState, path: String) -> Result<ResponseResul
         .await
         .map_err(actor_error)?;
     Ok(ResponseResult::Backup(BackupView::from(summary)))
+}
+
+async fn prune_backups(
+    state: ServerState,
+    directory: String,
+    keep: u16,
+) -> Result<ResponseResult, ProtocolError> {
+    require_path(&directory)?;
+    if keep == 0 {
+        return Err(ProtocolError::new(
+            ErrorCode::MalformedRequest,
+            "backup retention must be positive",
+        ));
+    }
+    let removed = state
+        .store
+        .prune_backups(directory.into(), keep)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::BackupsPruned(BackupsPrunedView {
+        removed: removed
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+    }))
 }
 
 async fn validate_restore(

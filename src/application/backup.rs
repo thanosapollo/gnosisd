@@ -137,6 +137,39 @@ pub(crate) fn validate_restore(
     Ok(summary)
 }
 
+pub(crate) fn prune_backups(directory: &Path, keep: u16) -> Result<Vec<PathBuf>, BackupError> {
+    require_directory(directory)?;
+    if keep == 0 {
+        return Err(BackupError::Destination);
+    }
+    let mut backups = fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    backups.retain(|path| is_managed_backup(path));
+    backups.sort();
+    let remove = backups.len().saturating_sub(usize::from(keep));
+    let removed = backups.into_iter().take(remove).collect::<Vec<_>>();
+    for backup in &removed {
+        require_directory(backup)?;
+        fs::remove_dir_all(backup)?;
+    }
+    File::open(directory)?.sync_all()?;
+    Ok(removed)
+}
+
+fn is_managed_backup(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    bytes.len() == 23
+        && bytes.starts_with(b"gnosis-")
+        && bytes[7..15].iter().all(u8::is_ascii_digit)
+        && bytes[15] == b'T'
+        && bytes[16..22].iter().all(u8::is_ascii_digit)
+        && bytes[22] == b'Z'
+}
+
 fn materialize_restore(backup: &Path, temporary: &Path) -> Result<(), BackupError> {
     fs::copy(backup.join(DATABASE_FILE), temporary.join(DATABASE_FILE))?;
     fs::set_permissions(

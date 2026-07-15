@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Gnosis backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=20m
+Unit=gnosis-backup.service
+
+[Install]
+WantedBy=timers.target

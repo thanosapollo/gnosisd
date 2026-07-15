@@ -65,6 +65,8 @@ pub enum Request {
     BackupCreate { destination: String },
     #[serde(rename = "admin.backup_verify")]
     BackupVerify { path: String },
+    #[serde(rename = "admin.backup_prune")]
+    BackupPrune { directory: String, keep: u16 },
     #[serde(rename = "admin.backup_restore_validate")]
     BackupRestoreValidate {
         path: String,
@@ -121,6 +123,12 @@ pub enum ResponseResult {
     Devices(Vec<DeviceView>),
     Device(DeviceView),
     Backup(BackupView),
+    BackupsPruned(BackupsPrunedView),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackupsPrunedView {
+    pub removed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
