@@ -49,7 +49,8 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 #+end_src
 
 The Unix message format is a four-byte big-endian length followed by UTF-8
-JSON. It provides local diagnostics, legacy read compatibility, device token
+JSON. It provides local diagnostics, legacy read compatibility, online review
+sessions and attempts, bounded managed-asset reads, device token
 administration, and online backup commands. Stable errors never expose SQL,
 paths, dependency failures, or backtraces.
 

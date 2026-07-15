@@ -33,6 +33,11 @@ directly.
   writes use immutable attempts and events plus atomic scheduling transitions.
 - `src/protocol` owns the versioned wire DTOs, framing, Unix-socket server, and
   client. Public fields use opaque string IDs, never SQLite row IDs.
+- Local online review DTOs remain in `src/protocol`, validation and orchestration
+  remain in `src/application`, and persistence remains in `src/store`. The
+  daemon owns grading, scheduling transitions, session progress, suspension,
+  daily totals, and immutable review events. Do not move that authority into a
+  frontend.
 - Replica bootstrap uses a device-bound immutable snapshot manifest captured at
   one content cursor. Cursorless retries reuse a resumable manifest. Clients
   must install every page atomically before promoting the terminal delta cursor.
@@ -61,8 +66,8 @@ Socket startup uses an atomic `.startup-lock` directory to serialize stale
 cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
 SIGTERM both enter graceful shutdown.
 
-Online reviews and device-bound offline review packs reconcile
-through immutable operations. The daemon remains authoritative, conflicts stay
+Online reviews and device-bound offline review packs reconcile through
+immutable operations. The daemon remains authoritative, conflicts stay
 explicit, and review or content state must never use last-write-wins.
 Offline review v1 submissions remain accepted; v2 pack and result envelopes
 return durable replica cursors.
