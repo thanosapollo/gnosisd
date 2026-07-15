@@ -27,6 +27,7 @@ pub(crate) struct PreparedNote {
     pub(crate) path_key: String,
     pub(crate) org: String,
     pub(crate) blob_sha256: String,
+    pub(crate) asset_paths: Vec<String>,
     pub(crate) projection: DocumentProjection,
     pub(crate) expected_revision: Option<u64>,
 }
@@ -351,6 +352,32 @@ fn validate_thema_references(
     Ok(())
 }
 
+pub(crate) fn validate_offline_thema_assets(content: &ThemaContent) -> Result<(), ContentError> {
+    let text = std::iter::once(content.keimenon.as_str())
+        .chain(content.hypothesis.iter().filter_map(Option::as_deref))
+        .chain(content.answer.iter().map(String::as_str))
+        .chain(content.parathema.as_deref());
+    for value in text {
+        for expression in file_link_expressions() {
+            for captures in expression.captures_iter(value) {
+                let target = captures.get(1).ok_or(ContentError::Path)?.as_str();
+                let target = target.split("::").next().ok_or(ContentError::Path)?;
+                if external_reference(target) {
+                    return Err(ContentError::UnmanagedAsset);
+                }
+            }
+        }
+    }
+    if content
+        .review_image
+        .as_deref()
+        .is_some_and(external_reference)
+    {
+        return Err(ContentError::UnmanagedAsset);
+    }
+    Ok(())
+}
+
 fn validate_thema_asset_reference(
     reference: &str,
     asset_paths: &[String],
@@ -418,7 +445,7 @@ pub(crate) fn prepare_note(
     expected_revision: Option<u64>,
 ) -> Result<PreparedNote, ContentError> {
     validate_org_path(&logical_path)?;
-    validate_file_links(&logical_path, &org)?;
+    let asset_paths = asset_paths_in_org(&org)?;
     let projection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_org(&org)))
         .map_err(|_| ContentError::OrgParser)?
         .map_err(ContentError::Org)?;
@@ -429,6 +456,7 @@ pub(crate) fn prepare_note(
         blob_sha256: format!("{:x}", Sha256::digest(org.as_bytes())),
         logical_path,
         org,
+        asset_paths,
         projection,
         expected_revision,
     })
@@ -490,16 +518,35 @@ pub(crate) fn path_key(value: &str) -> String {
     value.to_lowercase()
 }
 
-fn validate_file_links(document_path: &str, org: &str) -> Result<(), ContentError> {
-    let _ = document_path;
+pub(crate) fn asset_paths_in_org(org: &str) -> Result<Vec<String>, ContentError> {
+    let mut assets = BTreeSet::new();
     for expression in file_link_expressions() {
         for captures in expression.captures_iter(org) {
             let target = captures.get(1).ok_or(ContentError::Path)?.as_str();
             let target = target.split("::").next().ok_or(ContentError::Path)?;
             validate_reference(target)?;
+            if target.starts_with("assets/") {
+                assets.insert(target.to_owned());
+            }
         }
     }
-    Ok(())
+    Ok(assets.into_iter().collect())
+}
+
+pub(crate) fn retained_asset_paths_in_org(org: &str) -> Vec<String> {
+    let mut assets = BTreeSet::new();
+    for expression in file_link_expressions() {
+        for captures in expression.captures_iter(org) {
+            let Some(target) = captures.get(1).map(|value| value.as_str()) else {
+                continue;
+            };
+            let target = target.split("::").next().unwrap_or(target);
+            if target.starts_with("assets/") && validate_asset_path(target).is_ok() {
+                assets.insert(target.to_owned());
+            }
+        }
+    }
+    assets.into_iter().collect()
 }
 
 pub(crate) fn file_link_expressions() -> [&'static Regex; 2] {
@@ -587,7 +634,26 @@ mod tests {
         let org = format!("#+TITLE: Test\n[[file:other.org]]\n[[file:{asset}]]\n");
         let note = prepare_note(None, "notes/test.org".into(), org, None).unwrap();
         assert_eq!(note.logical_path, "notes/test.org");
+        assert_eq!(note.asset_paths.as_slice(), std::slice::from_ref(&asset));
         assert!(validate_asset_path(&asset).is_ok());
+    }
+
+    #[test]
+    fn note_asset_paths_are_unique_and_strip_link_searches() {
+        let asset = canonical_asset_path(&"a".repeat(64), "image.png").unwrap();
+        let org = format!("#+title: Test\n[[file:{asset}::target]]\nfile:{asset}\n");
+        let note = prepare_note(None, "note.org".into(), org, None).unwrap();
+        assert_eq!(note.asset_paths, [asset]);
+    }
+
+    #[test]
+    fn retained_asset_paths_ignore_legacy_local_links() {
+        let asset = canonical_asset_path(&"a".repeat(64), "image.png").unwrap();
+        let org = format!(
+            "#+title: Legacy\n[[file:image.png]]\n[[file:assets/not-canonical.png]]\n[[file:{asset}]]\n"
+        );
+
+        assert_eq!(super::retained_asset_paths_in_org(&org), [asset]);
     }
 
     #[test]
@@ -628,6 +694,10 @@ mod tests {
             Some("https://example.test/image.png".into()),
         )
         .unwrap();
-        assert!(prepare_thema(None, content, vec![], vec![], vec![], None).is_ok());
+        assert!(prepare_thema(None, content.clone(), vec![], vec![], vec![], None).is_ok());
+        assert_eq!(
+            super::validate_offline_thema_assets(&content).unwrap_err(),
+            ContentError::UnmanagedAsset
+        );
     }
 }

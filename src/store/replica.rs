@@ -827,16 +827,21 @@ impl LocalReplicaStore {
             .transpose()
     }
 
+    pub(crate) fn current_server_id(&self) -> Result<Option<String>, LocalReplicaError> {
+        let (active, observed) = replica_servers(&self.connection)?;
+        if active == observed {
+            Ok(active)
+        } else {
+            Err(LocalReplicaError::SyncOrder)
+        }
+    }
+
     pub(crate) fn document_id_for_path(
         &self,
         logical_path: &str,
     ) -> Result<Option<String>, LocalReplicaError> {
         validate_org_path(logical_path).map_err(|_| LocalReplicaError::Content)?;
-        let (active, observed) = replica_servers(&self.connection)?;
-        if active != observed {
-            return Err(LocalReplicaError::SyncOrder);
-        }
-        let Some(server_id) = active else {
+        let Some(server_id) = self.current_server_id()? else {
             return Ok(None);
         };
         let documents = working_documents(&self.connection, &server_id)?;

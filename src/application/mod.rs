@@ -22,8 +22,9 @@ pub(crate) use content::{
     DocumentReplicaRevision, DocumentRevision, NodeRecord, PreparedAsset, PreparedNote,
     PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
     ThemaRevision, canonical_asset_path, file_link_expressions, path_key, prepare_asset,
-    prepare_note, prepare_thema, stored_thema_content, supported_asset, thema_content,
-    validate_asset_path, validate_logical_path, validate_org_path,
+    prepare_note, prepare_thema, retained_asset_paths_in_org, stored_thema_content,
+    supported_asset, thema_content, validate_asset_path, validate_logical_path,
+    validate_offline_thema_assets, validate_org_path,
 };
 pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
 pub(crate) use import_document::{PreparedServerImport, persist_server_import};

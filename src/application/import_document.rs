@@ -9,6 +9,8 @@ use crate::{
     store::{SqliteStore, StoreError},
 };
 
+use super::content::{ContentError, asset_paths_in_org};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportDocument {
     document_id: DocumentId,
@@ -36,6 +38,7 @@ impl ImportDocument {
 
     pub(crate) fn prepare_server(self) -> Result<PreparedServerImport, ApplicationError> {
         let projection = parse_org(&self.org)?;
+        let asset_paths = asset_paths_in_org(&self.org)?;
         let prepared = PreparedImport {
             document_id: self.document_id,
             projection,
@@ -44,6 +47,7 @@ impl ImportDocument {
         Ok(PreparedServerImport {
             prepared,
             org: self.org,
+            asset_paths,
         })
     }
 }
@@ -59,6 +63,7 @@ pub struct PreparedImport {
 pub(crate) struct PreparedServerImport {
     pub(crate) prepared: PreparedImport,
     pub(crate) org: String,
+    pub(crate) asset_paths: Vec<String>,
 }
 
 pub(crate) fn persist_server_import(
@@ -78,6 +83,7 @@ pub(crate) fn persist_server_import(
         logical_path,
         org: server_import.org.clone(),
         blob_sha256: blob.sha256.clone(),
+        asset_paths: server_import.asset_paths.clone(),
         projection: prepared.projection.clone(),
         expected_revision: prepared.expected_revision,
     };
@@ -133,6 +139,7 @@ fn map_store_error(error: StoreError) -> ApplicationError {
         StoreError::Conflict { expected, actual } => {
             ApplicationError::Conflict { expected, actual }
         }
+        StoreError::NotFound => ApplicationError::InvalidContent(ContentError::UnmanagedAsset),
         _ => ApplicationError::Storage,
     }
 }
@@ -143,6 +150,8 @@ pub enum ApplicationError {
     InvalidDocumentId(#[from] IdError),
     #[error("invalid Org document")]
     InvalidOrg(#[from] OrgParseError),
+    #[error("invalid document content")]
+    InvalidContent(#[from] ContentError),
     #[error("document revision conflict")]
     Conflict { expected: u64, actual: Option<u64> },
     #[error("document storage failed")]

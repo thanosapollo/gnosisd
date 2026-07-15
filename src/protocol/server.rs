@@ -556,6 +556,9 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         ServiceError::Application(ApplicationError::Conflict { .. }) => {
             ProtocolError::new(ErrorCode::Conflict, "document revision conflict")
         }
+        ServiceError::Application(ApplicationError::InvalidContent(_)) => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid document content")
+        }
         ServiceError::Store(StoreError::NotFound) => {
             ProtocolError::new(ErrorCode::NotFound, "resource not found")
         }

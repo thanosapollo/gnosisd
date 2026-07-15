@@ -9,7 +9,7 @@ use crate::{
         AnswerInput, AuthoritativeDocument, ContentBase, ContentReconciliationStatus,
         OfflineAnswerInput, OfflineConflictReason, OfflineContentConflictReason,
         OfflineContentMutation, OfflineContentOperation, OfflineReviewOperation,
-        ReconciliationStatus,
+        ReconciliationStatus, validate_asset_path,
     },
     protocol::{
         OfflineContentSubmission, OfflineContentWireError, OfflineReviewWireError,
@@ -125,6 +125,23 @@ pub struct ReplicaProjection {
     pub tombstone: bool,
     pub blob_digests: Vec<String>,
     pub payload: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaAsset {
+    pub logical_path: String,
+    pub revision: u64,
+    pub content_sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplicaAssetState {
+    Missing,
+    Tombstoned { revision: u64 },
+    Available(ReplicaAsset),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,6 +392,32 @@ impl LocalReplica {
 
     pub fn document_id_for_path(&self, logical_path: &str) -> Result<Option<String>, Error> {
         Ok(self.store.document_id_for_path(logical_path)?)
+    }
+
+    pub fn asset(&self, logical_path: &str) -> Result<ReplicaAssetState, Error> {
+        validate_asset_path(logical_path).map_err(|_| Error::Content)?;
+        let _ = self.store.current_server_id()?;
+        let Some(item) = self.store.projection("asset", logical_path)? else {
+            return Ok(ReplicaAssetState::Missing);
+        };
+        if item.tombstone {
+            return Ok(ReplicaAssetState::Tombstoned {
+                revision: item.revision,
+            });
+        }
+        let (path, revision, digest, size, media_type) = decode_replica_asset(&item, logical_path)?;
+        let bytes = self.store.blob(&digest)?.ok_or(Error::MissingAssets)?;
+        if bytes.len() != usize::try_from(size).map_err(|_| Error::Response)? {
+            return Err(Error::Response);
+        }
+        Ok(ReplicaAssetState::Available(ReplicaAsset {
+            logical_path: path,
+            revision,
+            content_sha256: digest,
+            size_bytes: size,
+            media_type,
+            bytes,
+        }))
     }
 
     pub fn review_pack(&self, pack_id: &str) -> Result<Option<StoredOfflineReviewPack>, Error> {
@@ -1053,6 +1096,44 @@ impl From<crate::protocol::DecodedReplicaItem> for LocalReplicaItem {
     }
 }
 
+fn decode_replica_asset(
+    item: &LocalReplicaItem,
+    logical_path: &str,
+) -> Result<(String, u64, String, u64, String), Error> {
+    let payload: Value = serde_json::from_str(&item.payload_json).map_err(|_| Error::Response)?;
+    let projection = payload.get("projection").ok_or(Error::Response)?;
+    let path = projection
+        .get("logical_path")
+        .and_then(Value::as_str)
+        .ok_or(Error::Response)?;
+    let digest = projection
+        .get("content_sha256")
+        .and_then(Value::as_str)
+        .ok_or(Error::Response)?;
+    let size = projection
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .ok_or(Error::Response)?;
+    let media_type = projection
+        .get("media_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or(Error::Response)?;
+    if path != logical_path || logical_path.split('/').nth(1) != Some(digest) {
+        return Err(Error::Response);
+    }
+    if item.blob_digests.as_slice() != [digest] {
+        return Err(Error::Response);
+    }
+    Ok((
+        path.to_owned(),
+        item.revision,
+        digest.to_owned(),
+        size,
+        media_type.to_owned(),
+    ))
+}
+
 fn requested_after(
     requested: Option<&str>,
     page: &crate::protocol::DecodedSnapshotPage,
@@ -1158,7 +1239,7 @@ mod tests {
     use super::{
         Error, LocalReplica, OfflineAnswer, OfflineContentOutcome, OfflineDocumentEdit,
         OfflineDocumentRename, OfflineDocumentTombstone, OfflineResponse, PendingContentUpload,
-        ReviewConflictReason,
+        ReplicaAssetState, ReviewConflictReason,
     };
     use crate::{
         application::{
@@ -1409,6 +1490,109 @@ mod tests {
             assert_eq!(review.revision, 1);
             assert_eq!(review.payload["projection"]["state"]["review_count"], 1);
         }
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replica_asset_resolution_is_verified_and_tracks_tombstones() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("server.sqlite"),
+            directory.path().join("server-blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device =
+            generate_device("replica".into(), vec!["read".into(), "review".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let path = add_shared_asset(&service, &device_id).await;
+        add_thema(&service, "first", "First", &path, &device_id, 3).await;
+        let replica_path = directory.path().join("replica.sqlite");
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        let state = service.replica_state(device_id.clone()).await.unwrap();
+        replica
+            .observe_state(replica_state_json(&state).unwrap())
+            .unwrap();
+        install_server_snapshot(&mut replica, &service, &device_id).await;
+
+        assert!(matches!(replica.asset(&path), Err(Error::MissingAssets)));
+        install_missing_blobs(&mut replica, &service).await;
+        let ReplicaAssetState::Available(asset) = replica.asset(&path).unwrap() else {
+            panic!("active replica asset must resolve");
+        };
+        assert_eq!(asset.logical_path, path);
+        assert_eq!(asset.media_type, "image/png");
+        assert_eq!(asset.bytes, b"shared offline asset");
+        let digest = asset.content_sha256;
+        assert_eq!(
+            replica
+                .asset(&format!("assets/{}/missing.png", "b".repeat(64)))
+                .unwrap(),
+            ReplicaAssetState::Missing
+        );
+
+        let pack = service
+            .create_review_pack(
+                OFFLINE_REVIEW_VERSION,
+                manual_source(&["first"]),
+                Some(1),
+                device_id.clone(),
+                1_752_600_000_000_000,
+            )
+            .await
+            .unwrap();
+        let pack_id = replica
+            .install_review_pack(review_pack_json(&pack).unwrap())
+            .unwrap();
+        let thema = service.thema("first".into()).await.unwrap().unwrap();
+        service
+            .archive_thema(
+                "first".into(),
+                thema.revision,
+                true,
+                4,
+                Some(device_id.clone()),
+            )
+            .await
+            .unwrap();
+
+        let (head, _) = service.asset(path.clone()).await.unwrap().unwrap();
+        let tombstone = service
+            .tombstone_asset(path.clone(), head.revision, 5, Some(device_id.clone()))
+            .await
+            .unwrap();
+        pull_server_changes(&mut replica, &service).await;
+        assert_eq!(
+            replica.asset(&path).unwrap(),
+            ReplicaAssetState::Tombstoned {
+                revision: tombstone.revision
+            }
+        );
+        drop(replica);
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        let stored = replica.review_pack(&pack_id).unwrap().unwrap();
+        assert_eq!(stored.assets[0].content_sha256, digest);
+        assert_eq!(
+            replica.blob(&digest).unwrap().unwrap(),
+            b"shared offline asset"
+        );
+        assert!(matches!(
+            replica.asset(&path).unwrap(),
+            ReplicaAssetState::Tombstoned { .. }
+        ));
+
+        let replacement_server = "f".repeat(32);
+        let mut replacement = replica_state_json(&state).unwrap();
+        replacement["server_id"] = json!(replacement_server);
+        replacement["cursor"] =
+            json!(encode_cursor(&replacement_server, 0, &"e".repeat(32)).unwrap());
+        replica.observe_state(replacement).unwrap();
+        assert!(matches!(replica.asset(&path), Err(Error::SyncOrder)));
         drop(service);
         runtime.finish().await.unwrap();
     }

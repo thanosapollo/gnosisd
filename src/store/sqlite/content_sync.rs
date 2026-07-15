@@ -335,12 +335,16 @@ fn mutation_conflict_reason(
             if head.is_some_and(|head| head.logical_path != *logical_path) {
                 return Ok(Some(OfflineContentConflictReason::PathConflict));
             }
-            super::check_path_available(
-                transaction,
-                prepared.ok_or(StoreError::CorruptData {
-                    field: "content preparation",
-                })?,
-            )
+            let prepared = prepared.ok_or(StoreError::CorruptData {
+                field: "content preparation",
+            })?;
+            match super::validate_note_assets(transaction, prepared) {
+                Ok(()) => super::check_path_available(transaction, prepared),
+                Err(StoreError::NotFound) => {
+                    return Ok(Some(OfflineContentConflictReason::InvalidContent));
+                }
+                Err(error) => return Err(error),
+            }
         }
         OfflineContentMutation::Rename { logical_path, .. } => {
             if head.is_none_or(|head| head.blob_sha256.is_none()) {
@@ -1076,6 +1080,49 @@ mod tests {
                 Err(OfflineContentConflictReason::InvalidContent),
             )
             .unwrap();
+        assert_eq!(result.status, ContentReconciliationStatus::Conflict);
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineContentConflictReason::InvalidContent)
+        );
+        assert!(result.authoritative.is_none());
+        assert_eq!(store.latest_content_cursor().unwrap(), before);
+        assert_eq!(
+            store
+                .replica_state(&device_id)
+                .unwrap()
+                .next_device_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn missing_asset_is_preserved_without_replacing_the_head() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device_id = add_device(&mut store);
+        let missing = format!("assets/{}/missing.png", "a".repeat(64));
+        let operation = operation(
+            &store,
+            &device_id,
+            "operation-missing-asset",
+            1,
+            ContentBase::Absent,
+            &format!("#+title: Offline\n[[file:{missing}]]\n"),
+        );
+        let prepared = prepare_offline_document(&operation).unwrap();
+        let before = store.latest_content_cursor().unwrap();
+
+        let result = store
+            .reconcile_content_operation(
+                1,
+                &operation,
+                "missing-asset-operation",
+                Some(&device_id),
+                100,
+                Ok((prepared.as_ref(), Some(&blob(&operation)))),
+            )
+            .unwrap();
+
         assert_eq!(result.status, ContentReconciliationStatus::Conflict);
         assert_eq!(
             result.conflict_reason,

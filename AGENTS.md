@@ -83,6 +83,14 @@ Downloaded bases must predate the captured cursor; predicted bases require an
 accepted predecessor operation. A numeric revision alone must never authorize
 an offline write. A queued or accepted tombstone closes its local operation
 chain until a newer active canonical projection is downloaded.
+Canonical Org writes may reference only active content-addressed assets. Store
+current and historical document asset associations, rebuild them from retained
+Org blobs before daemon startup completes, and reject asset tombstones while
+active documents or themata still reference them. If an active legacy document
+has no source blob, asset deletion fails closed because its references cannot be
+verified. Offline review packs reject external assets. Replica asset lookup must
+distinguish missing, tombstoned, and available state and verify the downloaded
+bytes against the canonical path, digest, and recorded size.
 
 ## Commands
 

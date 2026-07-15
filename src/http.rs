@@ -407,7 +407,7 @@ async fn create_note(
         .service
         .replace_note(prepared, now_us_i64()?, Some(principal.device_id))
         .await
-        .map_err(ApiError::service)?;
+        .map_err(note_write_error)?;
     announce(&state).await;
     Ok((StatusCode::CREATED, Json(head_json(&head))))
 }
@@ -432,7 +432,7 @@ async fn update_note(
         .service
         .replace_note(prepared, now_us_i64()?, Some(principal.device_id))
         .await
-        .map_err(|error| conflict_with(error, id, revision))?;
+        .map_err(|error| conflict_with(error, revision))?;
     announce(&state).await;
     Ok(Json(head_json(&head)))
 }
@@ -1368,10 +1368,19 @@ async fn announce(state: &HttpState) {
         let _ = state.cursors.send(cursor);
     }
 }
-fn conflict_with(error: ServiceError, _id: String, expected: u64) -> ApiError {
+fn conflict_with(error: ServiceError, expected: u64) -> ApiError {
     match error {
         ServiceError::Store(StoreError::Conflict { actual, .. }) => {
             ApiError::conflict(expected, actual)
+        }
+        other => note_write_error(other),
+    }
+}
+
+fn note_write_error(error: ServiceError) -> ApiError {
+    match error {
+        ServiceError::Store(StoreError::NotFound) => {
+            ApiError::invalid_content("inactive document asset")
         }
         other => ApiError::service(other),
     }
@@ -1838,6 +1847,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_note_assets_are_invalid_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("writer".into(), vec!["content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let asset = format!("assets/{}/missing.png", "a".repeat(64));
+        let body = serde_json::to_vec(&json!({
+            "logical_path": "note.org",
+            "org": format!("#+title: Missing\n[[file:{asset}]]\n")
+        }))
+        .unwrap();
+
+        let response = router(service.clone())
+            .oneshot(authorized("POST", "/v1/notes", &token, Body::from(body)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_content"
+        );
+        assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn offline_content_http_is_scoped_idempotent_and_preserves_invalid_org() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
@@ -2270,7 +2315,7 @@ mod tests {
             Some(asset_path.clone()),
         )
         .unwrap();
-        service
+        let thema = service
             .put_thema(
                 prepare_thema(
                     Some("thema".into()),
@@ -2322,11 +2367,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let tombstone = service
-            .tombstone_asset(asset_path.clone(), asset_head.revision, 6, None)
-            .await
-            .unwrap();
-
         let active = app
             .clone()
             .oneshot(authorized(
@@ -2457,6 +2497,33 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         service
+            .archive_thema("thema".into(), thema.revision, true, 6, None)
+            .await
+            .unwrap();
+        let tombstone = service
+            .tombstone_asset(asset_path.clone(), asset_head.revision, 7, None)
+            .await
+            .unwrap();
+        let retained = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!(
+                    "/v1/review/packs/{}/assets/{}/image.png",
+                    pack.pack_id, asset.content_sha256
+                ),
+                &owner_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retained.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(retained.into_body(), usize::MAX).await.unwrap(),
+            image
+        );
+
+        service
             .put_asset(
                 prepare_asset(
                     asset_path.clone(),
@@ -2466,9 +2533,13 @@ mod tests {
                 .unwrap(),
                 image,
                 "image/png".into(),
-                7,
+                8,
                 None,
             )
+            .await
+            .unwrap();
+        service
+            .archive_thema("thema".into(), thema.revision + 1, false, 9, None)
             .await
             .unwrap();
         let stranded = app
@@ -2484,7 +2555,7 @@ mod tests {
         assert_eq!(stranded.status(), StatusCode::CREATED);
         let stranded = response_json(stranded).await;
         let stranded_id = stranded["pack"]["pack_id"].as_str().unwrap();
-        service.revoke_device(owner_id, 8).await.unwrap();
+        service.revoke_device(owner_id, 10).await.unwrap();
 
         let discovered = app
             .clone()

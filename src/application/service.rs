@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -20,13 +21,13 @@ use super::{
     PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
     ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
     SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord, create_backup,
-    persist_server_import, prepare_offline_document, prune_backups, token_digest, validate_restore,
-    verify_backup,
+    persist_server_import, prepare_offline_document, prune_backups, retained_asset_paths_in_org,
+    token_digest, validate_restore, verify_backup,
 };
 use crate::{
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
-    store::{SqliteStore, StoreError, StoredDocument},
+    store::{DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument},
 };
 
 #[derive(Clone)]
@@ -1362,12 +1363,47 @@ fn store_actor(
         let _ = ready.send(Err(error));
         return;
     }
+    if let Err(error) = rebuild_document_asset_index(&mut store, &blobs) {
+        let _ = ready.send(Err(error));
+        return;
+    }
     if ready.send(Ok(())).is_err() {
         return;
     }
     for command in receiver {
         run_store_command(&mut store, &blobs, command);
     }
+}
+
+fn rebuild_document_asset_index(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+) -> Result<(), StoreError> {
+    let mut parsed: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut associations = Vec::new();
+    for source in store.document_asset_sources()? {
+        let asset_paths = match parsed.get(&source.blob_sha256) {
+            Some(asset_paths) => asset_paths.clone(),
+            None => {
+                let bytes = blobs
+                    .read(&source.blob_sha256)
+                    .map_err(|error| StoreError::Storage(Box::new(error)))?;
+                let org = String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
+                    field: "document blob UTF-8",
+                })?;
+                let asset_paths = retained_asset_paths_in_org(&org);
+                parsed.insert(source.blob_sha256.clone(), asset_paths.clone());
+                asset_paths
+            }
+        };
+        associations.push(DocumentAssetAssociation {
+            document_id: source.document_id,
+            revision: source.revision,
+            asset_paths,
+            active_head: source.active_head,
+        });
+    }
+    store.rebuild_document_assets(&associations)
 }
 
 struct ContentCommand<'a> {
@@ -1957,8 +1993,10 @@ mod tests {
     use super::{ServiceError, ServiceRuntime};
     use crate::application::{
         ImportDocument, ParametersSnapshot, ReplicaProjection, SettingsInput, canonical_asset_path,
-        generate_device, prepare_asset, prepare_note,
+        generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
     };
+    use crate::blob::BlobStore;
+    use crate::store::StoreError;
 
     async fn runtime(directory: &tempfile::TempDir) -> ServiceRuntime {
         ServiceRuntime::start(
@@ -2068,6 +2106,294 @@ mod tests {
         assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
         drop(service);
         runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_document_assets_block_tombstones_until_the_reference_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let bytes = b"document image".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let path = canonical_asset_path(&digest, "image.png").unwrap();
+        let asset = service
+            .put_asset(
+                prepare_asset(path.clone(), "image.png".into(), None).unwrap(),
+                bytes,
+                "image/png".into(),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            format!("#+title: Linked\n[[file:{path}]]\n"),
+            None,
+        )
+        .unwrap();
+        service.replace_note(note, 2, None).await.unwrap();
+        assert!(matches!(
+            service
+                .tombstone_asset(path.clone(), asset.revision, 3, None)
+                .await,
+            Err(ServiceError::Store(StoreError::InvalidProjection { .. }))
+        ));
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Unlinked\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        service.replace_note(note, 4, None).await.unwrap();
+        assert!(
+            !service
+                .tombstone_asset(path, asset.revision, 5, None)
+                .await
+                .unwrap()
+                .active
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("gnosis.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM document_asset", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM document_revision_asset", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_asset_cannot_replace_a_document_head_or_advance_the_feed() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let path = canonical_asset_path(&"a".repeat(64), "missing.png").unwrap();
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            format!("#+title: Missing\n[[file:{path}]]\n"),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            service.replace_note(note, 1, None).await,
+            Err(ServiceError::Store(StoreError::NotFound))
+        ));
+        assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        assert!(
+            service
+                .note(crate::domain::DocumentId::new("document").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_thema_assets_block_tombstones_until_archived() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let bytes = b"thema image".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let path = canonical_asset_path(&digest, "image.png").unwrap();
+        let asset = service
+            .put_asset(
+                prepare_asset(path.clone(), "image.png".into(), None).unwrap(),
+                bytes,
+                "image/png".into(),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![],
+            vec!["Answer".into()],
+            None,
+            None,
+            Some(path.clone()),
+        )
+        .unwrap();
+        let thema = service
+            .put_thema(
+                prepare_thema(
+                    Some("thema".into()),
+                    content,
+                    vec![],
+                    vec![],
+                    vec![path.clone()],
+                    None,
+                )
+                .unwrap(),
+                20260715,
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            service
+                .tombstone_asset(path.clone(), asset.revision, 3, None)
+                .await,
+            Err(ServiceError::Store(StoreError::InvalidProjection { .. }))
+        ));
+        let archived = service
+            .archive_thema("thema".into(), thema.revision, true, 4, None)
+            .await
+            .unwrap();
+        assert!(
+            !service
+                .tombstone_asset(path, asset.revision, 5, None)
+                .await
+                .unwrap()
+                .active
+        );
+        let cursor = service.latest_content_cursor().await.unwrap();
+        assert!(matches!(
+            service
+                .archive_thema("thema".into(), archived.revision, false, 6, None)
+                .await,
+            Err(ServiceError::Store(StoreError::InvalidProjection { .. }))
+        ));
+        assert_eq!(service.latest_content_cursor().await.unwrap(), cursor);
+        assert!(
+            service
+                .thema("thema".into())
+                .await
+                .unwrap()
+                .unwrap()
+                .archived
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_upgrade_rebuilds_document_asset_associations() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blobs = directory.path().join("blobs");
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let bytes = b"restart image".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let path = canonical_asset_path(&digest, "image.png").unwrap();
+        let asset = service
+            .put_asset(
+                prepare_asset(path.clone(), "image.png".into(), None).unwrap(),
+                bytes,
+                "image/png".into(),
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    Some("document".into()),
+                    "note.org".into(),
+                    format!("#+title: Linked\n[[file:{path}]]\n"),
+                    None,
+                )
+                .unwrap(),
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+        let legacy_org = format!("#+title: Linked\n[[file:image.png]]\n[[file:{path}]]\n");
+        let legacy_blob = BlobStore::open(blobs.clone())
+            .unwrap()
+            .put(legacy_org.as_bytes(), "text/org; charset=utf-8")
+            .unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO blob(content_sha256, size_bytes, media_type, created_at_us)
+                 VALUES (?1, ?2, ?3, 3)",
+                rusqlite::params![
+                    legacy_blob.sha256,
+                    i64::try_from(legacy_blob.size_bytes).unwrap(),
+                    legacy_blob.media_type
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE document SET head_blob_sha256 = ?1, content_sha256 = ?1
+                 WHERE document_id = 'document'",
+                [&legacy_blob.sha256],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE document_revision SET blob_sha256 = ?1
+                 WHERE document_id = 'document' AND revision = 1",
+                [&legacy_blob.sha256],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE document_revision_asset;
+                 DROP TABLE document_asset;
+                 DELETE FROM schema_migration WHERE version = 8;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let runtime = ServiceRuntime::start(database.clone(), blobs, 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        assert!(matches!(
+            service.tombstone_asset(path, asset.revision, 3, None).await,
+            Err(ServiceError::Store(StoreError::InvalidProjection { .. }))
+        ));
+        drop(service);
+        runtime.finish().await.unwrap();
+        let connection = rusqlite::Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM document_asset", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM document_revision_asset", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

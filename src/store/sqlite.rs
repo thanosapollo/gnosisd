@@ -42,7 +42,9 @@ const REPLICA_SYNC_MIGRATION: &str = include_str!("migrations/0005_replica_sync.
 const OFFLINE_CONTENT_MIGRATION: &str = include_str!("migrations/0006_offline_content.sql");
 const OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION: &str =
     include_str!("migrations/0007_offline_document_lifecycle.sql");
-const SCHEMA_VERSION: u32 = 7;
+const DOCUMENT_ASSET_INTEGRITY_MIGRATION: &str =
+    include_str!("migrations/0008_document_asset_integrity.sql");
+const SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -103,6 +105,20 @@ impl StoredDocument {
     pub(crate) fn projection(&self) -> &DocumentProjection {
         &self.projection
     }
+}
+
+pub(crate) struct DocumentAssetSource {
+    pub(crate) document_id: String,
+    pub(crate) revision: u64,
+    pub(crate) blob_sha256: String,
+    pub(crate) active_head: bool,
+}
+
+pub(crate) struct DocumentAssetAssociation {
+    pub(crate) document_id: String,
+    pub(crate) revision: u64,
+    pub(crate) asset_paths: Vec<String>,
+    pub(crate) active_head: bool,
 }
 
 pub(crate) struct SqliteStore {
@@ -563,8 +579,11 @@ impl SqliteStore {
         author_device_id: Option<&str>,
     ) -> Result<AssetHead, StoreError> {
         let transaction = self.write_transaction()?;
-        let current = load_asset_head(&transaction, asset_path)?.ok_or(StoreError::NotFound)?;
+        let current = load_asset_head(&transaction, asset_path)?
+            .filter(|asset| asset.active)
+            .ok_or(StoreError::NotFound)?;
         check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+        require_asset_unreferenced(&transaction, asset_path)?;
         let revision = current
             .revision
             .checked_add(1)
@@ -840,6 +859,17 @@ impl SqliteStore {
         load_blob_rows(&self.connection)
     }
 
+    pub(crate) fn document_asset_sources(&self) -> Result<Vec<DocumentAssetSource>, StoreError> {
+        load_document_asset_sources(&self.connection)
+    }
+
+    pub(crate) fn rebuild_document_assets(
+        &mut self,
+        associations: &[DocumentAssetAssociation],
+    ) -> Result<(), StoreError> {
+        rebuild_document_asset_rows(&mut self.connection, associations)
+    }
+
     pub(crate) fn verify_database_file(path: &Path) -> Result<Vec<(String, u64)>, StoreError> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(StoreError::storage)?;
@@ -1013,6 +1043,9 @@ impl SqliteStore {
         let transaction = self.write_transaction()?;
         let current = thema_revision(&transaction, thema_id)?.ok_or(StoreError::NotFound)?;
         check_expected_number(Some(expected_revision), Some(current))?;
+        if !archived {
+            require_thema_assets_active(&transaction, thema_id)?;
+        }
         let revision = next_number(Some(current))?;
         transaction
             .execute(
@@ -2072,6 +2105,79 @@ fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreEr
         .map_err(StoreError::storage)
 }
 
+fn load_document_asset_sources(
+    connection: &Connection,
+) -> Result<Vec<DocumentAssetSource>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT revision.document_id, revision.revision, revision.blob_sha256,
+                    document.active = 1 AND document.revision = revision.revision
+             FROM document_revision AS revision
+             JOIN document USING(document_id)
+             WHERE revision.blob_sha256 IS NOT NULL
+             ORDER BY revision.document_id, revision.revision",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map([], |row| {
+            Ok(DocumentAssetSource {
+                document_id: row.get(0)?,
+                revision: row_u64(row, 1)?,
+                blob_sha256: row.get(2)?,
+                active_head: row.get(3)?,
+            })
+        })
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
+}
+
+fn rebuild_document_asset_rows(
+    connection: &mut Connection,
+    associations: &[DocumentAssetAssociation],
+) -> Result<(), StoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute("DELETE FROM document_asset", [])
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute("DELETE FROM document_revision_asset", [])
+        .map_err(StoreError::storage)?;
+    for association in associations {
+        insert_document_revision_assets(
+            &transaction,
+            &DocumentId::new(association.document_id.clone()).map_err(|_| {
+                StoreError::CorruptData {
+                    field: "document ID",
+                }
+            })?,
+            association.revision,
+            &association.asset_paths,
+        )?;
+        if association.active_head {
+            insert_current_document_assets(&transaction, association)?;
+        }
+    }
+    transaction.commit().map_err(StoreError::storage)
+}
+
+fn insert_current_document_assets(
+    transaction: &Transaction<'_>,
+    association: &DocumentAssetAssociation,
+) -> Result<(), StoreError> {
+    let mut insert = transaction
+        .prepare_cached("INSERT INTO document_asset(document_id, asset_path) VALUES (?1, ?2)")
+        .map_err(StoreError::storage)?;
+    for asset_path in &association.asset_paths {
+        insert
+            .execute(params![association.document_id, asset_path])
+            .map_err(StoreError::storage)?;
+    }
+    Ok(())
+}
+
 fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     let value = row.get::<_, i64>(index)?;
     u64::try_from(value).map_err(|error| {
@@ -2164,6 +2270,7 @@ fn record_document_rename(
         author_device_id,
     )?;
     insert_document_projection_history(transaction, document_id, revision, projection)?;
+    copy_document_revision_assets(transaction, document_id, revision)?;
     insert_content_change(
         transaction,
         "document",
@@ -2234,6 +2341,31 @@ fn retire_document(
         .execute(
             "UPDATE node SET active = 0 WHERE document_id = ?1",
             [document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM document_asset WHERE document_id = ?1",
+            [document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn copy_document_revision_assets(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    revision: u64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO document_revision_asset(document_id, revision, asset_path)
+             SELECT document_id, ?2, asset_path FROM document_asset
+             WHERE document_id = ?1",
+            params![
+                document_id.as_str(),
+                u64_to_i64(revision, "document revision")?
+            ],
         )
         .map_err(StoreError::storage)?;
     Ok(())
@@ -2367,6 +2499,44 @@ fn load_asset_head(
         .map_err(StoreError::storage)
 }
 
+fn require_asset_unreferenced(connection: &Connection, asset_path: &str) -> Result<(), StoreError> {
+    let unverifiable: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM document
+                 WHERE active = 1 AND head_blob_sha256 IS NULL
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    if unverifiable {
+        return Err(StoreError::InvalidProjection {
+            reason: "active document asset references cannot be verified",
+        });
+    }
+    let referenced: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM document_asset WHERE asset_path = ?1
+                 UNION ALL
+                 SELECT 1 FROM thema_asset AS asset
+                 JOIN thema ON thema.thema_id = asset.thema_id
+                 WHERE asset.asset_path = ?1 AND thema.archived_at_us IS NULL
+             )",
+            [asset_path],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    if referenced {
+        Err(StoreError::InvalidProjection {
+            reason: "asset is referenced by active content",
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn thema_revision(connection: &Connection, thema_id: &str) -> Result<Option<i64>, StoreError> {
     connection
         .query_row(
@@ -2387,6 +2557,80 @@ fn validate_thema_associations(
     }
     for asset_path in &prepared.asset_paths {
         require_active(connection, "managed_asset", "asset_path", asset_path)?;
+    }
+    Ok(())
+}
+
+fn validate_note_assets(
+    connection: &Connection,
+    prepared: &PreparedNote,
+) -> Result<(), StoreError> {
+    for asset_path in &prepared.asset_paths {
+        require_active(connection, "managed_asset", "asset_path", asset_path)?;
+    }
+    Ok(())
+}
+
+fn require_thema_assets_active(connection: &Connection, thema_id: &str) -> Result<(), StoreError> {
+    let unavailable: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM thema_asset AS reference
+                 LEFT JOIN managed_asset AS asset USING(asset_path)
+                 WHERE reference.thema_id = ?1
+                   AND (asset.asset_path IS NULL OR asset.active = 0)
+             )",
+            [thema_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    if unavailable {
+        Err(StoreError::InvalidProjection {
+            reason: "thema references an inactive asset",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn replace_document_assets(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedNote,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM document_asset WHERE document_id = ?1",
+            [prepared.document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    let mut insert = transaction
+        .prepare_cached("INSERT INTO document_asset(document_id, asset_path) VALUES (?1, ?2)")
+        .map_err(StoreError::storage)?;
+    for asset_path in &prepared.asset_paths {
+        insert
+            .execute(params![prepared.document_id.as_str(), asset_path])
+            .map_err(StoreError::storage)?;
+    }
+    Ok(())
+}
+
+fn insert_document_revision_assets(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    revision: u64,
+    asset_paths: &[String],
+) -> Result<(), StoreError> {
+    let mut insert = transaction
+        .prepare_cached(
+            "INSERT INTO document_revision_asset(document_id, revision, asset_path)
+             VALUES (?1, ?2, ?3)",
+        )
+        .map_err(StoreError::storage)?;
+    let revision = u64_to_i64(revision, "document revision")?;
+    for asset_path in asset_paths {
+        insert
+            .execute(params![document_id.as_str(), revision, asset_path])
+            .map_err(StoreError::storage)?;
     }
     Ok(())
 }
@@ -2948,6 +3192,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if found < 7 {
         connection
             .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
+    if found < 8 {
+        connection
+            .execute_batch(DOCUMENT_ASSET_INTEGRITY_MIGRATION)
             .map_err(StoreError::storage)?;
     }
     Ok(())
@@ -3698,6 +3947,7 @@ fn replace_note_in(
 ) -> Result<StoredDocument, StoreError> {
     let current = load_document(transaction, &prepared.document_id)?;
     check_revision(expected_revision, current.as_ref())?;
+    validate_note_assets(transaction, prepared)?;
     let current_path = document_path(transaction, &prepared.document_id)?;
     require_unchanged_path(prepared, current_path.as_deref())?;
     check_path_available(transaction, prepared)?;
@@ -3761,6 +4011,7 @@ fn write_note_revision(
         FailPoint::None,
     )?;
     update_note_head(transaction, prepared, blob, revision, created_at_us)?;
+    replace_document_assets(transaction, prepared)?;
     record_note_history(
         transaction,
         prepared,
@@ -3797,6 +4048,12 @@ fn record_note_history(
         &prepared.document_id,
         revision,
         &prepared.projection,
+    )?;
+    insert_document_revision_assets(
+        transaction,
+        &prepared.document_id,
+        revision,
+        &prepared.asset_paths,
     )?;
     insert_content_change(
         transaction,
@@ -4508,7 +4765,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            7
+            8
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4516,7 +4773,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            7
+            8
         );
     }
 
@@ -4529,7 +4786,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
@@ -4719,7 +4976,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 7);
+        assert_eq!(schema_version(&connection).unwrap(), 8);
         let floor: i64 = connection
             .query_row(
                 "SELECT retained_after_cursor FROM sync_feed_state",
@@ -5014,7 +5271,7 @@ mod tests {
             .unwrap();
 
         migrate(&store.connection).unwrap();
-        assert_eq!(schema_version(&store.connection).unwrap(), 7);
+        assert_eq!(schema_version(&store.connection).unwrap(), 8);
         let violations: i64 = store
             .connection
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
@@ -5300,6 +5557,34 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(review_states.len(), 1);
         assert_eq!(review_states[0].state.state_revision, 0);
+    }
+
+    #[test]
+    fn projection_only_documents_make_asset_tombstones_fail_closed() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .replace_document(
+                &DocumentId::new("legacy").unwrap(),
+                &projection("Legacy", &"a".repeat(64)),
+                None,
+            )
+            .unwrap();
+        let bytes = b"asset";
+        let digest = format!("{:x}", sha2::Sha256::digest(bytes));
+        let path = format!("assets/{digest}/asset.png");
+        let asset = prepare_asset(path.clone(), "asset.png".into(), None).unwrap();
+        let blob = BlobMeta {
+            sha256: digest,
+            size_bytes: bytes.len() as u64,
+            media_type: "image/png".into(),
+        };
+        store.put_asset(&asset, &blob, 1, None).unwrap();
+
+        assert!(matches!(
+            store.tombstone_asset(&path, 1, 2, None),
+            Err(StoreError::InvalidProjection { .. })
+        ));
+        assert!(store.asset_head(&path).unwrap().unwrap().active);
     }
 
     #[test]

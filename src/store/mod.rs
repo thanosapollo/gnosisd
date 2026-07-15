@@ -7,4 +7,6 @@ pub(crate) use replica::{
     SnapshotInstall, StoredContentResult, StoredContentResultPage, StoredReviewPack,
     StoredReviewResult, StoredReviewResultPage, canonical_json_sha256,
 };
-pub(crate) use sqlite::{SqliteStore, StoreError, StoredDocument, initialize_native_database};
+pub(crate) use sqlite::{
+    DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument, initialize_native_database,
+};

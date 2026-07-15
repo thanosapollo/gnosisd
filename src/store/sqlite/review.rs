@@ -16,7 +16,7 @@ use crate::{
         OfflineReviewResult, ParametersSnapshot, PresentationSnapshot, ReconciliationStatus,
         ReviewAttemptView, ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode,
         ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
-        presentation_content, review_day_at,
+        presentation_content, review_day_at, validate_offline_thema_assets,
     },
     domain::{MATCHER_VERSION, compute_transition, fuzz_delta, grade},
 };
@@ -1216,6 +1216,7 @@ fn capture_pack_item(
     let thema = load_thema(connection, thema_id)?.ok_or(StoreError::NotFound)?;
     let state = load_review_state(connection, thema_id)?;
     let parameters = resolved_parameters(connection, session_id, &thema.tags)?;
+    validate_offline_thema_assets(&thema.content).map_err(|_| StoreError::InvalidReviewState)?;
     let presentation = presentation(&thema);
     Ok(ReviewPackItem {
         position: u32::try_from(position).map_err(StoreError::storage)?,
@@ -2931,6 +2932,38 @@ mod tests {
             ),
             Err(crate::store::StoreError::InvalidReviewState)
         ));
+    }
+
+    #[test]
+    fn review_pack_rejects_external_assets_without_starting_a_session() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![None],
+            vec!["answer".into()],
+            None,
+            None,
+            Some("https://example.test/image.png".into()),
+        )
+        .unwrap();
+        let prepared =
+            prepare_thema(Some("thema".into()), content, vec![], vec![], vec![], None).unwrap();
+        store.put_thema(&prepared, 20260715, 1, None).unwrap();
+        let device_id = add_device(&mut store, "offline");
+
+        assert!(matches!(
+            store.create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            ),
+            Err(crate::store::StoreError::InvalidReviewState)
+        ));
+        assert_eq!(store.active_review_pack(Some(&device_id)).unwrap(), None);
+        assert_eq!(store.active_review_session(Some(&device_id)).unwrap(), None);
     }
 
     #[test]
