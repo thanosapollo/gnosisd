@@ -1,6 +1,7 @@
 mod client;
 mod frame;
 mod message;
+mod offline_content;
 mod offline_review;
 mod replica;
 mod server;
@@ -13,6 +14,10 @@ pub use message::{
     MAX_REQUEST_ID_LEN, NodeEdgeView, NodeView, PROTOCOL_VERSION, ProtocolError, Request,
     RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewStateView,
     SystemInfo, ThemaView,
+};
+pub(crate) use offline_content::{
+    DecodedOfflineContentResult, OfflineContentSubmission, OfflineContentWireError,
+    canonical_content_operation, decode_offline_content_result, offline_content_result_json,
 };
 pub(crate) use offline_review::canonical_offline_operation;
 pub(crate) use offline_review::{

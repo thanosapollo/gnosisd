@@ -15,11 +15,12 @@ use tokio::sync::oneshot;
 use super::{
     AnswerInput, ApplicationError, AssetHead, BackupError, BackupSummary, ContentChange,
     DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, NewDevice,
-    NodeRecord, OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedNote,
-    PreparedServerImport, PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange,
-    ReplicaState, ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView,
-    ReviewSource, SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
-    create_backup, persist_server_import, prune_backups, token_digest, validate_restore,
+    NodeRecord, OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+    OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedNote, PreparedServerImport,
+    PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
+    ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
+    SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord, create_backup,
+    persist_server_import, prepare_offline_document, prune_backups, token_digest, validate_restore,
     verify_backup,
 };
 use crate::{
@@ -840,6 +841,33 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn reconcile_content_operation(
+        &self,
+        format_version: u32,
+        operation: OfflineContentOperation,
+        canonical_payload: String,
+        device_id: Option<String>,
+        received_at_us: u64,
+    ) -> Result<OfflineContentResult, ServiceError> {
+        let prepared = match prepare_offline_document(&operation) {
+            Ok(note) => PreparedContentOperation::Ready(Box::new(note)),
+            Err(reason) => PreparedContentOperation::Conflict(reason),
+        };
+        request(&self.sender, |response| {
+            StoreCommand::ReconcileContentOperation {
+                format_version,
+                operation: Box::new(operation),
+                canonical_payload,
+                device_id,
+                received_at_us,
+                prepared,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn create_backup(
         &self,
         destination: PathBuf,
@@ -983,6 +1011,11 @@ impl ServiceRuntime {
 }
 
 type StoreResult<T> = Result<T, StoreError>;
+
+enum PreparedContentOperation {
+    Ready(Box<PreparedNote>),
+    Conflict(OfflineContentConflictReason),
+}
 
 enum StoreCommand {
     Replace {
@@ -1259,6 +1292,15 @@ enum StoreCommand {
         received_at_us: u64,
         response: oneshot::Sender<StoreResult<OfflineReviewResult>>,
     },
+    ReconcileContentOperation {
+        format_version: u32,
+        operation: Box<OfflineContentOperation>,
+        canonical_payload: String,
+        device_id: Option<String>,
+        received_at_us: u64,
+        prepared: PreparedContentOperation,
+        response: oneshot::Sender<StoreResult<OfflineContentResult>>,
+    },
     CreateBackup {
         destination: PathBuf,
         created_at_us: u64,
@@ -1324,11 +1366,54 @@ fn store_actor(
         return;
     }
     for command in receiver {
-        run_store_command(&mut store, command);
+        run_store_command(&mut store, &blobs, command);
     }
 }
 
-fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
+struct ContentCommand<'a> {
+    format_version: u32,
+    operation: &'a OfflineContentOperation,
+    canonical_payload: &'a str,
+    device_id: Option<&'a str>,
+    received_at_us: u64,
+    preparation: Result<&'a PreparedNote, OfflineContentConflictReason>,
+}
+
+fn reconcile_content_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    command: ContentCommand<'_>,
+) -> StoreResult<OfflineContentResult> {
+    let needs_blob = store.content_operation_needs_blob(
+        command.format_version,
+        command.operation,
+        command.canonical_payload,
+        command.device_id,
+        command.preparation,
+    )?;
+    let blob = if needs_blob {
+        let note = command.preparation.map_err(|_| StoreError::CorruptData {
+            field: "content preparation",
+        })?;
+        Some(
+            blobs
+                .put(note.org.as_bytes(), "text/org; charset=utf-8")
+                .map_err(|error| StoreError::Storage(Box::new(error)))?,
+        )
+    } else {
+        None
+    };
+    store.reconcile_content_operation(
+        command.format_version,
+        command.operation,
+        command.canonical_payload,
+        command.device_id,
+        command.received_at_us,
+        command.preparation.map(|note| (note, blob.as_ref())),
+    )
+}
+
+fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreCommand) {
     match command {
         StoreCommand::Replace {
             prepared,
@@ -1735,6 +1820,33 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
                 received_at_us,
             ),
         ),
+        StoreCommand::ReconcileContentOperation {
+            format_version,
+            operation,
+            canonical_payload,
+            device_id,
+            received_at_us,
+            prepared,
+            response,
+        } => {
+            let preparation = match &prepared {
+                PreparedContentOperation::Ready(note) => Ok(note.as_ref()),
+                PreparedContentOperation::Conflict(reason) => Err(*reason),
+            };
+            let result = reconcile_content_command(
+                store,
+                blobs,
+                ContentCommand {
+                    format_version,
+                    operation: &operation,
+                    canonical_payload: &canonical_payload,
+                    device_id: device_id.as_deref(),
+                    received_at_us,
+                    preparation,
+                },
+            );
+            send(response, result);
+        }
         StoreCommand::CreateBackup {
             destination,
             created_at_us,

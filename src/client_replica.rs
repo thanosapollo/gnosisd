@@ -1,21 +1,26 @@
 use std::path::Path;
 
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
     application::{
-        AnswerInput, OfflineAnswerInput, OfflineConflictReason, OfflineReviewOperation,
+        AnswerInput, AuthoritativeDocument, ContentBase, ContentReconciliationStatus,
+        OfflineAnswerInput, OfflineConflictReason, OfflineContentConflictReason,
+        OfflineContentMutation, OfflineContentOperation, OfflineReviewOperation,
         ReconciliationStatus,
     },
     protocol::{
-        OfflineReviewWireError, ReplicaWireError, canonical_offline_operation, decode_change_page,
-        decode_offline_result, decode_replica_state, decode_review_pack, decode_snapshot_cursor,
-        decode_snapshot_page,
+        OfflineContentSubmission, OfflineContentWireError, OfflineReviewWireError,
+        ReplicaWireError, canonical_content_operation, canonical_offline_operation,
+        decode_change_page, decode_cursor, decode_offline_content_result, decode_offline_result,
+        decode_replica_state, decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
     },
     store::{
-        DeltaInstall, LocalReplicaError as StoreReplicaError, LocalReplicaItem, LocalReplicaStore,
-        SnapshotInstall, StoredReviewPack, StoredReviewResult, StoredReviewResultPage,
+        ContentResultInstall, DeltaInstall, LocalReplicaError as StoreReplicaError,
+        LocalReplicaItem, LocalReplicaStore, SnapshotInstall, StoredContentResult,
+        StoredContentResultPage, StoredReviewPack, StoredReviewResult, StoredReviewResultPage,
         canonical_json_sha256,
     },
 };
@@ -31,6 +36,36 @@ pub struct PendingUpload {
     pub canonical_payload: String,
     pub submission: Value,
     operation: OfflineReviewOperation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingContentUpload {
+    pub operation_id: String,
+    pub device_sequence: u64,
+    pub document_id: String,
+    pub canonical_payload: String,
+    pub submission: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PendingDeviceUpload {
+    Review(Box<PendingUpload>),
+    Content(PendingContentUpload),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineDocumentEdit {
+    pub operation_id: String,
+    pub document_id: String,
+    pub logical_path: String,
+    pub org: String,
+    pub authored_at_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedContentOperation {
+    pub operation_id: String,
+    pub device_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,7 +98,7 @@ pub struct ReplicaStatus {
     pub observed_server_id: Option<String>,
     pub cursor: Option<String>,
     pub snapshot_next: Option<String>,
-    pub next_review_sequence: u64,
+    pub next_device_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,6 +189,49 @@ pub struct ReconciledOfflineReviewPage {
     pub next_after: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfflineContentOutcome {
+    Accepted,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentConflictReason {
+    CursorChanged,
+    BaseChanged,
+    InvalidContent,
+    PathConflict,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciledOfflineContent {
+    pub result_sequence: u64,
+    pub server_id: String,
+    pub operation_id: String,
+    pub device_sequence: u64,
+    pub document_id: String,
+    pub outcome: OfflineContentOutcome,
+    pub conflict_reason: Option<ContentConflictReason>,
+    pub operation: Value,
+    pub authoritative: Option<ReconciledDocumentHead>,
+    pub cursor: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciledDocumentHead {
+    pub document_id: String,
+    pub logical_path: String,
+    pub revision: u64,
+    pub content_sha256: Option<String>,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciledOfflineContentPage {
+    pub items: Vec<ReconciledOfflineContent>,
+    pub next_after: Option<u64>,
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("local replica storage failed")]
@@ -180,6 +258,10 @@ pub enum Error {
     ReplicaWire,
     #[error("offline review response is invalid")]
     ReviewWire,
+    #[error("offline content response is invalid")]
+    ContentWire,
+    #[error("offline content operation no longer matches the replica state")]
+    Content,
     #[error("local replica response is invalid")]
     Response,
 }
@@ -194,7 +276,7 @@ impl LocalReplica {
     pub fn observe_state(&mut self, value: Value) -> Result<(), Error> {
         let state = decode_replica_state(value)?;
         self.store
-            .observe_server(&state.server_id, state.next_review_sequence)?;
+            .observe_server(&state.server_id, state.next_device_sequence)?;
         Ok(())
     }
 
@@ -305,6 +387,115 @@ impl LocalReplica {
         }))
     }
 
+    pub fn record_document(
+        &mut self,
+        edit: OfflineDocumentEdit,
+    ) -> Result<RecordedContentOperation, Error> {
+        if let Some(json) = self.store.existing_content_operation(&edit.operation_id)? {
+            return replayed_document_edit(&json, &edit);
+        }
+        let context = self.store.content_context(&edit.document_id)?;
+        let (server_id, cursor, token) = decode_cursor(&context.cursor)?;
+        if server_id != context.server_id {
+            return Err(Error::Content);
+        }
+        let operation = OfflineContentOperation {
+            operation_id: edit.operation_id,
+            device_id: self.device_id()?,
+            device_sequence: context.next_device_sequence,
+            cursor_server_id: server_id,
+            cursor,
+            cursor_token: token,
+            authored_at_us: edit.authored_at_us,
+            mutation: OfflineContentMutation::PutDocument {
+                document_id: edit.document_id,
+                logical_path: edit.logical_path,
+                content_sha256: format!("{:x}", Sha256::digest(edit.org.as_bytes())),
+                org: edit.org,
+                base: context.base,
+            },
+        };
+        let canonical_payload = canonical_content_operation(&operation)?;
+        self.store
+            .record_content_operation(&operation, &context.cursor, &canonical_payload)?;
+        Ok(RecordedContentOperation {
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+        })
+    }
+
+    pub fn next_content_upload(&self) -> Result<Option<PendingContentUpload>, Error> {
+        let Some(pending) = self.store.next_pending_content_operation()? else {
+            return Ok(None);
+        };
+        let submission: Value =
+            serde_json::from_str(&pending.canonical_payload).map_err(|_| Error::Response)?;
+        let decoded: OfflineContentSubmission =
+            serde_json::from_value(submission.clone()).map_err(|_| Error::Response)?;
+        let operation = decoded.decode()?.operation;
+        let document_id = operation.document_id().to_owned();
+        Ok(Some(PendingContentUpload {
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+            document_id,
+            canonical_payload: pending.canonical_payload,
+            submission,
+        }))
+    }
+
+    pub fn next_device_upload(&self) -> Result<Option<PendingDeviceUpload>, Error> {
+        if let Some(review) = self.next_upload()? {
+            return Ok(Some(PendingDeviceUpload::Review(Box::new(review))));
+        }
+        Ok(self
+            .next_content_upload()?
+            .map(PendingDeviceUpload::Content))
+    }
+
+    pub fn record_content_result(&mut self, value: Value) -> Result<(), Error> {
+        let result_json = serde_json::to_string(&value).map_err(|_| Error::Response)?;
+        let decoded = decode_offline_content_result(value)?;
+        let operation_json = self
+            .store
+            .existing_content_operation(&decoded.operation_id)?
+            .ok_or(Error::Content)?;
+        let submission: OfflineContentSubmission =
+            serde_json::from_str(&operation_json).map_err(|_| Error::Response)?;
+        let operation = submission.decode()?.operation;
+        let install = validated_content_result(&operation, &decoded)?;
+        self.store
+            .record_content_result(&install, &decoded.cursor, &result_json)?;
+        Ok(())
+    }
+
+    pub fn content_results(
+        &self,
+        after: Option<u64>,
+        limit: u16,
+    ) -> Result<ReconciledOfflineContentPage, Error> {
+        self.content_result_page(after, limit, false)
+    }
+
+    pub fn content_conflicts(
+        &self,
+        after: Option<u64>,
+        limit: u16,
+    ) -> Result<ReconciledOfflineContentPage, Error> {
+        self.content_result_page(after, limit, true)
+    }
+
+    fn content_result_page(
+        &self,
+        after: Option<u64>,
+        limit: u16,
+        conflicts_only: bool,
+    ) -> Result<ReconciledOfflineContentPage, Error> {
+        let page = self
+            .store
+            .content_results(after.unwrap_or(0), limit, conflicts_only)?;
+        ReconciledOfflineContentPage::try_from(page)
+    }
+
     pub fn record_result(&mut self, value: Value) -> Result<(), Error> {
         let cursor = string_field(&value, &["result", "cursor"])?;
         let result_json = serde_json::to_string(&value).map_err(|_| Error::Response)?;
@@ -348,8 +539,12 @@ impl LocalReplica {
             observed_server_id: status.observed_server_id,
             cursor: status.cursor,
             snapshot_next: status.snapshot_next,
-            next_review_sequence: status.next_review_sequence,
+            next_device_sequence: status.next_device_sequence,
         })
+    }
+
+    fn device_id(&self) -> Result<String, Error> {
+        Ok(self.store.device_id()?)
     }
 
     #[cfg(test)]
@@ -361,6 +556,99 @@ impl LocalReplica {
     fn review_progress(&self, pack_id: &str) -> Result<u32, Error> {
         Ok(self.store.review_progress(pack_id)?)
     }
+}
+
+fn validated_content_result(
+    operation: &OfflineContentOperation,
+    result: &crate::protocol::DecodedOfflineContentResult,
+) -> Result<ContentResultInstall, Error> {
+    let (server_id, cursor, _) = decode_cursor(&result.cursor)?;
+    if server_id != operation.cursor_server_id || cursor < operation.cursor {
+        return Err(Error::Result);
+    }
+    validate_content_authority(operation, result)?;
+    Ok(ContentResultInstall {
+        operation_id: result.operation_id.clone(),
+        status: result.status,
+        conflict_reason: result.conflict_reason,
+        cursor_server_id: server_id,
+        authoritative_document_id: result
+            .authoritative
+            .as_ref()
+            .map(|document| document.document_id.clone()),
+    })
+}
+
+fn validate_content_authority(
+    operation: &OfflineContentOperation,
+    result: &crate::protocol::DecodedOfflineContentResult,
+) -> Result<(), Error> {
+    let Some(authoritative) = &result.authoritative else {
+        return if result.status == ContentReconciliationStatus::Conflict {
+            Ok(())
+        } else {
+            Err(Error::Result)
+        };
+    };
+    if authoritative.document_id != operation.document_id() {
+        return Err(Error::Result);
+    }
+    if result.status == ContentReconciliationStatus::Accepted {
+        validate_accepted_document(operation, authoritative)?;
+    }
+    Ok(())
+}
+
+fn validate_accepted_document(
+    operation: &OfflineContentOperation,
+    authoritative: &AuthoritativeDocument,
+) -> Result<(), Error> {
+    let OfflineContentMutation::PutDocument {
+        logical_path,
+        content_sha256,
+        base,
+        ..
+    } = &operation.mutation;
+    let expected_revision = match base {
+        ContentBase::Absent => 1,
+        ContentBase::Revision { revision, .. } => revision.checked_add(1).ok_or(Error::Result)?,
+    };
+    if authoritative.active
+        && authoritative.revision == expected_revision
+        && authoritative.logical_path == *logical_path
+        && authoritative.content_sha256.as_ref() == Some(content_sha256)
+    {
+        Ok(())
+    } else {
+        Err(Error::Result)
+    }
+}
+
+fn replayed_document_edit(
+    json: &str,
+    edit: &OfflineDocumentEdit,
+) -> Result<RecordedContentOperation, Error> {
+    let submission: OfflineContentSubmission =
+        serde_json::from_str(json).map_err(|_| Error::Response)?;
+    let operation = submission.decode()?.operation;
+    let OfflineContentMutation::PutDocument {
+        document_id,
+        logical_path,
+        org,
+        ..
+    } = &operation.mutation;
+    if operation.operation_id != edit.operation_id
+        || document_id != &edit.document_id
+        || logical_path != &edit.logical_path
+        || org != &edit.org
+        || operation.authored_at_us != edit.authored_at_us
+    {
+        return Err(Error::Content);
+    }
+    Ok(RecordedContentOperation {
+        operation_id: operation.operation_id,
+        device_sequence: operation.device_sequence,
+    })
 }
 
 impl TryFrom<LocalReplicaItem> for ReplicaProjection {
@@ -483,11 +771,87 @@ impl TryFrom<StoredReviewResultPage> for ReconciledOfflineReviewPage {
     }
 }
 
+impl TryFrom<StoredContentResult> for ReconciledOfflineContent {
+    type Error = Error;
+
+    fn try_from(value: StoredContentResult) -> Result<Self, Self::Error> {
+        let operation_value: Value =
+            serde_json::from_str(&value.operation_json).map_err(|_| Error::Response)?;
+        let submission: OfflineContentSubmission =
+            serde_json::from_value(operation_value.clone()).map_err(|_| Error::Response)?;
+        let operation = submission.decode()?.operation;
+        let result_value: Value =
+            serde_json::from_str(&value.result_json).map_err(|_| Error::Response)?;
+        let result = decode_offline_content_result(result_value)?;
+        let authoritative = result.authoritative.map(ReconciledDocumentHead::from);
+        let document_id = operation.document_id().to_owned();
+        Ok(Self {
+            result_sequence: value.sequence,
+            server_id: value.server_id,
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+            document_id,
+            outcome: result.status.into(),
+            conflict_reason: result.conflict_reason.map(ContentConflictReason::from),
+            operation: operation_value,
+            authoritative,
+            cursor: result.cursor,
+        })
+    }
+}
+
+impl From<AuthoritativeDocument> for ReconciledDocumentHead {
+    fn from(value: AuthoritativeDocument) -> Self {
+        Self {
+            document_id: value.document_id,
+            logical_path: value.logical_path,
+            revision: value.revision,
+            content_sha256: value.content_sha256,
+            active: value.active,
+        }
+    }
+}
+
+impl TryFrom<StoredContentResultPage> for ReconciledOfflineContentPage {
+    type Error = Error;
+
+    fn try_from(value: StoredContentResultPage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: value
+                .items
+                .into_iter()
+                .map(ReconciledOfflineContent::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            next_after: value.next_after,
+        })
+    }
+}
+
 impl From<ReconciliationStatus> for OfflineReviewOutcome {
     fn from(value: ReconciliationStatus) -> Self {
         match value {
             ReconciliationStatus::Accepted => Self::Accepted,
             ReconciliationStatus::Conflict => Self::Conflict,
+        }
+    }
+}
+
+impl From<ContentReconciliationStatus> for OfflineContentOutcome {
+    fn from(value: ContentReconciliationStatus) -> Self {
+        match value {
+            ContentReconciliationStatus::Accepted => Self::Accepted,
+            ContentReconciliationStatus::Conflict => Self::Conflict,
+        }
+    }
+}
+
+impl From<OfflineContentConflictReason> for ContentConflictReason {
+    fn from(value: OfflineContentConflictReason) -> Self {
+        match value {
+            OfflineContentConflictReason::CursorChanged => Self::CursorChanged,
+            OfflineContentConflictReason::BaseChanged => Self::BaseChanged,
+            OfflineContentConflictReason::InvalidContent => Self::InvalidContent,
+            OfflineContentConflictReason::PathConflict => Self::PathConflict,
         }
     }
 }
@@ -587,6 +951,7 @@ impl From<StoreReplicaError> for Error {
             StoreReplicaError::StaleAnswer => Self::StaleAnswer,
             StoreReplicaError::Answer(_) => Self::Answer,
             StoreReplicaError::Result => Self::Result,
+            StoreReplicaError::Content => Self::Content,
             StoreReplicaError::Storage(_)
             | StoreReplicaError::Io(_)
             | StoreReplicaError::Corrupt
@@ -607,6 +972,12 @@ impl From<OfflineReviewWireError> for Error {
     }
 }
 
+impl From<OfflineContentWireError> for Error {
+    fn from(_: OfflineContentWireError) -> Self {
+        Self::ContentWire
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -619,15 +990,20 @@ mod tests {
 
     use sha2::{Digest as _, Sha256};
 
-    use super::{Error, LocalReplica, OfflineAnswer, OfflineResponse, ReviewConflictReason};
+    use super::{
+        Error, LocalReplica, OfflineAnswer, OfflineContentOutcome, OfflineDocumentEdit,
+        OfflineResponse, PendingContentUpload, ReviewConflictReason,
+    };
     use crate::{
         application::{
             NewDevice, ReviewSource, ReviewSourceKind, ServiceHandle, ServiceRuntime,
-            canonical_asset_path, generate_device, prepare_asset, prepare_thema, thema_content,
+            canonical_asset_path, generate_device, prepare_asset, prepare_note, prepare_thema,
+            thema_content,
         },
         protocol::{
-            OFFLINE_REVIEW_VERSION, decode_cursor, decode_snapshot_cursor, encode_cursor,
-            encode_snapshot_cursor, offline_result_json, replica_changes_json,
+            OFFLINE_REVIEW_VERSION, OfflineContentSubmission, decode_cursor,
+            decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
+            offline_content_result_json, offline_result_json, replica_changes_json,
             replica_snapshot_json, replica_state_json, review_pack_json,
         },
     };
@@ -758,7 +1134,7 @@ mod tests {
                 .unwrap()
                 .status()
                 .unwrap()
-                .next_review_sequence,
+                .next_device_sequence,
             1
         );
     }
@@ -869,6 +1245,194 @@ mod tests {
         }
         drop(service);
         runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_document_survives_restarts_exact_retry_and_feed_convergence() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("content-server.sqlite");
+        let blobs = directory.path().join("content-blobs");
+        let replica_path = directory.path().join("content-replica.sqlite");
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "offline-content".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        let edit = OfflineDocumentEdit {
+            operation_id: "offline-document-1".into(),
+            document_id: "document".into(),
+            logical_path: "note.org".into(),
+            org: "#+title: Offline\n* Heading\n".into(),
+            authored_at_us: 10,
+        };
+        let recorded = replica.record_document(edit.clone()).unwrap();
+        assert_eq!(recorded.device_sequence, 1);
+        assert_eq!(replica.record_document(edit.clone()).unwrap(), recorded);
+        let mut changed_retry = edit;
+        changed_retry.org.push_str("Changed\n");
+        assert!(matches!(
+            replica.record_document(changed_retry),
+            Err(Error::Content)
+        ));
+        for (sequence, title) in [(2, "Second"), (3, "Third")] {
+            let recorded = replica
+                .record_document(OfflineDocumentEdit {
+                    operation_id: format!("offline-document-{sequence}"),
+                    document_id: "document".into(),
+                    logical_path: "note.org".into(),
+                    org: format!("#+title: {title}\n* Heading\n"),
+                    authored_at_us: 10 + sequence,
+                })
+                .unwrap();
+            assert_eq!(recorded.device_sequence, sequence);
+        }
+        assert_eq!(replica.status().unwrap().next_device_sequence, 4);
+        drop(replica);
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        let upload = replica.next_content_upload().unwrap().unwrap();
+        let lost = reconcile_content_upload(&service, &upload, &device_id, 20).await;
+        assert_eq!(lost["result"]["status"], "accepted");
+        for mut malformed in malformed_content_results(&lost) {
+            assert!(replica.record_content_result(malformed.take()).is_err());
+            assert_eq!(
+                replica.next_content_upload().unwrap().unwrap().operation_id,
+                "offline-document-1"
+            );
+        }
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let runtime = ServiceRuntime::start(database, blobs, 8).await.unwrap();
+        let service = runtime.handle();
+        drop(replica);
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        let retry = replica.next_content_upload().unwrap().unwrap();
+        assert_eq!(retry.canonical_payload, upload.canonical_payload);
+        let replay = reconcile_content_upload(&service, &retry, &device_id, 30).await;
+        assert_eq!(replay, lost);
+        replica.record_content_result(replay).unwrap();
+        for expected_sequence in [2, 3] {
+            let pending = replica.next_content_upload().unwrap().unwrap();
+            assert_eq!(pending.device_sequence, expected_sequence);
+            let result =
+                reconcile_content_upload(&service, &pending, &device_id, 30 + expected_sequence)
+                    .await;
+            assert_eq!(result["result"]["status"], "accepted");
+            replica.record_content_result(result).unwrap();
+        }
+        assert!(replica.next_device_upload().unwrap().is_none());
+        let results = replica.content_results(None, 10).unwrap();
+        assert_eq!(results.items.len(), 3);
+        assert!(
+            results
+                .items
+                .iter()
+                .all(|item| item.outcome == OfflineContentOutcome::Accepted)
+        );
+
+        pull_server_changes(&mut replica, &service).await;
+        let document = replica.projection("document", "document").unwrap().unwrap();
+        assert_eq!(document.revision, 3);
+        assert_eq!(document.payload["projection"]["logical_path"], "note.org");
+        assert_eq!(
+            document.payload["projection"]["projection"]["title"],
+            "Third"
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conflicting_document_does_not_publish_an_unreferenced_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let blobs = directory.path().join("blobs");
+        let runtime =
+            ServiceRuntime::start(directory.path().join("server.sqlite"), blobs.clone(), 8)
+                .await
+                .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "offline-content-conflict".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let original = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Original\n".into(),
+            None,
+        )
+        .unwrap();
+        service.replace_note(original, 2, None).await.unwrap();
+
+        let mut replica =
+            LocalReplica::open(directory.path().join("replica.sqlite"), &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        let offline_org = "#+title: Offline conflict\n";
+        let offline_digest = format!("{:x}", Sha256::digest(offline_org.as_bytes()));
+        replica
+            .record_document(OfflineDocumentEdit {
+                operation_id: "conflicting-document".into(),
+                document_id: "document".into(),
+                logical_path: "note.org".into(),
+                org: offline_org.into(),
+                authored_at_us: 3,
+            })
+            .unwrap();
+        let online = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Online wins\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        service.replace_note(online, 4, None).await.unwrap();
+
+        let upload = replica.next_content_upload().unwrap().unwrap();
+        let result = reconcile_content_upload(&service, &upload, &device_id, 5).await;
+        assert_eq!(result["result"]["conflict_reason"], "base_changed");
+        assert!(
+            !blobs
+                .join(&offline_digest[..2])
+                .join(offline_digest)
+                .exists()
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    fn malformed_content_results(valid: &Value) -> Vec<Value> {
+        let mut wrong_revision = valid.clone();
+        wrong_revision["result"]["authoritative"]["revision"] = json!(2);
+        let mut wrong_path = valid.clone();
+        wrong_path["result"]["authoritative"]["logical_path"] = json!("wrong.org");
+        let mut wrong_digest = valid.clone();
+        wrong_digest["result"]["authoritative"]["content_sha256"] = json!("b".repeat(64));
+        let mut tombstone = valid.clone();
+        tombstone["result"]["authoritative"]["active"] = json!(false);
+        tombstone["result"]["authoritative"]["content_sha256"] = Value::Null;
+        let mut wrong_server = valid.clone();
+        wrong_server["result"]["cursor"] =
+            json!(encode_cursor(&"f".repeat(32), 1, &"e".repeat(32)).unwrap());
+        vec![
+            wrong_revision,
+            wrong_path,
+            wrong_digest,
+            tombstone,
+            wrong_server,
+        ]
     }
 
     #[tokio::test]
@@ -1066,7 +1630,7 @@ mod tests {
             stale.review_pack(&pack_id).unwrap().unwrap().local_position,
             1
         );
-        assert_eq!(stale.status().unwrap().next_review_sequence, 2);
+        assert_eq!(stale.status().unwrap().next_device_sequence, 2);
         assert_eq!(
             stale.next_upload().unwrap().unwrap().attempt_id,
             "first-attempt"
@@ -1310,6 +1874,28 @@ mod tests {
         replica
             .install_review_pack(review_pack_json(&pack).unwrap())
             .unwrap()
+    }
+
+    async fn reconcile_content_upload(
+        service: &ServiceHandle,
+        upload: &PendingContentUpload,
+        device_id: &str,
+        received_at_us: u64,
+    ) -> Value {
+        let submission: OfflineContentSubmission =
+            serde_json::from_value(upload.submission.clone()).unwrap();
+        let decoded = submission.decode().unwrap();
+        let result = service
+            .reconcile_content_operation(
+                decoded.version,
+                decoded.operation,
+                decoded.canonical_payload,
+                Some(device_id.into()),
+                received_at_us,
+            )
+            .await
+            .unwrap();
+        offline_content_result_json(&result).unwrap()
     }
 
     async fn add_shared_asset(service: &ServiceHandle, device_id: &str) -> String {

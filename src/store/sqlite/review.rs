@@ -5,7 +5,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
-use super::{SqliteStore, StoreError, load_thema, to_u32, to_u64, u64_to_i64};
+use super::{
+    DeviceOperationInsert, SqliteStore, StoreError, advance_device_sequence,
+    insert_device_operation, load_thema, replayed_device_operation, require_device_sequence,
+    to_u32, to_u64, u64_to_i64,
+};
 use crate::{
     application::{
         AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineConflictReason, OfflineReviewOperation,
@@ -522,12 +526,18 @@ impl SqliteStore {
         require_operation_actor(operation, actor_device_id)?;
         let digest = format!("{:x}", Sha256::digest(canonical_payload.as_bytes()));
         let transaction = self.write_transaction()?;
-        if let Some(result) = replay_offline_operation(
+        if replayed_device_operation(
             &transaction,
             &operation.attempt_id,
+            "review",
             &digest,
             actor_device_id,
         )? {
+            let result = load_offline_result(&transaction, &operation.attempt_id)?.ok_or(
+                StoreError::CorruptData {
+                    field: "offline review result",
+                },
+            )?;
             transaction.commit().map_err(StoreError::storage)?;
             return Ok(result);
         }
@@ -537,7 +547,24 @@ impl SqliteStore {
         if pack.format_version != format_version {
             return Err(StoreError::InvalidReviewState);
         }
-        require_next_device_sequence(&transaction, operation)?;
+        require_device_sequence(
+            &transaction,
+            &operation.device_id,
+            operation.device_sequence,
+        )?;
+        insert_device_operation(
+            &transaction,
+            DeviceOperationInsert {
+                operation_id: &operation.attempt_id,
+                device_id: &operation.device_id,
+                device_sequence: operation.device_sequence,
+                operation_kind: "review",
+                format_version,
+                payload_sha256: &digest,
+                payload_json: canonical_payload,
+                received_at_us,
+            },
+        )?;
         insert_offline_operation(
             &transaction,
             format_version,
@@ -560,57 +587,6 @@ fn require_operation_actor(
         Ok(())
     } else {
         Err(StoreError::ReviewOwnership)
-    }
-}
-
-fn replay_offline_operation(
-    connection: &Connection,
-    attempt_id: &str,
-    payload_sha256: &str,
-    actor_device_id: Option<&str>,
-) -> Result<Option<OfflineReviewResult>, StoreError> {
-    let existing = connection
-        .query_row(
-            "SELECT payload_sha256, device_id FROM offline_review_operation
-             WHERE attempt_id = ?1",
-            [attempt_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-        .map_err(StoreError::storage)?;
-    let Some((existing_digest, device_id)) = existing else {
-        return Ok(None);
-    };
-    if actor_device_id.is_some_and(|actor| actor != device_id) {
-        return Err(StoreError::ReviewOwnership);
-    }
-    if existing_digest != payload_sha256 {
-        return Err(StoreError::IdempotencyConflict);
-    }
-    load_offline_result(connection, attempt_id)
-}
-
-fn require_next_device_sequence(
-    connection: &Connection,
-    operation: &OfflineReviewOperation,
-) -> Result<(), StoreError> {
-    let last: i64 = connection
-        .query_row(
-            "SELECT last_review_sequence FROM device WHERE device_id = ?1",
-            [&operation.device_id],
-            |row| row.get(0),
-        )
-        .map_err(StoreError::storage)?;
-    let expected =
-        to_u64(last, "device sequence")?
-            .checked_add(1)
-            .ok_or(StoreError::CorruptData {
-                field: "device sequence",
-            })?;
-    if operation.device_sequence == expected {
-        Ok(())
-    } else {
-        Err(StoreError::DeviceSequence { expected })
     }
 }
 
@@ -955,15 +931,7 @@ fn advance_pack_sequence(
     operation: &OfflineReviewOperation,
     result: &OfflineReviewResult,
 ) -> Result<(), StoreError> {
-    transaction
-        .execute(
-            "UPDATE device SET last_review_sequence = ?2 WHERE device_id = ?1",
-            params![
-                operation.device_id,
-                u64_to_i64(operation.device_sequence, "device sequence")?,
-            ],
-        )
-        .map_err(StoreError::storage)?;
+    advance_device_sequence(transaction, &operation.device_id, operation.device_sequence)?;
     transaction
         .execute(
             "UPDATE review_pack SET
@@ -2461,6 +2429,16 @@ mod tests {
         assert_eq!(pack.cursor_server_id, result.cursor_server_id);
         assert_eq!(pack.cursor_token, result.cursor_token);
         assert_eq!(pack.cursor_token.len(), 32);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_device_sequence FROM device WHERE device_id = 'device'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
         assert!(
             connection
                 .execute(

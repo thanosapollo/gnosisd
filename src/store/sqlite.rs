@@ -31,6 +31,7 @@ use crate::{
     blob::BlobMeta,
 };
 
+mod content_sync;
 mod review;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_initial.sql");
@@ -38,7 +39,8 @@ const SERVER_MIGRATION: &str = include_str!("migrations/0002_server.sql");
 const REMOTE_REVIEW_MIGRATION: &str = include_str!("migrations/0003_remote_review.sql");
 const OFFLINE_REVIEW_MIGRATION: &str = include_str!("migrations/0004_offline_review.sql");
 const REPLICA_SYNC_MIGRATION: &str = include_str!("migrations/0005_replica_sync.sql");
-const SCHEMA_VERSION: u32 = 5;
+const OFFLINE_CONTENT_MIGRATION: &str = include_str!("migrations/0006_offline_content.sql");
+const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -197,71 +199,17 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::storage)?;
-        let current = load_document(&transaction, &prepared.document_id)?;
-        check_revision(prepared.expected_revision, current.as_ref())?;
-        let current_path = document_path(&transaction, &prepared.document_id)?;
-        if current_path
-            .as_deref()
-            .is_some_and(|path| path != prepared.logical_path)
-        {
-            return Err(StoreError::PathChange);
-        }
-        check_path_available(&transaction, prepared)?;
-        let current_head = load_document_head(&transaction, &prepared.document_id)?;
-        let current_blob_matches = current_head.is_some_and(|head| {
-            head.active && head.blob_sha256.as_deref() == Some(prepared.blob_sha256.as_str())
-        });
-        if current.as_ref().is_some_and(|stored| {
-            stored.projection() == &prepared.projection
-                && current_path.as_deref() == Some(prepared.logical_path.as_str())
-        }) && current_blob_matches
-        {
-            transaction.commit().map_err(StoreError::storage)?;
-            return current.ok_or(StoreError::CorruptData { field: "document" });
-        }
-        let revision = next_revision(current.as_ref())?;
-        retire_removed_nodes(&transaction, prepared, revision)?;
-        insert_blob(&transaction, blob, created_at_us)?;
-        replace_rows(
-            &transaction,
-            &prepared.document_id,
-            &prepared.projection,
-            revision,
-            FailPoint::None,
-        )?;
-        update_note_head(&transaction, prepared, blob, revision, created_at_us)?;
-        insert_document_revision(
+        let stored = replace_note_in(
             &transaction,
             prepared,
-            revision,
-            current.is_some(),
+            blob,
+            prepared.expected_revision,
             created_at_us,
             author_device_id,
-        )?;
-        insert_document_projection_history(
-            &transaction,
-            &prepared.document_id,
-            revision,
-            &prepared.projection,
-        )?;
-        insert_content_change(
-            &transaction,
-            "document",
-            prepared.document_id.as_str(),
-            revision,
-            if current.is_some() {
-                "update"
-            } else {
-                "create"
-            },
-            created_at_us,
+            true,
         )?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(StoredDocument {
-            document_id: prepared.document_id.clone(),
-            revision,
-            projection: prepared.projection.clone(),
-        })
+        Ok(stored)
     }
 
     pub(crate) fn document_logical_path(
@@ -775,7 +723,7 @@ impl SqliteStore {
         let last_sequence = self
             .connection
             .query_row(
-                "SELECT last_review_sequence FROM device
+                "SELECT last_device_sequence FROM device
                  WHERE device_id = ?1 AND revoked_at_us IS NULL",
                 [device_id],
                 |row| row.get::<_, i64>(0),
@@ -783,7 +731,7 @@ impl SqliteStore {
             .optional()
             .map_err(StoreError::storage)?
             .ok_or(StoreError::ReviewOwnership)?;
-        let next_review_sequence = to_u64(last_sequence, "device sequence")?
+        let next_device_sequence = to_u64(last_sequence, "device sequence")?
             .checked_add(1)
             .ok_or(StoreError::CorruptData {
                 field: "device sequence",
@@ -792,7 +740,7 @@ impl SqliteStore {
             server_id,
             cursor,
             cursor_token,
-            next_review_sequence,
+            next_device_sequence,
         })
     }
 
@@ -1441,6 +1389,131 @@ impl SqliteStore {
             projection: projection.clone(),
         })
     }
+}
+
+fn replayed_device_operation(
+    connection: &Connection,
+    operation_id: &str,
+    operation_kind: &str,
+    payload_sha256: &str,
+    actor_device_id: Option<&str>,
+) -> Result<bool, StoreError> {
+    let existing = connection
+        .query_row(
+            "SELECT operation_kind, payload_sha256, device_id
+             FROM device_operation WHERE operation_id = ?1",
+            [operation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    let Some((stored_kind, stored_digest, stored_device)) = existing else {
+        return Ok(false);
+    };
+    if actor_device_id.is_some_and(|actor| actor != stored_device) {
+        return Err(StoreError::ReviewOwnership);
+    }
+    if stored_kind != operation_kind || stored_digest != payload_sha256 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    Ok(true)
+}
+
+fn require_device_sequence(
+    connection: &Connection,
+    device_id: &str,
+    sequence: u64,
+) -> Result<(), StoreError> {
+    let last = connection
+        .query_row(
+            "SELECT last_device_sequence FROM device WHERE device_id = ?1",
+            [device_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::storage)?;
+    let expected =
+        to_u64(last, "device sequence")?
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData {
+                field: "device sequence",
+            })?;
+    if sequence == expected {
+        Ok(())
+    } else {
+        Err(StoreError::DeviceSequence { expected })
+    }
+}
+
+struct DeviceOperationInsert<'a> {
+    operation_id: &'a str,
+    device_id: &'a str,
+    device_sequence: u64,
+    operation_kind: &'a str,
+    format_version: u32,
+    payload_sha256: &'a str,
+    payload_json: &'a str,
+    received_at_us: u64,
+}
+
+fn insert_device_operation(
+    transaction: &Transaction<'_>,
+    operation: DeviceOperationInsert<'_>,
+) -> Result<(), StoreError> {
+    let reused = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM device_operation
+                 WHERE device_id = ?1 AND device_sequence = ?2
+             )",
+            params![
+                operation.device_id,
+                u64_to_i64(operation.device_sequence, "device sequence")?
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StoreError::storage)?;
+    if reused {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    transaction
+        .execute(
+            "INSERT INTO device_operation(
+                 operation_id, device_id, device_sequence, operation_kind,
+                 format_version, payload_sha256, payload_json, received_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                operation.operation_id,
+                operation.device_id,
+                u64_to_i64(operation.device_sequence, "device sequence")?,
+                operation.operation_kind,
+                i64::from(operation.format_version),
+                operation.payload_sha256,
+                operation.payload_json,
+                u64_to_i64(operation.received_at_us, "operation receipt timestamp")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn advance_device_sequence(
+    transaction: &Transaction<'_>,
+    device_id: &str,
+    sequence: u64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "UPDATE device SET last_device_sequence = ?2 WHERE device_id = ?1",
+            params![device_id, u64_to_i64(sequence, "device sequence")?],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
 }
 
 fn document_head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentHead> {
@@ -2793,6 +2866,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             .execute_batch(REPLICA_SYNC_MIGRATION)
             .map_err(StoreError::storage)?;
     }
+    if found < 6 {
+        connection
+            .execute_batch(OFFLINE_CONTENT_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
     Ok(())
 }
 
@@ -3529,6 +3607,128 @@ fn check_path_available(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn replace_note_in(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedNote,
+    blob: &BlobMeta,
+    expected_revision: Option<u64>,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+    allow_noop: bool,
+) -> Result<StoredDocument, StoreError> {
+    let current = load_document(transaction, &prepared.document_id)?;
+    check_revision(expected_revision, current.as_ref())?;
+    let current_path = document_path(transaction, &prepared.document_id)?;
+    require_unchanged_path(prepared, current_path.as_deref())?;
+    check_path_available(transaction, prepared)?;
+    if allow_noop && note_is_unchanged(transaction, prepared, current.as_ref(), &current_path)? {
+        return current.ok_or(StoreError::CorruptData { field: "document" });
+    }
+    write_note_revision(
+        transaction,
+        prepared,
+        blob,
+        current,
+        created_at_us,
+        author_device_id,
+    )
+}
+
+fn require_unchanged_path(
+    prepared: &PreparedNote,
+    current_path: Option<&str>,
+) -> Result<(), StoreError> {
+    if current_path.is_some_and(|path| path != prepared.logical_path) {
+        Err(StoreError::PathChange)
+    } else {
+        Ok(())
+    }
+}
+
+fn note_is_unchanged(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedNote,
+    current: Option<&StoredDocument>,
+    current_path: &Option<String>,
+) -> Result<bool, StoreError> {
+    let head = load_document_head(transaction, &prepared.document_id)?;
+    let blob_matches = head.is_some_and(|head| {
+        head.active && head.blob_sha256.as_deref() == Some(prepared.blob_sha256.as_str())
+    });
+    Ok(blob_matches
+        && current.is_some_and(|stored| {
+            stored.projection() == &prepared.projection
+                && current_path.as_deref() == Some(prepared.logical_path.as_str())
+        }))
+}
+
+fn write_note_revision(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedNote,
+    blob: &BlobMeta,
+    current: Option<StoredDocument>,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<StoredDocument, StoreError> {
+    let revision = next_revision(current.as_ref())?;
+    retire_removed_nodes(transaction, prepared, revision)?;
+    insert_blob(transaction, blob, created_at_us)?;
+    replace_rows(
+        transaction,
+        &prepared.document_id,
+        &prepared.projection,
+        revision,
+        FailPoint::None,
+    )?;
+    update_note_head(transaction, prepared, blob, revision, created_at_us)?;
+    record_note_history(
+        transaction,
+        prepared,
+        revision,
+        current.is_some(),
+        created_at_us,
+        author_device_id,
+    )?;
+    Ok(StoredDocument {
+        document_id: prepared.document_id.clone(),
+        revision,
+        projection: prepared.projection.clone(),
+    })
+}
+
+fn record_note_history(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedNote,
+    revision: u64,
+    existed: bool,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    insert_document_revision(
+        transaction,
+        prepared,
+        revision,
+        existed,
+        created_at_us,
+        author_device_id,
+    )?;
+    insert_document_projection_history(
+        transaction,
+        &prepared.document_id,
+        revision,
+        &prepared.projection,
+    )?;
+    insert_content_change(
+        transaction,
+        "document",
+        prepared.document_id.as_str(),
+        revision,
+        if existed { "update" } else { "create" },
+        created_at_us,
+    )
+}
+
 fn document_path(
     connection: &Connection,
     document_id: &DocumentId,
@@ -4057,11 +4257,11 @@ mod tests {
 
     use super::{
         FailPoint, INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION,
-        SERVER_MIGRATION, SqliteStore, StoreError, migrate, schema_version,
+        REPLICA_SYNC_MIGRATION, SERVER_MIGRATION, SqliteStore, StoreError, migrate, schema_version,
     };
     use crate::application::{
-        ReplicaProjection, SettingsInput, generate_device, prepare_asset, prepare_note,
-        prepare_thema, thema_content,
+        OfflineReviewOperation, ReconciliationStatus, ReplicaProjection, SettingsInput,
+        generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
@@ -4226,7 +4426,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            5
+            6
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4234,7 +4434,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            5
+            6
         );
     }
 
@@ -4247,7 +4447,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 5);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
@@ -4255,7 +4455,7 @@ mod tests {
             ("review_attempt", "fuzz_sample"),
             ("review_session", "owner_device_id"),
             ("review_session", "review_mode"),
-            ("device", "last_review_sequence"),
+            ("device", "last_device_sequence"),
             ("server_identity", "server_id"),
             ("replica_snapshot_item", "entity_kind"),
             ("thema_revision", "content_sha256"),
@@ -4356,7 +4556,7 @@ mod tests {
 
         let device: (i64, i64) = connection
             .query_row(
-                "SELECT count(*), last_review_sequence FROM device WHERE device_id = 'device'",
+                "SELECT count(*), last_device_sequence FROM device WHERE device_id = 'device'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -4437,7 +4637,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 5);
+        assert_eq!(schema_version(&connection).unwrap(), 6);
         let floor: i64 = connection
             .query_row(
                 "SELECT retained_after_cursor FROM sync_feed_state",
@@ -4472,6 +4672,105 @@ mod tests {
                 .unwrap(),
             server_id
         );
+    }
+
+    #[test]
+    fn upgrades_schema_v5_review_journal_into_the_shared_device_ledger() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/protocol/offline-review-v1.json"
+        ))
+        .unwrap();
+        let operation: OfflineReviewOperation =
+            serde_json::from_value(fixture["submission"]["operation"].clone()).unwrap();
+        let canonical_payload = serde_json::to_string(&fixture["submission"]).unwrap();
+        let payload_sha256 = format!("{:x}", sha2::Sha256::digest(canonical_payload.as_bytes()));
+        let state_json =
+            serde_json::to_string(&fixture["result"]["result"]["authoritative_state"]).unwrap();
+        let session_json = serde_json::to_string(&fixture["result"]["result"]["session"]).unwrap();
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        for migration in [
+            INITIAL_MIGRATION,
+            SERVER_MIGRATION,
+            REMOTE_REVIEW_MIGRATION,
+            OFFLINE_REVIEW_MIGRATION,
+            REPLICA_SYNC_MIGRATION,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO device(
+                     device_id, name, token_digest, scopes_json, created_at_us
+                 ) VALUES ('device', 'Device', ?1, '[\"review\"]', 1)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO review_session(
+                     session_id, source_kind, source_json, timezone, day_boundary_hour,
+                     scheduler_json, status, started_at_us, owner_device_id, review_mode
+                 ) VALUES (
+                     'session', 'manual', '{}', 'UTC', 0, '{}', 'active', 1,
+                     'device', 'offline'
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO review_pack(
+                     pack_id, format_version, session_id, device_id, lease_id,
+                     status, cursor, issued_at_us, cursor_server_id, cursor_token
+                 ) SELECT 'pack', 1, 'session', 'device', 'lease', 'active', 0, 1,
+                          server_identity.server_id, sync_feed_state.retained_after_token
+                   FROM server_identity JOIN sync_feed_state ON sync_feed_state.id = 1",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO offline_review_operation(
+                     attempt_id, pack_id, device_id, device_sequence, format_version,
+                     payload_sha256, payload_json, received_at_us
+                 ) VALUES ('attempt', 'pack', 'device', 1, 1, ?1, ?2, 2)",
+                rusqlite::params![payload_sha256, canonical_payload],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO offline_review_result(
+                     attempt_id, format_version, status, conflict_reason, event_id,
+                     authoritative_state_json, session_json, cursor, reconciled_at_us,
+                     cursor_server_id, cursor_token
+                 ) SELECT 'attempt', 1, 'conflict', 'scheduling_changed', NULL,
+                          ?1, ?2, 0, 3, server_identity.server_id,
+                          sync_feed_state.retained_after_token
+                   FROM server_identity JOIN sync_feed_state ON sync_feed_state.id = 1",
+                rusqlite::params![state_json, session_json],
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_device_sequence FROM device WHERE device_id = 'device'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let mut store = SqliteStore { connection };
+        let replay = store
+            .reconcile_offline_operation(1, &operation, &canonical_payload, Some("device"), 4)
+            .unwrap();
+        assert_eq!(replay.status, ReconciliationStatus::Conflict);
+        assert_eq!(replay.attempt_id, "attempt");
     }
 
     #[test]

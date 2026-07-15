@@ -6,11 +6,14 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::application::{
-    OfflineAnswerError, OfflineAnswerInput, OfflineReviewOperation, OfflineReviewResult,
-    ReconciliationStatus, ReviewPackView, ReviewSessionMode, prepare_offline_operation,
+    ContentBase, ContentReconciliationStatus, OfflineAnswerError, OfflineAnswerInput,
+    OfflineContentConflictReason, OfflineContentOperation, OfflineReviewOperation,
+    OfflineReviewResult, ReconciliationStatus, ReviewPackView, ReviewSessionMode,
+    prepare_offline_operation,
 };
 
 const INITIAL_SCHEMA: &str = include_str!("replica/0001_initial.sql");
+const OFFLINE_CONTENT_SCHEMA: &str = include_str!("replica/0002_offline_content.sql");
 const FIRST_REQUEST: &str = "";
 
 pub(crate) struct LocalReplicaStore {
@@ -56,12 +59,43 @@ pub(crate) struct LocalReplicaStatus {
     pub(crate) observed_server_id: Option<String>,
     pub(crate) cursor: Option<String>,
     pub(crate) snapshot_next: Option<String>,
-    pub(crate) next_review_sequence: u64,
+    pub(crate) next_device_sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PendingReviewOperation {
     pub(crate) operation: OfflineReviewOperation,
+}
+
+pub(crate) struct LocalContentContext {
+    pub(crate) server_id: String,
+    pub(crate) cursor: String,
+    pub(crate) next_device_sequence: u64,
+    pub(crate) base: ContentBase,
+}
+
+pub(crate) struct PendingContentOperation {
+    pub(crate) canonical_payload: String,
+}
+
+pub(crate) struct ContentResultInstall {
+    pub(crate) operation_id: String,
+    pub(crate) status: ContentReconciliationStatus,
+    pub(crate) conflict_reason: Option<OfflineContentConflictReason>,
+    pub(crate) cursor_server_id: String,
+    pub(crate) authoritative_document_id: Option<String>,
+}
+
+pub(crate) struct StoredContentResult {
+    pub(crate) sequence: u64,
+    pub(crate) server_id: String,
+    pub(crate) operation_json: String,
+    pub(crate) result_json: String,
+}
+
+pub(crate) struct StoredContentResultPage {
+    pub(crate) items: Vec<StoredContentResult>,
+    pub(crate) next_after: Option<u64>,
 }
 
 pub(crate) struct StoredReviewPack {
@@ -110,6 +144,8 @@ pub(crate) enum LocalReplicaError {
     Answer(#[from] OfflineAnswerError),
     #[error("offline operation result is out of order or inconsistent")]
     Result,
+    #[error("offline content operation no longer matches the replica state")]
+    Content,
 }
 
 impl LocalReplicaStore {
@@ -131,7 +167,7 @@ impl LocalReplicaStore {
     pub(crate) fn observe_server(
         &mut self,
         server_id: &str,
-        next_review_sequence: u64,
+        next_device_sequence: u64,
     ) -> Result<(), LocalReplicaError> {
         let transaction = self.immediate()?;
         let (active, observed) = replica_servers(&transaction)?;
@@ -148,18 +184,18 @@ impl LocalReplicaStore {
                 [server_id],
             )
             .map_err(LocalReplicaError::Storage)?;
-        let sequence = u64_to_i64(next_review_sequence)?;
+        let sequence = u64_to_i64(next_device_sequence)?;
         if changed {
             transaction
                 .execute(
-                    "UPDATE replica_sync SET next_review_sequence = ?1 WHERE id = 1",
+                    "UPDATE replica_sync SET next_device_sequence = ?1 WHERE id = 1",
                     [sequence],
                 )
                 .map_err(LocalReplicaError::Storage)?;
         } else {
             transaction
                 .execute(
-                    "UPDATE replica_sync SET next_review_sequence = max(next_review_sequence, ?1)
+                    "UPDATE replica_sync SET next_device_sequence = max(next_device_sequence, ?1)
                      WHERE id = 1",
                     [sequence],
                 )
@@ -172,7 +208,7 @@ impl LocalReplicaStore {
         self.connection
             .query_row(
                 "SELECT identity.server_id, identity.observed_server_id, sync.cursor,
-                        sync.snapshot_next, sync.next_review_sequence
+                        sync.snapshot_next, sync.next_device_sequence
                  FROM replica_identity AS identity
                  JOIN replica_sync AS sync ON sync.id = identity.id WHERE identity.id = 1",
                 [],
@@ -182,9 +218,19 @@ impl LocalReplicaStore {
                         observed_server_id: row.get(1)?,
                         cursor: row.get(2)?,
                         snapshot_next: row.get(3)?,
-                        next_review_sequence: row_u64(row, 4)?,
+                        next_device_sequence: row_u64(row, 4)?,
                     })
                 },
+            )
+            .map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn device_id(&self) -> Result<String, LocalReplicaError> {
+        self.connection
+            .query_row(
+                "SELECT device_id FROM replica_identity WHERE id = 1",
+                [],
+                |row| row.get(0),
             )
             .map_err(LocalReplicaError::Storage)
     }
@@ -397,13 +443,13 @@ impl LocalReplicaStore {
             return Err(LocalReplicaError::StaleAnswer);
         }
         require_pack_assets(&transaction, pack_id)?;
-        let sequence = next_review_sequence(&transaction)?;
+        let sequence = next_device_sequence(&transaction)?;
         let operation = prepare_offline_operation(&pack, sequence, input)?;
         insert_review_operation(&transaction, &operation)?;
         advance_review_progress(&transaction, &pack, position)?;
         transaction
             .execute(
-                "UPDATE replica_sync SET next_review_sequence = next_review_sequence + 1
+                "UPDATE replica_sync SET next_device_sequence = next_device_sequence + 1
                  WHERE id = 1",
                 [],
             )
@@ -418,9 +464,25 @@ impl LocalReplicaStore {
         self.connection
             .query_row(
                 "SELECT operation.operation_json
-                 FROM replica_review_operation AS operation
+                 FROM replica_device_operation AS device
+                 JOIN replica_review_operation AS operation
+                   ON operation.attempt_id = device.operation_id
                  LEFT JOIN replica_review_result AS result USING(attempt_id)
-                 WHERE result.attempt_id IS NULL ORDER BY operation.device_sequence LIMIT 1",
+                 WHERE result.attempt_id IS NULL
+                   AND NOT EXISTS(
+                       SELECT 1 FROM replica_device_operation AS earlier
+                       LEFT JOIN replica_review_result AS review
+                           ON earlier.operation_kind = 'review'
+                          AND review.attempt_id = earlier.operation_id
+                       LEFT JOIN replica_content_result AS content
+                           ON earlier.operation_kind = 'content'
+                          AND content.operation_id = earlier.operation_id
+                       WHERE earlier.server_id = device.server_id
+                         AND earlier.device_sequence < device.device_sequence
+                         AND review.attempt_id IS NULL
+                         AND content.operation_id IS NULL
+                   )
+                 ORDER BY device.device_sequence LIMIT 1",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -432,6 +494,178 @@ impl LocalReplicaStore {
                     .map_err(|_| LocalReplicaError::Corrupt)
             })
             .transpose()
+    }
+
+    pub(crate) fn content_context(
+        &self,
+        document_id: &str,
+    ) -> Result<LocalContentContext, LocalReplicaError> {
+        let context = self
+            .connection
+            .query_row(
+                "SELECT identity.server_id, identity.observed_server_id, sync.cursor,
+                        sync.snapshot_id, sync.next_device_sequence
+                 FROM replica_identity AS identity
+                 JOIN replica_sync AS sync ON sync.id = identity.id WHERE identity.id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row_u64(row, 4)?,
+                    ))
+                },
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        let server_id = context.0.ok_or(LocalReplicaError::Content)?;
+        if context.1.as_deref() != Some(server_id.as_str()) || context.3.is_some() {
+            return Err(LocalReplicaError::Content);
+        }
+        let cursor = context.2.ok_or(LocalReplicaError::Content)?;
+        let base = working_content_base(&self.connection, document_id)?;
+        if matches!(
+            &base,
+            ContentBase::Revision {
+                content_sha256: None,
+                ..
+            }
+        ) {
+            return Err(LocalReplicaError::Content);
+        }
+        Ok(LocalContentContext {
+            server_id,
+            cursor,
+            next_device_sequence: context.4,
+            base,
+        })
+    }
+
+    pub(crate) fn existing_content_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<String>, LocalReplicaError> {
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT device.operation_kind, content.operation_json
+                 FROM replica_device_operation AS device
+                 LEFT JOIN replica_content_operation AS content USING(operation_id)
+                 WHERE device.operation_id = ?1",
+                [operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(LocalReplicaError::Storage)?;
+        match existing {
+            None => Ok(None),
+            Some((kind, Some(json))) if kind == "content" => Ok(Some(json)),
+            Some(_) => Err(LocalReplicaError::Content),
+        }
+    }
+
+    pub(crate) fn record_content_operation(
+        &mut self,
+        operation: &OfflineContentOperation,
+        cursor: &str,
+        canonical_payload: &str,
+    ) -> Result<(), LocalReplicaError> {
+        let transaction = self.immediate()?;
+        if replayed_content_operation(&transaction, operation, canonical_payload)? {
+            transaction.commit().map_err(LocalReplicaError::Storage)?;
+            return Ok(());
+        }
+        require_content_context(&transaction, operation, cursor)?;
+        insert_local_content_operation(&transaction, operation, canonical_payload)?;
+        transaction
+            .execute(
+                "UPDATE replica_sync SET next_device_sequence = next_device_sequence + 1
+                 WHERE id = 1",
+                [],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction.commit().map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn next_pending_content_operation(
+        &self,
+    ) -> Result<Option<PendingContentOperation>, LocalReplicaError> {
+        let pending = self
+            .connection
+            .query_row(
+                "SELECT content.operation_json
+                 FROM replica_device_operation AS device
+                 JOIN replica_content_operation AS content USING(operation_id)
+                 LEFT JOIN replica_content_result AS result USING(operation_id)
+                 WHERE result.operation_id IS NULL
+                   AND NOT EXISTS(
+                       SELECT 1 FROM replica_device_operation AS earlier
+                       LEFT JOIN replica_review_result AS review
+                           ON earlier.operation_kind = 'review'
+                          AND review.attempt_id = earlier.operation_id
+                       LEFT JOIN replica_content_result AS prior_content
+                           ON earlier.operation_kind = 'content'
+                          AND prior_content.operation_id = earlier.operation_id
+                       WHERE earlier.server_id = device.server_id
+                         AND earlier.device_sequence < device.device_sequence
+                         AND review.attempt_id IS NULL
+                         AND prior_content.operation_id IS NULL
+                   )
+                 ORDER BY device.device_sequence LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(LocalReplicaError::Storage)?
+            .map(|canonical_payload| PendingContentOperation { canonical_payload });
+        Ok(pending)
+    }
+
+    pub(crate) fn record_content_result(
+        &mut self,
+        result: &ContentResultInstall,
+        cursor: &str,
+        result_json: &str,
+    ) -> Result<(), LocalReplicaError> {
+        let transaction = self.immediate()?;
+        if replayed_content_result(&transaction, &result.operation_id, result_json)? {
+            transaction.commit().map_err(LocalReplicaError::Storage)?;
+            return Ok(());
+        }
+        require_next_content_result(&transaction, result)?;
+        transaction
+            .execute(
+                "INSERT INTO replica_content_result(
+                     operation_id, status, conflict_reason, result_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    result.operation_id,
+                    result.status.as_str(),
+                    result.conflict_reason.map(|reason| reason.as_str()),
+                    result_json,
+                ],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction
+            .execute(
+                "UPDATE replica_sync SET result_cursor_hint = ?1 WHERE id = 1",
+                [cursor],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction.commit().map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn content_results(
+        &self,
+        after: u64,
+        limit: u16,
+        conflicts_only: bool,
+    ) -> Result<StoredContentResultPage, LocalReplicaError> {
+        if limit == 0 || limit > 1000 {
+            return Err(LocalReplicaError::Result);
+        }
+        load_content_results(&self.connection, after, limit, conflicts_only)
     }
 
     pub(crate) fn record_result(
@@ -613,10 +847,18 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
         .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
         .map_err(LocalReplicaError::Storage)?;
     match version {
-        0 => transaction
-            .execute_batch(INITIAL_SCHEMA)
+        0 => {
+            transaction
+                .execute_batch(INITIAL_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
+            transaction
+                .execute_batch(OFFLINE_CONTENT_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
+        }
+        1 => transaction
+            .execute_batch(OFFLINE_CONTENT_SCHEMA)
             .map_err(LocalReplicaError::Storage)?,
-        1 => {}
+        2 => {}
         _ => return Err(LocalReplicaError::Schema),
     }
     let stored = transaction
@@ -640,7 +882,7 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
                 .map_err(LocalReplicaError::Storage)?;
             transaction
                 .execute(
-                    "INSERT INTO replica_sync(id, next_review_sequence) VALUES (1, 1)",
+                    "INSERT INTO replica_sync(id, next_device_sequence) VALUES (1, 1)",
                     [],
                 )
                 .map_err(LocalReplicaError::Storage)?;
@@ -677,9 +919,14 @@ fn has_pending_outbox(transaction: &Transaction<'_>) -> Result<bool, LocalReplic
     transaction
         .query_row(
             "SELECT EXISTS(
-                 SELECT 1 FROM replica_review_operation AS operation
-                 LEFT JOIN replica_review_result AS result USING(attempt_id)
-                 WHERE result.attempt_id IS NULL
+                 SELECT 1 FROM replica_device_operation AS operation
+                 LEFT JOIN replica_review_result AS review
+                   ON operation.operation_kind = 'review'
+                  AND review.attempt_id = operation.operation_id
+                 LEFT JOIN replica_content_result AS content
+                   ON operation.operation_kind = 'content'
+                  AND content.operation_id = operation.operation_id
+                 WHERE review.attempt_id IS NULL AND content.operation_id IS NULL
              )",
             [],
             |row| row.get(0),
@@ -1195,10 +1442,10 @@ fn load_pack_for_answer(
     Ok((pack, position))
 }
 
-fn next_review_sequence(transaction: &Transaction<'_>) -> Result<u64, LocalReplicaError> {
+fn next_device_sequence(transaction: &Transaction<'_>) -> Result<u64, LocalReplicaError> {
     transaction
         .query_row(
-            "SELECT next_review_sequence FROM replica_sync WHERE id = 1",
+            "SELECT next_device_sequence FROM replica_sync WHERE id = 1",
             [],
             |row| row_u64(row, 0),
         )
@@ -1210,7 +1457,21 @@ fn insert_review_operation(
     operation: &OfflineReviewOperation,
 ) -> Result<(), LocalReplicaError> {
     let json = serde_json::to_string(operation).map_err(|_| LocalReplicaError::Corrupt)?;
-    let changed = transaction
+    let device_changed = transaction
+        .execute(
+            "INSERT INTO replica_device_operation(
+                 operation_id, server_id, device_sequence, operation_kind, operation_json
+             ) SELECT ?1, pack.server_id, ?2, 'review', ?3
+               FROM replica_review_pack AS pack WHERE pack.pack_id = ?4",
+            params![
+                operation.attempt_id,
+                u64_to_i64(operation.device_sequence)?,
+                json,
+                operation.pack_id,
+            ],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let review_changed = transaction
         .execute(
             "INSERT INTO replica_review_operation(
                  attempt_id, server_id, device_sequence, pack_id,
@@ -1226,7 +1487,7 @@ fn insert_review_operation(
             ],
         )
         .map_err(LocalReplicaError::Storage)?;
-    if changed == 1 {
+    if device_changed == 1 && review_changed == 1 {
         Ok(())
     } else {
         Err(LocalReplicaError::Corrupt)
@@ -1259,6 +1520,334 @@ fn advance_review_progress(
     }
 }
 
+fn current_content_base(
+    connection: &Connection,
+    document_id: &str,
+) -> Result<ContentBase, LocalReplicaError> {
+    let stored = connection
+        .query_row(
+            "SELECT revision, payload_json FROM replica_projection
+             WHERE entity_kind = 'document' AND entity_id = ?1",
+            [document_id],
+            |row| Ok((row_u64(row, 0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    let Some((revision, payload)) = stored else {
+        return Ok(ContentBase::Absent);
+    };
+    Ok(ContentBase::Revision {
+        revision,
+        content_sha256: replica_document_digest(&payload)?,
+        predecessor_operation_id: None,
+    })
+}
+
+fn working_content_base(
+    connection: &Connection,
+    document_id: &str,
+) -> Result<ContentBase, LocalReplicaError> {
+    if let Some(base) = latest_chained_content_base(connection, document_id, false)? {
+        return Ok(base);
+    }
+    let canonical = current_content_base(connection, document_id)?;
+    let accepted = latest_chained_content_base(connection, document_id, true)?;
+    Ok(accepted
+        .filter(|base| content_base_revision(base) > content_base_revision(&canonical))
+        .unwrap_or(canonical))
+}
+
+fn latest_chained_content_base(
+    connection: &Connection,
+    document_id: &str,
+    accepted: bool,
+) -> Result<Option<ContentBase>, LocalReplicaError> {
+    connection
+        .query_row(
+            "SELECT content.base_kind, content.base_revision, content.content_sha256,
+                    content.operation_id
+             FROM replica_device_operation AS device
+             JOIN replica_content_operation AS content USING(operation_id)
+             LEFT JOIN replica_content_result AS result USING(operation_id)
+             WHERE content.document_id = ?1
+               AND ((?2 = 0 AND result.operation_id IS NULL)
+                    OR (?2 = 1 AND result.status = 'accepted'))
+             ORDER BY device.device_sequence DESC LIMIT 1",
+            params![document_id, i64::from(accepted)],
+            chained_content_base_row,
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)
+}
+
+fn chained_content_base_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentBase> {
+    let revision = match row.get::<_, String>(0)?.as_str() {
+        "absent" => 1,
+        "revision" => row_u64(row, 1)?
+            .checked_add(1)
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(1, i64::MAX))?,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(ContentBase::Revision {
+        revision,
+        content_sha256: Some(row.get(2)?),
+        predecessor_operation_id: Some(row.get(3)?),
+    })
+}
+
+fn replica_document_digest(payload: &str) -> Result<Option<String>, LocalReplicaError> {
+    let value: Value = serde_json::from_str(payload).map_err(|_| LocalReplicaError::Corrupt)?;
+    for pointer in [
+        "/projection/content_sha256",
+        "/projection/projection/content_sha256",
+    ] {
+        match value.pointer(pointer) {
+            Some(Value::String(digest)) => return Ok(Some(digest.clone())),
+            Some(Value::Null) | None => {}
+            Some(_) => return Err(LocalReplicaError::Corrupt),
+        }
+    }
+    Ok(None)
+}
+
+const fn content_base_revision(base: &ContentBase) -> u64 {
+    match base {
+        ContentBase::Absent => 0,
+        ContentBase::Revision { revision, .. } => *revision,
+    }
+}
+
+fn replayed_content_operation(
+    transaction: &Transaction<'_>,
+    operation: &OfflineContentOperation,
+    canonical_payload: &str,
+) -> Result<bool, LocalReplicaError> {
+    let existing = transaction
+        .query_row(
+            "SELECT operation_json FROM replica_content_operation WHERE operation_id = ?1",
+            [&operation.operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    match existing {
+        Some(existing) if existing == canonical_payload => Ok(true),
+        Some(_) => Err(LocalReplicaError::Content),
+        None => Ok(false),
+    }
+}
+
+fn require_content_context(
+    transaction: &Transaction<'_>,
+    operation: &OfflineContentOperation,
+    cursor: &str,
+) -> Result<(), LocalReplicaError> {
+    let context = transaction
+        .query_row(
+            "SELECT identity.device_id, identity.server_id, identity.observed_server_id,
+                    sync.cursor, sync.snapshot_id, sync.next_device_sequence
+             FROM replica_identity AS identity
+             JOIN replica_sync AS sync ON sync.id = identity.id WHERE identity.id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row_u64(row, 5)?,
+                ))
+            },
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let context_matches = context.0 == operation.device_id
+        && context.1.as_deref() == Some(operation.cursor_server_id.as_str())
+        && context.2 == context.1
+        && context.3.as_deref() == Some(cursor)
+        && context.4.is_none()
+        && context.5 == operation.device_sequence;
+    let base = working_content_base(transaction, operation.document_id())?;
+    if context_matches && &base == operation.base() {
+        Ok(())
+    } else {
+        Err(LocalReplicaError::Content)
+    }
+}
+
+fn insert_local_content_operation(
+    transaction: &Transaction<'_>,
+    operation: &OfflineContentOperation,
+    canonical_payload: &str,
+) -> Result<(), LocalReplicaError> {
+    transaction
+        .execute(
+            "INSERT INTO replica_device_operation(
+                 operation_id, server_id, device_sequence, operation_kind, operation_json
+             ) VALUES (?1, ?2, ?3, 'content', ?4)",
+            params![
+                operation.operation_id,
+                operation.cursor_server_id,
+                u64_to_i64(operation.device_sequence)?,
+                canonical_payload,
+            ],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let (base_kind, base_revision, base_digest, predecessor) = match operation.base() {
+        ContentBase::Absent => ("absent", None, None, None),
+        ContentBase::Revision {
+            revision,
+            content_sha256,
+            predecessor_operation_id,
+        } => (
+            "revision",
+            Some(u64_to_i64(*revision)?),
+            content_sha256.as_deref(),
+            predecessor_operation_id.as_deref(),
+        ),
+    };
+    transaction
+        .execute(
+            "INSERT INTO replica_content_operation(
+                 operation_id, document_id, content_sha256, base_kind, base_revision,
+                 base_content_sha256, predecessor_operation_id, operation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                operation.operation_id,
+                operation.document_id(),
+                operation.content_sha256(),
+                base_kind,
+                base_revision,
+                base_digest,
+                predecessor,
+                canonical_payload,
+            ],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    Ok(())
+}
+
+fn replayed_content_result(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    json: &str,
+) -> Result<bool, LocalReplicaError> {
+    let existing = transaction
+        .query_row(
+            "SELECT result_json FROM replica_content_result WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    match existing {
+        Some(existing) if existing == json => Ok(true),
+        Some(_) => Err(LocalReplicaError::Result),
+        None => Ok(false),
+    }
+}
+
+fn require_next_content_result(
+    transaction: &Transaction<'_>,
+    result: &ContentResultInstall,
+) -> Result<(), LocalReplicaError> {
+    let next = next_unresolved_device_operation(transaction)?;
+    let Some((kind, operation_id, server_id, document_id)) = next else {
+        return Err(LocalReplicaError::Result);
+    };
+    let status_matches = match result.status {
+        ContentReconciliationStatus::Accepted => {
+            result.conflict_reason.is_none() && result.authoritative_document_id.is_some()
+        }
+        ContentReconciliationStatus::Conflict => result.conflict_reason.is_some(),
+    };
+    let authoritative_matches = result
+        .authoritative_document_id
+        .as_deref()
+        .is_none_or(|id| id == document_id);
+    if kind == "content"
+        && operation_id == result.operation_id
+        && server_id == result.cursor_server_id
+        && status_matches
+        && authoritative_matches
+    {
+        Ok(())
+    } else {
+        Err(LocalReplicaError::Result)
+    }
+}
+
+type UnresolvedDeviceOperation = (String, String, String, String);
+
+fn next_unresolved_device_operation(
+    transaction: &Transaction<'_>,
+) -> Result<Option<UnresolvedDeviceOperation>, LocalReplicaError> {
+    transaction
+        .query_row(
+            "SELECT device.operation_kind, device.operation_id, device.server_id,
+                    coalesce(content.document_id, '')
+             FROM replica_device_operation AS device
+             LEFT JOIN replica_review_result AS review
+               ON device.operation_kind = 'review' AND review.attempt_id = device.operation_id
+             LEFT JOIN replica_content_operation AS content
+               ON device.operation_kind = 'content' AND content.operation_id = device.operation_id
+             LEFT JOIN replica_content_result AS result
+               ON device.operation_kind = 'content' AND result.operation_id = device.operation_id
+             WHERE review.attempt_id IS NULL AND result.operation_id IS NULL
+             ORDER BY device.device_sequence LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)
+}
+
+fn load_content_results(
+    connection: &Connection,
+    after: u64,
+    limit: u16,
+    conflicts_only: bool,
+) -> Result<StoredContentResultPage, LocalReplicaError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT result.result_sequence, device.server_id,
+                    content.operation_json, result.result_json
+             FROM replica_content_operation AS content
+             JOIN replica_device_operation AS device USING(operation_id)
+             JOIN replica_content_result AS result USING(operation_id)
+             WHERE result.result_sequence > ?1
+               AND (?2 = 0 OR result.status = 'conflict')
+             ORDER BY result.result_sequence LIMIT ?3",
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                u64_to_i64(after)?,
+                i64::from(conflicts_only),
+                i64::from(limit) + 1,
+            ],
+            |row| {
+                Ok(StoredContentResult {
+                    sequence: row_u64(row, 0)?,
+                    server_id: row.get(1)?,
+                    operation_json: row.get(2)?,
+                    result_json: row.get(3)?,
+                })
+            },
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let mut items = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(LocalReplicaError::Storage)?;
+    let has_more = items.len() > usize::from(limit);
+    if has_more {
+        items.pop();
+    }
+    let next_after = has_more.then(|| items.last().expect("nonzero page limit").sequence);
+    Ok(StoredContentResultPage { items, next_after })
+}
+
 fn replayed_result(
     transaction: &Transaction<'_>,
     attempt_id: &str,
@@ -1284,14 +1873,18 @@ fn require_next_result(
     result: &OfflineReviewResult,
 ) -> Result<(), LocalReplicaError> {
     let server_id = replica_servers(transaction)?.0;
+    let pending =
+        next_unresolved_device_operation(transaction)?.ok_or(LocalReplicaError::Result)?;
+    if pending.0 != "review" || pending.1 != result.attempt_id {
+        return Err(LocalReplicaError::Result);
+    }
     let next = transaction
         .query_row(
             "SELECT operation.attempt_id, operation.operation_json, pack.pack_json
              FROM replica_review_operation AS operation
              JOIN replica_review_pack AS pack USING(pack_id)
-             LEFT JOIN replica_review_result AS result USING(attempt_id)
-             WHERE result.attempt_id IS NULL ORDER BY operation.device_sequence LIMIT 1",
-            [],
+             WHERE operation.attempt_id = ?1",
+            [&result.attempt_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1300,9 +1893,7 @@ fn require_next_result(
                 ))
             },
         )
-        .optional()
-        .map_err(LocalReplicaError::Storage)?
-        .ok_or(LocalReplicaError::Result)?;
+        .map_err(LocalReplicaError::Storage)?;
     let operation: OfflineReviewOperation =
         serde_json::from_str(&next.1).map_err(|_| LocalReplicaError::Corrupt)?;
     let pack: ReviewPackView =
@@ -1378,4 +1969,72 @@ fn u64_to_i64(value: u64) -> Result<i64, LocalReplicaError> {
 pub(crate) fn canonical_json_sha256(value: &Value) -> Result<String, LocalReplicaError> {
     let bytes = serde_json::to_vec(value).map_err(|_| LocalReplicaError::Corrupt)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::{Connection, params};
+    use serde_json::Value;
+
+    use super::{INITIAL_SCHEMA, LocalReplicaStore};
+    use crate::{application::OfflineReviewOperation, protocol::decode_review_pack};
+
+    #[test]
+    fn v1_upgrade_preserves_pending_review_operations_in_the_device_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replica.sqlite");
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/protocol/offline-review-v1.json"
+        ))
+        .unwrap();
+        let pack = decode_review_pack(fixture["pack"].clone()).unwrap();
+        let operation: OfflineReviewOperation =
+            serde_json::from_value(fixture["submission"]["operation"].clone()).unwrap();
+        let pack_json = serde_json::to_string(&pack).unwrap();
+        let operation_json = serde_json::to_string(&operation).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(INITIAL_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_identity(
+                     id, device_id, server_id, observed_server_id
+                 ) VALUES (1, 'device', ?1, ?1)",
+                [&pack.cursor_server_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_sync(id, cursor, next_review_sequence)
+                 VALUES (1, ?1, 2)",
+                [fixture["pack"]["pack"]["cursor"].as_str().unwrap()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_review_pack(
+                     pack_id, session_id, device_id, server_id, cursor, pack_json
+                 ) VALUES ('pack', 'session', 'device', ?1, ?2, ?3)",
+                params![
+                    &pack.cursor_server_id,
+                    fixture["pack"]["pack"]["cursor"].as_str().unwrap(),
+                    pack_json,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_review_operation(
+                     attempt_id, server_id, device_sequence, pack_id,
+                     session_position, operation_json
+                 ) VALUES ('attempt', ?1, 1, 'pack', 0, ?2)",
+                params![&pack.cursor_server_id, operation_json],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = LocalReplicaStore::open(&path, "device").unwrap();
+        let pending = store.next_pending_operation().unwrap().unwrap();
+        assert_eq!(pending.operation, operation);
+        assert_eq!(store.status().unwrap().next_device_sequence, 2);
+    }
 }

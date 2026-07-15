@@ -32,9 +32,10 @@ use crate::{
     },
     domain::DocumentId,
     protocol::{
-        OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError, active_review_pack_json,
-        decode_cursor, decode_snapshot_cursor, offline_result_json, replica_changes_json,
-        replica_snapshot_json, replica_state_json, review_pack_json,
+        OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
+        OfflineReviewWireError, ReplicaWireError, active_review_pack_json, decode_cursor,
+        decode_snapshot_cursor, offline_content_result_json, offline_result_json,
+        replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
     },
     store::StoreError,
 };
@@ -149,6 +150,7 @@ fn data_router() -> Router<HttpState> {
             get(get_asset).put(put_asset).delete(delete_asset),
         )
         .route("/v1/blobs/{digest}", get(get_blob))
+        .route("/v1/content/offline-operations", post(reconcile_content))
         .route("/v1/themata", post(create_thema).get(search_themata))
         .route("/v1/themata/{id}", get(get_thema).put(update_thema))
         .route("/v1/themata/{id}/archive", post(archive_thema))
@@ -1207,6 +1209,32 @@ async fn reconcile_offline(
     ))
 }
 
+async fn reconcile_content(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(submission): ApiJson<OfflineContentSubmission>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    let decoded = submission
+        .decode()
+        .map_err(ApiError::offline_content_wire)?;
+    let result = state
+        .service
+        .reconcile_content_operation(
+            decoded.version,
+            decoded.operation,
+            decoded.canonical_payload,
+            Some(principal.device_id),
+            now_us()?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    announce(&state).await;
+    Ok(Json(
+        offline_content_result_json(&result).map_err(|_| ApiError::internal())?,
+    ))
+}
+
 fn review_actor(principal: &DevicePrincipal) -> Option<String> {
     (!principal.scopes.contains(&DeviceScope::Admin)).then(|| principal.device_id.clone())
 }
@@ -1419,6 +1447,20 @@ impl ApiError {
             ),
         }
     }
+    fn offline_content_wire(error: OfflineContentWireError) -> Self {
+        match error {
+            OfflineContentWireError::Version => Self::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_offline_content_version",
+                "offline content protocol version is unsupported",
+            ),
+            OfflineContentWireError::Operation => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_offline_content_operation",
+                "offline content operation is invalid",
+            ),
+        }
+    }
     fn replica_wire(error: ReplicaWireError) -> Self {
         match error {
             ReplicaWireError::Cursor | ReplicaWireError::Snapshot => {
@@ -1621,6 +1663,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/assets/{digest}/{name}", "put"),
     ("/v1/assets/{digest}/{name}", "delete"),
     ("/v1/blobs/{digest}", "get"),
+    ("/v1/content/offline-operations", "post"),
     ("/v1/themata", "get"),
     ("/v1/themata", "post"),
     ("/v1/themata/{id}", "get"),
@@ -1769,6 +1812,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_content_http_is_scoped_idempotent_and_preserves_invalid_org() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "content".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+        let state = response_json(
+            app.clone()
+                .oneshot(authorized("GET", "/v1/sync/state", &token, Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let accepted_body = content_operation_json(
+            "content-1",
+            &device_id,
+            1,
+            state["cursor"].as_str().unwrap(),
+            "document",
+            "#+title: Offline\n* Heading\n",
+        );
+        let accepted = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-operations",
+                &token,
+                Body::from(serde_json::to_vec(&accepted_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted = response_json(accepted).await;
+        assert_eq!(accepted["result"]["status"], "accepted");
+        assert_eq!(
+            accepted["result"]["authoritative"]["document_id"],
+            "document"
+        );
+        assert_eq!(accepted["result"]["authoritative"]["revision"], 1);
+
+        let replay = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-operations",
+                &token,
+                Body::from(serde_json::to_vec(&accepted_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(replay).await, accepted);
+
+        let state = response_json(
+            app.clone()
+                .oneshot(authorized("GET", "/v1/sync/state", &token, Body::empty()))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let invalid_body = content_operation_json(
+            "content-2",
+            &device_id,
+            2,
+            state["cursor"].as_str().unwrap(),
+            "invalid-document",
+            "* [[id:broken\n",
+        );
+        let invalid = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-operations",
+                &token,
+                Body::from(serde_json::to_vec(&invalid_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let invalid = response_json(invalid).await;
+        assert_eq!(invalid["result"]["status"], "conflict");
+        assert_eq!(invalid["result"]["conflict_reason"], "invalid_content");
+        assert!(invalid["result"]["authoritative"].is_null());
 
         drop(app);
         drop(service);
@@ -2393,6 +2537,34 @@ mod tests {
             .header("content-type", "application/json")
             .body(body)
             .unwrap()
+    }
+
+    fn content_operation_json(
+        operation_id: &str,
+        device_id: &str,
+        device_sequence: u64,
+        cursor: &str,
+        document_id: &str,
+        org: &str,
+    ) -> serde_json::Value {
+        json!({
+            "version": 1,
+            "operation": {
+                "operation_id": operation_id,
+                "device_id": device_id,
+                "device_sequence": device_sequence,
+                "cursor": cursor,
+                "authored_at_us": device_sequence + 10,
+                "mutation": {
+                    "kind": "put_document",
+                    "document_id": document_id,
+                    "logical_path": format!("{document_id}.org"),
+                    "content_sha256": format!("{:x}", Sha256::digest(org.as_bytes())),
+                    "org": org,
+                    "base": {"kind": "absent"}
+                }
+            }
+        })
     }
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {

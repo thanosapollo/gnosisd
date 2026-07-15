@@ -70,7 +70,7 @@ pub(crate) struct DocumentHead {
     pub(crate) active: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct DocumentRevision {
     pub(crate) document_id: String,
     pub(crate) revision: u64,
@@ -163,7 +163,7 @@ impl From<&DocumentProjection> for DocumentProjectionSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct DocumentReplicaRevision {
     pub(crate) revision: DocumentRevision,
     pub(crate) projection: Option<DocumentProjectionSnapshot>,

@@ -3,7 +3,8 @@ mod replica;
 mod sqlite;
 
 pub(crate) use replica::{
-    DeltaInstall, LocalReplicaError, LocalReplicaItem, LocalReplicaStore, SnapshotInstall,
-    StoredReviewPack, StoredReviewResult, StoredReviewResultPage, canonical_json_sha256,
+    ContentResultInstall, DeltaInstall, LocalReplicaError, LocalReplicaItem, LocalReplicaStore,
+    SnapshotInstall, StoredContentResult, StoredContentResultPage, StoredReviewPack,
+    StoredReviewResult, StoredReviewResultPage, canonical_json_sha256,
 };
 pub(crate) use sqlite::{SqliteStore, StoreError, StoredDocument, initialize_native_database};

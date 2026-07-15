@@ -39,7 +39,7 @@ pub(crate) struct ReplicaState {
     pub(crate) server_id: String,
     pub(crate) cursor: u64,
     pub(crate) cursor_token: String,
-    pub(crate) next_review_sequence: u64,
+    pub(crate) next_device_sequence: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

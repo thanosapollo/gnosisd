@@ -2,6 +2,7 @@ mod auth;
 mod backup;
 mod content;
 mod import_document;
+mod offline_content;
 mod query_document;
 mod query_legacy;
 mod review;
@@ -26,6 +27,11 @@ pub(crate) use content::{
 };
 pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
 pub(crate) use import_document::{PreparedServerImport, persist_server_import};
+pub(crate) use offline_content::{
+    AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentConflictReason,
+    OfflineContentMutation, OfflineContentOperation, OfflineContentResult,
+    prepare_offline_document,
+};
 pub use query_document::QueryDocument;
 pub(crate) use query_legacy::DueCursor;
 pub use query_legacy::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema};

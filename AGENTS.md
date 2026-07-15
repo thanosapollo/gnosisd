@@ -41,9 +41,9 @@ directly.
   row resolves to an exact immutable revision. SSE is only a wakeup.
 - `src/client_replica.rs` is the concrete offline client foundation. Partial
   snapshots stay in staging tables, terminal pages atomically replace active
-  projections, and snapshot recovery never deletes review packs, operations,
-  results, or device sequence state. Reconciliation cursors are hints and must
-  never fast-forward the replica feed cursor.
+  projections, and snapshot recovery never deletes review packs, content or
+  review operations, results, or device sequence state. Reconciliation cursors
+  are hints and must never fast-forward the replica feed cursor.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` uses only protocol methods.
 
@@ -66,6 +66,13 @@ through immutable operations. The daemon remains authoritative, conflicts stay
 explicit, and review or content state must never use last-write-wins.
 Offline review v1 submissions remain accepted; v2 pack and result envelopes
 return durable replica cursors.
+Review and content operations share one contiguous per-device sequence. Offline
+document puts retain their complete submitted Org revision and receive an
+immutable accepted or conflict result. Invalid, stale, or expired-cursor puts
+must leave the canonical document head and index unchanged.
+Queued puts bind every revision to its captured content digest. Downloaded bases
+must predate the captured cursor; predicted bases require an accepted predecessor
+operation. A numeric revision alone must never authorize an offline write.
 
 ## Commands
 
