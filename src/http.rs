@@ -16,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use schemars::generate::SchemaSettings;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
@@ -35,9 +36,14 @@ use crate::{
         OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
         OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
         active_review_pack_json, decode_cursor, decode_snapshot_cursor,
-        offline_asset_capabilities_json, offline_asset_result_json,
-        offline_content_capabilities_json, offline_content_result_json, offline_result_json,
-        replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
+        http_v1::{
+            ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            ReplicaStateV1,
+        },
+        offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
+        offline_content_result_json, offline_result_json, replica_change_page,
+        replica_snapshot_page, replica_state_response, review_pack_json,
     },
     store::StoreError,
 };
@@ -76,7 +82,7 @@ pub(crate) fn router(service: ServiceHandle) -> Router {
 async fn handle_service_error(_error: BoxError) -> ApiError {
     ApiError::new(
         StatusCode::REQUEST_TIMEOUT,
-        "request_timeout",
+        ApiErrorCodeV1::RequestTimeout,
         "request exceeded the server timeout",
     )
 }
@@ -95,7 +101,12 @@ async fn normalize_rejection(request: Request, next: Next) -> Response {
         return response;
     }
     let status = response.status();
-    ApiError::new(status, "invalid_request", "request could not be processed").into_response()
+    ApiError::new(
+        status,
+        ApiErrorCodeV1::InvalidRequest,
+        "request could not be processed",
+    )
+    .into_response()
 }
 
 struct ApiJson<T>(T);
@@ -291,7 +302,7 @@ struct ReplicaChangesQuery {
 async fn replica_state(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReplicaStateV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let replica = state
         .service
@@ -299,14 +310,14 @@ async fn replica_state(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
-        replica_state_json(&replica).map_err(ApiError::replica_wire)?,
+        replica_state_response(&replica).map_err(ApiError::replica_wire)?,
     ))
 }
 
 async fn content_capabilities(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ContentCapabilitiesV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let replica = state
         .service
@@ -314,15 +325,14 @@ async fn content_capabilities(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
-        offline_content_capabilities_json(&replica.server_id)
-            .map_err(ApiError::offline_content_wire)?,
+        offline_content_capabilities(&replica.server_id).map_err(ApiError::offline_content_wire)?,
     ))
 }
 
 async fn asset_capabilities(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<AssetCapabilitiesV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let replica = state
         .service
@@ -330,8 +340,7 @@ async fn asset_capabilities(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
-        offline_asset_capabilities_json(&replica.server_id)
-            .map_err(ApiError::offline_asset_wire)?,
+        offline_asset_capabilities(&replica.server_id).map_err(ApiError::offline_asset_wire)?,
     ))
 }
 
@@ -339,7 +348,7 @@ async fn replica_changes(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Query(query): Query<ReplicaChangesQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReplicaChangePageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let (server_id, after, after_token) =
         decode_cursor(&query.cursor).map_err(ApiError::replica_wire)?;
@@ -354,7 +363,7 @@ async fn replica_changes(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
-        replica_changes_json(&server_id, after, &after_token, latest, &changes)
+        replica_change_page(&server_id, after, &after_token, latest, &changes)
             .map_err(ApiError::replica_wire)?,
     ))
 }
@@ -369,7 +378,7 @@ async fn replica_snapshot(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Query(query): Query<SnapshotQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReplicaSnapshotPageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let limit = replica_page_limit(query.limit)?;
     let page = match query.cursor {
@@ -389,7 +398,7 @@ async fn replica_snapshot(
     }
     .map_err(ApiError::service)?;
     Ok(Json(
-        replica_snapshot_json(&page).map_err(ApiError::replica_wire)?,
+        replica_snapshot_page(&page).map_err(ApiError::replica_wire)?,
     ))
 }
 
@@ -1463,12 +1472,12 @@ fn note_write_error(error: ServiceError) -> ApiError {
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
-    code: &'static str,
+    code: ApiErrorCodeV1,
     message: &'static str,
-    meta: Option<Value>,
+    meta: Option<ApiErrorMetaV1>,
 }
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
+    fn new(status: StatusCode, code: ApiErrorCodeV1, message: &'static str) -> Self {
         Self {
             status,
             code,
@@ -1479,41 +1488,49 @@ impl ApiError {
     fn unauthorized() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
-            "unauthorized",
+            ApiErrorCodeV1::Unauthorized,
             "bearer token is missing or invalid",
         )
     }
     fn forbidden() -> Self {
         Self::new(
             StatusCode::FORBIDDEN,
-            "forbidden",
+            ApiErrorCodeV1::Forbidden,
             "token scope does not permit this operation",
         )
     }
     fn not_found() -> Self {
-        Self::new(StatusCode::NOT_FOUND, "not_found", "resource not found")
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ApiErrorCodeV1::NotFound,
+            "resource not found",
+        )
     }
     fn bad_request(message: &'static str) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ApiErrorCodeV1::InvalidRequest,
+            message,
+        )
     }
     fn precondition(message: &'static str) -> Self {
         Self::new(
             StatusCode::PRECONDITION_REQUIRED,
-            "precondition_required",
+            ApiErrorCodeV1::PreconditionRequired,
             message,
         )
     }
     fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
+            ApiErrorCodeV1::Internal,
             "internal server failure",
         )
     }
     fn invalid_content(_error: impl std::fmt::Debug) -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_content",
+            ApiErrorCodeV1::InvalidContent,
             "content validation failed",
         )
     }
@@ -1527,23 +1544,27 @@ impl ApiError {
         if status == StatusCode::PAYLOAD_TOO_LARGE {
             Self::new(
                 status,
-                "request_too_large",
+                ApiErrorCodeV1::RequestTooLarge,
                 "request body exceeds the 1 MiB limit",
             )
         } else {
-            Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_body", message)
+            Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCodeV1::InvalidBody,
+                message,
+            )
         }
     }
     fn offline_review_wire(error: OfflineReviewWireError) -> Self {
         match error {
             OfflineReviewWireError::Version => Self::new(
                 StatusCode::BAD_REQUEST,
-                "unsupported_offline_review_version",
+                ApiErrorCodeV1::UnsupportedOfflineReviewVersion,
                 "offline review protocol version is unsupported",
             ),
             OfflineReviewWireError::Operation => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_offline_review_operation",
+                ApiErrorCodeV1::InvalidOfflineReviewOperation,
                 "offline review operation is invalid",
             ),
         }
@@ -1552,12 +1573,12 @@ impl ApiError {
         match error {
             OfflineContentWireError::Version => Self::new(
                 StatusCode::BAD_REQUEST,
-                "unsupported_offline_content_version",
+                ApiErrorCodeV1::UnsupportedOfflineContentVersion,
                 "offline content protocol version is unsupported",
             ),
             OfflineContentWireError::Operation => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_offline_content_operation",
+                ApiErrorCodeV1::InvalidOfflineContentOperation,
                 "offline content operation is invalid",
             ),
         }
@@ -1566,12 +1587,12 @@ impl ApiError {
         match error {
             OfflineAssetWireError::Version => Self::new(
                 StatusCode::BAD_REQUEST,
-                "unsupported_offline_asset_version",
+                ApiErrorCodeV1::UnsupportedOfflineAssetVersion,
                 "offline asset protocol version is unsupported",
             ),
             OfflineAssetWireError::Operation => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_offline_asset_operation",
+                ApiErrorCodeV1::InvalidOfflineAssetOperation,
                 "offline asset operation is invalid",
             ),
         }
@@ -1583,7 +1604,7 @@ impl ApiError {
             }
             ReplicaWireError::PageTooLarge => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "replica_projection_too_large",
+                ApiErrorCodeV1::ReplicaProjectionTooLarge,
                 "stored projection exceeds the replica response budget",
             ),
             ReplicaWireError::Encode | ReplicaWireError::Response => Self::internal(),
@@ -1592,65 +1613,74 @@ impl ApiError {
     fn snapshot_required() -> Self {
         Self {
             status: StatusCode::CONFLICT,
-            code: "snapshot_required",
+            code: ApiErrorCodeV1::SnapshotRequired,
             message: "replica cursor cannot be resumed from this server state",
-            meta: Some(json!({"snapshot_url":"/v1/sync/snapshot"})),
+            meta: Some(ApiErrorMetaV1::Snapshot {
+                snapshot_url: "/v1/sync/snapshot".into(),
+            }),
         }
     }
     fn conflict(expected: u64, actual: Option<u64>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
-            code: "revision_conflict",
+            code: ApiErrorCodeV1::RevisionConflict,
             message: "resource revision changed",
-            meta: Some(json!({"expected_revision":expected,"current_revision":actual})),
+            meta: Some(ApiErrorMetaV1::Revision {
+                expected_revision: expected,
+                current_revision: actual,
+            }),
         }
     }
     fn service(error: ServiceError) -> Self {
         match error {
-            ServiceError::Busy => {
-                Self::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "server is busy")
-            }
+            ServiceError::Busy => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiErrorCodeV1::Busy,
+                "server is busy",
+            ),
             ServiceError::Store(StoreError::NotFound) => Self::not_found(),
             ServiceError::Store(StoreError::Conflict { expected, actual }) => {
                 Self::conflict(expected, actual)
             }
             ServiceError::Store(StoreError::ActiveReviewSession) => Self::new(
                 StatusCode::CONFLICT,
-                "active_session",
+                ApiErrorCodeV1::ActiveSession,
                 "a review session is already active",
             ),
             ServiceError::Store(StoreError::StaleAttempt) => Self::new(
                 StatusCode::PRECONDITION_FAILED,
-                "stale_attempt",
+                ApiErrorCodeV1::StaleAttempt,
                 "thema content or review state changed",
             ),
             ServiceError::Store(StoreError::ReviewOwnership) => Self::forbidden(),
             ServiceError::Store(StoreError::IdempotencyConflict) => Self::new(
                 StatusCode::CONFLICT,
-                "idempotency_conflict",
+                ApiErrorCodeV1::IdempotencyConflict,
                 "operation identity was reused with different content",
             ),
             ServiceError::Store(StoreError::DeviceSequence { expected }) => Self {
                 status: StatusCode::CONFLICT,
-                code: "device_sequence_gap",
+                code: ApiErrorCodeV1::DeviceSequenceGap,
                 message: "device operation sequence is not contiguous",
-                meta: Some(json!({"expected_sequence":expected})),
+                meta: Some(ApiErrorMetaV1::DeviceSequence {
+                    expected_sequence: expected,
+                }),
             },
             ServiceError::Store(StoreError::ReplicaCursor | StoreError::ReplicaServer) => {
                 Self::snapshot_required()
             }
             ServiceError::Store(StoreError::BlobRequired { digest }) => Self {
                 status: StatusCode::CONFLICT,
-                code: "blob_required",
+                code: ApiErrorCodeV1::BlobRequired,
                 message: "operation requires a staged blob",
-                meta: Some(json!({
-                    "content_sha256": digest,
-                    "upload_url": format!("/v1/sync/blobs/{digest}")
-                })),
+                meta: Some(ApiErrorMetaV1::Blob {
+                    upload_url: format!("/v1/sync/blobs/{digest}"),
+                    content_sha256: digest,
+                }),
             },
             ServiceError::Store(StoreError::BlobMetadata) => Self::new(
                 StatusCode::CONFLICT,
-                "blob_metadata_conflict",
+                ApiErrorCodeV1::BlobMetadataConflict,
                 "blob metadata does not match stored content",
             ),
             ServiceError::Store(StoreError::InvalidReviewState) | ServiceError::Review(_) => {
@@ -1658,7 +1688,7 @@ impl ApiError {
             }
             ServiceError::Store(StoreError::PathChange) => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "rename_required",
+                ApiErrorCodeV1::RenameRequired,
                 "document path changes require the rename endpoint",
             ),
             ServiceError::Store(StoreError::InvalidProjection { .. }) => {
@@ -1667,7 +1697,7 @@ impl ApiError {
             ServiceError::AssetDigest => Self::bad_request("asset digest does not match content"),
             ServiceError::InvalidBlobMetadata => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_blob_metadata",
+                ApiErrorCodeV1::InvalidBlobMetadata,
                 "blob size or media type is invalid",
             ),
             ServiceError::Settings(_) => Self::invalid_content("settings"),
@@ -1677,11 +1707,10 @@ impl ApiError {
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({"error":{"code":self.code,"message":self.message,"meta":self.meta}})),
-        )
-            .into_response()
+        let body = ApiErrorResponseV1 {
+            error: ApiErrorBodyV1::new(self.code, self.message.into(), self.meta),
+        };
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -1696,20 +1725,20 @@ fn openapi_document() -> Value {
     }
     json!({
         "openapi":"3.1.0",
+        "jsonSchemaDialect":"https://json-schema.org/draft/2020-12/schema",
         "info":{"title":"Gnosis API","version":"1.0.0"},
         "paths":paths,
         "components":{
             "securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}},
-            "schemas":{"Error":{"type":"object","required":["error"],"properties":{
-                "error":{"type":"object","required":["code","message"],"properties":{
-                    "code":{"type":"string"},"message":{"type":"string"},"meta":{}
-                }}
-            }}}
+            "schemas":http_v1_schemas()
         }
     })
 }
 
 fn openapi_operation(path: &str, method: &str) -> Value {
+    if let Some(operation) = openapi_sync_operation(path, method) {
+        return operation;
+    }
     let mut operation = json!({
         "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
         "security":[{"bearerAuth":[]}],
@@ -1720,6 +1749,90 @@ fn openapi_operation(path: &str, method: &str) -> Value {
         operation["requestBody"] = body;
     }
     operation
+}
+
+fn openapi_sync_operation(path: &str, method: &str) -> Option<Value> {
+    let schema = sync_success_schema(path, method)?;
+    Some(json!({
+        "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace('/', "_")),
+        "security":[{"bearerAuth":[]}],
+        "x-gnosis-required-scopes":["read"],
+        "parameters":sync_parameters(path),
+        "responses":sync_responses(path, schema)
+    }))
+}
+
+fn sync_success_schema(path: &str, method: &str) -> Option<&'static str> {
+    match (path, method) {
+        ("/v1/sync/state", "get") => Some("ReplicaStateV1"),
+        ("/v1/sync/content-capabilities", "get") => Some("ContentCapabilitiesV1"),
+        ("/v1/sync/asset-capabilities", "get") => Some("AssetCapabilitiesV1"),
+        ("/v1/sync/changes", "get") => Some("ReplicaChangePageV1"),
+        ("/v1/sync/snapshot", "get") => Some("ReplicaSnapshotPageV1"),
+        _ => None,
+    }
+}
+
+fn sync_parameters(path: &str) -> Vec<Value> {
+    let mut parameters = Vec::new();
+    if path == "/v1/sync/changes" {
+        parameters.push(replica_cursor_parameter(true));
+    } else if path == "/v1/sync/snapshot" {
+        parameters.push(replica_cursor_parameter(false));
+    }
+    if matches!(path, "/v1/sync/changes" | "/v1/sync/snapshot") {
+        parameters.push(json!({
+            "name":"limit","in":"query","required":false,
+            "schema":{"type":"integer","minimum":1,"maximum":MAX_REPLICA_PAGE,"default":16}
+        }));
+    }
+    parameters
+}
+
+fn replica_cursor_parameter(required: bool) -> Value {
+    json!({
+        "name":"cursor","in":"query","required":required,
+        "schema":{"type":"string","minLength":1,"maxLength":crate::protocol::MAX_REPLICA_CURSOR_BYTES}
+    })
+}
+
+fn sync_responses(path: &str, schema: &str) -> Value {
+    let mut responses = serde_json::Map::new();
+    responses.insert("200".into(), openapi_json_response("Success", schema));
+    let statuses = if matches!(path, "/v1/sync/changes" | "/v1/sync/snapshot") {
+        &["400", "401", "403", "408", "409", "500", "503"][..]
+    } else {
+        &["401", "403", "408", "500", "503"][..]
+    };
+    for status in statuses {
+        responses.insert((*status).into(), openapi_error_response());
+    }
+    Value::Object(responses)
+}
+
+fn openapi_json_response(description: &str, schema: &str) -> Value {
+    json!({
+        "description":description,
+        "content":{"application/json":{"schema":{
+            "$ref":format!("#/components/schemas/{schema}")
+        }}}
+    })
+}
+
+fn http_v1_schemas() -> serde_json::Map<String, Value> {
+    let settings = SchemaSettings::draft2020_12().with(|settings| {
+        settings.definitions_path = "/components/schemas".into();
+        settings.meta_schema = None;
+    });
+    let mut generator = settings.for_serialize().into_generator();
+    generator.subschema_for::<ReplicaStateV1>();
+    generator.subschema_for::<ContentCapabilitiesV1>();
+    generator.subschema_for::<AssetCapabilitiesV1>();
+    generator.subschema_for::<ReplicaChangePageV1>();
+    generator.subschema_for::<ReplicaSnapshotPageV1>();
+    generator.subschema_for::<ApiErrorCodeV1>();
+    generator.subschema_for::<ApiErrorResponseV1>();
+    generator.take_definitions(true)
 }
 
 fn openapi_path_parameters(path: &str) -> Vec<Value> {
@@ -1774,7 +1887,7 @@ fn openapi_responses() -> Value {
 
 fn openapi_error_response() -> Value {
     json!({"description":"Stable JSON error","content":{"application/json":{
-        "schema":{"$ref":"#/components/schemas/Error"}
+        "schema":{"$ref":"#/components/schemas/ApiErrorResponseV1"}
     }}})
 }
 
@@ -1832,6 +1945,8 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode},
@@ -1852,6 +1967,7 @@ mod tests {
     };
     use crate::protocol::{
         MAX_REPLICA_PAGE_BYTES, canonical_asset_operation, decode_cursor, encode_cursor,
+        http_v1::{ApiErrorCodeV1, ApiErrorResponseV1, ContentCapabilitiesV1, ReplicaStateV1},
     };
     use crate::store::SqliteStore;
 
@@ -1867,6 +1983,132 @@ mod tests {
             let operation = &api["paths"][path][method];
             assert!(operation["responses"].is_object(), "{method} {path}");
             assert_eq!(operation["security"][0]["bearerAuth"], json!([]));
+        }
+    }
+
+    #[test]
+    fn openapi_types_replica_bootstrap_exactly() {
+        let api = openapi_document();
+        let state = &api["paths"]["/v1/sync/state"]["get"];
+        assert_eq!(
+            response_statuses(state),
+            set(&["200", "401", "403", "408", "500", "503"])
+        );
+        assert_eq!(
+            state["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReplicaStateV1"
+        );
+        assert_eq!(state["x-gnosis-required-scopes"], json!(["read"]));
+
+        let changes = &api["paths"]["/v1/sync/changes"]["get"];
+        assert_eq!(changes["parameters"][0]["name"], "cursor");
+        assert_eq!(changes["parameters"][0]["required"], true);
+        assert_eq!(changes["parameters"][1]["schema"]["maximum"], 32);
+        assert_eq!(
+            response_statuses(changes),
+            set(&["200", "400", "401", "403", "408", "409", "500", "503"])
+        );
+
+        let schemas = &api["components"]["schemas"];
+        assert!(
+            schemas["ReplicaStateV1"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("next_review_sequence"))
+        );
+        assert!(
+            schemas["ReplicaStateV1"]["properties"]
+                .get("next_device_sequence")
+                .is_none()
+        );
+        assert!(
+            schemas["ApiErrorCodeV1"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("snapshot_required"))
+        );
+        assert_eq!(
+            schemas["DocumentOperationV1"]["enum"],
+            json!(["create", "update", "rename", "snapshot", "tombstone"])
+        );
+        assert_eq!(
+            schemas["ThemaKindV1"]["enum"],
+            json!(["basic", "cloze", "mcq", "mc-cloze"])
+        );
+        assert_eq!(
+            schemas["SettingsRevisionV1"]["properties"]["day_boundary_hour"]["maximum"],
+            23
+        );
+        assert_eq!(
+            schemas["ApiErrorBodyV1"]["anyOf"].as_array().unwrap().len(),
+            5
+        );
+        assert_eq!(
+            schemas["SnapshotApiErrorSchemaV1"]["properties"]["code"]["const"],
+            "snapshot_required"
+        );
+        assert_eq!(
+            schemas["ReplicaSnapshotPageV1"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            schemas["ReplicaSnapshotPageV1"]["properties"]["version"],
+            json!({"type":"integer","format":"uint32","minimum":0,"const":1})
+        );
+        assert_eq!(
+            schemas["ReplicaSnapshotPageV1"]["oneOf"][0]["properties"]["cursor"]["maxLength"],
+            512
+        );
+        assert_eq!(
+            schemas["PlainApiErrorCodeSchemaV1"]["allOf"][0]["$ref"],
+            "#/components/schemas/ApiErrorCodeV1"
+        );
+        assert_eq!(
+            schemas["PlainApiErrorCodeSchemaV1"]["allOf"][1]["not"]["enum"],
+            json!([
+                "snapshot_required",
+                "revision_conflict",
+                "device_sequence_gap",
+                "blob_required"
+            ])
+        );
+        assert_local_refs_resolve(&api, &api);
+    }
+
+    fn response_statuses(operation: &serde_json::Value) -> BTreeSet<&str> {
+        operation["responses"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn set<'a>(values: &[&'a str]) -> BTreeSet<&'a str> {
+        values.iter().copied().collect()
+    }
+
+    fn assert_local_refs_resolve(root: &serde_json::Value, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    assert_local_refs_resolve(root, value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                if let Some(reference) = values.get("$ref").and_then(|value| value.as_str())
+                    && let Some(pointer) = reference.strip_prefix('#')
+                {
+                    assert!(root.pointer(pointer).is_some(), "{reference}");
+                }
+                for value in values.values() {
+                    assert_local_refs_resolve(root, value);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2014,7 +2256,7 @@ mod tests {
         let token = device.token.clone();
         service.create_device(device, 1).await.unwrap();
         let app = router(service.clone());
-        let state = response_json(
+        let state: ReplicaStateV1 = response_typed(
             app.clone()
                 .oneshot(authorized("GET", "/v1/sync/state", &token, Body::empty()))
                 .await
@@ -2025,7 +2267,7 @@ mod tests {
             "content-1",
             &device_id,
             1,
-            state["cursor"].as_str().unwrap(),
+            &state.cursor,
             "document",
             "#+title: Offline\n* Heading\n",
         );
@@ -2060,7 +2302,7 @@ mod tests {
             .unwrap();
         assert_eq!(response_json(replay).await, accepted);
 
-        let state = response_json(
+        let state: ReplicaStateV1 = response_typed(
             app.clone()
                 .oneshot(authorized("GET", "/v1/sync/state", &token, Body::empty()))
                 .await
@@ -2071,7 +2313,7 @@ mod tests {
             "content-2",
             &device_id,
             2,
-            state["cursor"].as_str().unwrap(),
+            &state.cursor,
             "invalid-document",
             "* [[id:broken\n",
         );
@@ -2285,7 +2527,7 @@ mod tests {
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
 
-        let state = response_json(
+        let state: ReplicaStateV1 = response_typed(
             app.clone()
                 .oneshot(authorized(
                     "GET",
@@ -2297,10 +2539,10 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(state["version"], 1);
-        assert_eq!(state["snapshot_required"], true);
-        let server_id = state["server_id"].as_str().unwrap();
-        let capabilities = response_json(
+        assert_eq!(state.version, 1);
+        assert!(state.snapshot_required);
+        let server_id = state.server_id.clone();
+        let capabilities: ContentCapabilitiesV1 = response_typed(
             app.clone()
                 .oneshot(authorized(
                     "GET",
@@ -2312,9 +2554,9 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(capabilities["version"], 1);
-        assert_eq!(capabilities["server_id"], server_id);
-        assert_eq!(capabilities["document_lifecycle"], 1);
+        assert_eq!(capabilities.version, 1);
+        assert_eq!(capabilities.server_id, server_id);
+        assert_eq!(capabilities.document_lifecycle, 1);
 
         let first_request = app.clone().oneshot(authorized(
             "GET",
@@ -2411,8 +2653,8 @@ mod tests {
         assert_eq!(delta["items"][0]["projection"]["revision"], 2);
         assert_eq!(delta["items"][0]["projection"]["timezone"], "UTC");
 
-        let (_, position, token) = decode_cursor(state["cursor"].as_str().unwrap()).unwrap();
-        let ahead = encode_cursor(server_id, position + 100, &token).unwrap();
+        let (_, position, token) = decode_cursor(&state.cursor).unwrap();
+        let ahead = encode_cursor(&server_id, position + 100, &token).unwrap();
         let response = app
             .clone()
             .oneshot(authorized(
@@ -2424,10 +2666,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            response_json(response).await["error"]["code"],
-            "snapshot_required"
-        );
+        let error: ApiErrorResponseV1 = response_typed(response).await;
+        assert_eq!(error.error.code(), ApiErrorCodeV1::SnapshotRequired);
 
         let bytes = b"shared asset".to_vec();
         let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -2947,6 +3187,12 @@ mod tests {
     }
 
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    async fn response_typed<T: serde::de::DeserializeOwned>(
+        response: axum::response::Response,
+    ) -> T {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
     }
 

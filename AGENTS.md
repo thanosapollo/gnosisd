@@ -33,6 +33,8 @@ directly.
   writes use immutable attempts and events plus atomic scheduling transitions.
 - `src/protocol` owns the versioned wire DTOs, framing, Unix-socket server, and
   client. Public fields use opaque string IDs, never SQLite row IDs.
+  `src/protocol/http_v1.rs` is the client-facing HTTP contract kernel. Generate
+  OpenAPI schemas from these DTOs instead of maintaining parallel JSON models.
 - Local online review DTOs remain in `src/protocol`, validation and orchestration
   remain in `src/application`, and persistence remains in `src/store`. The
   daemon owns grading, scheduling transitions, session progress, suspension,

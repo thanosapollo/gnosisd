@@ -49,10 +49,11 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 #+end_src
 
 The Unix message format is a four-byte big-endian length followed by UTF-8
-JSON. It provides local diagnostics, legacy read compatibility, online review
-sessions and attempts, bounded managed-asset reads, device token
-administration, and online backup commands. Stable errors never expose SQL,
-paths, dependency failures, or backtraces.
+JSON. It is the privileged local and administrative transport. It provides
+local diagnostics, legacy read compatibility, online review sessions and
+attempts, bounded managed-asset reads, device token administration, and online
+backup commands. Stable errors never expose SQL, paths, dependency failures,
+or backtraces.
 
 * HTTP API
 
@@ -72,14 +73,29 @@ The ~/v1~ API provides:
 - bounded offline review packs and immutable review reconciliation;
 - sequenced offline document, lifecycle, and asset-create operations.
 
-Mutations use ~If-Match~. A stale revision returns ~412~ with the current
-revision and leaves server state unchanged. The first attempt response hides
-the answer. Grading returns the detected result, revealed answer, matcher
-version, and proposed transition.
+Revisioned content and settings updates use ~If-Match~. A stale revision
+returns ~412~ with the current revision and leaves server state unchanged.
+Sequenced offline mutations instead use immutable operation IDs and contiguous
+device sequence numbers. Review answer and commit retries use retained attempt
+state. The current override and suspension toggle endpoints must not be retried
+after an ambiguous transport failure.
 
-The checked OpenAPI 3.1 document is available at ~/v1/openapi.json~. CORS is
-disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted network
-boundary.
+The first attempt response hides the answer. Grading returns the detected
+result, revealed answer, matcher version, and proposed transition.
+
+The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap
+and stable error schemas are generated from the public Rust DTOs in
+~protocol::http_v1~, including exact cursor parameters, status sets, bearer
+security, and required ~read~ scope. The remaining endpoints are still a
+route-level catalogue and are not yet a complete client-generation contract.
+CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
+network boundary.
+
+A complete offline-review replica needs both ~read~ and ~review~ scopes.
+~review~ alone supports the bounded pack flow but cannot bootstrap a full
+~LocalReplica~. SSE cursor announcements are advisory wakeups. A replica runner
+must also synchronize periodically because Unix-socket writes do not emit HTTP
+events.
 
 * Storage
 
@@ -209,8 +225,10 @@ replacing the live server.
 
 * Scope
 
-This remains a single-user canonical server. multi-server synchronization, Markdown, embeddings, client filesystem
-watching, Emacs client migration, and mobile development remain out of scope.
+This remains a single-user canonical server. Multi-server synchronization,
+Markdown, embeddings, and client filesystem watching remain out of scope. Full
+Emacs content-workflow migration and mobile UI development are separate client
+milestones.
 
 Service installation and migration are covered in
 [[file:docs/deployment.org][docs/deployment.org]].

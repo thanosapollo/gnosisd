@@ -10,7 +10,10 @@ use crate::{
         OfflineContentResult, validate_org_path,
     },
     domain::DocumentId,
-    protocol::replica::{decode_cursor, encode_cursor},
+    protocol::{
+        http_v1::ContentCapabilitiesV1,
+        replica::{decode_cursor, encode_cursor},
+    },
 };
 
 pub(crate) const OFFLINE_CONTENT_VERSION: u32 = 1;
@@ -78,26 +81,22 @@ pub(crate) fn canonical_content_operation(
     encode_operation(&wire)
 }
 
-pub(crate) fn offline_content_capabilities_json(
+pub(crate) fn offline_content_capabilities(
     server_id: &str,
-) -> Result<Value, OfflineContentWireError> {
+) -> Result<ContentCapabilitiesV1, OfflineContentWireError> {
     if !is_hex_identity(server_id) {
         return Err(OfflineContentWireError::Operation);
     }
-    serde_json::to_value(ContentCapabilitiesV1 {
+    Ok(ContentCapabilitiesV1 {
         version: OFFLINE_CONTENT_CAPABILITIES_VERSION,
         server_id: server_id.to_owned(),
         document_lifecycle: 1,
     })
-    .map_err(invalid_operation)
 }
 
 pub(crate) fn decode_offline_content_capabilities(
-    value: Value,
+    capabilities: ContentCapabilitiesV1,
 ) -> Result<DecodedOfflineContentCapabilities, OfflineContentWireError> {
-    require_size(&value, MAX_OFFLINE_CONTENT_RESULT_BYTES)?;
-    let capabilities: ContentCapabilitiesV1 =
-        serde_json::from_value(value).map_err(invalid_operation)?;
     if capabilities.version != OFFLINE_CONTENT_CAPABILITIES_VERSION
         || capabilities.document_lifecycle != 1
         || !is_hex_identity(&capabilities.server_id)
@@ -407,14 +406,6 @@ struct VersionedOperationV1<'a> {
     operation: &'a OfflineContentOperationV1,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ContentCapabilitiesV1 {
-    version: u32,
-    server_id: String,
-    document_lifecycle: u32,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OfflineContentOperationV1 {
@@ -616,7 +607,7 @@ mod tests {
 
     use super::{
         OfflineContentSubmission, OfflineContentWireError, decode_offline_content_capabilities,
-        offline_content_capabilities_json, offline_content_result_json,
+        offline_content_capabilities, offline_content_result_json,
     };
     use crate::application::{
         AuthoritativeDocument, ContentReconciliationStatus, OfflineContentConflictReason,
@@ -831,7 +822,7 @@ mod tests {
     #[test]
     fn lifecycle_capability_is_explicit_and_server_bound() {
         let server_id = "a".repeat(32);
-        let value = offline_content_capabilities_json(&server_id).unwrap();
+        let value = offline_content_capabilities(&server_id).unwrap();
         assert_eq!(
             decode_offline_content_capabilities(value)
                 .unwrap()
@@ -841,9 +832,18 @@ mod tests {
         for invalid in [
             json!({"version":1,"server_id":"bad","document_lifecycle":1}),
             json!({"version":1,"server_id":"a".repeat(32),"document_lifecycle":0}),
-            json!({"version":1,"server_id":"a".repeat(32),"document_lifecycle":1,"extra":true}),
         ] {
+            let invalid = serde_json::from_value(invalid).unwrap();
             assert!(decode_offline_content_capabilities(invalid).is_err());
         }
+        assert!(
+            serde_json::from_value::<crate::protocol::http_v1::ContentCapabilitiesV1>(json!({
+                "version":1,
+                "server_id":"a".repeat(32),
+                "document_lifecycle":1,
+                "extra":true
+            }))
+            .is_err()
+        );
     }
 }

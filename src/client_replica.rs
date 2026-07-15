@@ -20,6 +20,10 @@ use crate::{
         decode_offline_asset_result, decode_offline_content_capabilities,
         decode_offline_content_result, decode_offline_result, decode_replica_state,
         decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
+        http_v1::{
+            AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            ReplicaStateV1,
+        },
     },
     store::{
         AssetResultInstall, ContentResultInstall, DeltaInstall,
@@ -399,22 +403,28 @@ impl LocalReplica {
         })
     }
 
-    pub fn observe_state(&mut self, value: Value) -> Result<(), Error> {
-        let state = decode_replica_state(value)?;
+    pub fn observe_state(&mut self, response: ReplicaStateV1) -> Result<(), Error> {
+        let state = decode_replica_state(response)?;
         self.store
             .observe_server(&state.server_id, state.next_device_sequence)?;
         Ok(())
     }
 
-    pub fn install_content_capabilities(&mut self, value: Value) -> Result<(), Error> {
-        let capabilities = decode_offline_content_capabilities(value)?;
+    pub fn install_content_capabilities(
+        &mut self,
+        response: ContentCapabilitiesV1,
+    ) -> Result<(), Error> {
+        let capabilities = decode_offline_content_capabilities(response)?;
         self.store
             .install_content_capabilities(&capabilities.server_id)?;
         Ok(())
     }
 
-    pub fn install_asset_capabilities(&mut self, value: Value) -> Result<(), Error> {
-        let capabilities = decode_offline_asset_capabilities(value)?;
+    pub fn install_asset_capabilities(
+        &mut self,
+        response: AssetCapabilitiesV1,
+    ) -> Result<(), Error> {
+        let capabilities = decode_offline_asset_capabilities(response)?;
         self.store
             .install_asset_capabilities(&capabilities.server_id, capabilities.max_blob_bytes)?;
         Ok(())
@@ -423,10 +433,11 @@ impl LocalReplica {
     pub fn install_snapshot_page(
         &mut self,
         requested: Option<&str>,
-        value: Value,
+        response: ReplicaSnapshotPageV1,
     ) -> Result<(), Error> {
+        let value = serde_json::to_value(&response).map_err(|_| Error::Response)?;
         let response_sha256 = canonical_json_sha256(&value)?;
-        let page = decode_snapshot_page(value)?;
+        let page = decode_snapshot_page(response)?;
         let after = requested_after(requested, &page)?;
         self.store.install_snapshot(SnapshotInstall {
             snapshot_id: page.snapshot_id,
@@ -444,8 +455,8 @@ impl LocalReplica {
         Ok(())
     }
 
-    pub fn install_change_page(&mut self, value: Value) -> Result<bool, Error> {
-        let page = decode_change_page(value)?;
+    pub fn install_change_page(&mut self, response: ReplicaChangePageV1) -> Result<bool, Error> {
+        let page = decode_change_page(response)?;
         let has_more = page.has_more;
         self.store.install_delta(DeltaInstall {
             server_id: page.server_id,
@@ -1654,9 +1665,9 @@ mod tests {
         protocol::{
             OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineContentSubmission,
             decode_cursor, decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
-            offline_asset_capabilities_json, offline_asset_result_json,
-            offline_content_capabilities_json, offline_content_result_json, offline_result_json,
-            replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
+            offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
+            offline_content_result_json, offline_result_json, replica_change_page,
+            replica_snapshot_page, replica_state_response, review_pack_json,
         },
     };
 
@@ -1670,9 +1681,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("replica.sqlite");
         let mut replica = LocalReplica::open(&path, "device").unwrap();
-        replica.observe_state(fixture["state"].clone()).unwrap();
         replica
-            .install_snapshot_page(None, fixture["snapshot_partial"].clone())
+            .observe_state(decode_response(fixture["state"].clone()))
+            .unwrap();
+        replica
+            .install_snapshot_page(None, decode_response(fixture["snapshot_partial"].clone()))
             .unwrap();
         assert_eq!(replica.counts().unwrap().0, 0);
         let next = replica.status().unwrap().snapshot_next.unwrap();
@@ -1681,10 +1694,13 @@ mod tests {
         let mut replica = LocalReplica::open(&path, "device").unwrap();
         assert_eq!(replica.status().unwrap().snapshot_next, Some(next.clone()));
         replica
-            .install_snapshot_page(None, fixture["snapshot_partial"].clone())
+            .install_snapshot_page(None, decode_response(fixture["snapshot_partial"].clone()))
             .unwrap();
         replica
-            .install_snapshot_page(Some(&next), fixture["snapshot_terminal"].clone())
+            .install_snapshot_page(
+                Some(&next),
+                decode_response(fixture["snapshot_terminal"].clone()),
+            )
             .unwrap();
         assert_eq!(replica.counts().unwrap().0, 2);
         assert!(
@@ -1696,13 +1712,13 @@ mod tests {
         );
 
         replica
-            .install_change_page(fixture["changes"].clone())
+            .install_change_page(decode_response(fixture["changes"].clone()))
             .unwrap();
         let cursor = replica.status().unwrap().cursor.unwrap();
         let before = replica.projection("thema", "thema").unwrap().unwrap();
         let malformed = malformed_delta(&fixture, &cursor);
         assert!(matches!(
-            replica.install_change_page(malformed),
+            replica.install_change_page(decode_response(malformed)),
             Err(Error::ReplicaWire)
         ));
         assert_eq!(replica.status().unwrap().cursor, Some(cursor.clone()));
@@ -1711,17 +1727,17 @@ mod tests {
             before
         );
         assert!(matches!(
-            replica.install_change_page(noncanonical_asset_delta(&cursor)),
+            replica.install_change_page(decode_response(noncanonical_asset_delta(&cursor))),
             Err(Error::ReplicaWire)
         ));
         assert_eq!(replica.status().unwrap().cursor, Some(cursor.clone()));
         assert!(matches!(
-            replica.install_change_page(invalid_review_delta(&fixture, &cursor)),
+            replica.install_change_page(decode_response(invalid_review_delta(&fixture, &cursor))),
             Err(Error::ReplicaWire)
         ));
         assert_eq!(replica.status().unwrap().cursor, Some(cursor.clone()));
         assert!(matches!(
-            replica.install_change_page(older_asset_delta(&cursor)),
+            replica.install_change_page(decode_response(older_asset_delta(&cursor))),
             Err(Error::Projection)
         ));
         assert!(
@@ -1742,9 +1758,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("replica.sqlite");
         let mut replica = LocalReplica::open(&path, "device").unwrap();
-        replica.observe_state(fixture["state"].clone()).unwrap();
         replica
-            .install_snapshot_page(None, fixture["snapshot_partial"].clone())
+            .observe_state(decode_response(fixture["state"].clone()))
+            .unwrap();
+        replica
+            .install_snapshot_page(None, decode_response(fixture["snapshot_partial"].clone()))
             .unwrap();
 
         let mut replacement = fixture["snapshot_partial"].clone();
@@ -1753,13 +1771,15 @@ mod tests {
         position.snapshot_id = "snapshot-2".into();
         let replacement_next = encode_snapshot_cursor(&position).unwrap();
         replacement["next"] = json!(replacement_next.clone());
-        replica.install_snapshot_page(None, replacement).unwrap();
+        replica
+            .install_snapshot_page(None, decode_response(replacement))
+            .unwrap();
         assert_eq!(replica.counts().unwrap().0, 0);
 
         let mut terminal = fixture["snapshot_terminal"].clone();
         terminal["snapshot_id"] = json!("snapshot-2");
         replica
-            .install_snapshot_page(Some(&replacement_next), terminal)
+            .install_snapshot_page(Some(&replacement_next), decode_response(terminal))
             .unwrap();
         assert_eq!(replica.counts().unwrap().0, 2);
         assert_eq!(snapshot_page_count(&path), 2);
@@ -1811,7 +1831,7 @@ mod tests {
         let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
         let state = service.replica_state(device_id.clone()).await.unwrap();
         replica
-            .observe_state(replica_state_json(&state).unwrap())
+            .observe_state(replica_state_response(&state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
         install_missing_blobs(&mut replica, &service).await;
@@ -1885,10 +1905,7 @@ mod tests {
 
         pull_server_changes(&mut replica, &service).await;
         let server_state = service.replica_state(device_id).await.unwrap();
-        let server_cursor = replica_state_json(&server_state).unwrap()["cursor"]
-            .as_str()
-            .unwrap()
-            .to_owned();
+        let server_cursor = replica_state_response(&server_state).unwrap().cursor;
         assert_eq!(replica.status().unwrap().cursor, Some(server_cursor));
         for thema_id in ["first", "second"] {
             let review = replica.projection("review", thema_id).unwrap().unwrap();
@@ -1920,7 +1937,7 @@ mod tests {
         let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
         let state = service.replica_state(device_id.clone()).await.unwrap();
         replica
-            .observe_state(replica_state_json(&state).unwrap())
+            .observe_state(replica_state_response(&state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
 
@@ -1992,10 +2009,9 @@ mod tests {
         ));
 
         let replacement_server = "f".repeat(32);
-        let mut replacement = replica_state_json(&state).unwrap();
-        replacement["server_id"] = json!(replacement_server);
-        replacement["cursor"] =
-            json!(encode_cursor(&replacement_server, 0, &"e".repeat(32)).unwrap());
+        let mut replacement = replica_state_response(&state).unwrap();
+        replacement.server_id = replacement_server.clone();
+        replacement.cursor = encode_cursor(&replacement_server, 0, &"e".repeat(32)).unwrap();
         replica.observe_state(replacement).unwrap();
         assert!(matches!(replica.asset(&path), Err(Error::SyncOrder)));
         drop(service);
@@ -2447,7 +2463,7 @@ mod tests {
         assert_eq!(conflicts.items[0].operation["operation"]["size_bytes"], 11);
 
         replica
-            .observe_state(replica_state_json(&changed_state).unwrap())
+            .observe_state(replica_state_response(&changed_state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
         install_missing_blobs(&mut replica, &service).await;
@@ -2563,7 +2579,7 @@ mod tests {
         service.create_device(device, 1).await.unwrap();
         let state = service.replica_state(device_id.clone()).await.unwrap();
         replica
-            .observe_state(replica_state_json(&state).unwrap())
+            .observe_state(replica_state_response(&state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
         install_missing_blobs(&mut replica, &service).await;
@@ -2586,9 +2602,7 @@ mod tests {
             Err(Error::Content)
         ));
         replica
-            .install_content_capabilities(
-                offline_content_capabilities_json(&state.server_id).unwrap(),
-            )
+            .install_content_capabilities(offline_content_capabilities(&state.server_id).unwrap())
             .unwrap();
         let upload = replica.next_content_upload().unwrap().unwrap();
         assert_eq!(
@@ -2651,7 +2665,7 @@ mod tests {
         let state = service.replica_state(device_id.clone()).await.unwrap();
         let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
         replica
-            .observe_state(replica_state_json(&state).unwrap())
+            .observe_state(replica_state_response(&state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
         install_missing_blobs(&mut replica, &service).await;
@@ -2674,14 +2688,12 @@ mod tests {
         assert!(
             replica
                 .install_content_capabilities(
-                    offline_content_capabilities_json(&"f".repeat(32)).unwrap()
+                    offline_content_capabilities(&"f".repeat(32)).unwrap()
                 )
                 .is_err()
         );
         replica
-            .install_content_capabilities(
-                offline_content_capabilities_json(&state.server_id).unwrap(),
-            )
+            .install_content_capabilities(offline_content_capabilities(&state.server_id).unwrap())
             .unwrap();
         assert!(matches!(
             replica.rename_document(OfflineDocumentRename {
@@ -2856,7 +2868,7 @@ mod tests {
         let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
         let state = service.replica_state(device_id.clone()).await.unwrap();
         replica
-            .observe_state(replica_state_json(&state).unwrap())
+            .observe_state(replica_state_response(&state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
         install_missing_blobs(&mut replica, &service).await;
@@ -2912,7 +2924,7 @@ mod tests {
             .await
             .unwrap();
         replica
-            .observe_state(replica_state_json(&changed_state).unwrap())
+            .observe_state(replica_state_response(&changed_state).unwrap())
             .unwrap();
         install_server_snapshot(&mut replica, &service, &device_id).await;
         assert_eq!(
@@ -3250,15 +3262,13 @@ mod tests {
     async fn sync_server(replica: &mut LocalReplica, service: &ServiceHandle, device_id: &str) {
         let state = service.replica_state(device_id.into()).await.unwrap();
         replica
-            .observe_state(replica_state_json(&state).unwrap())
+            .observe_state(replica_state_response(&state).unwrap())
             .unwrap();
         replica
-            .install_content_capabilities(
-                offline_content_capabilities_json(&state.server_id).unwrap(),
-            )
+            .install_content_capabilities(offline_content_capabilities(&state.server_id).unwrap())
             .unwrap();
         replica
-            .install_asset_capabilities(offline_asset_capabilities_json(&state.server_id).unwrap())
+            .install_asset_capabilities(offline_asset_capabilities(&state.server_id).unwrap())
             .unwrap();
         install_server_snapshot(replica, service, device_id).await;
         install_missing_blobs(replica, service).await;
@@ -3417,7 +3427,7 @@ mod tests {
             .await
             .unwrap();
         loop {
-            let wire = replica_snapshot_json(&page).unwrap();
+            let wire = replica_snapshot_page(&page).unwrap();
             replica
                 .install_snapshot_page(requested.as_deref(), wire)
                 .unwrap();
@@ -3490,7 +3500,7 @@ mod tests {
                 .replica_changes(server_id.clone(), after, token.clone(), 2)
                 .await
                 .unwrap();
-            let page = replica_changes_json(&server_id, after, &token, latest, &changes).unwrap();
+            let page = replica_change_page(&server_id, after, &token, latest, &changes).unwrap();
             replica.install_change_page(page).unwrap();
             if decode_cursor(replica.status().unwrap().cursor.as_deref().unwrap())
                 .unwrap()
@@ -3520,6 +3530,10 @@ mod tests {
             "has_more": false,
             "items": [thema, stale_review]
         })
+    }
+
+    fn decode_response<T: serde::de::DeserializeOwned>(value: Value) -> T {
+        serde_json::from_value(value).unwrap()
     }
 
     fn valid_replica_fixture(mut fixture: Value) -> Value {

@@ -8,7 +8,10 @@ use crate::{
         OfflineAssetConflictReason, OfflineAssetOperation, canonical_asset_path, prepare_asset,
         validate_asset_path,
     },
-    protocol::replica::{decode_cursor, encode_cursor},
+    protocol::{
+        http_v1::AssetCapabilitiesV1,
+        replica::{decode_cursor, encode_cursor},
+    },
 };
 
 pub(crate) const OFFLINE_ASSET_VERSION: u32 = 1;
@@ -76,28 +79,23 @@ pub(crate) fn canonical_asset_operation(
     encode_operation(&wire)
 }
 
-pub(crate) fn offline_asset_capabilities_json(
+pub(crate) fn offline_asset_capabilities(
     server_id: &str,
-) -> Result<Value, OfflineAssetWireError> {
+) -> Result<AssetCapabilitiesV1, OfflineAssetWireError> {
     if !is_hex_identity(server_id) {
         return Err(OfflineAssetWireError::Operation);
     }
-    bounded_value(
-        &AssetCapabilitiesV1 {
-            version: OFFLINE_ASSET_VERSION,
-            server_id: server_id.to_owned(),
-            put_asset: 1,
-            max_blob_bytes: MAX_OFFLINE_ASSET_BYTES,
-        },
-        MAX_RESULT_BYTES,
-    )
+    Ok(AssetCapabilitiesV1 {
+        version: OFFLINE_ASSET_VERSION,
+        server_id: server_id.to_owned(),
+        put_asset: 1,
+        max_blob_bytes: MAX_OFFLINE_ASSET_BYTES,
+    })
 }
 
 pub(crate) fn decode_offline_asset_capabilities(
-    value: Value,
+    value: AssetCapabilitiesV1,
 ) -> Result<DecodedOfflineAssetCapabilities, OfflineAssetWireError> {
-    require_size(&value, MAX_RESULT_BYTES)?;
-    let value: AssetCapabilitiesV1 = serde_json::from_value(value).map_err(invalid_operation)?;
     if value.version != OFFLINE_ASSET_VERSION
         || value.put_asset != 1
         || value.max_blob_bytes != MAX_OFFLINE_ASSET_BYTES
@@ -324,15 +322,6 @@ fn invalid_operation<T>(_error: T) -> OfflineAssetWireError {
     OfflineAssetWireError::Operation
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AssetCapabilitiesV1 {
-    version: u32,
-    server_id: String,
-    put_asset: u32,
-    max_blob_bytes: u64,
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AssetOperationV1 {
@@ -469,18 +458,18 @@ mod tests {
 
     use super::{
         OfflineAssetSubmission, decode_offline_asset_capabilities, decode_offline_asset_result,
-        offline_asset_capabilities_json,
+        offline_asset_capabilities,
     };
 
     #[test]
     fn capability_is_strict_and_server_bound() {
         let server = "a".repeat(32);
-        let value = offline_asset_capabilities_json(&server).unwrap();
+        let value = offline_asset_capabilities(&server).unwrap();
         let decoded = decode_offline_asset_capabilities(value).unwrap();
         assert_eq!(decoded.server_id, server);
         assert_eq!(decoded.max_blob_bytes, super::MAX_OFFLINE_ASSET_BYTES);
         assert!(
-            decode_offline_asset_capabilities(json!({
+            serde_json::from_value::<crate::protocol::http_v1::AssetCapabilitiesV1>(json!({
                 "version": 1,
                 "server_id": "a".repeat(32),
                 "put_asset": 1,
