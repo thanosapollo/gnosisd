@@ -2,6 +2,7 @@ mod auth;
 mod backup;
 mod content;
 mod import_document;
+mod offline_asset;
 mod offline_content;
 mod query_document;
 mod query_legacy;
@@ -21,13 +22,17 @@ pub(crate) use content::{
     AssetHead, AssetRevision, ContentChange, DocumentHead, DocumentProjectionSnapshot,
     DocumentReplicaRevision, DocumentRevision, NodeRecord, PreparedAsset, PreparedNote,
     PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
-    ThemaRevision, canonical_asset_path, file_link_expressions, path_key, prepare_asset,
-    prepare_note, prepare_thema, retained_asset_paths_in_org, stored_thema_content,
+    ThemaRevision, asset_paths_in_org, canonical_asset_path, file_link_expressions, path_key,
+    prepare_asset, prepare_note, prepare_thema, retained_asset_paths_in_org, stored_thema_content,
     supported_asset, thema_content, validate_asset_path, validate_logical_path,
     validate_offline_thema_assets, validate_org_path,
 };
 pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
 pub(crate) use import_document::{PreparedServerImport, persist_server_import};
+pub(crate) use offline_asset::{
+    AssetReconciliationStatus, AuthoritativeAsset, MAX_OFFLINE_ASSET_BYTES,
+    OfflineAssetConflictReason, OfflineAssetOperation, OfflineAssetResult,
+};
 pub(crate) use offline_content::{
     AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentConflictReason,
     OfflineContentMutation, OfflineContentOperation, OfflineContentResult,

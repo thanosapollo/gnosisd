@@ -25,23 +25,24 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 use crate::{
     application::{
         AnswerInput, AssetHead, ContentChange, DevicePrincipal, DeviceScope, DocumentHead,
-        DocumentRevision, MAX_REVIEW_PACK_BYTES, NodeRecord, ReviewAttemptView, ReviewSessionView,
-        ReviewSource, ServiceError, ServiceHandle, SettingsInput, SettingsRecord, ThemaRecord,
-        canonical_asset_path, prepare_asset, prepare_note, prepare_thema, review_day_at,
-        thema_content,
+        DocumentRevision, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, NodeRecord,
+        ReviewAttemptView, ReviewSessionView, ReviewSource, ServiceError, ServiceHandle,
+        SettingsInput, SettingsRecord, ThemaRecord, canonical_asset_path, prepare_asset,
+        prepare_note, prepare_thema, review_day_at, thema_content,
     },
     domain::DocumentId,
     protocol::{
-        OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
-        OfflineReviewWireError, ReplicaWireError, active_review_pack_json, decode_cursor,
-        decode_snapshot_cursor, offline_content_capabilities_json, offline_content_result_json,
-        offline_result_json, replica_changes_json, replica_snapshot_json, replica_state_json,
-        review_pack_json,
+        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
+        OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
+        active_review_pack_json, decode_cursor, decode_snapshot_cursor,
+        offline_asset_capabilities_json, offline_asset_result_json,
+        offline_content_capabilities_json, offline_content_result_json, offline_result_json,
+        replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
     },
     store::StoreError,
 };
 
-const MAX_BODY: usize = 1024 * 1024;
+const MAX_BODY: usize = MAX_OFFLINE_ASSET_BYTES as usize;
 const MAX_OFFLINE_OPERATION_BODY: usize = MAX_REVIEW_PACK_BYTES + 2 * MAX_BODY;
 const MAX_PAGE: u16 = 500;
 const MAX_REPLICA_PAGE: u16 = 32;
@@ -135,6 +136,8 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/changes", get(changes))
         .route("/v1/sync/state", get(replica_state))
         .route("/v1/sync/content-capabilities", get(content_capabilities))
+        .route("/v1/sync/asset-capabilities", get(asset_capabilities))
+        .route("/v1/sync/blobs/{digest}", axum::routing::put(stage_blob))
         .route("/v1/sync/changes", get(replica_changes))
         .route("/v1/sync/snapshot", get(replica_snapshot))
         .route("/v1/events", get(events))
@@ -153,6 +156,10 @@ fn data_router() -> Router<HttpState> {
         )
         .route("/v1/blobs/{digest}", get(get_blob))
         .route("/v1/content/offline-operations", post(reconcile_content))
+        .route(
+            "/v1/content/offline-asset-operations",
+            post(reconcile_asset),
+        )
         .route("/v1/themata", post(create_thema).get(search_themata))
         .route("/v1/themata/{id}", get(get_thema).put(update_thema))
         .route("/v1/themata/{id}/archive", post(archive_thema))
@@ -309,6 +316,22 @@ async fn content_capabilities(
     Ok(Json(
         offline_content_capabilities_json(&replica.server_id)
             .map_err(ApiError::offline_content_wire)?,
+    ))
+}
+
+async fn asset_capabilities(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let replica = state
+        .service
+        .replica_state(principal.device_id)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        offline_asset_capabilities_json(&replica.server_id)
+            .map_err(ApiError::offline_asset_wire)?,
     ))
 }
 
@@ -618,6 +641,33 @@ async fn put_asset(
         .map_err(ApiError::service)?;
     announce(&state).await;
     Ok((StatusCode::CREATED, Json(asset_json(&head))))
+}
+
+async fn stage_blob(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(digest): Path<String>,
+    headers: HeaderMap,
+    ApiBytes(body): ApiBytes,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    let media_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let blob = state
+        .service
+        .stage_blob(&digest, body.to_vec(), media_type, now_us_i64()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "content_sha256": blob.sha256,
+            "size_bytes": blob.size_bytes
+        })),
+    ))
 }
 
 async fn get_asset(
@@ -1253,6 +1303,30 @@ async fn reconcile_content(
     ))
 }
 
+async fn reconcile_asset(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(submission): ApiJson<OfflineAssetSubmission>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    let decoded = submission.decode().map_err(ApiError::offline_asset_wire)?;
+    let result = state
+        .service
+        .reconcile_asset_operation(
+            decoded.version,
+            decoded.operation,
+            decoded.canonical_payload,
+            Some(principal.device_id),
+            now_us()?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    announce(&state).await;
+    Ok(Json(
+        offline_asset_result_json(&result).map_err(|_| ApiError::internal())?,
+    ))
+}
+
 fn review_actor(principal: &DevicePrincipal) -> Option<String> {
     (!principal.scopes.contains(&DeviceScope::Admin)).then(|| principal.device_id.clone())
 }
@@ -1488,6 +1562,20 @@ impl ApiError {
             ),
         }
     }
+    fn offline_asset_wire(error: OfflineAssetWireError) -> Self {
+        match error {
+            OfflineAssetWireError::Version => Self::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_offline_asset_version",
+                "offline asset protocol version is unsupported",
+            ),
+            OfflineAssetWireError::Operation => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_offline_asset_operation",
+                "offline asset operation is invalid",
+            ),
+        }
+    }
     fn replica_wire(error: ReplicaWireError) -> Self {
         match error {
             ReplicaWireError::Cursor | ReplicaWireError::Snapshot => {
@@ -1551,6 +1639,20 @@ impl ApiError {
             ServiceError::Store(StoreError::ReplicaCursor | StoreError::ReplicaServer) => {
                 Self::snapshot_required()
             }
+            ServiceError::Store(StoreError::BlobRequired { digest }) => Self {
+                status: StatusCode::CONFLICT,
+                code: "blob_required",
+                message: "operation requires a staged blob",
+                meta: Some(json!({
+                    "content_sha256": digest,
+                    "upload_url": format!("/v1/sync/blobs/{digest}")
+                })),
+            },
+            ServiceError::Store(StoreError::BlobMetadata) => Self::new(
+                StatusCode::CONFLICT,
+                "blob_metadata_conflict",
+                "blob metadata does not match stored content",
+            ),
             ServiceError::Store(StoreError::InvalidReviewState) | ServiceError::Review(_) => {
                 Self::bad_request("review operation is invalid")
             }
@@ -1563,6 +1665,11 @@ impl ApiError {
                 Self::invalid_content("stored projection")
             }
             ServiceError::AssetDigest => Self::bad_request("asset digest does not match content"),
+            ServiceError::InvalidBlobMetadata => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_blob_metadata",
+                "blob size or media type is invalid",
+            ),
             ServiceError::Settings(_) => Self::invalid_content("settings"),
             _ => Self::internal(),
         }
@@ -1641,7 +1748,7 @@ fn openapi_request_body(path: &str, method: &str) -> Option<Value> {
         && !path.ends_with("/override")
         && !path.ends_with("/suspension")
         && !path.ends_with("/commit");
-    if path.starts_with("/v1/assets/") && method == "put" {
+    if (path.starts_with("/v1/assets/") || path.starts_with("/v1/sync/blobs/")) && method == "put" {
         Some(
             json!({"required":true,"content":{"application/octet-stream":{"schema":{"type":"string","contentEncoding":"binary"}}}}),
         )
@@ -1675,6 +1782,8 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/changes", "get"),
     ("/v1/sync/state", "get"),
     ("/v1/sync/content-capabilities", "get"),
+    ("/v1/sync/asset-capabilities", "get"),
+    ("/v1/sync/blobs/{digest}", "put"),
     ("/v1/sync/changes", "get"),
     ("/v1/sync/snapshot", "get"),
     ("/v1/events", "get"),
@@ -1692,6 +1801,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/assets/{digest}/{name}", "delete"),
     ("/v1/blobs/{digest}", "get"),
     ("/v1/content/offline-operations", "post"),
+    ("/v1/content/offline-asset-operations", "post"),
     ("/v1/themata", "get"),
     ("/v1/themata", "post"),
     ("/v1/themata/{id}", "get"),
@@ -1732,15 +1842,17 @@ mod tests {
 
     use super::{OPENAPI_OPERATIONS, attempt_json, openapi_document, router};
     use crate::application::{
-        AnswerInput, OfflineReviewOperation, PresentationSnapshot, ReviewAttemptView,
-        ReviewPackView, ServiceRuntime, SettingsInput, generate_device, prepare_asset,
-        prepare_thema, presentation_content, review_day_at, thema_content,
+        AnswerInput, OfflineAssetOperation, OfflineReviewOperation, PresentationSnapshot,
+        ReviewAttemptView, ReviewPackView, ServiceRuntime, SettingsInput, generate_device,
+        prepare_asset, prepare_thema, presentation_content, review_day_at, thema_content,
     };
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, fuzz_delta,
         grade,
     };
-    use crate::protocol::{MAX_REPLICA_PAGE_BYTES, decode_cursor, encode_cursor};
+    use crate::protocol::{
+        MAX_REPLICA_PAGE_BYTES, canonical_asset_operation, decode_cursor, encode_cursor,
+    };
     use crate::store::SqliteStore;
 
     #[test]
@@ -1977,6 +2089,152 @@ mod tests {
         assert_eq!(invalid["result"]["status"], "conflict");
         assert_eq!(invalid["result"]["conflict_reason"], "invalid_content");
         assert!(invalid["result"]["authoritative"].is_null());
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_asset_http_stages_before_sequenced_reconciliation() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device =
+            generate_device("asset".into(), vec!["read".into(), "content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let state = service.replica_state(device_id.clone()).await.unwrap();
+        let bytes = b"offline image";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let operation = OfflineAssetOperation {
+            operation_id: "asset-1".into(),
+            device_id,
+            device_sequence: 1,
+            cursor_server_id: state.server_id,
+            cursor: state.cursor,
+            cursor_token: state.cursor_token,
+            authored_at_us: 10,
+            logical_path: format!("assets/{digest}/image.png"),
+            original_name: "image.png".into(),
+            content_sha256: digest.clone(),
+            size_bytes: bytes.len() as u64,
+            media_type: "image/png".into(),
+        };
+        let body = canonical_asset_operation(&operation).unwrap();
+        let app = router(service.clone());
+
+        let missing = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-asset-operations",
+                &token,
+                Body::from(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(missing).await["error"]["code"],
+            "blob_required"
+        );
+
+        let upload = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{digest}"),
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        assert_eq!(
+            app.clone().oneshot(upload).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let exact_retry = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{digest}"),
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        assert_eq!(
+            app.clone().oneshot(exact_retry).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        let alternate_media_retry = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{digest}"),
+            &token,
+            "application/octet-stream",
+            Body::from(bytes.to_vec()),
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(alternate_media_retry)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let mismatch = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{}", "a".repeat(64)),
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        assert_eq!(
+            app.clone().oneshot(mismatch).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let oversized = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{digest}"),
+            &token,
+            "image/png",
+            Body::from(vec![0; super::MAX_BODY + 1]),
+        );
+        assert_eq!(
+            app.clone().oneshot(oversized).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let accepted = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-asset-operations",
+                &token,
+                Body::from(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted = response_json(accepted).await;
+        assert_eq!(accepted["result"]["status"], "accepted");
+        assert_eq!(
+            accepted["result"]["authoritative"]["content_sha256"],
+            digest
+        );
+        let replay = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-asset-operations",
+                &token,
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(replay).await, accepted);
 
         drop(app);
         drop(service);
@@ -2640,6 +2898,22 @@ mod tests {
             .uri(uri)
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    fn authorized_with_type(
+        method: &str,
+        uri: &str,
+        token: &str,
+        media_type: &str,
+        body: Body,
+    ) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", media_type)
             .body(body)
             .unwrap()
     }

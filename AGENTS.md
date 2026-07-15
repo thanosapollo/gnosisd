@@ -91,6 +91,14 @@ has no source blob, asset deletion fails closed because its references cannot be
 verified. Offline review packs reject external assets. Replica asset lookup must
 distinguish missing, tombstoned, and available state and verify the downloaded
 bytes against the canonical path, digest, and recorded size.
+Offline asset creation uses a separate strict capability and wire protocol but
+shares the contiguous device operation sequence. A replica must store the bytes
+and immutable operation in one local transaction. It uploads the blob before
+the operation; missing server bytes must not create a journal result or consume
+the sequence. Server reconciliation atomically commits the asset head, revision,
+feed row, result, and sequence. Asset rename, deletion, and reactivation remain
+online-only until their offline reference-rewrite and resurrection contracts are
+explicit.
 
 ## Commands
 

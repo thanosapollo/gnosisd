@@ -565,6 +565,7 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         ServiceError::Stopped
         | ServiceError::Corrupt
         | ServiceError::AssetDigest
+        | ServiceError::InvalidBlobMetadata
         | ServiceError::Blob(_)
         | ServiceError::Review(_)
         | ServiceError::Settings(_)

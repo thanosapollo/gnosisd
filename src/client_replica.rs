@@ -6,21 +6,25 @@ use thiserror::Error;
 
 use crate::{
     application::{
-        AnswerInput, AuthoritativeDocument, ContentBase, ContentReconciliationStatus,
-        OfflineAnswerInput, OfflineConflictReason, OfflineContentConflictReason,
+        AnswerInput, AssetReconciliationStatus, AuthoritativeAsset, AuthoritativeDocument,
+        ContentBase, ContentReconciliationStatus, OfflineAnswerInput, OfflineAssetConflictReason,
+        OfflineAssetOperation, OfflineConflictReason, OfflineContentConflictReason,
         OfflineContentMutation, OfflineContentOperation, OfflineReviewOperation,
-        ReconciliationStatus, validate_asset_path,
+        ReconciliationStatus, asset_paths_in_org, canonical_asset_path, validate_asset_path,
     },
     protocol::{
-        OfflineContentSubmission, OfflineContentWireError, OfflineReviewWireError,
-        ReplicaWireError, canonical_content_operation, canonical_offline_operation,
-        decode_change_page, decode_cursor, decode_offline_content_capabilities,
+        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
+        OfflineContentWireError, OfflineReviewWireError, ReplicaWireError,
+        canonical_asset_operation, canonical_content_operation, canonical_offline_operation,
+        decode_change_page, decode_cursor, decode_offline_asset_capabilities,
+        decode_offline_asset_result, decode_offline_content_capabilities,
         decode_offline_content_result, decode_offline_result, decode_replica_state,
         decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
     },
     store::{
-        ContentResultInstall, DeltaInstall, LocalReplicaError as StoreReplicaError,
-        LocalReplicaItem, LocalReplicaStore, SnapshotInstall, StoredContentResult,
+        AssetResultInstall, ContentResultInstall, DeltaInstall,
+        LocalReplicaError as StoreReplicaError, LocalReplicaItem, LocalReplicaStore,
+        SnapshotInstall, StoredAssetResult, StoredAssetResultPage, StoredContentResult,
         StoredContentResultPage, StoredReviewPack, StoredReviewResult, StoredReviewResultPage,
         canonical_json_sha256,
     },
@@ -52,6 +56,37 @@ pub struct PendingContentUpload {
 pub enum PendingDeviceUpload {
     Review(Box<PendingUpload>),
     Content(PendingContentUpload),
+    Asset(PendingAssetUpload),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingAssetUpload {
+    pub operation_id: String,
+    pub device_sequence: u64,
+    pub logical_path: String,
+    pub content_sha256: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+    pub canonical_payload: String,
+    pub submission: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineAssetCreate {
+    pub operation_id: String,
+    pub original_name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+    pub authored_at_us: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordedAssetOperation {
+    pub operation_id: String,
+    pub device_sequence: u64,
+    pub logical_path: String,
+    pub content_sha256: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,9 +173,19 @@ pub struct ReplicaAsset {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaStagedAsset {
+    pub logical_path: String,
+    pub content_sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicaAssetState {
     Missing,
     Tombstoned { revision: u64 },
+    Staged(ReplicaStagedAsset),
     Available(ReplicaAsset),
 }
 
@@ -265,6 +310,50 @@ pub struct ReconciledOfflineContentPage {
     pub next_after: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OfflineAssetOutcome {
+    Accepted,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetConflictReason {
+    CursorChanged,
+    BaseChanged,
+    InvalidContent,
+    PathConflict,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciledOfflineAsset {
+    pub result_sequence: u64,
+    pub server_id: String,
+    pub operation_id: String,
+    pub device_sequence: u64,
+    pub logical_path: String,
+    pub outcome: OfflineAssetOutcome,
+    pub conflict_reason: Option<AssetConflictReason>,
+    pub operation: Value,
+    pub authoritative: Option<ReplicaAssetHead>,
+    pub cursor: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplicaAssetHead {
+    pub logical_path: String,
+    pub revision: u64,
+    pub content_sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReconciledOfflineAssetPage {
+    pub items: Vec<ReconciledOfflineAsset>,
+    pub next_after: Option<u64>,
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("local replica storage failed")]
@@ -293,6 +382,8 @@ pub enum Error {
     ReviewWire,
     #[error("offline content response is invalid")]
     ContentWire,
+    #[error("offline asset response is invalid")]
+    AssetWire,
     #[error("offline content operation no longer matches the replica state")]
     Content,
     #[error("offline content path is already owned by another document")]
@@ -319,6 +410,13 @@ impl LocalReplica {
         let capabilities = decode_offline_content_capabilities(value)?;
         self.store
             .install_content_capabilities(&capabilities.server_id)?;
+        Ok(())
+    }
+
+    pub fn install_asset_capabilities(&mut self, value: Value) -> Result<(), Error> {
+        let capabilities = decode_offline_asset_capabilities(value)?;
+        self.store
+            .install_asset_capabilities(&capabilities.server_id, capabilities.max_blob_bytes)?;
         Ok(())
     }
 
@@ -398,7 +496,7 @@ impl LocalReplica {
         validate_asset_path(logical_path).map_err(|_| Error::Content)?;
         let _ = self.store.current_server_id()?;
         let Some(item) = self.store.projection("asset", logical_path)? else {
-            return Ok(ReplicaAssetState::Missing);
+            return self.local_asset_overlay(logical_path);
         };
         if item.tombstone {
             return Ok(ReplicaAssetState::Tombstoned {
@@ -417,6 +515,28 @@ impl LocalReplica {
             size_bytes: size,
             media_type,
             bytes,
+        }))
+    }
+
+    fn local_asset_overlay(&self, logical_path: &str) -> Result<ReplicaAssetState, Error> {
+        let Some(asset) = self.store.asset_overlay(logical_path)? else {
+            return Ok(ReplicaAssetState::Missing);
+        };
+        let actual = format!("{:x}", Sha256::digest(&asset.bytes));
+        let path_digest = logical_path.split('/').nth(1);
+        let size = usize::try_from(asset.size_bytes).map_err(|_| Error::Response)?;
+        if actual != asset.content_sha256
+            || path_digest != Some(asset.content_sha256.as_str())
+            || asset.bytes.len() != size
+        {
+            return Err(Error::Response);
+        }
+        Ok(ReplicaAssetState::Staged(ReplicaStagedAsset {
+            logical_path: logical_path.to_owned(),
+            content_sha256: asset.content_sha256,
+            size_bytes: asset.size_bytes,
+            media_type: asset.media_type,
+            bytes: asset.bytes,
         }))
     }
 
@@ -466,6 +586,8 @@ impl LocalReplica {
         if let Some(json) = self.store.existing_content_operation(&edit.operation_id)? {
             return replayed_document_edit(&json, &edit);
         }
+        let asset_paths = asset_paths_in_org(&edit.org).unwrap_or_default();
+        self.store.require_document_assets(&asset_paths)?;
         let operation_id = edit.operation_id;
         let document_id = edit.document_id;
         let authored_at_us = edit.authored_at_us;
@@ -520,6 +642,55 @@ impl LocalReplica {
         })
     }
 
+    pub fn record_asset(
+        &mut self,
+        create: OfflineAssetCreate,
+    ) -> Result<RecordedAssetOperation, Error> {
+        let digest = format!("{:x}", Sha256::digest(&create.bytes));
+        let logical_path =
+            canonical_asset_path(&digest, &create.original_name).map_err(|_| Error::Content)?;
+        if let Some(json) = self.store.existing_asset_operation(&create.operation_id)? {
+            return replayed_asset_create(&json, &create, &logical_path, &digest);
+        }
+        let context = self.store.asset_context(&logical_path)?;
+        let size_bytes = u64::try_from(create.bytes.len()).map_err(|_| Error::Content)?;
+        if size_bytes == 0 || size_bytes > context.max_blob_bytes {
+            return Err(Error::Content);
+        }
+        let (server_id, cursor, token) = decode_cursor(&context.cursor)?;
+        if server_id != context.server_id {
+            return Err(Error::Content);
+        }
+        let operation = OfflineAssetOperation {
+            operation_id: create.operation_id,
+            device_id: self.device_id()?,
+            device_sequence: context.next_device_sequence,
+            cursor_server_id: server_id,
+            cursor,
+            cursor_token: token,
+            authored_at_us: create.authored_at_us,
+            logical_path: logical_path.clone(),
+            original_name: create.original_name,
+            content_sha256: digest.clone(),
+            size_bytes,
+            media_type: create.media_type,
+        };
+        let canonical_payload = canonical_asset_operation(&operation)?;
+        self.store.record_asset_operation(
+            &operation,
+            &context.cursor,
+            &canonical_payload,
+            &create.bytes,
+        )?;
+        Ok(RecordedAssetOperation {
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+            logical_path,
+            content_sha256: digest,
+            size_bytes,
+        })
+    }
+
     fn record_content_mutation(
         &mut self,
         operation_id: String,
@@ -570,13 +741,38 @@ impl LocalReplica {
         }))
     }
 
+    pub fn next_asset_upload(&self) -> Result<Option<PendingAssetUpload>, Error> {
+        let Some(pending) = self.store.next_pending_asset_operation()? else {
+            return Ok(None);
+        };
+        let submission: Value =
+            serde_json::from_str(&pending.canonical_payload).map_err(|_| Error::Response)?;
+        let decoded: OfflineAssetSubmission =
+            serde_json::from_value(submission.clone()).map_err(|_| Error::Response)?;
+        let operation = decoded.decode()?.operation;
+        if format!("{:x}", Sha256::digest(&pending.bytes)) != operation.content_sha256 {
+            return Err(Error::Response);
+        }
+        Ok(Some(PendingAssetUpload {
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+            logical_path: operation.logical_path,
+            content_sha256: operation.content_sha256,
+            media_type: operation.media_type,
+            bytes: pending.bytes,
+            canonical_payload: pending.canonical_payload,
+            submission,
+        }))
+    }
+
     pub fn next_device_upload(&self) -> Result<Option<PendingDeviceUpload>, Error> {
         if let Some(review) = self.next_upload()? {
             return Ok(Some(PendingDeviceUpload::Review(Box::new(review))));
         }
-        Ok(self
-            .next_content_upload()?
-            .map(PendingDeviceUpload::Content))
+        if let Some(content) = self.next_content_upload()? {
+            return Ok(Some(PendingDeviceUpload::Content(content)));
+        }
+        Ok(self.next_asset_upload()?.map(PendingDeviceUpload::Asset))
     }
 
     pub fn record_content_result(&mut self, value: Value) -> Result<(), Error> {
@@ -593,6 +789,50 @@ impl LocalReplica {
         self.store
             .record_content_result(&install, &decoded.cursor, &result_json)?;
         Ok(())
+    }
+
+    pub fn record_asset_result(&mut self, value: Value) -> Result<(), Error> {
+        let result_json = serde_json::to_string(&value).map_err(|_| Error::Response)?;
+        let decoded = decode_offline_asset_result(value)?;
+        let operation_json = self
+            .store
+            .existing_asset_operation(&decoded.operation_id)?
+            .ok_or(Error::Content)?;
+        let submission: OfflineAssetSubmission =
+            serde_json::from_str(&operation_json).map_err(|_| Error::Response)?;
+        let operation = submission.decode()?.operation;
+        let install = validated_asset_result(&operation, &decoded)?;
+        self.store
+            .record_asset_result(&install, &decoded.cursor, &result_json)?;
+        Ok(())
+    }
+
+    pub fn asset_results(
+        &self,
+        after: Option<u64>,
+        limit: u16,
+    ) -> Result<ReconciledOfflineAssetPage, Error> {
+        self.asset_result_page(after, limit, false)
+    }
+
+    pub fn asset_conflicts(
+        &self,
+        after: Option<u64>,
+        limit: u16,
+    ) -> Result<ReconciledOfflineAssetPage, Error> {
+        self.asset_result_page(after, limit, true)
+    }
+
+    fn asset_result_page(
+        &self,
+        after: Option<u64>,
+        limit: u16,
+        conflicts_only: bool,
+    ) -> Result<ReconciledOfflineAssetPage, Error> {
+        let page = self
+            .store
+            .asset_results(after.unwrap_or(0), limit, conflicts_only)?;
+        ReconciledOfflineAssetPage::try_from(page)
     }
 
     pub fn content_results(
@@ -704,6 +944,88 @@ fn validated_content_result(
             .as_ref()
             .map(|document| document.document_id.clone()),
     })
+}
+
+fn replayed_asset_create(
+    json: &str,
+    create: &OfflineAssetCreate,
+    logical_path: &str,
+    digest: &str,
+) -> Result<RecordedAssetOperation, Error> {
+    let submission: OfflineAssetSubmission =
+        serde_json::from_str(json).map_err(|_| Error::Response)?;
+    let operation = submission.decode()?.operation;
+    let size_bytes = u64::try_from(create.bytes.len()).map_err(|_| Error::Content)?;
+    let matches = operation.operation_id == create.operation_id
+        && operation.original_name == create.original_name
+        && operation.media_type == create.media_type
+        && operation.authored_at_us == create.authored_at_us
+        && operation.logical_path == logical_path
+        && operation.content_sha256 == digest
+        && operation.size_bytes == size_bytes;
+    matches
+        .then_some(RecordedAssetOperation {
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+            logical_path: operation.logical_path,
+            content_sha256: operation.content_sha256,
+            size_bytes: operation.size_bytes,
+        })
+        .ok_or(Error::Content)
+}
+
+fn validated_asset_result(
+    operation: &OfflineAssetOperation,
+    result: &crate::protocol::DecodedOfflineAssetResult,
+) -> Result<AssetResultInstall, Error> {
+    let (server_id, cursor, _) = decode_cursor(&result.cursor)?;
+    if server_id != operation.cursor_server_id || cursor < operation.cursor {
+        return Err(Error::Result);
+    }
+    validate_asset_authority(operation, result)?;
+    Ok(AssetResultInstall {
+        operation_id: result.operation_id.clone(),
+        status: result.status,
+        conflict_reason: result.conflict_reason,
+        cursor_server_id: server_id,
+        authoritative_path: result
+            .authoritative
+            .as_ref()
+            .map(|asset| asset.logical_path.clone()),
+    })
+}
+
+fn validate_asset_authority(
+    operation: &OfflineAssetOperation,
+    result: &crate::protocol::DecodedOfflineAssetResult,
+) -> Result<(), Error> {
+    let Some(authoritative) = &result.authoritative else {
+        return if result.status == AssetReconciliationStatus::Conflict {
+            Ok(())
+        } else {
+            Err(Error::Result)
+        };
+    };
+    if authoritative.logical_path != operation.logical_path {
+        return Err(Error::Result);
+    }
+    if result.status == AssetReconciliationStatus::Accepted {
+        validate_accepted_asset(operation, authoritative)?;
+    }
+    Ok(())
+}
+
+fn validate_accepted_asset(
+    operation: &OfflineAssetOperation,
+    authoritative: &AuthoritativeAsset,
+) -> Result<(), Error> {
+    (authoritative.active
+        && authoritative.revision == 1
+        && authoritative.content_sha256 == operation.content_sha256
+        && authoritative.size_bytes == operation.size_bytes
+        && authoritative.media_type == operation.media_type)
+        .then_some(())
+        .ok_or(Error::Result)
 }
 
 fn validate_content_authority(
@@ -1034,6 +1356,61 @@ impl TryFrom<StoredContentResultPage> for ReconciledOfflineContentPage {
     }
 }
 
+impl TryFrom<StoredAssetResult> for ReconciledOfflineAsset {
+    type Error = Error;
+
+    fn try_from(value: StoredAssetResult) -> Result<Self, Self::Error> {
+        let operation_value: Value =
+            serde_json::from_str(&value.operation_json).map_err(|_| Error::Response)?;
+        let submission: OfflineAssetSubmission =
+            serde_json::from_value(operation_value.clone()).map_err(|_| Error::Response)?;
+        let operation = submission.decode()?.operation;
+        let result_value: Value =
+            serde_json::from_str(&value.result_json).map_err(|_| Error::Response)?;
+        let result = decode_offline_asset_result(result_value)?;
+        Ok(Self {
+            result_sequence: value.sequence,
+            server_id: value.server_id,
+            operation_id: operation.operation_id,
+            device_sequence: operation.device_sequence,
+            logical_path: operation.logical_path,
+            outcome: result.status.into(),
+            conflict_reason: result.conflict_reason.map(AssetConflictReason::from),
+            operation: operation_value,
+            authoritative: result.authoritative.map(ReplicaAssetHead::from),
+            cursor: result.cursor,
+        })
+    }
+}
+
+impl TryFrom<StoredAssetResultPage> for ReconciledOfflineAssetPage {
+    type Error = Error;
+
+    fn try_from(value: StoredAssetResultPage) -> Result<Self, Self::Error> {
+        Ok(Self {
+            items: value
+                .items
+                .into_iter()
+                .map(ReconciledOfflineAsset::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            next_after: value.next_after,
+        })
+    }
+}
+
+impl From<AuthoritativeAsset> for ReplicaAssetHead {
+    fn from(value: AuthoritativeAsset) -> Self {
+        Self {
+            logical_path: value.logical_path,
+            revision: value.revision,
+            content_sha256: value.content_sha256,
+            size_bytes: value.size_bytes,
+            media_type: value.media_type,
+            active: value.active,
+        }
+    }
+}
+
 impl From<ReconciliationStatus> for OfflineReviewOutcome {
     fn from(value: ReconciliationStatus) -> Self {
         match value {
@@ -1048,6 +1425,26 @@ impl From<ContentReconciliationStatus> for OfflineContentOutcome {
         match value {
             ContentReconciliationStatus::Accepted => Self::Accepted,
             ContentReconciliationStatus::Conflict => Self::Conflict,
+        }
+    }
+}
+
+impl From<AssetReconciliationStatus> for OfflineAssetOutcome {
+    fn from(value: AssetReconciliationStatus) -> Self {
+        match value {
+            AssetReconciliationStatus::Accepted => Self::Accepted,
+            AssetReconciliationStatus::Conflict => Self::Conflict,
+        }
+    }
+}
+
+impl From<OfflineAssetConflictReason> for AssetConflictReason {
+    fn from(value: OfflineAssetConflictReason) -> Self {
+        match value {
+            OfflineAssetConflictReason::CursorChanged => Self::CursorChanged,
+            OfflineAssetConflictReason::BaseChanged => Self::BaseChanged,
+            OfflineAssetConflictReason::InvalidContent => Self::InvalidContent,
+            OfflineAssetConflictReason::PathConflict => Self::PathConflict,
         }
     }
 }
@@ -1224,6 +1621,12 @@ impl From<OfflineContentWireError> for Error {
     }
 }
 
+impl From<OfflineAssetWireError> for Error {
+    fn from(_: OfflineAssetWireError) -> Self {
+        Self::AssetWire
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1237,9 +1640,10 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        Error, LocalReplica, OfflineAnswer, OfflineContentOutcome, OfflineDocumentEdit,
-        OfflineDocumentRename, OfflineDocumentTombstone, OfflineResponse, PendingContentUpload,
-        ReplicaAssetState, ReviewConflictReason,
+        AssetConflictReason, ContentConflictReason, Error, LocalReplica, OfflineAnswer,
+        OfflineAssetCreate, OfflineContentOutcome, OfflineDocumentEdit, OfflineDocumentRename,
+        OfflineDocumentTombstone, OfflineResponse, PendingAssetUpload, PendingContentUpload,
+        PendingDeviceUpload, ReplicaAssetState, ReviewConflictReason,
     };
     use crate::{
         application::{
@@ -1248,8 +1652,9 @@ mod tests {
             thema_content,
         },
         protocol::{
-            OFFLINE_REVIEW_VERSION, OfflineContentSubmission, decode_cursor,
-            decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
+            OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineContentSubmission,
+            decode_cursor, decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
+            offline_asset_capabilities_json, offline_asset_result_json,
             offline_content_capabilities_json, offline_content_result_json, offline_result_json,
             replica_changes_json, replica_snapshot_json, replica_state_json, review_pack_json,
         },
@@ -1822,6 +2227,281 @@ mod tests {
         assert_eq!(document.revision, 3);
         assert!(document.tombstone);
         assert!(document.blob_digests.is_empty());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_asset_outbox_restarts_replays_and_converges() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("asset-server.sqlite");
+        let blobs = directory.path().join("asset-blobs");
+        let replica_path = directory.path().join("asset-replica.sqlite");
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "offline-asset".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        assert!(matches!(
+            replica.record_asset(OfflineAssetCreate {
+                operation_id: "oversized".into(),
+                original_name: "large.png".into(),
+                media_type: "application/octet-stream".into(),
+                bytes: vec![0; crate::application::MAX_OFFLINE_ASSET_BYTES as usize + 1],
+                authored_at_us: 9,
+            }),
+            Err(Error::Content)
+        ));
+        assert_eq!(replica.status().unwrap().next_device_sequence, 1);
+        let create = OfflineAssetCreate {
+            operation_id: "offline-asset-1".into(),
+            original_name: "image.png".into(),
+            media_type: "image/png".into(),
+            bytes: b"offline image".to_vec(),
+            authored_at_us: 10,
+        };
+        let recorded = replica.record_asset(create.clone()).unwrap();
+        assert_eq!(recorded.device_sequence, 1);
+        assert_eq!(replica.record_asset(create.clone()).unwrap(), recorded);
+        assert!(matches!(
+            replica.asset(&recorded.logical_path).unwrap(),
+            ReplicaAssetState::Staged(asset) if asset.bytes == b"offline image"
+        ));
+        let document = replica
+            .record_document(OfflineDocumentEdit {
+                operation_id: "offline-document-2".into(),
+                document_id: "asset-note".into(),
+                logical_path: "asset-note.org".into(),
+                org: format!("#+title: Asset\n[[file:{}]]\n", recorded.logical_path),
+                authored_at_us: 11,
+            })
+            .unwrap();
+        assert_eq!(document.device_sequence, 2);
+        let mut changed = create;
+        changed.bytes.push(0);
+        assert!(matches!(replica.record_asset(changed), Err(Error::Content)));
+        let upload = match replica.next_device_upload().unwrap().unwrap() {
+            PendingDeviceUpload::Asset(upload) => upload,
+            _ => panic!("expected asset upload"),
+        };
+        let missing = reconcile_asset_upload(&service, &upload, &device_id, 20).await;
+        assert!(matches!(
+            missing,
+            Err(crate::application::ServiceError::Store(
+                crate::store::StoreError::BlobRequired { .. }
+            ))
+        ));
+        assert_eq!(
+            service
+                .replica_state(device_id.clone())
+                .await
+                .unwrap()
+                .next_device_sequence,
+            1
+        );
+        service
+            .stage_blob(
+                &upload.content_sha256,
+                upload.bytes.clone(),
+                upload.media_type.clone(),
+                21,
+            )
+            .await
+            .unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        drop(replica);
+        let runtime = ServiceRuntime::start(database, blobs, 8).await.unwrap();
+        let service = runtime.handle();
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        let retry = replica.next_asset_upload().unwrap().unwrap();
+        assert_eq!(retry.canonical_payload, upload.canonical_payload);
+        let missing_after_restart = reconcile_asset_upload(&service, &retry, &device_id, 22).await;
+        assert!(matches!(
+            missing_after_restart,
+            Err(crate::application::ServiceError::Store(
+                crate::store::StoreError::BlobRequired { .. }
+            ))
+        ));
+        service
+            .stage_blob(
+                &retry.content_sha256,
+                retry.bytes.clone(),
+                retry.media_type.clone(),
+                23,
+            )
+            .await
+            .unwrap();
+        let accepted = reconcile_asset_upload(&service, &retry, &device_id, 24)
+            .await
+            .unwrap();
+        assert_eq!(accepted["result"]["status"], "accepted");
+        let replay = reconcile_asset_upload(&service, &retry, &device_id, 25)
+            .await
+            .unwrap();
+        assert_eq!(replay, accepted);
+        replica.record_asset_result(accepted).unwrap();
+        assert_eq!(replica.asset_results(None, 10).unwrap().items.len(), 1);
+        assert!(matches!(
+            replica.asset(&recorded.logical_path).unwrap(),
+            ReplicaAssetState::Staged(asset) if asset.bytes == b"offline image"
+        ));
+        let document = match replica.next_device_upload().unwrap().unwrap() {
+            PendingDeviceUpload::Content(upload) => upload,
+            _ => panic!("expected dependent document upload"),
+        };
+        let document_result = reconcile_content_upload(&service, &document, &device_id, 26).await;
+        assert_eq!(document_result["result"]["status"], "accepted");
+        replica.record_content_result(document_result).unwrap();
+        assert!(replica.next_device_upload().unwrap().is_none());
+
+        pull_server_changes(&mut replica, &service).await;
+        assert!(matches!(
+            replica.asset(&recorded.logical_path).unwrap(),
+            ReplicaAssetState::Available(asset) if asset.bytes == b"offline image"
+        ));
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn offline_asset_conflict_is_queryable_and_reauthorable_after_resync() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica_path = directory.path().join("replica.sqlite");
+        let runtime = ServiceRuntime::start(
+            directory.path().join("server.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "asset-conflict".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        let create = OfflineAssetCreate {
+            operation_id: "stale-asset".into(),
+            original_name: "image.png".into(),
+            media_type: "image/png".into(),
+            bytes: b"stale asset".to_vec(),
+            authored_at_us: 2,
+        };
+        let recorded = replica.record_asset(create.clone()).unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    None,
+                    "unrelated.org".into(),
+                    "#+title: Changed\n".into(),
+                    None,
+                )
+                .unwrap(),
+                3,
+                Some(device_id.clone()),
+            )
+            .await
+            .unwrap();
+        let changed_state = service.replica_state(device_id.clone()).await.unwrap();
+        service
+            .expire_replica_changes_through(changed_state.cursor)
+            .await
+            .unwrap();
+        let upload = replica.next_asset_upload().unwrap().unwrap();
+        service
+            .stage_blob(
+                &upload.content_sha256,
+                upload.bytes.clone(),
+                upload.media_type.clone(),
+                4,
+            )
+            .await
+            .unwrap();
+        let result = reconcile_asset_upload(&service, &upload, &device_id, 5)
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["conflict_reason"], "cursor_changed");
+        replica.record_asset_result(result).unwrap();
+        let conflicts = replica.asset_conflicts(None, 10).unwrap();
+        assert_eq!(conflicts.items.len(), 1);
+        assert_eq!(
+            conflicts.items[0].conflict_reason,
+            Some(AssetConflictReason::CursorChanged)
+        );
+        assert_eq!(conflicts.items[0].logical_path, recorded.logical_path);
+        assert_eq!(conflicts.items[0].operation["operation"]["size_bytes"], 11);
+
+        replica
+            .observe_state(replica_state_json(&changed_state).unwrap())
+            .unwrap();
+        install_server_snapshot(&mut replica, &service, &device_id).await;
+        install_missing_blobs(&mut replica, &service).await;
+        let mut reauthored = create;
+        reauthored.operation_id = "reauthored-asset".into();
+        assert_eq!(replica.record_asset(reauthored).unwrap().device_sequence, 2);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_offline_org_survives_restart_as_an_explicit_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let replica_path = directory.path().join("replica.sqlite");
+        let runtime = ServiceRuntime::start(
+            directory.path().join("server.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "invalid-org".into(),
+            vec!["read".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        sync_server(&mut replica, &service, &device_id).await;
+        replica
+            .record_document(OfflineDocumentEdit {
+                operation_id: "invalid-org".into(),
+                document_id: "invalid-document".into(),
+                logical_path: "invalid.org".into(),
+                org: "#+title: Invalid\n[[file:../outside.png]]\n".into(),
+                authored_at_us: 2,
+            })
+            .unwrap();
+        drop(replica);
+
+        let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+        let upload = replica.next_content_upload().unwrap().unwrap();
+        let result = reconcile_content_upload(&service, &upload, &device_id, 3).await;
+        assert_eq!(result["result"]["conflict_reason"], "invalid_content");
+        replica.record_content_result(result).unwrap();
+        let conflicts = replica.content_conflicts(None, 10).unwrap();
+        assert_eq!(conflicts.items.len(), 1);
+        assert_eq!(
+            conflicts.items[0].conflict_reason,
+            Some(ContentConflictReason::InvalidContent)
+        );
+        assert!(replica.next_device_upload().unwrap().is_none());
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -2577,6 +3257,9 @@ mod tests {
                 offline_content_capabilities_json(&state.server_id).unwrap(),
             )
             .unwrap();
+        replica
+            .install_asset_capabilities(offline_asset_capabilities_json(&state.server_id).unwrap())
+            .unwrap();
         install_server_snapshot(replica, service, device_id).await;
         install_missing_blobs(replica, service).await;
     }
@@ -2622,6 +3305,27 @@ mod tests {
             .await
             .unwrap();
         offline_content_result_json(&result).unwrap()
+    }
+
+    async fn reconcile_asset_upload(
+        service: &ServiceHandle,
+        upload: &PendingAssetUpload,
+        device_id: &str,
+        received_at_us: u64,
+    ) -> Result<Value, crate::application::ServiceError> {
+        let submission: OfflineAssetSubmission =
+            serde_json::from_value(upload.submission.clone()).unwrap();
+        let decoded = submission.decode().unwrap();
+        let result = service
+            .reconcile_asset_operation(
+                decoded.version,
+                decoded.operation,
+                decoded.canonical_payload,
+                Some(device_id.into()),
+                received_at_us,
+            )
+            .await?;
+        Ok(offline_asset_result_json(&result).unwrap())
     }
 
     async fn add_shared_asset(service: &ServiceHandle, device_id: &str) -> String {

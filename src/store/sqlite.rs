@@ -31,6 +31,7 @@ use crate::{
     blob::BlobMeta,
 };
 
+mod asset_sync;
 mod content_sync;
 mod review;
 
@@ -44,7 +45,8 @@ const OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION: &str =
     include_str!("migrations/0007_offline_document_lifecycle.sql");
 const DOCUMENT_ASSET_INTEGRITY_MIGRATION: &str =
     include_str!("migrations/0008_document_asset_integrity.sql");
-const SCHEMA_VERSION: u32 = 8;
+const OFFLINE_ASSET_PUT_MIGRATION: &str = include_str!("migrations/0009_offline_asset_put.sql");
+const SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -68,6 +70,10 @@ pub(crate) enum StoreError {
     ReplicaCursor,
     #[error("replica snapshot belongs to another server")]
     ReplicaServer,
+    #[error("operation requires a staged blob")]
+    BlobRequired { digest: String },
+    #[error("blob metadata does not match stored content")]
+    BlobMetadata,
     #[error("document path changes require a rename operation")]
     PathChange,
     #[error("document projection is invalid: {reason}")]
@@ -346,6 +352,44 @@ impl SqliteStore {
         )?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(revision)
+    }
+
+    pub(crate) fn stage_blob(
+        &mut self,
+        blob: &BlobMeta,
+        created_at_us: i64,
+    ) -> Result<(), StoreError> {
+        let transaction = self.write_transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT size_bytes FROM staged_blob WHERE content_sha256 = ?1",
+                [&blob.sha256],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StoreError::storage)?;
+        if existing.is_some_and(|size| u64::try_from(size).ok() != Some(blob.size_bytes)) {
+            return Err(StoreError::BlobMetadata);
+        }
+        transaction
+            .execute(
+                "INSERT INTO staged_blob(content_sha256, size_bytes, staged_at_us)
+                 VALUES (?1, ?2, ?3) ON CONFLICT(content_sha256) DO NOTHING",
+                params![
+                    blob.sha256,
+                    u64_to_i64(blob.size_bytes, "staged blob size")?,
+                    created_at_us,
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        transaction.commit().map_err(StoreError::storage)
+    }
+
+    pub(crate) fn clear_staged_blobs(&mut self) -> Result<(), StoreError> {
+        self.connection
+            .execute("DELETE FROM staged_blob", [])
+            .map(|_| ())
+            .map_err(StoreError::storage)
     }
 
     pub(crate) fn rewrite_imported_thema_content(
@@ -2085,7 +2129,11 @@ fn load_settings(connection: &Connection) -> Result<SettingsRecord, StoreError> 
 
 fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreError> {
     let mut statement = connection
-        .prepare("SELECT content_sha256, size_bytes FROM blob ORDER BY content_sha256")
+        .prepare(
+            "SELECT content_sha256, size_bytes FROM blob
+             UNION SELECT content_sha256, size_bytes FROM offline_asset_evidence
+             ORDER BY content_sha256",
+        )
         .map_err(StoreError::storage)?;
     statement
         .query_map([], |row| {
@@ -3199,6 +3247,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             .execute_batch(DOCUMENT_ASSET_INTEGRITY_MIGRATION)
             .map_err(StoreError::storage)?;
     }
+    if found < 9 {
+        connection
+            .execute_batch(OFFLINE_ASSET_PUT_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
     Ok(())
 }
 
@@ -4080,7 +4133,7 @@ fn document_path(
         .map_err(StoreError::storage)
 }
 
-fn insert_blob(
+pub(super) fn insert_blob(
     transaction: &Transaction<'_>,
     blob: &BlobMeta,
     created_at_us: i64,
@@ -4765,7 +4818,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            8
+            9
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -4773,7 +4826,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            8
+            9
         );
     }
 
@@ -4786,7 +4839,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
@@ -4976,7 +5029,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 8);
+        assert_eq!(schema_version(&connection).unwrap(), 9);
         let floor: i64 = connection
             .query_row(
                 "SELECT retained_after_cursor FROM sync_feed_state",
@@ -5271,7 +5324,7 @@ mod tests {
             .unwrap();
 
         migrate(&store.connection).unwrap();
-        assert_eq!(schema_version(&store.connection).unwrap(), 8);
+        assert_eq!(schema_version(&store.connection).unwrap(), 9);
         let violations: i64 = store
             .connection
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {

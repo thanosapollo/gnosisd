@@ -15,8 +15,9 @@ use tokio::sync::oneshot;
 
 use super::{
     AnswerInput, ApplicationError, AssetHead, BackupError, BackupSummary, ContentChange,
-    DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, NewDevice,
-    NodeRecord, OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+    DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary,
+    MAX_OFFLINE_ASSET_BYTES, NewDevice, NodeRecord, OfflineAssetOperation, OfflineAssetResult,
+    OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
     OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedNote, PreparedServerImport,
     PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
     ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
@@ -240,6 +241,29 @@ impl ServiceHandle {
         })
         .await?
         .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn stage_blob(
+        &self,
+        expected_digest: &str,
+        bytes: Vec<u8>,
+        media_type: String,
+        created_at_us: i64,
+    ) -> Result<BlobMeta, ServiceError> {
+        validate_blob_metadata(&bytes, &media_type)?;
+        let actual_digest = format!("{:x}", Sha256::digest(&bytes));
+        if actual_digest != expected_digest {
+            return Err(ServiceError::AssetDigest);
+        }
+        let blob = self.blobs.put(&bytes, &media_type)?;
+        request(&self.sender, |response| StoreCommand::StageBlob {
+            blob: blob.clone(),
+            created_at_us,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)?;
+        Ok(blob)
     }
 
     pub(crate) async fn asset(
@@ -869,6 +893,28 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn reconcile_asset_operation(
+        &self,
+        format_version: u32,
+        operation: OfflineAssetOperation,
+        canonical_payload: String,
+        device_id: Option<String>,
+        received_at_us: u64,
+    ) -> Result<OfflineAssetResult, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ReconcileAssetOperation {
+                format_version,
+                operation: Box::new(operation),
+                canonical_payload,
+                device_id,
+                received_at_us,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn create_backup(
         &self,
         destination: PathBuf,
@@ -1088,6 +1134,11 @@ enum StoreCommand {
         author_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<AssetHead>>,
     },
+    StageBlob {
+        blob: BlobMeta,
+        created_at_us: i64,
+        response: oneshot::Sender<StoreResult<()>>,
+    },
     AssetHead {
         asset_path: String,
         response: oneshot::Sender<StoreResult<Option<AssetHead>>>,
@@ -1302,6 +1353,14 @@ enum StoreCommand {
         prepared: PreparedContentOperation,
         response: oneshot::Sender<StoreResult<OfflineContentResult>>,
     },
+    ReconcileAssetOperation {
+        format_version: u32,
+        operation: Box<OfflineAssetOperation>,
+        canonical_payload: String,
+        device_id: Option<String>,
+        received_at_us: u64,
+        response: oneshot::Sender<StoreResult<OfflineAssetResult>>,
+    },
     CreateBackup {
         destination: PathBuf,
         created_at_us: u64,
@@ -1354,11 +1413,14 @@ fn store_actor(
             return;
         }
     };
-    let recovery = store.referenced_blobs().and_then(|expected| {
-        blobs
-            .recover(&expected)
-            .map_err(|error| StoreError::Storage(Box::new(error)))
-    });
+    let recovery = store
+        .clear_staged_blobs()
+        .and_then(|()| store.referenced_blobs())
+        .and_then(|expected| {
+            blobs
+                .recover(&expected)
+                .map_err(|error| StoreError::Storage(Box::new(error)))
+        });
     if let Err(error) = recovery {
         let _ = ready.send(Err(error));
         return;
@@ -1560,6 +1622,11 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
                 });
             send(response, result);
         }
+        StoreCommand::StageBlob {
+            blob,
+            created_at_us,
+            response,
+        } => send(response, store.stage_blob(&blob, created_at_us)),
         StoreCommand::AssetHead {
             asset_path,
             response,
@@ -1888,6 +1955,44 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             );
             send(response, result);
         }
+        StoreCommand::ReconcileAssetOperation {
+            format_version,
+            operation,
+            canonical_payload,
+            device_id,
+            received_at_us,
+            response,
+        } => {
+            let needs_blob = store.asset_operation_needs_blob(
+                format_version,
+                &operation,
+                &canonical_payload,
+                device_id.as_deref(),
+            );
+            let result = needs_blob.and_then(|needs_blob| {
+                if needs_blob {
+                    match blobs.read(&operation.content_sha256) {
+                        Ok(_) => {}
+                        Err(BlobError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            return Err(StoreError::BlobRequired {
+                                digest: operation.content_sha256.clone(),
+                            });
+                        }
+                        Err(error) => return Err(StoreError::Storage(Box::new(error))),
+                    }
+                }
+                store.reconcile_asset_operation(
+                    format_version,
+                    &operation,
+                    &canonical_payload,
+                    device_id.as_deref(),
+                    received_at_us,
+                )
+            });
+            send(response, result);
+        }
         StoreCommand::CreateBackup {
             destination,
             created_at_us,
@@ -1943,6 +2048,8 @@ pub(crate) enum ServiceError {
     Corrupt,
     #[error("asset digest does not match its canonical path")]
     AssetDigest,
+    #[error("blob metadata is invalid")]
+    InvalidBlobMetadata,
     #[error("blob operation failed")]
     Blob(#[from] BlobError),
     #[error("store operation failed")]
@@ -1955,6 +2062,21 @@ pub(crate) enum ServiceError {
     Settings(#[source] super::SettingsError),
     #[error("backup operation failed")]
     Backup(#[source] BackupError),
+}
+
+fn validate_blob_metadata(bytes: &[u8], media_type: &str) -> Result<(), ServiceError> {
+    let valid_media = !media_type.is_empty()
+        && media_type.len() <= 255
+        && media_type
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        && media_type.trim() == media_type;
+    let size = u64::try_from(bytes.len()).map_err(|_| ServiceError::InvalidBlobMetadata)?;
+    if size == 0 || size > MAX_OFFLINE_ASSET_BYTES || !valid_media {
+        Err(ServiceError::InvalidBlobMetadata)
+    } else {
+        Ok(())
+    }
 }
 
 fn random_fuzz_sample() -> Result<f64, ServiceError> {
@@ -1992,10 +2114,13 @@ mod tests {
 
     use super::{ServiceError, ServiceRuntime};
     use crate::application::{
-        ImportDocument, ParametersSnapshot, ReplicaProjection, SettingsInput, canonical_asset_path,
-        generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
+        AssetReconciliationStatus, ImportDocument, OfflineAssetConflictReason,
+        OfflineAssetOperation, ParametersSnapshot, ReplicaProjection, SettingsInput,
+        canonical_asset_path, generate_device, prepare_asset, prepare_note, prepare_thema,
+        thema_content,
     };
     use crate::blob::BlobStore;
+    use crate::protocol::canonical_asset_operation;
     use crate::store::StoreError;
 
     async fn runtime(directory: &tempfile::TempDir) -> ServiceRuntime {
@@ -2034,6 +2159,92 @@ mod tests {
             .await
             .unwrap();
         assert!(!restore.exists());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_asset_evidence_survives_restart_and_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blobs = directory.path().join("blobs");
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("offline".into(), vec!["content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let state = service.replica_state(device_id.clone()).await.unwrap();
+        let bytes = b"conflicted asset".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let operation = OfflineAssetOperation {
+            operation_id: "conflicted-asset".into(),
+            device_id: device_id.clone(),
+            device_sequence: 1,
+            cursor_server_id: state.server_id,
+            cursor: state.cursor,
+            cursor_token: state.cursor_token,
+            authored_at_us: 2,
+            logical_path: canonical_asset_path(&digest, "image.png").unwrap(),
+            original_name: "image.png".into(),
+            content_sha256: digest.clone(),
+            size_bytes: bytes.len() as u64 + 1,
+            media_type: "image/png".into(),
+        };
+        let payload = canonical_asset_operation(&operation).unwrap();
+        service
+            .stage_blob(&digest, bytes, "application/octet-stream".into(), 3)
+            .await
+            .unwrap();
+        let result = service
+            .reconcile_asset_operation(
+                1,
+                operation.clone(),
+                payload.clone(),
+                Some(device_id.clone()),
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, AssetReconciliationStatus::Conflict);
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineAssetConflictReason::InvalidContent)
+        );
+        assert!(
+            service
+                .asset(operation.logical_path.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        let backup = service
+            .create_backup(directory.path().join("backup"), 5)
+            .await
+            .unwrap();
+        assert_eq!(backup.blob_count, 1);
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let runtime = ServiceRuntime::start(database, blobs, 8).await.unwrap();
+        let service = runtime.handle();
+        let replay = service
+            .reconcile_asset_operation(1, operation.clone(), payload, Some(device_id.clone()), 6)
+            .await
+            .unwrap();
+        assert_eq!(replay, result);
+        let mut reused = operation;
+        reused.content_sha256 = "a".repeat(64);
+        reused.logical_path = canonical_asset_path(&reused.content_sha256, "image.png").unwrap();
+        let reused_payload = canonical_asset_operation(&reused).unwrap();
+        assert!(matches!(
+            service
+                .reconcile_asset_operation(1, reused, reused_payload, Some(device_id), 7)
+                .await,
+            Err(ServiceError::Store(StoreError::IdempotencyConflict))
+        ));
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -2104,6 +2315,34 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ServiceError::AssetDigest));
         assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn online_assets_reuse_identical_bytes_across_request_media_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let bytes = b"shared bytes".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        for (name, media_type) in [
+            ("first.png", "image/png"),
+            ("second.jpg", "application/octet-stream"),
+        ] {
+            let path = canonical_asset_path(&digest, name).unwrap();
+            let head = service
+                .put_asset(
+                    prepare_asset(path.clone(), name.into(), None).unwrap(),
+                    bytes.clone(),
+                    media_type.into(),
+                    10,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(head.logical_path, path);
+        }
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -2359,8 +2598,13 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE document_revision_asset;
+                "DROP TABLE offline_asset_evidence;
+                 DROP TABLE offline_asset_result;
+                 DROP TABLE offline_asset_operation;
+                 DROP TABLE staged_blob;
+                 DROP TABLE document_revision_asset;
                  DROP TABLE document_asset;
+                 DELETE FROM schema_migration WHERE version = 9;
                  DELETE FROM schema_migration WHERE version = 8;
                  PRAGMA user_version = 7;",
             )

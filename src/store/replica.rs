@@ -6,7 +6,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::application::{
-    ContentBase, ContentReconciliationStatus, OfflineAnswerError, OfflineAnswerInput,
+    AssetReconciliationStatus, ContentBase, ContentReconciliationStatus, OfflineAnswerError,
+    OfflineAnswerInput, OfflineAssetConflictReason, OfflineAssetOperation,
     OfflineContentConflictReason, OfflineContentMutation, OfflineContentOperation,
     OfflineReviewOperation, OfflineReviewResult, ReconciliationStatus, ReviewPackView,
     ReviewSessionMode, path_key, prepare_offline_operation, validate_org_path,
@@ -16,6 +17,7 @@ const INITIAL_SCHEMA: &str = include_str!("replica/0001_initial.sql");
 const OFFLINE_CONTENT_SCHEMA: &str = include_str!("replica/0002_offline_content.sql");
 const OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA: &str =
     include_str!("replica/0003_offline_document_lifecycle.sql");
+const OFFLINE_ASSET_PUT_SCHEMA: &str = include_str!("replica/0004_offline_asset_put.sql");
 const FIRST_REQUEST: &str = "";
 
 pub(crate) struct LocalReplicaStore {
@@ -80,6 +82,33 @@ pub(crate) struct PendingContentOperation {
     pub(crate) canonical_payload: String,
 }
 
+pub(crate) struct LocalAssetContext {
+    pub(crate) server_id: String,
+    pub(crate) cursor: String,
+    pub(crate) next_device_sequence: u64,
+    pub(crate) max_blob_bytes: u64,
+}
+
+pub(crate) struct PendingAssetOperation {
+    pub(crate) canonical_payload: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) struct LocalAssetOverlay {
+    pub(crate) content_sha256: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) media_type: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) struct AssetResultInstall {
+    pub(crate) operation_id: String,
+    pub(crate) status: AssetReconciliationStatus,
+    pub(crate) conflict_reason: Option<OfflineAssetConflictReason>,
+    pub(crate) cursor_server_id: String,
+    pub(crate) authoritative_path: Option<String>,
+}
+
 pub(crate) struct ContentResultInstall {
     pub(crate) operation_id: String,
     pub(crate) status: ContentReconciliationStatus,
@@ -97,6 +126,18 @@ pub(crate) struct StoredContentResult {
 
 pub(crate) struct StoredContentResultPage {
     pub(crate) items: Vec<StoredContentResult>,
+    pub(crate) next_after: Option<u64>,
+}
+
+pub(crate) struct StoredAssetResult {
+    pub(crate) sequence: u64,
+    pub(crate) server_id: String,
+    pub(crate) operation_json: String,
+    pub(crate) result_json: String,
+}
+
+pub(crate) struct StoredAssetResultPage {
+    pub(crate) items: Vec<StoredAssetResult>,
     pub(crate) next_after: Option<u64>,
 }
 
@@ -186,7 +227,10 @@ impl LocalReplicaStore {
             .execute(
                 "UPDATE replica_identity SET observed_server_id = ?1,
                      offline_document_lifecycle = CASE WHEN ?2 = 1 THEN 0
-                         ELSE offline_document_lifecycle END
+                         ELSE offline_document_lifecycle END,
+                     offline_asset_put = CASE WHEN ?2 = 1 THEN 0 ELSE offline_asset_put END,
+                     offline_asset_max_bytes = CASE WHEN ?2 = 1 THEN 0
+                         ELSE offline_asset_max_bytes END
                  WHERE id = 1",
                 params![server_id, i64::from(changed)],
             )
@@ -230,6 +274,32 @@ impl LocalReplicaStore {
             .execute(
                 "UPDATE replica_identity SET offline_document_lifecycle = 1 WHERE id = 1",
                 [],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction.commit().map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn install_asset_capabilities(
+        &mut self,
+        server_id: &str,
+        max_blob_bytes: u64,
+    ) -> Result<(), LocalReplicaError> {
+        let transaction = self.immediate()?;
+        let observed = transaction
+            .query_row(
+                "SELECT observed_server_id FROM replica_identity WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        if observed.as_deref() != Some(server_id) {
+            return Err(LocalReplicaError::SyncOrder);
+        }
+        transaction
+            .execute(
+                "UPDATE replica_identity SET offline_asset_put = 1,
+                     offline_asset_max_bytes = ?1 WHERE id = 1",
+                [u64_to_i64(max_blob_bytes)?],
             )
             .map_err(LocalReplicaError::Storage)?;
         transaction.commit().map_err(LocalReplicaError::Storage)
@@ -508,10 +578,13 @@ impl LocalReplicaStore {
                        LEFT JOIN replica_content_result AS content
                            ON earlier.operation_kind = 'content'
                           AND content.operation_id = earlier.operation_id
+                       LEFT JOIN replica_asset_result AS asset
+                           ON asset.operation_id = earlier.operation_id
                        WHERE earlier.server_id = device.server_id
                          AND earlier.device_sequence < device.device_sequence
                          AND review.attempt_id IS NULL
                          AND content.operation_id IS NULL
+                         AND asset.operation_id IS NULL
                    )
                  ORDER BY device.device_sequence LIMIT 1",
                 [],
@@ -596,6 +669,41 @@ impl LocalReplicaStore {
         }
     }
 
+    pub(crate) fn require_document_assets(
+        &self,
+        asset_paths: &[String],
+    ) -> Result<(), LocalReplicaError> {
+        let server_id = self
+            .current_server_id()?
+            .ok_or(LocalReplicaError::MissingAssets)?;
+        for path in asset_paths {
+            let projection = self
+                .connection
+                .query_row(
+                    "SELECT projection.tombstone, EXISTS(
+                         SELECT 1 FROM replica_projection_blob AS required
+                         JOIN replica_blob AS blob USING(content_sha256)
+                         WHERE required.entity_kind = projection.entity_kind
+                           AND required.entity_id = projection.entity_id
+                     )
+                     FROM replica_projection AS projection
+                     WHERE projection.entity_kind = 'asset' AND projection.entity_id = ?1",
+                    [path],
+                    |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+                )
+                .optional()
+                .map_err(LocalReplicaError::Storage)?;
+            let available = match projection {
+                Some((tombstone, has_blob)) => !tombstone && has_blob,
+                None => pending_or_accepted_asset(&self.connection, &server_id, path)?,
+            };
+            if !available {
+                return Err(LocalReplicaError::MissingAssets);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_content_operation(
         &mut self,
         operation: &OfflineContentOperation,
@@ -638,10 +746,13 @@ impl LocalReplicaStore {
                        LEFT JOIN replica_content_result AS prior_content
                            ON earlier.operation_kind = 'content'
                           AND prior_content.operation_id = earlier.operation_id
+                       LEFT JOIN replica_asset_result AS asset
+                           ON asset.operation_id = earlier.operation_id
                        WHERE earlier.server_id = device.server_id
                          AND earlier.device_sequence < device.device_sequence
                          AND review.attempt_id IS NULL
                          AND prior_content.operation_id IS NULL
+                         AND asset.operation_id IS NULL
                    )
                  ORDER BY device.device_sequence LIMIT 1",
                 [],
@@ -687,6 +798,202 @@ impl LocalReplicaStore {
         transaction.commit().map_err(LocalReplicaError::Storage)
     }
 
+    pub(crate) fn asset_context(
+        &self,
+        logical_path: &str,
+    ) -> Result<LocalAssetContext, LocalReplicaError> {
+        let context = self
+            .connection
+            .query_row(
+                "SELECT identity.server_id, identity.observed_server_id, sync.cursor,
+                        sync.snapshot_id, sync.next_device_sequence, identity.offline_asset_put,
+                        identity.offline_asset_max_bytes
+                 FROM replica_identity AS identity
+                 JOIN replica_sync AS sync ON sync.id = identity.id WHERE identity.id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row_u64(row, 4)?,
+                        row.get::<_, bool>(5)?,
+                        row_u64(row, 6)?,
+                    ))
+                },
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        let server_id = context.0.ok_or(LocalReplicaError::Content)?;
+        if context.1.as_deref() != Some(server_id.as_str())
+            || context.2.is_none()
+            || context.3.is_some()
+            || !context.5
+            || local_asset_exists(&self.connection, &server_id, logical_path)?
+        {
+            return Err(LocalReplicaError::Content);
+        }
+        Ok(LocalAssetContext {
+            server_id,
+            cursor: context.2.ok_or(LocalReplicaError::Content)?,
+            next_device_sequence: context.4,
+            max_blob_bytes: context.6,
+        })
+    }
+
+    pub(crate) fn existing_asset_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<String>, LocalReplicaError> {
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT device.operation_kind, asset.operation_json
+                 FROM replica_device_operation AS device
+                 LEFT JOIN replica_asset_operation AS asset USING(operation_id)
+                 WHERE device.operation_id = ?1",
+                [operation_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(LocalReplicaError::Storage)?;
+        match existing {
+            None => Ok(None),
+            Some((kind, Some(json))) if kind == "content" => Ok(Some(json)),
+            Some(_) => Err(LocalReplicaError::Content),
+        }
+    }
+
+    pub(crate) fn asset_overlay(
+        &self,
+        logical_path: &str,
+    ) -> Result<Option<LocalAssetOverlay>, LocalReplicaError> {
+        let Some(server_id) = self.current_server_id()? else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT operation.content_sha256, operation.size_bytes,
+                        operation.media_type, blob.bytes
+                 FROM replica_asset_operation AS operation
+                 JOIN replica_device_operation AS device USING(operation_id)
+                 JOIN replica_blob AS blob USING(content_sha256)
+                 LEFT JOIN replica_asset_result AS result USING(operation_id)
+                 WHERE operation.logical_path = ?1 AND device.server_id = ?2
+                   AND (result.operation_id IS NULL OR result.status = 'accepted')
+                 ORDER BY device.device_sequence DESC LIMIT 1",
+                params![logical_path, server_id],
+                |row| {
+                    Ok(LocalAssetOverlay {
+                        content_sha256: row.get(0)?,
+                        size_bytes: row_u64(row, 1)?,
+                        media_type: row.get(2)?,
+                        bytes: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn record_asset_operation(
+        &mut self,
+        operation: &OfflineAssetOperation,
+        cursor: &str,
+        canonical_payload: &str,
+        bytes: &[u8],
+    ) -> Result<(), LocalReplicaError> {
+        let transaction = self.immediate()?;
+        if replayed_asset_operation(&transaction, operation, canonical_payload, bytes)? {
+            transaction.commit().map_err(LocalReplicaError::Storage)?;
+            return Ok(());
+        }
+        require_asset_context(&transaction, operation, cursor)?;
+        install_blob_in(&transaction, &operation.content_sha256, bytes)?;
+        insert_local_asset_operation(&transaction, operation, canonical_payload)?;
+        transaction
+            .execute(
+                "UPDATE replica_sync SET next_device_sequence = next_device_sequence + 1
+                 WHERE id = 1",
+                [],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction.commit().map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn next_pending_asset_operation(
+        &self,
+    ) -> Result<Option<PendingAssetOperation>, LocalReplicaError> {
+        self.connection
+            .query_row(
+                "SELECT asset.operation_json, blob.bytes
+                 FROM replica_device_operation AS device
+                 JOIN replica_asset_operation AS asset USING(operation_id)
+                 JOIN replica_blob AS blob USING(content_sha256)
+                 LEFT JOIN replica_asset_result AS result USING(operation_id)
+                 WHERE result.operation_id IS NULL
+                   AND NOT EXISTS(
+                       SELECT 1 FROM replica_device_operation AS earlier
+                       LEFT JOIN replica_review_result AS review
+                           ON earlier.operation_kind = 'review'
+                          AND review.attempt_id = earlier.operation_id
+                       LEFT JOIN replica_content_result AS content
+                           ON content.operation_id = earlier.operation_id
+                       LEFT JOIN replica_asset_result AS prior_asset
+                           ON prior_asset.operation_id = earlier.operation_id
+                       WHERE earlier.server_id = device.server_id
+                         AND earlier.device_sequence < device.device_sequence
+                         AND review.attempt_id IS NULL
+                         AND content.operation_id IS NULL
+                         AND prior_asset.operation_id IS NULL
+                   )
+                 ORDER BY device.device_sequence LIMIT 1",
+                [],
+                |row| {
+                    Ok(PendingAssetOperation {
+                        canonical_payload: row.get(0)?,
+                        bytes: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(LocalReplicaError::Storage)
+    }
+
+    pub(crate) fn record_asset_result(
+        &mut self,
+        result: &AssetResultInstall,
+        cursor: &str,
+        result_json: &str,
+    ) -> Result<(), LocalReplicaError> {
+        let transaction = self.immediate()?;
+        if replayed_asset_result(&transaction, &result.operation_id, result_json)? {
+            transaction.commit().map_err(LocalReplicaError::Storage)?;
+            return Ok(());
+        }
+        require_next_asset_result(&transaction, result)?;
+        transaction
+            .execute(
+                "INSERT INTO replica_asset_result(
+                     operation_id, status, conflict_reason, result_json
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    result.operation_id,
+                    result.status.as_str(),
+                    result.conflict_reason.map(|reason| reason.as_str()),
+                    result_json,
+                ],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction
+            .execute(
+                "UPDATE replica_sync SET result_cursor_hint = ?1 WHERE id = 1",
+                [cursor],
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        transaction.commit().map_err(LocalReplicaError::Storage)
+    }
+
     pub(crate) fn content_results(
         &self,
         after: u64,
@@ -697,6 +1004,18 @@ impl LocalReplicaStore {
             return Err(LocalReplicaError::Result);
         }
         load_content_results(&self.connection, after, limit, conflicts_only)
+    }
+
+    pub(crate) fn asset_results(
+        &self,
+        after: u64,
+        limit: u16,
+        conflicts_only: bool,
+    ) -> Result<StoredAssetResultPage, LocalReplicaError> {
+        if limit == 0 || limit > 1000 {
+            return Err(LocalReplicaError::Result);
+        }
+        load_asset_results(&self.connection, after, limit, conflicts_only)
     }
 
     pub(crate) fn record_result(
@@ -891,6 +1210,27 @@ impl LocalReplicaStore {
     }
 }
 
+fn pending_or_accepted_asset(
+    connection: &Connection,
+    server_id: &str,
+    logical_path: &str,
+) -> Result<bool, LocalReplicaError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM replica_asset_operation AS operation
+                 JOIN replica_device_operation AS device USING(operation_id)
+                 JOIN replica_blob AS blob USING(content_sha256)
+                 LEFT JOIN replica_asset_result AS result USING(operation_id)
+                 WHERE operation.logical_path = ?1 AND device.server_id = ?2
+                   AND (result.operation_id IS NULL OR result.status = 'accepted')
+             )",
+            params![logical_path, server_id],
+            |row| row.get(0),
+        )
+        .map_err(LocalReplicaError::Storage)
+}
+
 fn decode_stored_pack(
     stored: (String, i64, String),
 ) -> Result<StoredReviewPack, LocalReplicaError> {
@@ -922,6 +1262,9 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
             transaction
                 .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
                 .map_err(LocalReplicaError::Storage)?;
+            transaction
+                .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
         }
         1 => {
             transaction
@@ -930,11 +1273,22 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
             transaction
                 .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
                 .map_err(LocalReplicaError::Storage)?;
+            transaction
+                .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
         }
-        2 => transaction
-            .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
+        2 => {
+            transaction
+                .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
+            transaction
+                .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
+                .map_err(LocalReplicaError::Storage)?;
+        }
+        3 => transaction
+            .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
             .map_err(LocalReplicaError::Storage)?,
-        3 => {}
+        4 => {}
         _ => return Err(LocalReplicaError::Schema),
     }
     let stored = transaction
@@ -1002,7 +1356,10 @@ fn has_pending_outbox(transaction: &Transaction<'_>) -> Result<bool, LocalReplic
                  LEFT JOIN replica_content_result AS content
                    ON operation.operation_kind = 'content'
                   AND content.operation_id = operation.operation_id
+                 LEFT JOIN replica_asset_result AS asset
+                   ON asset.operation_id = operation.operation_id
                  WHERE review.attempt_id IS NULL AND content.operation_id IS NULL
+                   AND asset.operation_id IS NULL
              )",
             [],
             |row| row.get(0),
@@ -1992,6 +2349,218 @@ fn replayed_content_result(
     }
 }
 
+fn local_asset_exists(
+    connection: &Connection,
+    server_id: &str,
+    logical_path: &str,
+) -> Result<bool, LocalReplicaError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM replica_projection
+                 WHERE entity_kind = 'asset' AND entity_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM replica_asset_operation AS operation
+                 JOIN replica_device_operation AS device USING(operation_id)
+                 LEFT JOIN replica_asset_result AS result USING(operation_id)
+                 WHERE operation.logical_path = ?1 AND device.server_id = ?2
+                   AND (result.operation_id IS NULL OR result.status = 'accepted')
+             )",
+            params![logical_path, server_id],
+            |row| row.get(0),
+        )
+        .map_err(LocalReplicaError::Storage)
+}
+
+fn replayed_asset_operation(
+    transaction: &Transaction<'_>,
+    operation: &OfflineAssetOperation,
+    canonical_payload: &str,
+    bytes: &[u8],
+) -> Result<bool, LocalReplicaError> {
+    let existing = transaction
+        .query_row(
+            "SELECT operation.operation_json, blob.bytes
+             FROM replica_asset_operation AS operation
+             JOIN replica_blob AS blob USING(content_sha256)
+             WHERE operation.operation_id = ?1",
+            [&operation.operation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    match existing {
+        Some((json, stored)) if json == canonical_payload && stored == bytes => Ok(true),
+        Some(_) => Err(LocalReplicaError::Content),
+        None => Ok(false),
+    }
+}
+
+fn require_asset_context(
+    transaction: &Transaction<'_>,
+    operation: &OfflineAssetOperation,
+    cursor: &str,
+) -> Result<(), LocalReplicaError> {
+    let context = transaction
+        .query_row(
+            "SELECT identity.device_id, identity.server_id, identity.observed_server_id,
+                    sync.cursor, sync.snapshot_id, sync.next_device_sequence,
+                    identity.offline_asset_put
+             FROM replica_identity AS identity
+             JOIN replica_sync AS sync ON sync.id = identity.id WHERE identity.id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row_u64(row, 5)?,
+                    row.get::<_, bool>(6)?,
+                ))
+            },
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let matches = context.0 == operation.device_id
+        && context.1.as_deref() == Some(operation.cursor_server_id.as_str())
+        && context.2 == context.1
+        && context.3.as_deref() == Some(cursor)
+        && context.4.is_none()
+        && context.5 == operation.device_sequence
+        && context.6
+        && !local_asset_exists(
+            transaction,
+            &operation.cursor_server_id,
+            &operation.logical_path,
+        )?;
+    matches.then_some(()).ok_or(LocalReplicaError::Content)
+}
+
+fn install_blob_in(
+    transaction: &Transaction<'_>,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<(), LocalReplicaError> {
+    if format!("{:x}", Sha256::digest(bytes)) != digest {
+        return Err(LocalReplicaError::Corrupt);
+    }
+    let existing = transaction
+        .query_row(
+            "SELECT bytes FROM replica_blob WHERE content_sha256 = ?1",
+            [digest],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    if let Some(existing) = existing {
+        return if existing == bytes {
+            Ok(())
+        } else {
+            Err(LocalReplicaError::Corrupt)
+        };
+    }
+    transaction
+        .execute(
+            "INSERT INTO replica_blob(content_sha256, size_bytes, bytes) VALUES (?1, ?2, ?3)",
+            params![
+                digest,
+                u64_to_i64(u64::try_from(bytes.len()).map_err(|_| LocalReplicaError::Corrupt)?)?,
+                bytes,
+            ],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    Ok(())
+}
+
+fn insert_local_asset_operation(
+    transaction: &Transaction<'_>,
+    operation: &OfflineAssetOperation,
+    canonical_payload: &str,
+) -> Result<(), LocalReplicaError> {
+    transaction
+        .execute(
+            "INSERT INTO replica_device_operation(
+                 operation_id, server_id, device_sequence, operation_kind, operation_json
+             ) VALUES (?1, ?2, ?3, 'content', ?4)",
+            params![
+                operation.operation_id,
+                operation.cursor_server_id,
+                u64_to_i64(operation.device_sequence)?,
+                canonical_payload,
+            ],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    transaction
+        .execute(
+            "INSERT INTO replica_asset_operation(
+                 operation_id, logical_path, content_sha256, size_bytes,
+                 media_type, operation_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                operation.operation_id,
+                operation.logical_path,
+                operation.content_sha256,
+                u64_to_i64(operation.size_bytes)?,
+                operation.media_type,
+                canonical_payload,
+            ],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    Ok(())
+}
+
+fn replayed_asset_result(
+    transaction: &Transaction<'_>,
+    operation_id: &str,
+    json: &str,
+) -> Result<bool, LocalReplicaError> {
+    let existing = transaction
+        .query_row(
+            "SELECT result_json FROM replica_asset_result WHERE operation_id = ?1",
+            [operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    match existing {
+        Some(existing) if existing == json => Ok(true),
+        Some(_) => Err(LocalReplicaError::Result),
+        None => Ok(false),
+    }
+}
+
+fn require_next_asset_result(
+    transaction: &Transaction<'_>,
+    result: &AssetResultInstall,
+) -> Result<(), LocalReplicaError> {
+    let Some((kind, operation_id, server_id, logical_path)) =
+        next_unresolved_device_operation(transaction)?
+    else {
+        return Err(LocalReplicaError::Result);
+    };
+    let status_matches = match result.status {
+        AssetReconciliationStatus::Accepted => {
+            result.conflict_reason.is_none() && result.authoritative_path.is_some()
+        }
+        AssetReconciliationStatus::Conflict => result.conflict_reason.is_some(),
+    };
+    let authority_matches = result
+        .authoritative_path
+        .as_deref()
+        .is_none_or(|path| path == logical_path);
+    if kind == "asset"
+        && operation_id == result.operation_id
+        && server_id == result.cursor_server_id
+        && status_matches
+        && authority_matches
+    {
+        Ok(())
+    } else {
+        Err(LocalReplicaError::Result)
+    }
+}
+
 fn require_next_content_result(
     transaction: &Transaction<'_>,
     result: &ContentResultInstall,
@@ -2010,7 +2579,7 @@ fn require_next_content_result(
         .authoritative_document_id
         .as_deref()
         .is_none_or(|id| id == document_id);
-    if kind == "content"
+    if kind == "document"
         && operation_id == result.operation_id
         && server_id == result.cursor_server_id
         && status_matches
@@ -2029,16 +2598,29 @@ fn next_unresolved_device_operation(
 ) -> Result<Option<UnresolvedDeviceOperation>, LocalReplicaError> {
     transaction
         .query_row(
-            "SELECT device.operation_kind, device.operation_id, device.server_id,
-                    coalesce(content.document_id, '')
+            "SELECT CASE
+                        WHEN review_operation.attempt_id IS NOT NULL THEN 'review'
+                        WHEN content.operation_id IS NOT NULL THEN 'document'
+                        WHEN asset.operation_id IS NOT NULL THEN 'asset'
+                        ELSE 'invalid'
+                    END,
+                    device.operation_id, device.server_id,
+                    coalesce(content.document_id, asset.logical_path, '')
              FROM replica_device_operation AS device
+             LEFT JOIN replica_review_operation AS review_operation
+               ON review_operation.attempt_id = device.operation_id
              LEFT JOIN replica_review_result AS review
-               ON device.operation_kind = 'review' AND review.attempt_id = device.operation_id
+               ON review.attempt_id = device.operation_id
              LEFT JOIN replica_content_operation AS content
-               ON device.operation_kind = 'content' AND content.operation_id = device.operation_id
+               ON content.operation_id = device.operation_id
              LEFT JOIN replica_content_result AS result
-               ON device.operation_kind = 'content' AND result.operation_id = device.operation_id
+               ON result.operation_id = device.operation_id
+             LEFT JOIN replica_asset_operation AS asset
+               ON asset.operation_id = device.operation_id
+             LEFT JOIN replica_asset_result AS asset_result
+               ON asset_result.operation_id = device.operation_id
              WHERE review.attempt_id IS NULL AND result.operation_id IS NULL
+               AND asset_result.operation_id IS NULL
              ORDER BY device.device_sequence LIMIT 1",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -2091,6 +2673,52 @@ fn load_content_results(
     }
     let next_after = has_more.then(|| items.last().expect("nonzero page limit").sequence);
     Ok(StoredContentResultPage { items, next_after })
+}
+
+fn load_asset_results(
+    connection: &Connection,
+    after: u64,
+    limit: u16,
+    conflicts_only: bool,
+) -> Result<StoredAssetResultPage, LocalReplicaError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT result.result_sequence, device.server_id,
+                    asset.operation_json, result.result_json
+             FROM replica_asset_operation AS asset
+             JOIN replica_device_operation AS device USING(operation_id)
+             JOIN replica_asset_result AS result USING(operation_id)
+             WHERE result.result_sequence > ?1
+               AND (?2 = 0 OR result.status = 'conflict')
+             ORDER BY result.result_sequence LIMIT ?3",
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let rows = statement
+        .query_map(
+            params![
+                u64_to_i64(after)?,
+                i64::from(conflicts_only),
+                i64::from(limit) + 1,
+            ],
+            |row| {
+                Ok(StoredAssetResult {
+                    sequence: row_u64(row, 0)?,
+                    server_id: row.get(1)?,
+                    operation_json: row.get(2)?,
+                    result_json: row.get(3)?,
+                })
+            },
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    let mut items = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(LocalReplicaError::Storage)?;
+    let has_more = items.len() > usize::from(limit);
+    if has_more {
+        items.pop();
+    }
+    let next_after = has_more.then(|| items.last().expect("nonzero page limit").sequence);
+    Ok(StoredAssetResultPage { items, next_after })
 }
 
 fn replayed_result(

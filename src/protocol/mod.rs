@@ -1,6 +1,7 @@
 mod client;
 mod frame;
 mod message;
+mod offline_asset;
 mod offline_content;
 mod offline_review;
 mod replica;
@@ -14,6 +15,11 @@ pub use message::{
     MAX_REQUEST_ID_LEN, NodeEdgeView, NodeView, PROTOCOL_VERSION, ProtocolError, Request,
     RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewStateView,
     SystemInfo, ThemaView,
+};
+pub(crate) use offline_asset::{
+    DecodedOfflineAssetResult, OfflineAssetSubmission, OfflineAssetWireError,
+    canonical_asset_operation, decode_offline_asset_capabilities, decode_offline_asset_result,
+    offline_asset_capabilities_json, offline_asset_result_json,
 };
 pub(crate) use offline_content::{
     DecodedOfflineContentResult, OfflineContentSubmission, OfflineContentWireError,
