@@ -324,7 +324,7 @@ pub enum ResponseResult {
     DuePage(DuePageView),
     ReviewSession(LocalReviewSessionView),
     ActiveReviewSession(ActiveReviewSessionView),
-    ReviewAttempt(LocalReviewAttemptView),
+    ReviewAttempt(Box<LocalReviewAttemptView>),
     ReviewEvent(ReviewEventView),
     AssetChunk(AssetChunkView),
     DeviceCreated(DeviceCreatedView),
@@ -1051,9 +1051,8 @@ mod tests {
         ];
 
         for json in invalid {
-            match serde_json::from_str::<RequestEnvelope>(json) {
-                Ok(request) => assert!(request.validate().is_err(), "accepted {json}"),
-                Err(_) => {}
+            if let Ok(request) = serde_json::from_str::<RequestEnvelope>(json) {
+                assert!(request.validate().is_err(), "accepted {json}");
             }
         }
         let request = RequestEnvelope {

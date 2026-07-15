@@ -319,10 +319,7 @@ async fn asset_chunk(
         return Err(invalid_asset_offset());
     }
     let limit = usize::try_from(limit).map_err(|_| invalid_asset_offset())?;
-    let end = start
-        .checked_add(limit)
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
+    let end = start.saturating_add(limit).min(bytes.len());
     let content_sha256 = head.blob_sha256.ok_or_else(internal_error)?;
     Ok(ResponseResult::AssetChunk(AssetChunkView {
         logical_path,
@@ -453,8 +450,8 @@ async fn begin_review_attempt(
         .begin_review_attempt(session_id, None, review_now_us()?)
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
-        attempt,
+    Ok(ResponseResult::ReviewAttempt(Box::new(
+        LocalReviewAttemptView::from(attempt),
     )))
 }
 
@@ -468,8 +465,8 @@ async fn answer_review_attempt(
         .grade_review_attempt(attempt_id, None, response.into(), review_now_us()?)
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
-        attempt,
+    Ok(ResponseResult::ReviewAttempt(Box::new(
+        LocalReviewAttemptView::from(attempt),
     )))
 }
 
@@ -484,8 +481,8 @@ async fn override_review_attempt(
         .override_local_review_attempt(attempt_id, request_id, request_sha256, review_now_us()?)
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
-        attempt,
+    Ok(ResponseResult::ReviewAttempt(Box::new(
+        LocalReviewAttemptView::from(attempt),
     )))
 }
 
@@ -500,8 +497,8 @@ async fn toggle_review_suspension(
         .toggle_local_attempt_suspension(attempt_id, request_id, request_sha256, review_now_us()?)
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(LocalReviewAttemptView::from(
-        attempt,
+    Ok(ResponseResult::ReviewAttempt(Box::new(
+        LocalReviewAttemptView::from(attempt),
     )))
 }
 

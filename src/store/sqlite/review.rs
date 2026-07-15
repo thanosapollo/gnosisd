@@ -23,6 +23,13 @@ use crate::{
 
 const MAX_REVIEW_PACK_ITEMS: usize = 500;
 
+struct LocalReviewReplay<'a> {
+    request_id: &'a str,
+    request_sha256: &'a str,
+    action: &'a str,
+    created_at_us: u64,
+}
+
 impl SqliteStore {
     pub(crate) fn create_review_session(
         &mut self,
@@ -418,10 +425,12 @@ impl SqliteStore {
         self.local_review_action(
             attempt_id,
             actor_device_id,
-            request_id,
-            request_sha256,
-            "override",
-            created_at_us,
+            LocalReviewReplay {
+                request_id,
+                request_sha256,
+                action: "override",
+                created_at_us,
+            },
             override_review_attempt_in,
         )
     }
@@ -445,10 +454,12 @@ impl SqliteStore {
         self.local_review_action(
             attempt_id,
             actor_device_id,
-            request_id,
-            request_sha256,
-            "suspension_toggle",
-            created_at_us,
+            LocalReviewReplay {
+                request_id,
+                request_sha256,
+                action: "suspension_toggle",
+                created_at_us,
+            },
             toggle_attempt_suspension_in,
         )
     }
@@ -457,19 +468,16 @@ impl SqliteStore {
         &mut self,
         attempt_id: &str,
         actor_device_id: Option<&str>,
-        request_id: &str,
-        request_sha256: &str,
-        action: &str,
-        created_at_us: u64,
+        replay: LocalReviewReplay<'_>,
         apply: fn(&Connection, &str, Option<&str>) -> Result<ReviewAttemptView, StoreError>,
     ) -> Result<ReviewAttemptView, StoreError> {
         let transaction = self.write_transaction()?;
         if let Some(attempt) = replayed_local_review_action(
             &transaction,
-            request_id,
-            request_sha256,
+            replay.request_id,
+            replay.request_sha256,
             attempt_id,
-            action,
+            replay.action,
         )? {
             transaction.commit().map_err(StoreError::storage)?;
             return Ok(attempt);
@@ -477,12 +485,12 @@ impl SqliteStore {
         let attempt = apply(&transaction, attempt_id, actor_device_id)?;
         insert_local_review_replay(
             &transaction,
-            request_id,
-            request_sha256,
+            replay.request_id,
+            replay.request_sha256,
             attempt_id,
-            action,
+            replay.action,
             &attempt,
-            created_at_us,
+            replay.created_at_us,
         )?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(attempt)

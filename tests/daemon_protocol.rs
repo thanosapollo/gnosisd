@@ -1033,7 +1033,7 @@ fn review_attempt_result(result: ResponseResult) -> gnosis_core::protocol::Local
     let ResponseResult::ReviewAttempt(attempt) = result else {
         panic!("unexpected review attempt response");
     };
-    attempt
+    *attempt
 }
 
 fn manual_review_source() -> ReviewSourceInput {
