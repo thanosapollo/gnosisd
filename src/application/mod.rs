@@ -22,7 +22,7 @@ pub(crate) use content::{
     PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
     ThemaRevision, canonical_asset_path, file_link_expressions, path_key, prepare_asset,
     prepare_note, prepare_thema, stored_thema_content, supported_asset, thema_content,
-    validate_logical_path, validate_org_path,
+    validate_asset_path, validate_logical_path, validate_org_path,
 };
 pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
 pub(crate) use import_document::{PreparedServerImport, persist_server_import};
@@ -30,11 +30,12 @@ pub use query_document::QueryDocument;
 pub(crate) use query_legacy::DueCursor;
 pub use query_legacy::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema};
 pub(crate) use review::{
-    AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineConflictReason, OfflineReviewOperation,
-    OfflineReviewResult, ParametersSnapshot, PresentationSnapshot, ReconciliationStatus,
-    ReviewAttemptView, ReviewError, ReviewPackAsset, ReviewPackItem, ReviewPackView,
-    ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot,
-    TransitionSnapshot, presentation_content, review_day_at,
+    AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,
+    OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot,
+    PresentationSnapshot, ReconciliationStatus, ReviewAttemptView, ReviewError, ReviewPackAsset,
+    ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource,
+    ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation,
+    presentation_content, review_day_at,
 };
 pub(crate) use service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError};
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};

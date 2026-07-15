@@ -112,7 +112,7 @@ pub(crate) fn fuzz_delta(
     })
 }
 
-fn validate_state(state: &ReviewState) -> Result<(), SchedulerError> {
+pub(crate) fn validate_state(state: &ReviewState) -> Result<(), SchedulerError> {
     let counts_match = state.review_count
         == state.total_successes + state.total_failures + state.legacy_unclassified_count;
     let legacy_match = state.legacy_unclassified_count <= state.legacy_review_count

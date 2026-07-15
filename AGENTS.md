@@ -23,7 +23,8 @@ directly.
 - `src/parser` is the concrete Org adapter. Do not add a parser trait until a
   second implementation creates a real substitution boundary.
 - `src/store` is the only SQLite adapter. One daemon-owned thread holds the
-  connection and handles both reads and atomic writes through a bounded queue.
+  canonical connection and handles reads and atomic writes through a bounded
+  queue. The concrete client replica store owns a separate local connection.
   SQLite files are mode `0600`.
 - `src/migration.rs` owns the offline schema-v9 snapshot path. It must never
   modify or replace the source database, and it publishes only a fully checked
@@ -38,6 +39,11 @@ directly.
 - Delta cursors bind the stable server identity, numeric position, and unique
   feed token so restored branches cannot reuse a cursor silently. Every feed
   row resolves to an exact immutable revision. SSE is only a wakeup.
+- `src/client_replica.rs` is the concrete offline client foundation. Partial
+  snapshots stay in staging tables, terminal pages atomically replace active
+  projections, and snapshot recovery never deletes review packs, operations,
+  results, or device sequence state. Reconciliation cursors are hints and must
+  never fast-forward the replica feed cursor.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` uses only protocol methods.
 

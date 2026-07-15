@@ -1429,7 +1429,7 @@ impl ApiError {
                 "replica_projection_too_large",
                 "stored projection exceeds the replica response budget",
             ),
-            ReplicaWireError::Encode => Self::internal(),
+            ReplicaWireError::Encode | ReplicaWireError::Response => Self::internal(),
         }
     }
     fn snapshot_required() -> Self {

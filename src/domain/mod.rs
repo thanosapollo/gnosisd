@@ -15,7 +15,7 @@ pub use ids::{DocumentId, IdError, NodeId, ThemaId};
 pub(crate) use legacy::{DueThema, LegacyDatabaseInfo, LegacyReviewState, LegacyThema};
 pub(crate) use scheduling::{
     ReviewState, SchedulerParameters, Transition, compute_transition, fuzz_delta,
-    validate_parameters,
+    validate_parameters, validate_state,
 };
 pub use thema::{ThemaConcept, ThemaConceptRelation};
 pub(crate) use thema::{ThemaContent, ThemaContentError, ThemaKind};

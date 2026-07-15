@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::domain::{
     ReviewState, SchedulerParameters, StructuredResponse, ThemaContent, Transition,
+    compute_transition, fuzz_delta, grade,
 };
 
 const MAX_TOPIC_DEPTH: u32 = 32;
@@ -405,6 +406,163 @@ pub(crate) struct OfflineReviewOperation {
     pub(crate) desired_suspended: bool,
     pub(crate) answered_at_us: u64,
     pub(crate) fuzz_sample: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OfflineAnswerInput {
+    pub(crate) attempt_id: String,
+    pub(crate) session_position: u32,
+    pub(crate) response: AnswerInput,
+    pub(crate) accepted_success: Option<bool>,
+    pub(crate) desired_suspended: bool,
+    pub(crate) answered_at_us: u64,
+    pub(crate) fuzz_sample: f64,
+}
+
+pub(crate) fn prepare_offline_operation(
+    pack: &ReviewPackView,
+    device_sequence: u64,
+    input: OfflineAnswerInput,
+) -> Result<OfflineReviewOperation, OfflineAnswerError> {
+    let item = pack_item(pack, input.session_position)?;
+    validate_offline_answer(pack, &input)?;
+    let detected = detected_success(item, &input.response)?;
+    let accepted = input.accepted_success.unwrap_or(detected);
+    let transition = offline_transition(pack, item, accepted, &input)?;
+    Ok(build_offline_operation(
+        pack,
+        item,
+        device_sequence,
+        input,
+        detected,
+        accepted,
+        transition,
+    ))
+}
+
+fn pack_item(
+    pack: &ReviewPackView,
+    session_position: u32,
+) -> Result<&ReviewPackItem, OfflineAnswerError> {
+    if pack.status != "active" {
+        return Err(OfflineAnswerError::Pack);
+    }
+    pack.items
+        .iter()
+        .find(|item| item.position == session_position)
+        .ok_or(OfflineAnswerError::Pack)
+}
+
+fn validate_offline_answer(
+    pack: &ReviewPackView,
+    input: &OfflineAnswerInput,
+) -> Result<(), OfflineAnswerError> {
+    if input.attempt_id.is_empty()
+        || input.attempt_id.len() > 128
+        || input.answered_at_us < pack.issued_at_us
+        || !input.fuzz_sample.is_finite()
+        || !(-1.0..=1.0).contains(&input.fuzz_sample)
+    {
+        return Err(OfflineAnswerError::Input);
+    }
+    Ok(())
+}
+
+fn detected_success(
+    item: &ReviewPackItem,
+    response: &AnswerInput,
+) -> Result<bool, OfflineAnswerError> {
+    let content =
+        presentation_content(&item.presentation).map_err(|_| OfflineAnswerError::Grade)?;
+    grade(item.matcher_version, &content, &response.clone().into())
+        .map(|result| result.success)
+        .map_err(|_| OfflineAnswerError::Grade)
+}
+
+fn offline_transition(
+    pack: &ReviewPackView,
+    item: &ReviewPackItem,
+    accepted: bool,
+    input: &OfflineAnswerInput,
+) -> Result<Transition, OfflineAnswerError> {
+    let day = review_day_at(input.answered_at_us, &pack.timezone, pack.day_boundary_hour)
+        .map_err(|_| OfflineAnswerError::Clock)?;
+    let state = item.review_state.clone().into();
+    let parameters = item.parameters.clone().into();
+    let probe = compute_transition(
+        &state,
+        &parameters,
+        accepted,
+        day,
+        input.answered_at_us,
+        0.0,
+    )
+    .map_err(|_| OfflineAnswerError::Schedule)?;
+    let delta = fuzz_delta(
+        probe.algorithm_interval_days,
+        parameters.interval_fuzz,
+        input.fuzz_sample,
+    )
+    .map_err(|_| OfflineAnswerError::Schedule)?;
+    compute_transition(
+        &state,
+        &parameters,
+        accepted,
+        day,
+        input.answered_at_us,
+        delta,
+    )
+    .map_err(|_| OfflineAnswerError::Schedule)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_offline_operation(
+    pack: &ReviewPackView,
+    item: &ReviewPackItem,
+    device_sequence: u64,
+    input: OfflineAnswerInput,
+    detected_success: bool,
+    accepted_success: bool,
+    transition: Transition,
+) -> OfflineReviewOperation {
+    OfflineReviewOperation {
+        attempt_id: input.attempt_id,
+        pack_id: pack.pack_id.clone(),
+        session_id: pack.session_id.clone(),
+        lease_id: pack.lease_id.clone(),
+        device_id: pack.device_id.clone(),
+        device_sequence,
+        session_position: item.position,
+        thema_id: item.thema_id.clone(),
+        thema_revision: item.thema_revision,
+        base_state_revision: item.review_state.state_revision,
+        content_sha256: item.content_sha256.clone(),
+        presentation: item.presentation.clone(),
+        parameters: item.parameters.clone(),
+        matcher_version: item.matcher_version,
+        response: input.response,
+        detected_success,
+        accepted_success,
+        override_count: u32::from(detected_success != accepted_success),
+        proposed_transition: (&transition).into(),
+        desired_suspended: input.desired_suspended,
+        answered_at_us: input.answered_at_us,
+        fuzz_sample: input.fuzz_sample,
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub(crate) enum OfflineAnswerError {
+    #[error("offline review pack cannot accept an answer")]
+    Pack,
+    #[error("offline review answer input is invalid")]
+    Input,
+    #[error("offline review response cannot be graded")]
+    Grade,
+    #[error("offline review clock is invalid")]
+    Clock,
+    #[error("offline review transition cannot be computed")]
+    Schedule,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

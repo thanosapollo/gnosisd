@@ -6,9 +6,10 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::application::{
-    DocumentProjectionSnapshot, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
-    ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateSnapshot, SnapshotPage,
-    SnapshotPosition, TagRule,
+    DocumentProjectionSnapshot, ParametersSnapshot, ProjectionEdge, ProjectionLinkOccurrence,
+    ProjectionNode, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateSnapshot,
+    SettingsInput, SnapshotPage, SnapshotPosition, TagRule, prepare_thema, thema_content,
+    validate_asset_path, validate_org_path,
 };
 
 pub(crate) const REPLICA_VERSION: u32 = 1;
@@ -25,6 +26,46 @@ pub(crate) enum ReplicaWireError {
     Encode,
     #[error("replica projection exceeds the response budget")]
     PageTooLarge,
+    #[error("replica response is invalid")]
+    Response,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedReplicaState {
+    pub(crate) server_id: String,
+    pub(crate) cursor: String,
+    pub(crate) next_review_sequence: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedReplicaItem {
+    pub(crate) entity_kind: String,
+    pub(crate) entity_id: String,
+    pub(crate) revision: u64,
+    pub(crate) tombstone: bool,
+    pub(crate) blob_digests: Vec<String>,
+    pub(crate) payload_json: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedChangePage {
+    pub(crate) server_id: String,
+    pub(crate) from: String,
+    pub(crate) next: String,
+    pub(crate) has_more: bool,
+    pub(crate) items: Vec<DecodedReplicaItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedSnapshotPage {
+    pub(crate) snapshot_id: String,
+    pub(crate) server_id: String,
+    pub(crate) cut_cursor: u64,
+    pub(crate) cut_token: String,
+    pub(crate) cursor: Option<String>,
+    pub(crate) next: Option<String>,
+    pub(crate) next_after: Option<u64>,
+    pub(crate) items: Vec<DecodedReplicaItem>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -144,6 +185,135 @@ pub(crate) fn replica_snapshot_json(page: &SnapshotPage) -> Result<Value, Replic
     encode_snapshot_page(page, &items)
 }
 
+pub(crate) fn decode_replica_state(value: Value) -> Result<DecodedReplicaState, ReplicaWireError> {
+    require_response_size(&value)?;
+    let state: ReplicaStateV1 = serde_json::from_value(value).map_err(invalid_response)?;
+    if state.version != REPLICA_VERSION || !state.snapshot_required {
+        return Err(ReplicaWireError::Response);
+    }
+    let (server_id, _, _) = decode_cursor(&state.cursor)?;
+    if server_id != state.server_id || state.server_id.is_empty() {
+        return Err(ReplicaWireError::Response);
+    }
+    Ok(DecodedReplicaState {
+        server_id: state.server_id,
+        cursor: state.cursor,
+        next_review_sequence: state.next_review_sequence,
+    })
+}
+
+pub(crate) fn decode_change_page(value: Value) -> Result<DecodedChangePage, ReplicaWireError> {
+    require_response_size(&value)?;
+    let page: ChangePageInputV1 = serde_json::from_value(value).map_err(invalid_response)?;
+    if page.version != REPLICA_VERSION {
+        return Err(ReplicaWireError::Response);
+    }
+    let (server_id, from, _) = decode_cursor(&page.from)?;
+    let (next_server, next, _) = decode_cursor(&page.next)?;
+    let terminal_matches = page
+        .items
+        .last()
+        .map_or(page.from == page.next, |item| item.cursor == page.next);
+    if server_id != next_server
+        || next < from
+        || !terminal_matches
+        || (page.has_more && page.items.is_empty())
+    {
+        return Err(ReplicaWireError::Response);
+    }
+    let items = decode_changes(&page.items, &server_id, from, next)?;
+    Ok(DecodedChangePage {
+        server_id,
+        from: page.from,
+        next: page.next,
+        has_more: page.has_more,
+        items,
+    })
+}
+
+pub(crate) fn decode_snapshot_page(value: Value) -> Result<DecodedSnapshotPage, ReplicaWireError> {
+    require_response_size(&value)?;
+    let page: SnapshotPageInputV1 = serde_json::from_value(value).map_err(invalid_response)?;
+    if page.version != REPLICA_VERSION || page.snapshot_id.is_empty() {
+        return Err(ReplicaWireError::Response);
+    }
+    let identity = snapshot_identity(&page)?;
+    let items = page
+        .items
+        .iter()
+        .map(DecodedReplicaItem::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DecodedSnapshotPage {
+        snapshot_id: page.snapshot_id,
+        server_id: identity.0,
+        cut_cursor: identity.1,
+        cut_token: identity.2,
+        cursor: page.cursor,
+        next: page.next,
+        next_after: identity.3,
+        items,
+    })
+}
+
+fn decode_changes(
+    changes: &[ChangeV1],
+    server_id: &str,
+    from: u64,
+    next: u64,
+) -> Result<Vec<DecodedReplicaItem>, ReplicaWireError> {
+    let mut previous = from;
+    let mut decoded = Vec::with_capacity(changes.len());
+    for change in changes {
+        let (change_server, position, _) = decode_cursor(&change.cursor)?;
+        if change_server != server_id || position <= previous || position > next {
+            return Err(ReplicaWireError::Response);
+        }
+        previous = position;
+        decoded.push(DecodedReplicaItem::try_from(&change.projection)?);
+    }
+    if previous != next {
+        return Err(ReplicaWireError::Response);
+    }
+    Ok(decoded)
+}
+
+fn snapshot_identity(
+    page: &SnapshotPageInputV1,
+) -> Result<(String, u64, String, Option<u64>), ReplicaWireError> {
+    match (&page.cursor, &page.next) {
+        (Some(cursor), None) => {
+            let (server_id, cut, token) = decode_cursor(cursor)?;
+            Ok((server_id, cut, token, None))
+        }
+        (None, Some(next)) => {
+            let position = decode_snapshot_cursor(next)?;
+            if position.snapshot_id != page.snapshot_id || position.after == 0 {
+                return Err(ReplicaWireError::Response);
+            }
+            Ok((
+                position.server_id,
+                position.cut_cursor,
+                position.cut_token,
+                Some(position.after),
+            ))
+        }
+        _ => Err(ReplicaWireError::Response),
+    }
+}
+
+fn invalid_response(_: serde_json::Error) -> ReplicaWireError {
+    ReplicaWireError::Response
+}
+
+fn require_response_size(value: &Value) -> Result<(), ReplicaWireError> {
+    let bytes = serde_json::to_vec(value).map_err(invalid_response)?;
+    if bytes.len() <= MAX_REPLICA_PAGE_BYTES {
+        Ok(())
+    } else {
+        Err(ReplicaWireError::Response)
+    }
+}
+
 fn encode_change_page(
     server_id: &str,
     from: u64,
@@ -232,13 +402,24 @@ fn bounded_json(value: &impl Serialize) -> Result<Option<Value>, ReplicaWireErro
         .map_err(|_| ReplicaWireError::Encode)
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReplicaStateV1 {
     version: u32,
     server_id: String,
     cursor: String,
     next_review_sequence: u64,
     snapshot_required: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangePageInputV1 {
+    version: u32,
+    from: String,
+    next: String,
+    has_more: bool,
+    items: Vec<ChangeV1>,
 }
 
 #[derive(Serialize)]
@@ -250,7 +431,8 @@ struct ChangePageV1<'a> {
     items: &'a [ChangeV1],
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ChangeV1 {
     cursor: String,
     #[serde(flatten)]
@@ -275,7 +457,17 @@ struct SnapshotPageV1<'a> {
     items: &'a [ProjectionV1],
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SnapshotPageInputV1 {
+    version: u32,
+    snapshot_id: String,
+    cursor: Option<String>,
+    next: Option<String>,
+    items: Vec<ProjectionV1>,
+}
+
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "entity_kind", content = "projection", rename_all = "snake_case")]
 enum ProjectionV1 {
     Document(DocumentRevisionV1),
@@ -322,11 +514,275 @@ impl From<&ReplicaProjection> for ProjectionV1 {
     }
 }
 
+impl TryFrom<&ProjectionV1> for DecodedReplicaItem {
+    type Error = ReplicaWireError;
+
+    fn try_from(value: &ProjectionV1) -> Result<Self, Self::Error> {
+        let (kind, id, revision, tombstone, blobs) = projection_identity(value)?;
+        let payload_json = serde_json::to_string(value).map_err(|_| ReplicaWireError::Response)?;
+        Ok(Self {
+            entity_kind: kind.into(),
+            entity_id: id,
+            revision,
+            tombstone,
+            blob_digests: blobs,
+            payload_json,
+        })
+    }
+}
+
+type ProjectionIdentity = (&'static str, String, u64, bool, Vec<String>);
+
+fn projection_identity(value: &ProjectionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
+    match value {
+        ProjectionV1::Document(value) => document_identity(value),
+        ProjectionV1::Asset(value) => asset_identity(value),
+        ProjectionV1::Thema(value) => thema_identity(value),
+        ProjectionV1::Settings(value) => settings_identity(value),
+        ProjectionV1::ReviewState(value) => review_identity(value),
+    }
+}
+
+fn document_identity(value: &DocumentRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
+    require_identity(&value.document_id)?;
+    validate_org_path(&value.logical_path).map_err(|_| ReplicaWireError::Response)?;
+    validate_operation(
+        &value.operation,
+        &["create", "update", "rename", "snapshot", "tombstone"],
+    )?;
+    validate_blob_reference(value.content_sha256.as_deref(), value.blob_url.as_deref())?;
+    let tombstone = value.operation == "tombstone";
+    let invalid_tombstone =
+        tombstone && (value.projection.is_some() || value.content_sha256.is_some());
+    let invalid_active = !tombstone
+        && (value.projection.is_none()
+            || (value.operation == "snapshot") != value.content_sha256.is_none());
+    if invalid_tombstone || invalid_active {
+        return Err(ReplicaWireError::Response);
+    }
+    if let Some(projection) = &value.projection {
+        require_digest(&projection.content_sha256)?;
+        if value
+            .content_sha256
+            .as_ref()
+            .is_some_and(|digest| digest != &projection.content_sha256)
+        {
+            return Err(ReplicaWireError::Response);
+        }
+    }
+    Ok((
+        "document",
+        value.document_id.clone(),
+        value.revision,
+        tombstone,
+        value.content_sha256.iter().cloned().collect(),
+    ))
+}
+
+fn asset_identity(value: &AssetRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
+    validate_asset_path(&value.logical_path).map_err(|_| ReplicaWireError::Response)?;
+    validate_operation(&value.operation, &["create", "update", "tombstone"])?;
+    validate_blob_reference(value.content_sha256.as_deref(), value.blob_url.as_deref())?;
+    let tombstone = value.operation == "tombstone";
+    let has_content = value.content_sha256.is_some()
+        && value.size_bytes.is_some()
+        && value
+            .media_type
+            .as_ref()
+            .is_some_and(|value| !value.is_empty());
+    if tombstone == has_content {
+        return Err(ReplicaWireError::Response);
+    }
+    if value
+        .content_sha256
+        .as_ref()
+        .is_some_and(|digest| value.logical_path.split('/').nth(1) != Some(digest.as_str()))
+    {
+        return Err(ReplicaWireError::Response);
+    }
+    Ok((
+        "asset",
+        value.logical_path.clone(),
+        value.revision,
+        tombstone,
+        value.content_sha256.iter().cloned().collect(),
+    ))
+}
+
+fn thema_identity(value: &ThemaRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
+    require_identity(&value.thema_id)?;
+    require_digest(&value.content_sha256)?;
+    validate_operation(
+        &value.operation,
+        &["create", "update", "archive", "unarchive", "snapshot"],
+    )?;
+    let content = thema_content(
+        &value.kind,
+        value.keimenon.clone(),
+        value.hypothesis.clone(),
+        value.answer.clone(),
+        value.source_guid.clone(),
+        value.parathema.clone(),
+        value.review_image.clone(),
+    )
+    .map_err(|_| ReplicaWireError::Response)?;
+    let prepared = prepare_thema(
+        Some(value.thema_id.clone()),
+        content,
+        value.tags.clone(),
+        value.node_ids.clone(),
+        value.asset_paths.clone(),
+        None,
+    )
+    .map_err(|_| ReplicaWireError::Response)?;
+    if prepared.content_sha256 != value.content_sha256 {
+        return Err(ReplicaWireError::Response);
+    }
+    Ok((
+        "thema",
+        value.thema_id.clone(),
+        value.revision,
+        false,
+        Vec::new(),
+    ))
+}
+
+fn parameters_snapshot(value: &ParametersV1) -> ParametersSnapshot {
+    ParametersSnapshot {
+        scheduler_version: value.scheduler_version,
+        amnesia: value.amnesia,
+        epignosis: value.epignosis,
+        agnoia: value.agnoia,
+        anagnosis: value.anagnosis,
+        lethe: value.lethe,
+        synolon_max: value.synolon_max,
+        interval_fuzz: value.interval_fuzz,
+        proto: value.proto.clone(),
+    }
+}
+
+fn settings_identity(value: &SettingsRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
+    if value.timezone.is_empty()
+        || value.day_boundary_hour > 23
+        || !matches!(value.operation.as_str(), "snapshot" | "update")
+    {
+        return Err(ReplicaWireError::Response);
+    }
+    let settings = SettingsInput {
+        timezone: value.timezone.clone(),
+        day_boundary_hour: value.day_boundary_hour,
+        scheduler: parameters_snapshot(&value.scheduler),
+        tag_rules: value
+            .tag_rules
+            .iter()
+            .map(|(tag, rule)| {
+                (
+                    tag.clone(),
+                    TagRule {
+                        amnesia: rule.amnesia,
+                        epignosis: rule.epignosis,
+                        agnoia: rule.agnoia,
+                        anagnosis: rule.anagnosis,
+                        lethe: rule.lethe,
+                        proto: rule.proto.clone(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    settings
+        .validate()
+        .map_err(|_| ReplicaWireError::Response)?;
+    Ok((
+        "settings",
+        "settings".into(),
+        value.revision,
+        false,
+        Vec::new(),
+    ))
+}
+
+fn review_identity(value: &ReviewStateRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
+    require_identity(&value.thema_id)?;
+    if (value.state.state_revision == 0) != value.event_id.is_none()
+        || value.event_id.as_ref().is_some_and(String::is_empty)
+        || value.created_at_us == 0
+    {
+        return Err(ReplicaWireError::Response);
+    }
+    let state = ReviewStateSnapshot {
+        state_revision: value.state.state_revision,
+        review_count: value.state.review_count,
+        legacy_review_count: value.state.legacy_review_count,
+        legacy_unclassified_count: value.state.legacy_unclassified_count,
+        last_reviewed_at_us: value.state.last_reviewed_at_us,
+        last_review_day: value.state.last_review_day,
+        next_review_day: value.state.next_review_day,
+        interval_days: value.state.interval_days,
+        consecutive_successes: value.state.consecutive_successes,
+        total_successes: value.state.total_successes,
+        consecutive_failures: value.state.consecutive_failures,
+        total_failures: value.state.total_failures,
+        suspended: value.state.suspended,
+        gnosis_plus: value.state.gnosis_plus,
+        gnosis_minus: value.state.gnosis_minus,
+        gnosis_synolon: value.state.gnosis_synolon,
+    };
+    crate::domain::validate_state(&state.into()).map_err(|_| ReplicaWireError::Response)?;
+    Ok((
+        "review",
+        value.thema_id.clone(),
+        value.state.state_revision,
+        false,
+        Vec::new(),
+    ))
+}
+
+fn require_identity(value: &str) -> Result<(), ReplicaWireError> {
+    if value.is_empty() || value.len() > 4096 {
+        Err(ReplicaWireError::Response)
+    } else {
+        Ok(())
+    }
+}
+
+fn require_digest(value: &str) -> Result<(), ReplicaWireError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ReplicaWireError::Response)
+    }
+}
+
+fn validate_blob_reference(
+    digest: Option<&str>,
+    url: Option<&str>,
+) -> Result<(), ReplicaWireError> {
+    match (digest, url) {
+        (Some(digest), Some(url)) if url == blob_url(digest) => require_digest(digest),
+        (None, None) => Ok(()),
+        _ => Err(ReplicaWireError::Response),
+    }
+}
+
+fn validate_operation(value: &str, allowed: &[&str]) -> Result<(), ReplicaWireError> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(ReplicaWireError::Response)
+    }
+}
+
 fn blob_url(digest: &str) -> String {
     format!("/v1/blobs/{digest}")
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DocumentRevisionV1 {
     document_id: String,
     revision: u64,
@@ -339,7 +795,8 @@ struct DocumentRevisionV1 {
     projection: Option<DocumentProjectionV1>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DocumentProjectionV1 {
     title: String,
     file_node_id: Option<String>,
@@ -374,7 +831,8 @@ impl From<&DocumentProjectionSnapshot> for DocumentProjectionV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectionNodeV1 {
     node_id: String,
     title: String,
@@ -397,7 +855,8 @@ impl From<&ProjectionNode> for ProjectionNodeV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectionLinkV1 {
     owner_id: String,
     target_id: String,
@@ -416,7 +875,8 @@ impl From<&ProjectionLinkOccurrence> for ProjectionLinkV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ProjectionEdgeV1 {
     source_id: String,
     target_id: String,
@@ -431,7 +891,8 @@ impl From<&ProjectionEdge> for ProjectionEdgeV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct AssetRevisionV1 {
     logical_path: String,
     revision: u64,
@@ -444,7 +905,8 @@ struct AssetRevisionV1 {
     author_device_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ThemaRevisionV1 {
     thema_id: String,
     revision: u64,
@@ -489,7 +951,8 @@ impl From<&crate::application::ThemaRevision> for ThemaRevisionV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SettingsRevisionV1 {
     revision: u64,
     timezone: String,
@@ -521,7 +984,8 @@ impl From<&crate::application::SettingsRevision> for SettingsRevisionV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ParametersV1 {
     scheduler_version: u32,
     amnesia: f64,
@@ -550,7 +1014,8 @@ impl From<&crate::application::ParametersSnapshot> for ParametersV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct TagRuleV1 {
     amnesia: Option<f64>,
     epignosis: Option<f64>,
@@ -573,7 +1038,8 @@ impl From<&TagRule> for TagRuleV1 {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReviewStateRevisionV1 {
     thema_id: String,
     state: ReviewStateV1,
@@ -581,7 +1047,8 @@ struct ReviewStateRevisionV1 {
     created_at_us: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReviewStateV1 {
     state_revision: u64,
     review_count: u64,

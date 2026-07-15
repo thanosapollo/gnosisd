@@ -357,6 +357,18 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn expire_replica_changes_through(
+        &self,
+        cursor: u64,
+    ) -> Result<(), ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ExpireReplicaChanges { cursor, response }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn blob(
         &self,
         digest: String,
@@ -1084,6 +1096,11 @@ enum StoreCommand {
         limit: u16,
         response: oneshot::Sender<StoreResult<SnapshotPage>>,
     },
+    #[cfg(test)]
+    ExpireReplicaChanges {
+        cursor: u64,
+        response: oneshot::Sender<StoreResult<()>>,
+    },
     BlobMeta {
         digest: String,
         response: oneshot::Sender<StoreResult<Option<BlobMeta>>>,
@@ -1476,6 +1493,10 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
             response,
             store.replica_snapshot_page(&device_id, &position, limit),
         ),
+        #[cfg(test)]
+        StoreCommand::ExpireReplicaChanges { cursor, response } => {
+            send(response, store.expire_replica_changes_through(cursor))
+        }
         StoreCommand::BlobMeta { digest, response } => send(response, store.blob_meta(&digest)),
         StoreCommand::GetSettings { response } => send(response, store.settings()),
         StoreCommand::UpdateSettings {

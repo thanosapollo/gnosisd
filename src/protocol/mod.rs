@@ -14,16 +14,17 @@ pub use message::{
     RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewStateView,
     SystemInfo, ThemaView,
 };
-#[cfg(test)]
 pub(crate) use offline_review::canonical_offline_operation;
 pub(crate) use offline_review::{
     OFFLINE_REVIEW_VERSION, OfflineReviewSubmission, OfflineReviewWireError,
-    active_review_pack_json, offline_result_json, review_pack_json,
+    active_review_pack_json, decode_offline_result, decode_review_pack, offline_result_json,
+    review_pack_json,
 };
-#[cfg(test)]
-pub(crate) use replica::{MAX_REPLICA_PAGE_BYTES, encode_cursor};
 pub(crate) use replica::{
-    ReplicaWireError, decode_cursor, decode_snapshot_cursor, replica_changes_json,
+    DecodedReplicaItem, DecodedSnapshotPage, ReplicaWireError, decode_change_page, decode_cursor,
+    decode_replica_state, decode_snapshot_cursor, decode_snapshot_page, replica_changes_json,
     replica_snapshot_json, replica_state_json,
 };
+#[cfg(test)]
+pub(crate) use replica::{MAX_REPLICA_PAGE_BYTES, encode_cursor, encode_snapshot_cursor};
 pub use server::{DaemonConfig, DaemonServer, ServerError};
