@@ -8,6 +8,7 @@ use crate::domain::{
 };
 
 const MAX_TOPIC_DEPTH: u32 = 32;
+pub(crate) const MAX_REVIEW_PACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,6 +97,7 @@ impl ReviewSource {
                     && self.topic_forward_depth.is_none()
                     && self.topic_backward_depth.is_none()
                     && !self.manual_ids.is_empty()
+                    && self.manual_ids.iter().all(|id| !id.is_empty())
             }
         };
         if valid {
@@ -106,9 +108,11 @@ impl ReviewSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ReviewSessionView {
     pub(crate) session_id: String,
+    pub(crate) owner_device_id: Option<String>,
+    pub(crate) mode: ReviewSessionMode,
     pub(crate) source: ReviewSource,
     pub(crate) target_count: Option<u32>,
     pub(crate) status: String,
@@ -117,7 +121,24 @@ pub(crate) struct ReviewSessionView {
     pub(crate) started_at_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReviewSessionMode {
+    Online,
+    Offline,
+}
+
+impl ReviewSessionMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PresentationSnapshot {
     pub(crate) kind: String,
     pub(crate) keimenon: String,
@@ -130,6 +151,7 @@ pub(crate) struct PresentationSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReviewStateSnapshot {
     pub(crate) state_revision: u64,
     pub(crate) review_count: u64,
@@ -196,6 +218,7 @@ impl From<&ReviewState> for ReviewStateSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ParametersSnapshot {
     #[serde(default)]
     pub(crate) scheduler_version: u32,
@@ -242,7 +265,12 @@ impl From<&SchedulerParameters> for ParametersSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub(crate) enum AnswerInput {
     Text(String),
     Texts(Vec<String>),
@@ -260,6 +288,7 @@ impl From<AnswerInput> for StructuredResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TransitionSnapshot {
     pub(crate) before: ReviewStateSnapshot,
     pub(crate) after: ReviewStateSnapshot,
@@ -306,6 +335,125 @@ pub(crate) struct ReviewAttemptView {
     pub(crate) proposed_transition: Option<TransitionSnapshot>,
     pub(crate) desired_suspended: bool,
     pub(crate) status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewPackAsset {
+    pub(crate) logical_path: String,
+    pub(crate) content_sha256: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) media_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewPackItem {
+    pub(crate) position: u32,
+    pub(crate) thema_id: String,
+    pub(crate) thema_revision: u64,
+    pub(crate) content_sha256: String,
+    pub(crate) presentation: PresentationSnapshot,
+    pub(crate) review_state: ReviewStateSnapshot,
+    pub(crate) parameters: ParametersSnapshot,
+    pub(crate) matcher_version: u32,
+    pub(crate) asset_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewPackView {
+    pub(crate) format_version: u32,
+    pub(crate) pack_id: String,
+    pub(crate) session_id: String,
+    pub(crate) device_id: String,
+    pub(crate) lease_id: String,
+    pub(crate) status: String,
+    pub(crate) cursor: u64,
+    pub(crate) issued_at_us: u64,
+    pub(crate) current_position: u32,
+    pub(crate) timezone: String,
+    pub(crate) day_boundary_hour: u8,
+    pub(crate) items: Vec<ReviewPackItem>,
+    pub(crate) assets: Vec<ReviewPackAsset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OfflineReviewOperation {
+    pub(crate) attempt_id: String,
+    pub(crate) pack_id: String,
+    pub(crate) session_id: String,
+    pub(crate) lease_id: String,
+    pub(crate) device_id: String,
+    pub(crate) device_sequence: u64,
+    pub(crate) session_position: u32,
+    pub(crate) thema_id: String,
+    pub(crate) thema_revision: u64,
+    pub(crate) base_state_revision: u64,
+    pub(crate) content_sha256: String,
+    pub(crate) presentation: PresentationSnapshot,
+    pub(crate) parameters: ParametersSnapshot,
+    pub(crate) matcher_version: u32,
+    pub(crate) response: AnswerInput,
+    pub(crate) detected_success: bool,
+    pub(crate) accepted_success: bool,
+    pub(crate) override_count: u32,
+    pub(crate) proposed_transition: TransitionSnapshot,
+    pub(crate) desired_suspended: bool,
+    pub(crate) answered_at_us: u64,
+    pub(crate) fuzz_sample: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReconciliationStatus {
+    Accepted,
+    Conflict,
+}
+
+impl ReconciliationStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OfflineConflictReason {
+    LeaseEnded,
+    SessionAdvanced,
+    ContentChanged,
+    SchedulingChanged,
+    CaptureMismatch,
+}
+
+impl OfflineConflictReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::LeaseEnded => "lease_ended",
+            Self::SessionAdvanced => "session_advanced",
+            Self::ContentChanged => "content_changed",
+            Self::SchedulingChanged => "scheduling_changed",
+            Self::CaptureMismatch => "capture_mismatch",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OfflineReviewResult {
+    pub(crate) format_version: u32,
+    pub(crate) attempt_id: String,
+    pub(crate) status: ReconciliationStatus,
+    pub(crate) conflict_reason: Option<OfflineConflictReason>,
+    pub(crate) event_id: Option<String>,
+    pub(crate) authoritative_state: ReviewStateSnapshot,
+    pub(crate) session: ReviewSessionView,
+    pub(crate) cursor: u64,
 }
 
 pub(crate) fn presentation_content(

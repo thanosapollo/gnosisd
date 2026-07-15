@@ -2,23 +2,29 @@ use std::collections::BTreeMap;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use super::{SqliteStore, StoreError, load_thema, to_u32, to_u64, u64_to_i64};
 use crate::{
     application::{
-        AnswerInput, ParametersSnapshot, PresentationSnapshot, ReviewAttemptView,
+        AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineConflictReason, OfflineReviewOperation,
+        OfflineReviewResult, ParametersSnapshot, PresentationSnapshot, ReconciliationStatus,
+        ReviewAttemptView, ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode,
         ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
         presentation_content, review_day_at,
     },
-    domain::{compute_transition, fuzz_delta, grade},
+    domain::{MATCHER_VERSION, compute_transition, fuzz_delta, grade},
 };
+
+const MAX_REVIEW_PACK_ITEMS: usize = 500;
 
 impl SqliteStore {
     pub(crate) fn create_review_session(
         &mut self,
         source: &ReviewSource,
         target_count: Option<u32>,
+        owner_device_id: Option<&str>,
         started_at_us: u64,
     ) -> Result<ReviewSessionView, StoreError> {
         require_no_active_session(&self.connection)?;
@@ -47,6 +53,7 @@ impl SqliteStore {
             source,
             target_count,
             &captured,
+            SessionAccess::Online(owner_device_id),
             started_at_us,
         )?;
         insert_session_items(&transaction, &session_id, &queue)?;
@@ -62,12 +69,147 @@ impl SqliteStore {
         load_session(&self.connection, session_id)
     }
 
-    pub(crate) fn active_review_session(&self) -> Result<Option<ReviewSessionView>, StoreError> {
+    pub(crate) fn create_review_pack(
+        &mut self,
+        format_version: u32,
+        source: &ReviewSource,
+        target_count: Option<u32>,
+        device_id: &str,
+        issued_at_us: u64,
+    ) -> Result<ReviewPackView, StoreError> {
+        if format_version != 1 {
+            return Err(StoreError::InvalidReviewState);
+        }
+        let target_count = Some(target_count.unwrap_or(100));
+        if !target_count.is_some_and(|count| (1..=MAX_REVIEW_PACK_ITEMS as u32).contains(&count))
+            || source.kind == ReviewSourceKind::Manual
+                && source.manual_ids.len() > MAX_REVIEW_PACK_ITEMS
+        {
+            return Err(StoreError::InvalidReviewState);
+        }
+        require_review_device(&self.connection, device_id)?;
+        if let Some(pack) = self.active_review_pack(Some(device_id))? {
+            let session =
+                load_session(&self.connection, &pack.session_id)?.ok_or(StoreError::NotFound)?;
+            if session.source == *source && session.target_count == target_count {
+                return Ok(pack);
+            }
+            return Err(StoreError::ActiveReviewSession);
+        }
+        require_no_active_session(&self.connection)?;
+        let captured = captured_settings(&self.connection)?;
+        let review_day =
+            review_day_at(issued_at_us, &captured.timezone, captured.day_boundary_hour)
+                .map_err(StoreError::storage)?;
+        let queue = bounded_queue(&self.connection, source, target_count, review_day)?;
+        let ids = PackIds::new();
+        let cursor = self.latest_content_cursor()?;
+        let transaction = self.write_transaction()?;
+        insert_offline_session(
+            &transaction,
+            &ids,
+            source,
+            target_count,
+            &captured,
+            device_id,
+            issued_at_us,
+        )?;
+        insert_session_items(&transaction, &ids.session_id, &queue)?;
+        insert_review_pack(
+            &transaction,
+            &ids,
+            format_version,
+            device_id,
+            cursor,
+            issued_at_us,
+        )?;
+        capture_review_pack(&transaction, &ids, &queue)?;
+        let pack = load_review_pack(&transaction, &ids.pack_id)?.ok_or(StoreError::NotFound)?;
+        if serde_json::to_vec(&pack)
+            .map_err(StoreError::storage)?
+            .len()
+            > MAX_REVIEW_PACK_BYTES
+        {
+            return Err(StoreError::InvalidReviewState);
+        }
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(pack)
+    }
+
+    pub(crate) fn review_pack(
+        &self,
+        pack_id: &str,
+        device_id: Option<&str>,
+    ) -> Result<Option<ReviewPackView>, StoreError> {
+        let pack = load_review_pack(&self.connection, pack_id)?;
+        if let (Some(pack), Some(device_id)) = (&pack, device_id)
+            && pack.device_id != device_id
+        {
+            return Err(StoreError::ReviewOwnership);
+        }
+        Ok(pack)
+    }
+
+    pub(crate) fn active_review_pack(
+        &self,
+        device_id: Option<&str>,
+    ) -> Result<Option<ReviewPackView>, StoreError> {
+        let pack_id = self
+            .connection
+            .query_row(
+                "SELECT pack_id FROM review_pack
+                 WHERE status = 'active' AND (?1 IS NULL OR device_id = ?1)",
+                [device_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::storage)?;
+        pack_id
+            .map(|pack_id| load_review_pack(&self.connection, &pack_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn abandon_review_pack(
+        &mut self,
+        pack_id: &str,
+        device_id: Option<&str>,
+        ended_at_us: u64,
+    ) -> Result<ReviewPackView, StoreError> {
+        let transaction = self.write_transaction()?;
+        let pack = load_review_pack(&transaction, pack_id)?.ok_or(StoreError::NotFound)?;
+        require_pack_owner(&pack, device_id)?;
+        if pack.status != "active" {
+            return Err(StoreError::InvalidReviewState);
+        }
+        transaction
+            .execute(
+                "UPDATE review_pack SET status = 'abandoned' WHERE pack_id = ?1",
+                [pack_id],
+            )
+            .map_err(StoreError::storage)?;
+        transaction
+            .execute(
+                "UPDATE review_session SET status = 'aborted', ended_at_us = ?2
+                 WHERE session_id = ?1 AND status = 'active'",
+                params![pack.session_id, u64_to_i64(ended_at_us, "session end")?],
+            )
+            .map_err(StoreError::storage)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        load_review_pack(&self.connection, pack_id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn active_review_session(
+        &self,
+        actor_device_id: Option<&str>,
+    ) -> Result<Option<ReviewSessionView>, StoreError> {
         let id = self
             .connection
             .query_row(
-                "SELECT session_id FROM review_session WHERE status = 'active'",
-                [],
+                "SELECT session_id FROM review_session
+                 WHERE status = 'active'
+                   AND (?1 IS NULL OR owner_device_id = ?1)",
+                [actor_device_id],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -81,7 +223,14 @@ impl SqliteStore {
     pub(crate) fn resume_review_session(
         &mut self,
         session_id: &str,
+        actor_device_id: Option<&str>,
     ) -> Result<ReviewSessionView, StoreError> {
+        require_session_actor(
+            &self.connection,
+            session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         require_no_active_other(&self.connection, session_id)?;
         let changed = self
             .connection
@@ -103,9 +252,16 @@ impl SqliteStore {
     pub(crate) fn stop_review_session(
         &mut self,
         session_id: &str,
+        actor_device_id: Option<&str>,
         abort: bool,
         ended_at_us: u64,
     ) -> Result<ReviewSessionView, StoreError> {
+        require_session_actor(
+            &self.connection,
+            session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         let status = if abort { "aborted" } else { "quit" };
         let changed = self
             .connection
@@ -124,8 +280,15 @@ impl SqliteStore {
     pub(crate) fn begin_review_attempt(
         &mut self,
         session_id: &str,
+        actor_device_id: Option<&str>,
         started_at_us: u64,
     ) -> Result<ReviewAttemptView, StoreError> {
+        require_session_actor(
+            &self.connection,
+            session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         if let Some(attempt) = current_attempt(&self.connection, session_id)? {
             return Ok(attempt);
         }
@@ -167,11 +330,18 @@ impl SqliteStore {
     pub(crate) fn grade_review_attempt(
         &mut self,
         attempt_id: &str,
+        actor_device_id: Option<&str>,
         response: &AnswerInput,
         answered_at_us: u64,
         fuzz_sample: f64,
     ) -> Result<ReviewAttemptView, StoreError> {
         let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
+        require_session_actor(
+            &self.connection,
+            &row.session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         if row.status == "graded" || row.status == "committed" {
             return load_attempt(&self.connection, attempt_id)?.ok_or(StoreError::NotFound);
         }
@@ -214,8 +384,15 @@ impl SqliteStore {
     pub(crate) fn override_review_attempt(
         &mut self,
         attempt_id: &str,
+        actor_device_id: Option<&str>,
     ) -> Result<ReviewAttemptView, StoreError> {
         let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
+        require_session_actor(
+            &self.connection,
+            &row.session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         if row.status != "graded" {
             return Err(StoreError::InvalidReviewState);
         }
@@ -254,7 +431,15 @@ impl SqliteStore {
     pub(crate) fn toggle_attempt_suspension(
         &mut self,
         attempt_id: &str,
+        actor_device_id: Option<&str>,
     ) -> Result<ReviewAttemptView, StoreError> {
+        let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
+        require_session_actor(
+            &self.connection,
+            &row.session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         let changed = self
             .connection
             .execute(
@@ -272,12 +457,19 @@ impl SqliteStore {
     pub(crate) fn commit_review_attempt(
         &mut self,
         attempt_id: &str,
+        actor_device_id: Option<&str>,
         committed_at_us: u64,
     ) -> Result<String, StoreError> {
+        let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
+        require_session_actor(
+            &self.connection,
+            &row.session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
         if let Some(event_id) = committed_event(&self.connection, attempt_id)? {
             return Ok(event_id);
         }
-        let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
         if row.status != "graded" {
             return Err(StoreError::InvalidReviewState);
         }
@@ -296,9 +488,585 @@ impl SqliteStore {
         insert_review_event(&transaction, &row, &transition, &event_id)?;
         finish_attempt(&transaction, &row, &event_id, committed_at_us)?;
         update_review_day(&transaction, &transition, row.override_count)?;
+        super::insert_content_change(
+            &transaction,
+            "review",
+            &row.thema_id,
+            transition.after.state_revision,
+            "commit",
+            u64_to_i64(committed_at_us, "commit timestamp")?,
+        )?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(event_id)
     }
+
+    pub(crate) fn reconcile_offline_operation(
+        &mut self,
+        format_version: u32,
+        operation: &OfflineReviewOperation,
+        canonical_payload: &str,
+        actor_device_id: Option<&str>,
+        received_at_us: u64,
+    ) -> Result<OfflineReviewResult, StoreError> {
+        if format_version != 1 {
+            return Err(StoreError::InvalidReviewState);
+        }
+        require_operation_actor(operation, actor_device_id)?;
+        let digest = format!("{:x}", Sha256::digest(canonical_payload.as_bytes()));
+        let transaction = self.write_transaction()?;
+        if let Some(result) = replay_offline_operation(
+            &transaction,
+            &operation.attempt_id,
+            &digest,
+            actor_device_id,
+        )? {
+            transaction.commit().map_err(StoreError::storage)?;
+            return Ok(result);
+        }
+        let pack =
+            load_review_pack(&transaction, &operation.pack_id)?.ok_or(StoreError::NotFound)?;
+        require_pack_owner(&pack, Some(&operation.device_id))?;
+        if pack.format_version != format_version {
+            return Err(StoreError::InvalidReviewState);
+        }
+        require_next_device_sequence(&transaction, operation)?;
+        insert_offline_operation(
+            &transaction,
+            format_version,
+            operation,
+            canonical_payload,
+            &digest,
+            received_at_us,
+        )?;
+        let result = reconcile_new_operation(&transaction, operation, &pack, received_at_us)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(result)
+    }
+}
+
+fn require_operation_actor(
+    operation: &OfflineReviewOperation,
+    actor_device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    if actor_device_id.is_none_or(|actor| actor == operation.device_id) {
+        Ok(())
+    } else {
+        Err(StoreError::ReviewOwnership)
+    }
+}
+
+fn replay_offline_operation(
+    connection: &Connection,
+    attempt_id: &str,
+    payload_sha256: &str,
+    actor_device_id: Option<&str>,
+) -> Result<Option<OfflineReviewResult>, StoreError> {
+    let existing = connection
+        .query_row(
+            "SELECT payload_sha256, device_id FROM offline_review_operation
+             WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    let Some((existing_digest, device_id)) = existing else {
+        return Ok(None);
+    };
+    if actor_device_id.is_some_and(|actor| actor != device_id) {
+        return Err(StoreError::ReviewOwnership);
+    }
+    if existing_digest != payload_sha256 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    load_offline_result(connection, attempt_id)
+}
+
+fn require_next_device_sequence(
+    connection: &Connection,
+    operation: &OfflineReviewOperation,
+) -> Result<(), StoreError> {
+    let last: i64 = connection
+        .query_row(
+            "SELECT last_review_sequence FROM device WHERE device_id = ?1",
+            [&operation.device_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    let expected =
+        to_u64(last, "device sequence")?
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData {
+                field: "device sequence",
+            })?;
+    if operation.device_sequence == expected {
+        Ok(())
+    } else {
+        Err(StoreError::DeviceSequence { expected })
+    }
+}
+
+fn insert_offline_operation(
+    transaction: &Transaction<'_>,
+    format_version: u32,
+    operation: &OfflineReviewOperation,
+    payload: &str,
+    digest: &str,
+    received_at_us: u64,
+) -> Result<(), StoreError> {
+    let reused = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM offline_review_operation
+                 WHERE device_id = ?1 AND device_sequence = ?2
+             )",
+            params![
+                operation.device_id,
+                u64_to_i64(operation.device_sequence, "device sequence")?
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StoreError::storage)?;
+    if reused {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    transaction
+        .execute(
+            "INSERT INTO offline_review_operation(
+                 attempt_id, pack_id, device_id, device_sequence, format_version,
+                 payload_sha256, payload_json, received_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                operation.attempt_id,
+                operation.pack_id,
+                operation.device_id,
+                u64_to_i64(operation.device_sequence, "device sequence")?,
+                i64::from(format_version),
+                digest,
+                payload,
+                u64_to_i64(received_at_us, "operation receipt timestamp")?
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn reconcile_new_operation(
+    transaction: &Transaction<'_>,
+    operation: &OfflineReviewOperation,
+    pack: &ReviewPackView,
+    reconciled_at_us: u64,
+) -> Result<OfflineReviewResult, StoreError> {
+    let session = load_session(transaction, &pack.session_id)?.ok_or(StoreError::NotFound)?;
+    let state_item = pack
+        .items
+        .iter()
+        .find(|item| item.position == operation.session_position)
+        .or_else(|| pack.items.first())
+        .ok_or(StoreError::InvalidReviewState)?;
+    let state = load_review_state(transaction, &state_item.thema_id)?;
+    let reason = offline_conflict_reason(transaction, operation, pack, &session, &state)?;
+    let result = match reason {
+        Some(reason) => conflict_result(
+            transaction,
+            pack.format_version,
+            operation,
+            session,
+            state,
+            reason,
+        )?,
+        None => accept_offline_operation(
+            transaction,
+            pack.format_version,
+            operation,
+            state,
+            reconciled_at_us,
+        )?,
+    };
+    advance_pack_sequence(transaction, operation, &result)?;
+    insert_offline_result(transaction, &result, reconciled_at_us)?;
+    Ok(result)
+}
+
+fn offline_conflict_reason(
+    connection: &Connection,
+    operation: &OfflineReviewOperation,
+    pack: &ReviewPackView,
+    session: &ReviewSessionView,
+    state: &crate::domain::ReviewState,
+) -> Result<Option<OfflineConflictReason>, StoreError> {
+    if pack.status != "active" || session.status != "active" {
+        return Ok(Some(OfflineConflictReason::LeaseEnded));
+    }
+    if operation.session_id != pack.session_id
+        || operation.lease_id != pack.lease_id
+        || operation.device_id != pack.device_id
+    {
+        return Ok(Some(OfflineConflictReason::CaptureMismatch));
+    }
+    if session.current_position != operation.session_position {
+        return Ok(Some(OfflineConflictReason::SessionAdvanced));
+    }
+    let Some(item) = pack
+        .items
+        .iter()
+        .find(|item| item.position == operation.session_position)
+    else {
+        return Ok(Some(OfflineConflictReason::CaptureMismatch));
+    };
+    if !operation_matches_item(operation, item) || !operation_transition_is_valid(operation, pack) {
+        return Ok(Some(OfflineConflictReason::CaptureMismatch));
+    }
+    let thema = load_thema(connection, &operation.thema_id)?;
+    if thema.as_ref().is_none_or(|thema| {
+        thema.archived
+            || thema.revision != operation.thema_revision
+            || thema.content_sha256 != operation.content_sha256
+    }) {
+        return Ok(Some(OfflineConflictReason::ContentChanged));
+    }
+    if state.state_revision != operation.base_state_revision {
+        return Ok(Some(OfflineConflictReason::SchedulingChanged));
+    }
+    Ok(None)
+}
+
+fn operation_matches_item(operation: &OfflineReviewOperation, item: &ReviewPackItem) -> bool {
+    operation.thema_id == item.thema_id
+        && operation.thema_revision == item.thema_revision
+        && operation.base_state_revision == item.review_state.state_revision
+        && operation.content_sha256 == item.content_sha256
+        && operation.presentation == item.presentation
+        && operation.parameters == item.parameters
+        && operation.matcher_version == item.matcher_version
+        && operation.proposed_transition.before == item.review_state
+        && operation.proposed_transition.parameters == item.parameters
+}
+
+fn operation_transition_is_valid(
+    operation: &OfflineReviewOperation,
+    pack: &ReviewPackView,
+) -> bool {
+    if operation.answered_at_us < pack.issued_at_us {
+        return false;
+    }
+    let Ok(review_day) = review_day_at(
+        operation.answered_at_us,
+        &pack.timezone,
+        pack.day_boundary_hour,
+    ) else {
+        return false;
+    };
+    if review_day != operation.proposed_transition.review_day {
+        return false;
+    }
+    let Ok(content) = presentation_content(&operation.presentation) else {
+        return false;
+    };
+    let Ok(grade) = grade(
+        operation.matcher_version,
+        &content,
+        &operation.response.clone().into(),
+    ) else {
+        return false;
+    };
+    let parity = (operation.detected_success == operation.accepted_success)
+        == operation.override_count.is_multiple_of(2);
+    let before: crate::domain::ReviewState = operation.proposed_transition.before.clone().into();
+    let parameters = operation.parameters.clone().into();
+    let Ok(expected) = transition_with_sample(
+        &before,
+        &parameters,
+        operation.accepted_success,
+        operation.proposed_transition.review_day,
+        operation.answered_at_us,
+        operation.fuzz_sample,
+    ) else {
+        return false;
+    };
+    grade.success == operation.detected_success
+        && parity
+        && TransitionSnapshot::from(&expected) == operation.proposed_transition
+}
+
+fn conflict_result(
+    connection: &Connection,
+    format_version: u32,
+    operation: &OfflineReviewOperation,
+    session: ReviewSessionView,
+    state: crate::domain::ReviewState,
+    reason: OfflineConflictReason,
+) -> Result<OfflineReviewResult, StoreError> {
+    Ok(OfflineReviewResult {
+        format_version,
+        attempt_id: operation.attempt_id.clone(),
+        status: ReconciliationStatus::Conflict,
+        conflict_reason: Some(reason),
+        event_id: None,
+        authoritative_state: (&state).into(),
+        session,
+        cursor: latest_content_cursor(connection)?,
+    })
+}
+
+fn accept_offline_operation(
+    transaction: &Transaction<'_>,
+    format_version: u32,
+    operation: &OfflineReviewOperation,
+    state: crate::domain::ReviewState,
+    reconciled_at_us: u64,
+) -> Result<OfflineReviewResult, StoreError> {
+    let mut transition = authoritative_transition(operation, &state)?;
+    transition.after.suspended = operation.desired_suspended;
+    let row = offline_attempt_row(operation, transition.clone());
+    insert_accepted_attempt(transaction, operation, &transition)?;
+    let event_id = Uuid::now_v7().to_string();
+    commit_state(transaction, &row, &transition)?;
+    insert_review_event(transaction, &row, &transition, &event_id)?;
+    finish_attempt(transaction, &row, &event_id, reconciled_at_us)?;
+    update_review_day(transaction, &transition, operation.override_count)?;
+    super::insert_content_change(
+        transaction,
+        "review",
+        &operation.thema_id,
+        transition.after.state_revision,
+        "commit",
+        u64_to_i64(reconciled_at_us, "reconciliation timestamp")?,
+    )?;
+    let session = load_session(transaction, &operation.session_id)?.ok_or(StoreError::NotFound)?;
+    Ok(OfflineReviewResult {
+        format_version,
+        attempt_id: operation.attempt_id.clone(),
+        status: ReconciliationStatus::Accepted,
+        conflict_reason: None,
+        event_id: Some(event_id),
+        authoritative_state: transition.after,
+        session,
+        cursor: latest_content_cursor(transaction)?,
+    })
+}
+
+fn authoritative_transition(
+    operation: &OfflineReviewOperation,
+    state: &crate::domain::ReviewState,
+) -> Result<TransitionSnapshot, StoreError> {
+    let parameters = operation.parameters.clone().into();
+    let transition = transition_with_sample(
+        state,
+        &parameters,
+        operation.accepted_success,
+        operation.proposed_transition.review_day,
+        operation.answered_at_us,
+        operation.fuzz_sample,
+    )?;
+    Ok((&transition).into())
+}
+
+fn offline_attempt_row(
+    operation: &OfflineReviewOperation,
+    transition: TransitionSnapshot,
+) -> AttemptRow {
+    AttemptRow {
+        attempt_id: operation.attempt_id.clone(),
+        session_id: operation.session_id.clone(),
+        thema_id: operation.thema_id.clone(),
+        thema_revision: operation.thema_revision,
+        state_revision: operation.base_state_revision,
+        content_sha256: operation.content_sha256.clone(),
+        presentation: operation.presentation.clone(),
+        parameters: operation.parameters.clone(),
+        matcher_version: operation.matcher_version,
+        response: Some(operation.response.clone()),
+        detected_success: Some(operation.detected_success),
+        accepted_success: Some(operation.accepted_success),
+        override_count: operation.override_count,
+        fuzz_sample: Some(operation.fuzz_sample),
+        transition: Some(transition),
+        desired_suspended: operation.desired_suspended,
+        status: "graded".into(),
+    }
+}
+
+fn insert_accepted_attempt(
+    transaction: &Transaction<'_>,
+    operation: &OfflineReviewOperation,
+    transition: &TransitionSnapshot,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO review_attempt(
+                 attempt_id, session_id, session_position, thema_id, thema_revision,
+                 state_revision, content_sha256, presentation_json, parameters_json,
+                 matcher_version, response_json, detected_success, accepted_success,
+                 override_count, fuzz_sample, proposed_transition_json, desired_suspended,
+                 status, started_at_us, answered_at_us
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17, 'graded', ?18, ?18
+             )",
+            params![
+                operation.attempt_id,
+                operation.session_id,
+                i64::from(operation.session_position),
+                operation.thema_id,
+                u64_to_i64(operation.thema_revision, "thema revision")?,
+                u64_to_i64(operation.base_state_revision, "state revision")?,
+                operation.content_sha256,
+                serde_json::to_string(&operation.presentation).map_err(StoreError::storage)?,
+                serde_json::to_string(&operation.parameters).map_err(StoreError::storage)?,
+                i64::from(operation.matcher_version),
+                serde_json::to_string(&operation.response).map_err(StoreError::storage)?,
+                i64::from(operation.detected_success),
+                i64::from(operation.accepted_success),
+                i64::from(operation.override_count),
+                operation.fuzz_sample,
+                serde_json::to_string(transition).map_err(StoreError::storage)?,
+                i64::from(operation.desired_suspended),
+                u64_to_i64(operation.answered_at_us, "answer timestamp")?
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn advance_pack_sequence(
+    transaction: &Transaction<'_>,
+    operation: &OfflineReviewOperation,
+    result: &OfflineReviewResult,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "UPDATE device SET last_review_sequence = ?2 WHERE device_id = ?1",
+            params![
+                operation.device_id,
+                u64_to_i64(operation.device_sequence, "device sequence")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "UPDATE review_pack SET
+                 status = CASE WHEN ?2 = 'completed' THEN 'completed' ELSE status END
+             WHERE pack_id = ?1",
+            params![operation.pack_id, result.session.status],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn insert_offline_result(
+    transaction: &Transaction<'_>,
+    result: &OfflineReviewResult,
+    reconciled_at_us: u64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO offline_review_result(
+                 attempt_id, format_version, status, conflict_reason, event_id,
+                 authoritative_state_json, session_json, cursor, reconciled_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                result.attempt_id,
+                i64::from(result.format_version),
+                result.status.as_str(),
+                result.conflict_reason.map(OfflineConflictReason::as_str),
+                result.event_id,
+                serde_json::to_string(&result.authoritative_state).map_err(StoreError::storage)?,
+                serde_json::to_string(&result.session).map_err(StoreError::storage)?,
+                u64_to_i64(result.cursor, "reconciliation cursor")?,
+                u64_to_i64(reconciled_at_us, "reconciliation timestamp")?
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn load_offline_result(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<OfflineReviewResult>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT format_version, status, conflict_reason, event_id,
+                    authoritative_state_json, session_json, cursor
+             FROM offline_review_result WHERE attempt_id = ?1",
+            [attempt_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    row.map(|row| materialize_offline_result(attempt_id, row))
+        .transpose()
+}
+
+type OfflineResultRow = (
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    i64,
+);
+
+fn materialize_offline_result(
+    attempt_id: &str,
+    row: OfflineResultRow,
+) -> Result<OfflineReviewResult, StoreError> {
+    Ok(OfflineReviewResult {
+        format_version: to_u32(row.0, "offline review format version")?,
+        attempt_id: attempt_id.to_owned(),
+        status: parse_reconciliation_status(&row.1)?,
+        conflict_reason: row.2.as_deref().map(parse_conflict_reason).transpose()?,
+        event_id: row.3,
+        authoritative_state: serde_json::from_str(&row.4).map_err(StoreError::storage)?,
+        session: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
+        cursor: to_u64(row.6, "reconciliation cursor")?,
+    })
+}
+
+fn parse_reconciliation_status(value: &str) -> Result<ReconciliationStatus, StoreError> {
+    match value {
+        "accepted" => Ok(ReconciliationStatus::Accepted),
+        "conflict" => Ok(ReconciliationStatus::Conflict),
+        _ => Err(StoreError::CorruptData {
+            field: "reconciliation status",
+        }),
+    }
+}
+
+fn parse_conflict_reason(value: &str) -> Result<OfflineConflictReason, StoreError> {
+    match value {
+        "lease_ended" => Ok(OfflineConflictReason::LeaseEnded),
+        "session_advanced" => Ok(OfflineConflictReason::SessionAdvanced),
+        "content_changed" => Ok(OfflineConflictReason::ContentChanged),
+        "scheduling_changed" => Ok(OfflineConflictReason::SchedulingChanged),
+        "capture_mismatch" => Ok(OfflineConflictReason::CaptureMismatch),
+        _ => Err(StoreError::CorruptData {
+            field: "offline conflict reason",
+        }),
+    }
+}
+
+fn latest_content_cursor(connection: &Connection) -> Result<u64, StoreError> {
+    let cursor: i64 = connection
+        .query_row(
+            "SELECT coalesce(max(cursor), 0) FROM content_change",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    to_u64(cursor, "content cursor")
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -317,6 +1085,198 @@ struct Rule {
     anagnosis: Option<u64>,
     lethe: Option<u64>,
     proto: Option<Vec<u32>>,
+}
+
+struct PackIds {
+    pack_id: String,
+    session_id: String,
+    lease_id: String,
+}
+
+impl PackIds {
+    fn new() -> Self {
+        Self {
+            pack_id: Uuid::now_v7().to_string(),
+            session_id: Uuid::now_v7().to_string(),
+            lease_id: Uuid::now_v7().to_string(),
+        }
+    }
+}
+
+fn require_review_device(connection: &Connection, device_id: &str) -> Result<(), StoreError> {
+    let active: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM device WHERE device_id = ?1 AND revoked_at_us IS NULL
+             )",
+            [device_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    if active {
+        Ok(())
+    } else {
+        Err(StoreError::ReviewOwnership)
+    }
+}
+
+fn bounded_queue(
+    connection: &Connection,
+    source: &ReviewSource,
+    target_count: Option<u32>,
+    review_day: u32,
+) -> Result<Vec<String>, StoreError> {
+    let mut queue = select_queue(connection, source, review_day)?;
+    if let Some(target) = target_count {
+        queue.truncate(target as usize);
+    }
+    if queue.is_empty() {
+        Err(StoreError::NotFound)
+    } else {
+        Ok(queue)
+    }
+}
+
+fn insert_offline_session(
+    transaction: &Transaction<'_>,
+    ids: &PackIds,
+    source: &ReviewSource,
+    target_count: Option<u32>,
+    captured: &CapturedSettings,
+    device_id: &str,
+    issued_at_us: u64,
+) -> Result<(), StoreError> {
+    insert_session(
+        transaction,
+        &ids.session_id,
+        source,
+        target_count,
+        captured,
+        SessionAccess::Offline(device_id),
+        issued_at_us,
+    )
+}
+
+fn insert_review_pack(
+    transaction: &Transaction<'_>,
+    ids: &PackIds,
+    format_version: u32,
+    device_id: &str,
+    cursor: u64,
+    issued_at_us: u64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO review_pack(
+                 pack_id, format_version, session_id, device_id, lease_id,
+                 status, cursor, issued_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+            params![
+                ids.pack_id,
+                i64::from(format_version),
+                ids.session_id,
+                device_id,
+                ids.lease_id,
+                u64_to_i64(cursor, "review pack cursor")?,
+                u64_to_i64(issued_at_us, "review pack issue timestamp")?
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn capture_review_pack(
+    transaction: &Transaction<'_>,
+    ids: &PackIds,
+    queue: &[String],
+) -> Result<(), StoreError> {
+    let mut captured_bytes = 0;
+    for (position, thema_id) in queue.iter().enumerate() {
+        let item = capture_pack_item(transaction, &ids.session_id, position, thema_id)?;
+        insert_pack_item(transaction, &ids.pack_id, &item, &mut captured_bytes)?;
+        insert_pack_assets(transaction, &ids.pack_id, &item.asset_paths)?;
+    }
+    Ok(())
+}
+
+fn capture_pack_item(
+    connection: &Connection,
+    session_id: &str,
+    position: usize,
+    thema_id: &str,
+) -> Result<ReviewPackItem, StoreError> {
+    let thema = load_thema(connection, thema_id)?.ok_or(StoreError::NotFound)?;
+    let state = load_review_state(connection, thema_id)?;
+    let parameters = resolved_parameters(connection, session_id, &thema.tags)?;
+    let presentation = presentation(&thema);
+    Ok(ReviewPackItem {
+        position: u32::try_from(position).map_err(StoreError::storage)?,
+        thema_id: thema.thema_id,
+        thema_revision: thema.revision,
+        content_sha256: thema.content_sha256,
+        presentation,
+        review_state: (&state).into(),
+        parameters: (&parameters).into(),
+        matcher_version: MATCHER_VERSION,
+        asset_paths: thema.asset_paths,
+    })
+}
+
+fn insert_pack_item(
+    transaction: &Transaction<'_>,
+    pack_id: &str,
+    item: &ReviewPackItem,
+    captured_bytes: &mut usize,
+) -> Result<(), StoreError> {
+    let item_json = serde_json::to_string(item).map_err(StoreError::storage)?;
+    *captured_bytes = captured_bytes
+        .checked_add(item_json.len())
+        .ok_or(StoreError::InvalidReviewState)?;
+    if *captured_bytes > MAX_REVIEW_PACK_BYTES {
+        return Err(StoreError::InvalidReviewState);
+    }
+    transaction
+        .execute(
+            "INSERT INTO review_pack_item(pack_id, position, thema_id, item_json)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![pack_id, i64::from(item.position), item.thema_id, item_json],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn insert_pack_assets(
+    transaction: &Transaction<'_>,
+    pack_id: &str,
+    asset_paths: &[String],
+) -> Result<(), StoreError> {
+    for path in asset_paths {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO review_pack_asset(
+                     pack_id, asset_path, content_sha256, size_bytes, media_type
+                 )
+                 SELECT ?1, asset.asset_path, asset.blob_sha256, blob.size_bytes, blob.media_type
+                 FROM managed_asset AS asset JOIN blob ON blob.content_sha256 = asset.blob_sha256
+                 WHERE asset.asset_path = ?2 AND asset.active = 1",
+                params![pack_id, path],
+            )
+            .map_err(StoreError::storage)?;
+        let captured: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM review_pack_asset
+                     WHERE pack_id = ?1 AND asset_path = ?2
+                 )",
+                params![pack_id, path],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::storage)?;
+        if !captured {
+            return Err(StoreError::InvalidReviewState);
+        }
+    }
+    Ok(())
 }
 
 fn captured_settings(connection: &Connection) -> Result<CapturedSettings, StoreError> {
@@ -503,20 +1463,37 @@ fn select_filtered(
         .map_err(StoreError::storage)
 }
 
+enum SessionAccess<'a> {
+    Online(Option<&'a str>),
+    Offline(&'a str),
+}
+
+impl SessionAccess<'_> {
+    fn columns(&self) -> (Option<&str>, ReviewSessionMode) {
+        match self {
+            Self::Online(owner) => (*owner, ReviewSessionMode::Online),
+            Self::Offline(device) => (Some(*device), ReviewSessionMode::Offline),
+        }
+    }
+}
+
 fn insert_session(
     transaction: &Transaction<'_>,
     session_id: &str,
     source: &ReviewSource,
     target_count: Option<u32>,
     captured: &CapturedSettings,
+    access: SessionAccess<'_>,
     started_at_us: u64,
 ) -> Result<(), StoreError> {
+    let (owner_device_id, mode) = access.columns();
     transaction
         .execute(
             "INSERT INTO review_session(
              session_id, source_kind, source_json, target_count, timezone,
-             day_boundary_hour, scheduler_json, status, started_at_us
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8)",
+             day_boundary_hour, scheduler_json, status, started_at_us,
+             owner_device_id, review_mode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
             params![
                 session_id,
                 source.kind.as_str(),
@@ -526,6 +1503,8 @@ fn insert_session(
                 i64::from(captured.day_boundary_hour),
                 serde_json::to_string(captured).map_err(StoreError::storage)?,
                 u64_to_i64(started_at_us, "session start")?,
+                owner_device_id,
+                mode.as_str(),
             ],
         )
         .map_err(StoreError::storage)?;
@@ -561,7 +1540,8 @@ fn load_session(
     connection
         .query_row(
             "SELECT session_id, source_json, target_count, status, current_position,
-                started_at_us, (SELECT count(*) FROM review_session_item WHERE session_id = ?1)
+                started_at_us, (SELECT count(*) FROM review_session_item WHERE session_id = ?1),
+                owner_device_id, review_mode
          FROM review_session WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -573,6 +1553,8 @@ fn load_session(
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
@@ -581,6 +1563,8 @@ fn load_session(
         .map(|row| {
             Ok(ReviewSessionView {
                 session_id: row.0,
+                owner_device_id: row.7,
+                mode: parse_session_mode(&row.8)?,
                 source: serde_json::from_str(&row.1).map_err(StoreError::storage)?,
                 target_count: row
                     .2
@@ -593,6 +1577,163 @@ fn load_session(
             })
         })
         .transpose()
+}
+
+fn parse_session_mode(value: &str) -> Result<ReviewSessionMode, StoreError> {
+    match value {
+        "online" => Ok(ReviewSessionMode::Online),
+        "offline" => Ok(ReviewSessionMode::Offline),
+        _ => Err(StoreError::CorruptData {
+            field: "review session mode",
+        }),
+    }
+}
+
+type PackRow = (
+    String,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    i64,
+);
+
+fn load_review_pack(
+    connection: &Connection,
+    pack_id: &str,
+) -> Result<Option<ReviewPackView>, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT pack.pack_id, pack.format_version, pack.session_id, pack.device_id,
+                    pack.lease_id, pack.status, pack.cursor, pack.issued_at_us, session.current_position,
+                    session.timezone, session.day_boundary_hour
+             FROM review_pack AS pack
+             JOIN review_session AS session USING(session_id)
+             WHERE pack.pack_id = ?1",
+            [pack_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    row.map(|row| materialize_review_pack(connection, row))
+        .transpose()
+}
+
+fn materialize_review_pack(
+    connection: &Connection,
+    row: PackRow,
+) -> Result<ReviewPackView, StoreError> {
+    Ok(ReviewPackView {
+        items: load_pack_items(connection, &row.0)?,
+        assets: load_pack_assets(connection, &row.0)?,
+        format_version: to_u32(row.1, "review pack format version")?,
+        pack_id: row.0,
+        session_id: row.2,
+        device_id: row.3,
+        lease_id: row.4,
+        status: row.5,
+        cursor: to_u64(row.6, "review pack cursor")?,
+        issued_at_us: to_u64(row.7, "review pack issue timestamp")?,
+        current_position: to_u32(row.8, "review pack position")?,
+        timezone: row.9,
+        day_boundary_hour: u8::try_from(row.10).map_err(|_| StoreError::CorruptData {
+            field: "review pack day boundary",
+        })?,
+    })
+}
+
+fn load_pack_items(
+    connection: &Connection,
+    pack_id: &str,
+) -> Result<Vec<ReviewPackItem>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT item_json FROM review_pack_item WHERE pack_id = ?1 ORDER BY position")
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map([pack_id], |row| row.get::<_, String>(0))
+        .map_err(StoreError::storage)?
+        .map(|row| {
+            let value = row.map_err(StoreError::storage)?;
+            serde_json::from_str(&value).map_err(StoreError::storage)
+        })
+        .collect()
+}
+
+fn load_pack_assets(
+    connection: &Connection,
+    pack_id: &str,
+) -> Result<Vec<ReviewPackAsset>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT asset_path, content_sha256, size_bytes, media_type
+             FROM review_pack_asset WHERE pack_id = ?1 ORDER BY asset_path",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map([pack_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(StoreError::storage)?
+        .map(|row| {
+            let (logical_path, content_sha256, size_bytes, media_type) =
+                row.map_err(StoreError::storage)?;
+            Ok(ReviewPackAsset {
+                logical_path,
+                content_sha256,
+                size_bytes: to_u64(size_bytes, "review pack asset size")?,
+                media_type,
+            })
+        })
+        .collect()
+}
+
+fn require_pack_owner(pack: &ReviewPackView, device_id: Option<&str>) -> Result<(), StoreError> {
+    if device_id.is_none_or(|device_id| device_id == pack.device_id) {
+        Ok(())
+    } else {
+        Err(StoreError::ReviewOwnership)
+    }
+}
+
+fn require_session_actor(
+    connection: &Connection,
+    session_id: &str,
+    actor_device_id: Option<&str>,
+    mode: ReviewSessionMode,
+) -> Result<(), StoreError> {
+    let session = load_session(connection, session_id)?.ok_or(StoreError::NotFound)?;
+    if session.mode != mode {
+        return Err(StoreError::InvalidReviewState);
+    }
+    if actor_device_id.is_some_and(|actor| session.owner_device_id.as_deref() != Some(actor)) {
+        Err(StoreError::ReviewOwnership)
+    } else {
+        Ok(())
+    }
 }
 
 fn current_attempt(
@@ -1129,9 +2270,13 @@ fn update_review_day(
 
 #[cfg(test)]
 mod tests {
-    use super::SqliteStore;
+    use tempfile::tempdir;
+
+    use super::{MAX_REVIEW_PACK_ITEMS, SqliteStore};
     use crate::application::{
-        AnswerInput, ReviewSource, ReviewSourceKind, prepare_thema, thema_content,
+        AnswerInput, OfflineConflictReason, OfflineReviewOperation, ReconciliationStatus,
+        ReviewSource, ReviewSourceKind, generate_device, prepare_thema, presentation_content,
+        review_day_at, thema_content,
     };
 
     fn add_thema_with_tags(
@@ -1172,19 +2317,533 @@ mod tests {
         }
     }
 
+    fn add_device(store: &mut SqliteStore, name: &str) -> String {
+        let device = generate_device(name.into(), vec!["review".into()]).unwrap();
+        let id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        id
+    }
+
+    fn offline_answer(
+        pack: &crate::application::ReviewPackView,
+        attempt_id: &str,
+        sequence: u64,
+    ) -> OfflineReviewOperation {
+        let item = &pack.items[0];
+        let response = AnswerInput::Text("answer".into());
+        let detected = crate::domain::grade(
+            item.matcher_version,
+            &presentation_content(&item.presentation).unwrap(),
+            &response.clone().into(),
+        )
+        .unwrap()
+        .success;
+        let reviewed_at_us = pack.issued_at_us + 1_000;
+        let review_day =
+            review_day_at(reviewed_at_us, &pack.timezone, pack.day_boundary_hour).unwrap();
+        let transition = super::transition_with_sample(
+            &item.review_state.clone().into(),
+            &item.parameters.clone().into(),
+            detected,
+            review_day,
+            reviewed_at_us,
+            0.0,
+        )
+        .unwrap();
+        OfflineReviewOperation {
+            attempt_id: attempt_id.into(),
+            pack_id: pack.pack_id.clone(),
+            session_id: pack.session_id.clone(),
+            lease_id: pack.lease_id.clone(),
+            device_id: pack.device_id.clone(),
+            device_sequence: sequence,
+            session_position: item.position,
+            thema_id: item.thema_id.clone(),
+            thema_revision: item.thema_revision,
+            base_state_revision: item.review_state.state_revision,
+            content_sha256: item.content_sha256.clone(),
+            presentation: item.presentation.clone(),
+            parameters: item.parameters.clone(),
+            matcher_version: item.matcher_version,
+            response,
+            detected_success: detected,
+            accepted_success: detected,
+            override_count: 0,
+            proposed_transition: (&transition).into(),
+            desired_suspended: false,
+            answered_at_us: reviewed_at_us,
+            fuzz_sample: 0.0,
+        }
+    }
+
+    fn reconcile(
+        store: &mut SqliteStore,
+        operation: &OfflineReviewOperation,
+        device_id: &str,
+        received_at_us: u64,
+    ) -> Result<crate::application::OfflineReviewResult, crate::store::StoreError> {
+        let payload = crate::protocol::canonical_offline_operation(1, operation).unwrap();
+        store.reconcile_offline_operation(1, operation, &payload, Some(device_id), received_at_us)
+    }
+
+    #[test]
+    fn offline_pack_commits_atomically_and_replays_the_stored_result() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        let pack = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        let operation = offline_answer(&pack, "attempt", 1);
+
+        let result = reconcile(&mut store, &operation, &device_id, 1_752_600_000_002_000).unwrap();
+
+        assert_eq!(result.status, ReconciliationStatus::Accepted);
+        assert_eq!(result.authoritative_state.review_count, 1);
+        assert_eq!(result.session.status, "completed");
+        assert_eq!(result.cursor, 2);
+        assert_eq!(
+            reconcile(&mut store, &operation, &device_id, 1_752_600_000_003_000,).unwrap(),
+            result
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM review_event", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_pack_attempt_is_preserved_without_changing_canonical_state() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "First", None);
+        let device_id = add_device(&mut store, "offline");
+        let pack = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                None,
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        add_thema(&mut store, "thema", "Changed", Some(1));
+        let operation = offline_answer(&pack, "stale-attempt", 1);
+
+        let result = reconcile(&mut store, &operation, &device_id, 1_752_600_000_002_000).unwrap();
+
+        assert_eq!(result.status, ReconciliationStatus::Conflict);
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineConflictReason::ContentChanged)
+        );
+        assert_eq!(result.authoritative_state.review_count, 0);
+        assert_eq!(result.session.current_position, 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM offline_review_operation", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM review_event", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn stale_scheduling_revision_is_preserved_without_an_event() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        let pack = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE review_state SET state_revision = state_revision + 1
+                 WHERE thema_id = 'thema'",
+                [],
+            )
+            .unwrap();
+        let operation = offline_answer(&pack, "stale-state", 1);
+
+        let result = reconcile(&mut store, &operation, &device_id, 1_752_600_000_002_000).unwrap();
+
+        assert_eq!(result.status, ReconciliationStatus::Conflict);
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineConflictReason::SchedulingChanged)
+        );
+        assert_eq!(result.authoritative_state.state_revision, 1);
+        let events: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM review_event", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    #[test]
+    fn device_sequence_gap_does_not_consume_the_missing_sequence() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        let pack = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            reconcile(
+                &mut store,
+                &offline_answer(&pack, "gap", 2),
+                &device_id,
+                1_752_600_000_002_000,
+            ),
+            Err(crate::store::StoreError::DeviceSequence { expected: 1 })
+        ));
+        let accepted = reconcile(
+            &mut store,
+            &offline_answer(&pack, "first", 1),
+            &device_id,
+            1_752_600_000_003_000,
+        )
+        .unwrap();
+        assert_eq!(accepted.status, ReconciliationStatus::Accepted);
+    }
+
+    #[test]
+    fn device_sequence_continues_across_review_packs() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        let first = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        reconcile(
+            &mut store,
+            &offline_answer(&first, "first-attempt", 1),
+            &device_id,
+            1_752_600_000_002_000,
+        )
+        .unwrap();
+        let second = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_003_000,
+            )
+            .unwrap();
+
+        let result = reconcile(
+            &mut store,
+            &offline_answer(&second, "second-attempt", 2),
+            &device_id,
+            1_752_600_000_004_000,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, ReconciliationStatus::Accepted);
+        assert_eq!(result.authoritative_state.review_count, 2);
+    }
+
+    #[test]
+    fn pack_creation_retry_recovers_the_same_lease_after_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gnosis.sqlite");
+        let (pack, device_id) = {
+            let mut store = SqliteStore::open(&path).unwrap();
+            add_thema(&mut store, "thema", "Question", None);
+            let device_id = add_device(&mut store, "offline");
+            let pack = store
+                .create_review_pack(
+                    1,
+                    &manual_source("thema"),
+                    Some(1),
+                    &device_id,
+                    1_752_600_000_000_000,
+                )
+                .unwrap();
+            (pack, device_id)
+        };
+        let mut reopened = SqliteStore::open(&path).unwrap();
+
+        let recovered = reopened
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_001_000,
+            )
+            .unwrap();
+
+        assert_eq!(recovered, pack);
+        assert_eq!(
+            reopened.active_review_pack(Some(&device_id)).unwrap(),
+            Some(pack)
+        );
+    }
+
+    #[test]
+    fn accepted_operation_replays_exactly_after_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gnosis.sqlite");
+        let (operation, device_id, accepted) = {
+            let mut store = SqliteStore::open(&path).unwrap();
+            add_thema(&mut store, "thema", "Question", None);
+            let device_id = add_device(&mut store, "offline");
+            let pack = store
+                .create_review_pack(
+                    1,
+                    &manual_source("thema"),
+                    Some(1),
+                    &device_id,
+                    1_752_600_000_000_000,
+                )
+                .unwrap();
+            let operation = offline_answer(&pack, "attempt", 1);
+            let accepted =
+                reconcile(&mut store, &operation, &device_id, 1_752_600_000_002_000).unwrap();
+            (operation, device_id, accepted)
+        };
+        let mut reopened = SqliteStore::open(&path).unwrap();
+
+        let replay =
+            reconcile(&mut reopened, &operation, &device_id, 1_752_600_000_003_000).unwrap();
+
+        assert_eq!(replay, accepted);
+        let events: i64 = reopened
+            .connection
+            .query_row("SELECT count(*) FROM review_event", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn forged_review_day_is_preserved_as_a_capture_conflict() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        let pack = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        let mut operation = offline_answer(&pack, "forged-day", 1);
+        let forged_day = operation.proposed_transition.review_day + 1;
+        let transition = super::transition_with_sample(
+            &pack.items[0].review_state.clone().into(),
+            &pack.items[0].parameters.clone().into(),
+            operation.accepted_success,
+            forged_day,
+            operation.answered_at_us,
+            operation.fuzz_sample,
+        )
+        .unwrap();
+        operation.proposed_transition = (&transition).into();
+
+        let result = reconcile(&mut store, &operation, &device_id, 1_752_600_000_002_000).unwrap();
+
+        assert_eq!(result.status, ReconciliationStatus::Conflict);
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineConflictReason::CaptureMismatch)
+        );
+        assert_eq!(result.authoritative_state.review_count, 0);
+    }
+
+    #[test]
+    fn active_offline_lease_blocks_a_competing_review_session() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                None,
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_001,),
+            Err(crate::store::StoreError::ActiveReviewSession)
+        ));
+    }
+
+    #[test]
+    fn review_pack_rejects_unbounded_manual_sources() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device_id = add_device(&mut store, "offline");
+        let source = ReviewSource {
+            manual_ids: (0..=MAX_REVIEW_PACK_ITEMS)
+                .map(|index| format!("thema-{index}"))
+                .collect(),
+            ..manual_source("unused")
+        };
+
+        assert!(matches!(
+            store.create_review_pack(
+                1,
+                &source,
+                Some(MAX_REVIEW_PACK_ITEMS as u32),
+                &device_id,
+                1_752_600_000_000_000,
+            ),
+            Err(crate::store::StoreError::InvalidReviewState)
+        ));
+    }
+
+    #[test]
+    fn ownerless_online_sessions_require_local_or_admin_recovery() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "remote");
+        let session = store
+            .create_review_session(
+                &manual_source("thema"),
+                Some(1),
+                None,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+
+        assert_eq!(store.active_review_session(Some(&device_id)).unwrap(), None);
+        assert!(matches!(
+            store.begin_review_attempt(
+                &session.session_id,
+                Some(&device_id),
+                1_752_600_000_001_000,
+            ),
+            Err(crate::store::StoreError::ReviewOwnership)
+        ));
+        assert!(
+            store
+                .begin_review_attempt(&session.session_id, None, 1_752_600_000_001_000)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn offline_and_online_paths_produce_the_same_transition() {
+        let mut offline = SqliteStore::open_in_memory().unwrap();
+        let mut online = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut offline, "thema", "Question", None);
+        add_thema(&mut online, "thema", "Question", None);
+        let device_id = add_device(&mut offline, "offline");
+        let pack = offline
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                None,
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        let operation = offline_answer(&pack, "offline-attempt", 1);
+        reconcile(&mut offline, &operation, &device_id, 1_752_600_000_002_000).unwrap();
+
+        let session = online
+            .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_000)
+            .unwrap();
+        let attempt = online
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
+            .unwrap();
+        online
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                1_752_600_000_001_000,
+                0.0,
+            )
+            .unwrap();
+        online
+            .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_002_000)
+            .unwrap();
+
+        assert_eq!(
+            super::load_review_state(&offline.connection, "thema").unwrap(),
+            super::load_review_state(&online.connection, "thema").unwrap()
+        );
+        let transition = |store: &SqliteStore| {
+            store
+                .connection
+                .query_row("SELECT transition_json FROM review_event", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(transition(&offline), transition(&online));
+        assert_eq!(
+            super::latest_content_cursor(&offline.connection).unwrap(),
+            super::latest_content_cursor(&online.connection).unwrap()
+        );
+    }
+
     #[test]
     fn review_attempt_commits_atomically_and_replays_by_attempt_id() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         add_thema(&mut store, "thema", "Question", None);
         let session = store
-            .create_review_session(&manual_source("thema"), Some(1), 1_752_600_000_000_000)
+            .create_review_session(
+                &manual_source("thema"),
+                Some(1),
+                None,
+                1_752_600_000_000_000,
+            )
             .unwrap();
         let attempt = store
-            .begin_review_attempt(&session.session_id, 1_752_600_000_000_001)
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
             .unwrap();
         let graded = store
             .grade_review_attempt(
                 &attempt.attempt_id,
+                None,
                 &AnswerInput::Text("ANSWER".into()),
                 1_752_600_000_001_000,
                 0.0,
@@ -1192,11 +2851,11 @@ mod tests {
             .unwrap();
         assert_eq!(graded.detected_success, Some(true));
         let event = store
-            .commit_review_attempt(&attempt.attempt_id, 1_752_600_000_002_000)
+            .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_002_000)
             .unwrap();
         assert_eq!(
             store
-                .commit_review_attempt(&attempt.attempt_id, 1_752_600_000_003_000)
+                .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_003_000)
                 .unwrap(),
             event
         );
@@ -1221,25 +2880,31 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         add_thema(&mut store, "thema", "Question", None);
         let session = store
-            .create_review_session(&manual_source("thema"), Some(1), 1_752_600_000_000_000)
+            .create_review_session(
+                &manual_source("thema"),
+                Some(1),
+                None,
+                1_752_600_000_000_000,
+            )
             .unwrap();
         let attempt = store
-            .begin_review_attempt(&session.session_id, 1_752_600_000_000_001)
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
             .unwrap();
         store
             .grade_review_attempt(
                 &attempt.attempt_id,
+                None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
                 0.0,
             )
             .unwrap();
         store
-            .stop_review_session(&session.session_id, true, 1_752_600_000_002_000)
+            .stop_review_session(&session.session_id, None, true, 1_752_600_000_002_000)
             .unwrap();
 
         assert!(matches!(
-            store.commit_review_attempt(&attempt.attempt_id, 1_752_600_000_003_000),
+            store.commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_003_000),
             Err(crate::store::StoreError::InvalidReviewState)
         ));
     }
@@ -1249,16 +2914,17 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         add_thema(&mut store, "thema", "First", None);
         let session = store
-            .create_review_session(&manual_source("thema"), None, 1_752_600_000_000_000)
+            .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_000)
             .unwrap();
         let attempt = store
-            .begin_review_attempt(&session.session_id, 1_752_600_000_000_001)
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
             .unwrap();
         add_thema(&mut store, "thema", "Changed", Some(1));
 
         let error = store
             .grade_review_attempt(
                 &attempt.attempt_id,
+                None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
                 0.0,
@@ -1297,7 +2963,7 @@ mod tests {
             .collect::<Vec<_>>();
         add_thema_with_tags(&mut store, "tagged", "Question", tags.clone(), None);
         let session = store
-            .create_review_session(&manual_source("tagged"), None, 1_752_600_000_000_000)
+            .create_review_session(&manual_source("tagged"), None, None, 1_752_600_000_000_000)
             .unwrap();
         let parameters =
             super::resolved_parameters(&store.connection, &session.session_id, &tags).unwrap();
@@ -1356,10 +3022,10 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         add_thema(&mut store, "thema", "Question", None);
         let session = store
-            .create_review_session(&manual_source("thema"), None, 1_752_600_000_000_000)
+            .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_000)
             .unwrap();
         let attempt = store
-            .begin_review_attempt(&session.session_id, 1_752_600_000_000_001)
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
             .unwrap();
         store
             .connection
@@ -1372,6 +3038,7 @@ mod tests {
             store
                 .grade_review_attempt(
                     &attempt.attempt_id,
+                    None,
                     &AnswerInput::Text("answer".into()),
                     1_752_600_000_001_000,
                     0.0,
@@ -1385,24 +3052,25 @@ mod tests {
         let mut store = SqliteStore::open_in_memory().unwrap();
         add_thema(&mut store, "thema", "Question", None);
         let session = store
-            .create_review_session(&manual_source("thema"), None, 1_752_600_000_000_000)
+            .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_000)
             .unwrap();
         let attempt = store
-            .begin_review_attempt(&session.session_id, 1_752_600_000_000_001)
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
             .unwrap();
         store
             .grade_review_attempt(
                 &attempt.attempt_id,
+                None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
                 0.0,
             )
             .unwrap();
         store
-            .toggle_attempt_suspension(&attempt.attempt_id)
+            .toggle_attempt_suspension(&attempt.attempt_id, None)
             .unwrap();
         let event = store
-            .commit_review_attempt(&attempt.attempt_id, 1_752_600_000_002_000)
+            .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_002_000)
             .unwrap();
         let transition: String = store
             .connection

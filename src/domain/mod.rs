@@ -9,7 +9,7 @@ mod thema;
 pub use document::{
     DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, SourceSpan, TitlePath,
 };
-pub(crate) use grading::{StructuredResponse, grade};
+pub(crate) use grading::{MATCHER_VERSION, StructuredResponse, grade};
 pub use graph::{NodeEdge, project_unique_edges};
 pub use ids::{DocumentId, IdError, NodeId, ThemaId};
 pub(crate) use legacy::{DueThema, LegacyDatabaseInfo, LegacyReviewState, LegacyThema};

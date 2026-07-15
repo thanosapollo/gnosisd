@@ -28,8 +28,8 @@ directly.
 - `src/migration.rs` owns the offline schema-v9 snapshot path. It must never
   modify or replace the source database, and it publishes only a fully checked
   target.
-- Legacy themata and scheduling state are exposed through a read-only adapter.
-  Keep review mutations out until their compatibility contract is explicit.
+- Legacy themata remain exposed through a read-only adapter. Normalized review
+  writes use immutable attempts and events plus atomic scheduling transitions.
 - `src/protocol` owns the versioned wire DTOs, framing, Unix-socket server, and
   client. Public fields use opaque string IDs, never SQLite row IDs.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
@@ -49,10 +49,9 @@ Socket startup uses an atomic `.startup-lock` directory to serialize stale
 cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
 SIGTERM both enter graceful shutdown.
 
-Emacs integration and the migration of complete frontend operations are active
-work. Review writes remain unavailable until their scheduling, immutable event,
-and atomic state-transition contract is explicit. Remote transport,
-authentication, and synchronization remain out of scope.
+Online reviews and device-bound offline review packs reconcile
+through immutable operations. The daemon remains authoritative, conflicts stay
+explicit, and review or content state must never use last-write-wins.
 
 ## Commands
 

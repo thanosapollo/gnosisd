@@ -25,16 +25,21 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 use crate::{
     application::{
         AnswerInput, AssetHead, ContentChange, DevicePrincipal, DeviceScope, DocumentHead,
-        DocumentRevision, NodeRecord, ReviewAttemptView, ReviewSessionView, ReviewSource,
-        ServiceError, ServiceHandle, SettingsInput, SettingsRecord, ThemaRecord,
+        DocumentRevision, MAX_REVIEW_PACK_BYTES, NodeRecord, ReviewAttemptView, ReviewSessionView,
+        ReviewSource, ServiceError, ServiceHandle, SettingsInput, SettingsRecord, ThemaRecord,
         canonical_asset_path, prepare_asset, prepare_note, prepare_thema, review_day_at,
         thema_content,
     },
     domain::DocumentId,
+    protocol::{
+        OfflineReviewSubmission, OfflineReviewWireError, active_review_pack_json,
+        offline_result_json, review_pack_json,
+    },
     store::StoreError,
 };
 
 const MAX_BODY: usize = 1024 * 1024;
+const MAX_OFFLINE_OPERATION_BODY: usize = MAX_REVIEW_PACK_BYTES + 2 * MAX_BODY;
 const MAX_PAGE: u16 = 500;
 
 #[derive(Clone)]
@@ -152,6 +157,18 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/review/sessions/{id}/quit", post(quit_session))
         .route("/v1/review/sessions/{id}/abort", post(abort_session))
         .route("/v1/review/sessions/{id}/attempts", post(begin_attempt))
+        .route("/v1/review/packs", post(create_pack))
+        .route("/v1/review/packs/active", get(active_pack))
+        .route("/v1/review/packs/{id}", get(get_pack))
+        .route(
+            "/v1/review/packs/{id}/assets/{digest}/{name}",
+            get(get_pack_asset),
+        )
+        .route("/v1/review/packs/{id}/abandon", post(abandon_pack))
+        .route(
+            "/v1/review/offline-operations",
+            post(reconcile_offline).layer(DefaultBodyLimit::max(MAX_OFFLINE_OPERATION_BODY)),
+        )
         .route("/v1/review/attempts/{id}/answer", post(answer_attempt))
         .route("/v1/review/attempts/{id}/override", post(override_attempt))
         .route(
@@ -780,7 +797,12 @@ async fn create_session(
     require(&principal, DeviceScope::Review)?;
     let session = state
         .service
-        .create_review_session(input.source, input.target_count, now_us()?)
+        .create_review_session(
+            input.source,
+            input.target_count,
+            Some(principal.device_id),
+            now_us()?,
+        )
         .await
         .map_err(ApiError::service)?;
     Ok((StatusCode::CREATED, Json(session_json(&session))))
@@ -792,7 +814,7 @@ async fn active_session(
     require(&principal, DeviceScope::Review)?;
     let session = state
         .service
-        .active_review_session()
+        .active_review_session(review_actor(&principal))
         .await
         .map_err(ApiError::service)?;
     Ok(Json(json!({"session":session.as_ref().map(session_json)})))
@@ -806,7 +828,7 @@ async fn resume_session(
     Ok(Json(session_json(
         &state
             .service
-            .resume_review_session(id)
+            .resume_review_session(id, review_actor(&principal))
             .await
             .map_err(ApiError::service)?,
     )))
@@ -835,7 +857,7 @@ async fn stop_session(
     Ok(Json(session_json(
         &state
             .service
-            .stop_review_session(id, abort, now_us()?)
+            .stop_review_session(id, review_actor(&principal), abort, now_us()?)
             .await
             .map_err(ApiError::service)?,
     )))
@@ -848,7 +870,7 @@ async fn begin_attempt(
     require(&principal, DeviceScope::Review)?;
     let attempt = state
         .service
-        .begin_review_attempt(id, now_us()?)
+        .begin_review_attempt(id, review_actor(&principal), now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok((StatusCode::CREATED, Json(attempt_json(&attempt))))
@@ -863,7 +885,7 @@ async fn answer_attempt(
     Ok(Json(attempt_json(
         &state
             .service
-            .grade_review_attempt(id, answer, now_us()?)
+            .grade_review_attempt(id, review_actor(&principal), answer, now_us()?)
             .await
             .map_err(ApiError::service)?,
     )))
@@ -877,7 +899,7 @@ async fn override_attempt(
     Ok(Json(attempt_json(
         &state
             .service
-            .override_review_attempt(id)
+            .override_review_attempt(id, review_actor(&principal))
             .await
             .map_err(ApiError::service)?,
     )))
@@ -891,7 +913,7 @@ async fn toggle_suspension(
     Ok(Json(attempt_json(
         &state
             .service
-            .toggle_attempt_suspension(id)
+            .toggle_attempt_suspension(id, review_actor(&principal))
             .await
             .map_err(ApiError::service)?,
     )))
@@ -904,13 +926,143 @@ async fn commit_attempt(
     require(&principal, DeviceScope::Review)?;
     let event = state
         .service
-        .commit_review_attempt(id, now_us()?)
+        .commit_review_attempt(id, review_actor(&principal), now_us()?)
         .await
         .map_err(ApiError::service)?;
+    announce(&state).await;
     Ok(Json(json!({"event_id":event})))
 }
+
+async fn create_pack(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(input): ApiJson<SessionInput>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let pack = state
+        .service
+        .create_review_pack(
+            crate::protocol::OFFLINE_REVIEW_VERSION,
+            input.source,
+            input.target_count,
+            principal.device_id,
+            now_us()?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(review_pack_json(&pack).map_err(|_| ApiError::internal())?),
+    ))
+}
+
+async fn get_pack(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let pack = state
+        .service
+        .review_pack(id, review_actor(&principal))
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(
+        review_pack_json(&pack).map_err(|_| ApiError::internal())?,
+    ))
+}
+
+async fn active_pack(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let pack = state
+        .service
+        .active_review_pack(review_actor(&principal))
+        .await
+        .map_err(ApiError::service)?;
+    let version = pack
+        .as_ref()
+        .map_or(crate::protocol::OFFLINE_REVIEW_VERSION, |pack| {
+            pack.format_version
+        });
+    Ok(Json(
+        active_review_pack_json(version, pack.as_ref()).map_err(|_| ApiError::internal())?,
+    ))
+}
+
+async fn get_pack_asset(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path((id, digest, name)): Path<(String, String, String)>,
+) -> Result<Response, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let path = canonical_asset_path(&digest, &name).map_err(ApiError::invalid_content)?;
+    let (asset, bytes) = state
+        .service
+        .review_pack_asset(id, review_actor(&principal), &path, &digest)
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        asset.media_type.parse().map_err(|_| ApiError::internal())?,
+    );
+    Ok(response)
+}
+
+async fn abandon_pack(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let pack = state
+        .service
+        .abandon_review_pack(id, review_actor(&principal), now_us()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        review_pack_json(&pack).map_err(|_| ApiError::internal())?,
+    ))
+}
+
+async fn reconcile_offline(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(submission): ApiJson<OfflineReviewSubmission>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let decoded = submission.decode().map_err(ApiError::offline_review_wire)?;
+    let result = state
+        .service
+        .reconcile_offline_operation(
+            decoded.version,
+            decoded.operation,
+            decoded.canonical_payload,
+            review_actor(&principal),
+            now_us()?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    announce(&state).await;
+    Ok(Json(
+        offline_result_json(&result).map_err(|_| ApiError::internal())?,
+    ))
+}
+
+fn review_actor(principal: &DevicePrincipal) -> Option<String> {
+    (!principal.scopes.contains(&DeviceScope::Admin)).then(|| principal.device_id.clone())
+}
+
 fn session_json(s: &ReviewSessionView) -> Value {
-    json!({"session_id":s.session_id,"source":s.source,"target_count":s.target_count,"status":s.status,"current_position":s.current_position,"queue_length":s.queue_length,"started_at_us":s.started_at_us})
+    json!({"session_id":s.session_id,"owner_device_id":s.owner_device_id,"mode":s.mode,
+        "source":s.source,"target_count":s.target_count,"status":s.status,
+        "current_position":s.current_position,"queue_length":s.queue_length,
+        "started_at_us":s.started_at_us})
 }
 fn attempt_json(a: &ReviewAttemptView) -> Value {
     let presentation = &a.presentation;
@@ -1095,6 +1247,20 @@ impl ApiError {
             Self::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_body", message)
         }
     }
+    fn offline_review_wire(error: OfflineReviewWireError) -> Self {
+        match error {
+            OfflineReviewWireError::Version => Self::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_offline_review_version",
+                "offline review protocol version is unsupported",
+            ),
+            OfflineReviewWireError::Operation => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_offline_review_operation",
+                "offline review operation is invalid",
+            ),
+        }
+    }
     fn conflict(expected: u64, actual: Option<u64>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
@@ -1122,6 +1288,18 @@ impl ApiError {
                 "stale_attempt",
                 "thema content or review state changed",
             ),
+            ServiceError::Store(StoreError::ReviewOwnership) => Self::forbidden(),
+            ServiceError::Store(StoreError::IdempotencyConflict) => Self::new(
+                StatusCode::CONFLICT,
+                "idempotency_conflict",
+                "operation identity was reused with different content",
+            ),
+            ServiceError::Store(StoreError::DeviceSequence { expected }) => Self {
+                status: StatusCode::CONFLICT,
+                code: "device_sequence_gap",
+                message: "device operation sequence is not contiguous",
+                meta: Some(json!({"expected_sequence":expected})),
+            },
             ServiceError::Store(StoreError::InvalidReviewState) | ServiceError::Review(_) => {
                 Self::bad_request("review operation is invalid")
             }
@@ -1273,6 +1451,12 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/review/sessions/{id}/quit", "post"),
     ("/v1/review/sessions/{id}/abort", "post"),
     ("/v1/review/sessions/{id}/attempts", "post"),
+    ("/v1/review/packs", "post"),
+    ("/v1/review/packs/active", "get"),
+    ("/v1/review/packs/{id}", "get"),
+    ("/v1/review/packs/{id}/assets/{digest}/{name}", "get"),
+    ("/v1/review/packs/{id}/abandon", "post"),
+    ("/v1/review/offline-operations", "post"),
     ("/v1/review/attempts/{id}/answer", "post"),
     ("/v1/review/attempts/{id}/override", "post"),
     ("/v1/review/attempts/{id}/suspension", "post"),
@@ -1282,16 +1466,20 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
 
     use super::{OPENAPI_OPERATIONS, attempt_json, openapi_document, router};
     use crate::application::{
-        AnswerInput, PresentationSnapshot, ReviewAttemptView, ServiceRuntime, generate_device,
+        AnswerInput, OfflineReviewOperation, PresentationSnapshot, ReviewAttemptView,
+        ReviewPackView, ServiceRuntime, generate_device, prepare_asset, prepare_thema,
+        presentation_content, review_day_at, thema_content,
     };
+    use crate::domain::{compute_transition, fuzz_delta, grade};
 
     #[test]
     fn openapi_covers_versioned_routes_and_bearer_security() {
@@ -1396,6 +1584,303 @@ mod tests {
         runtime.finish().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn offline_review_http_flow_is_versioned_owned_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let owner = generate_device("owner".into(), vec!["review".into()]).unwrap();
+        let other = generate_device("other".into(), vec!["review".into()]).unwrap();
+        let admin = generate_device("admin".into(), vec!["admin".into(), "review".into()]).unwrap();
+        let owner_id = owner.device_id.clone();
+        let owner_token = owner.token.clone();
+        let other_token = other.token.clone();
+        let admin_token = admin.token.clone();
+        service.create_device(owner, 1).await.unwrap();
+        service.create_device(other, 2).await.unwrap();
+        service.create_device(admin, 3).await.unwrap();
+        let image = b"offline image".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&image));
+        let asset_path = super::canonical_asset_path(&digest, "image.png").unwrap();
+        let asset_head = service
+            .put_asset(
+                prepare_asset(asset_path.clone(), "image.png".into(), None).unwrap(),
+                image.clone(),
+                "image/png".into(),
+                4,
+                None,
+            )
+            .await
+            .unwrap();
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![None],
+            vec!["answer".into()],
+            None,
+            None,
+            Some(asset_path.clone()),
+        )
+        .unwrap();
+        service
+            .put_thema(
+                prepare_thema(
+                    Some("thema".into()),
+                    content,
+                    vec![],
+                    vec![],
+                    vec![asset_path.clone()],
+                    None,
+                )
+                .unwrap(),
+                20260715,
+                5,
+            )
+            .await
+            .unwrap();
+        let app = router(service.clone());
+        let pack_body = json!({
+            "source": {
+                "kind": "manual",
+                "tags": [],
+                "exclude_tags": [],
+                "topic_node_id": null,
+                "topic_forward_depth": null,
+                "topic_backward_depth": null,
+                "manual_ids": ["thema"]
+            },
+            "target_count": 1
+        });
+        let created = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/packs",
+                &owner_token,
+                Body::from(serde_json::to_vec(&pack_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = response_json(created).await;
+        assert_eq!(created["version"], 1);
+        let mut pack_json = created["pack"].clone();
+        pack_json["format_version"] = created["version"].clone();
+        let pack: ReviewPackView = serde_json::from_value(pack_json).unwrap();
+        let tombstone = service
+            .tombstone_asset(asset_path.clone(), asset_head.revision, 6, None)
+            .await
+            .unwrap();
+
+        let active = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/review/packs/active",
+                &owner_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(active).await["pack"]["pack_id"], pack.pack_id);
+        let denied = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/review/packs/{}", pack.pack_id),
+                &other_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let asset = &pack.assets[0];
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!(
+                    "/v1/review/packs/{}/assets/{}/image.png",
+                    pack.pack_id, asset.content_sha256
+                ),
+                &owner_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            image
+        );
+        let denied_asset = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!(
+                    "/v1/review/packs/{}/assets/{}/image.png",
+                    pack.pack_id, asset.content_sha256
+                ),
+                &other_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_asset.status(), StatusCode::FORBIDDEN);
+
+        let operation = offline_operation(&pack, "attempt", 1);
+        let submission = json!({"version": 1, "operation": operation});
+        let body = serde_json::to_vec(&submission).unwrap();
+        let accepted = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/offline-operations",
+                &owner_token,
+                Body::from(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted = response_json(accepted).await;
+        assert_eq!(accepted["version"], 1);
+        assert_eq!(accepted["result"]["status"], "accepted");
+        let replay = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/offline-operations",
+                &owner_token,
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(replay).await, accepted);
+        let mut changed = submission.clone();
+        changed["operation"]["desired_suspended"] = json!(true);
+        let conflict = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/offline-operations",
+                &owner_token,
+                Body::from(serde_json::to_vec(&changed).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let mut unknown = submission;
+        unknown["operation"]["presentation"]["future"] = json!(true);
+        let invalid = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/offline-operations",
+                &owner_token,
+                Body::from(serde_json::to_vec(&unknown).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let large_invalid = json!({
+            "version": 1,
+            "operation": {"padding": "x".repeat(super::MAX_BODY + 1)}
+        });
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/offline-operations",
+                &owner_token,
+                Body::from(serde_json::to_vec(&large_invalid).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        service
+            .put_asset(
+                prepare_asset(
+                    asset_path.clone(),
+                    "image.png".into(),
+                    Some(tombstone.revision),
+                )
+                .unwrap(),
+                image,
+                "image/png".into(),
+                7,
+                None,
+            )
+            .await
+            .unwrap();
+        let stranded = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/packs",
+                &owner_token,
+                Body::from(serde_json::to_vec(&pack_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stranded.status(), StatusCode::CREATED);
+        let stranded = response_json(stranded).await;
+        let stranded_id = stranded["pack"]["pack_id"].as_str().unwrap();
+        service.revoke_device(owner_id, 8).await.unwrap();
+
+        let discovered = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/review/packs/active",
+                &admin_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(discovered).await["pack"]["pack_id"],
+            stranded_id
+        );
+        let abandoned = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/packs/{stranded_id}/abandon"),
+                &admin_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(abandoned).await["pack"]["status"],
+            "abandoned"
+        );
+        let replacement = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/packs",
+                &admin_token,
+                Body::from(serde_json::to_vec(&pack_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replacement.status(), StatusCode::CREATED);
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
     #[test]
     fn pending_attempts_do_not_reveal_captured_answers() {
         let mut attempt = ReviewAttemptView {
@@ -1436,5 +1921,74 @@ mod tests {
             .header("content-type", "application/json")
             .body(body)
             .unwrap()
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    fn offline_operation(
+        pack: &ReviewPackView,
+        attempt_id: &str,
+        device_sequence: u64,
+    ) -> OfflineReviewOperation {
+        let item = &pack.items[0];
+        let response = AnswerInput::Text("answer".into());
+        let detected_success = grade(
+            item.matcher_version,
+            &presentation_content(&item.presentation).unwrap(),
+            &response.clone().into(),
+        )
+        .unwrap()
+        .success;
+        let answered_at_us = pack.issued_at_us + 1;
+        let review_day =
+            review_day_at(answered_at_us, &pack.timezone, pack.day_boundary_hour).unwrap();
+        let state = item.review_state.clone().into();
+        let parameters = item.parameters.clone().into();
+        let probe = compute_transition(
+            &state,
+            &parameters,
+            detected_success,
+            review_day,
+            answered_at_us,
+            0.0,
+        )
+        .unwrap();
+        let delta =
+            fuzz_delta(probe.algorithm_interval_days, parameters.interval_fuzz, 0.0).unwrap();
+        let transition = compute_transition(
+            &state,
+            &parameters,
+            detected_success,
+            review_day,
+            answered_at_us,
+            delta,
+        )
+        .unwrap();
+        OfflineReviewOperation {
+            attempt_id: attempt_id.into(),
+            pack_id: pack.pack_id.clone(),
+            session_id: pack.session_id.clone(),
+            lease_id: pack.lease_id.clone(),
+            device_id: pack.device_id.clone(),
+            device_sequence,
+            session_position: item.position,
+            thema_id: item.thema_id.clone(),
+            thema_revision: item.thema_revision,
+            base_state_revision: item.review_state.state_revision,
+            content_sha256: item.content_sha256.clone(),
+            presentation: item.presentation.clone(),
+            parameters: item.parameters.clone(),
+            matcher_version: item.matcher_version,
+            response,
+            detected_success,
+            accepted_success: detected_success,
+            override_count: 0,
+            proposed_transition: (&transition).into(),
+            desired_suspended: false,
+            answered_at_us,
+            fuzz_sample: 0.0,
+        }
     }
 }

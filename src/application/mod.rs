@@ -27,9 +27,11 @@ pub use query_document::QueryDocument;
 pub(crate) use query_legacy::DueCursor;
 pub use query_legacy::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema};
 pub(crate) use review::{
-    AnswerInput, ParametersSnapshot, PresentationSnapshot, ReviewAttemptView, ReviewError,
-    ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
-    presentation_content, review_day_at,
+    AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineConflictReason, OfflineReviewOperation,
+    OfflineReviewResult, ParametersSnapshot, PresentationSnapshot, ReconciliationStatus,
+    ReviewAttemptView, ReviewError, ReviewPackAsset, ReviewPackItem, ReviewPackView,
+    ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot,
+    TransitionSnapshot, presentation_content, review_day_at,
 };
 pub(crate) use service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError};
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};

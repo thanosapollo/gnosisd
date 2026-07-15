@@ -14,8 +14,9 @@ use tokio::sync::oneshot;
 use super::{
     AnswerInput, ApplicationError, AssetHead, BackupError, BackupSummary, ContentChange,
     DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, NewDevice,
-    NodeRecord, PreparedAsset, PreparedImport, PreparedNote, PreparedThema, QueryDueThemata,
-    QueryDueThemataPage, ReviewAttemptView, ReviewSessionView, ReviewSource, SettingsInput,
+    NodeRecord, OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedImport,
+    PreparedNote, PreparedThema, QueryDueThemata, QueryDueThemataPage, ReviewAttemptView,
+    ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource, SettingsInput,
     SettingsRecord, ThemaRecord, create_backup, persist_import, prune_backups, token_digest,
     validate_restore, verify_backup,
 };
@@ -469,6 +470,7 @@ impl ServiceHandle {
         &self,
         source: ReviewSource,
         target_count: Option<u32>,
+        owner_device_id: Option<String>,
         started_at_us: u64,
     ) -> Result<ReviewSessionView, ServiceError> {
         let source = source.validate().map_err(ServiceError::Review)?;
@@ -478,6 +480,7 @@ impl ServiceHandle {
         request(&self.sender, |response| StoreCommand::CreateReviewSession {
             source,
             target_count,
+            owner_device_id,
             started_at_us,
             response,
         })
@@ -487,8 +490,10 @@ impl ServiceHandle {
 
     pub(crate) async fn active_review_session(
         &self,
+        actor_device_id: Option<String>,
     ) -> Result<Option<ReviewSessionView>, ServiceError> {
         request(&self.sender, |response| StoreCommand::ActiveReviewSession {
+            actor_device_id,
             response,
         })
         .await?
@@ -498,9 +503,11 @@ impl ServiceHandle {
     pub(crate) async fn resume_review_session(
         &self,
         session_id: String,
+        actor_device_id: Option<String>,
     ) -> Result<ReviewSessionView, ServiceError> {
         request(&self.sender, |response| StoreCommand::ResumeReviewSession {
             session_id,
+            actor_device_id,
             response,
         })
         .await?
@@ -510,11 +517,13 @@ impl ServiceHandle {
     pub(crate) async fn stop_review_session(
         &self,
         session_id: String,
+        actor_device_id: Option<String>,
         abort: bool,
         ended_at_us: u64,
     ) -> Result<ReviewSessionView, ServiceError> {
         request(&self.sender, |response| StoreCommand::StopReviewSession {
             session_id,
+            actor_device_id,
             abort,
             ended_at_us,
             response,
@@ -526,10 +535,12 @@ impl ServiceHandle {
     pub(crate) async fn begin_review_attempt(
         &self,
         session_id: String,
+        actor_device_id: Option<String>,
         started_at_us: u64,
     ) -> Result<ReviewAttemptView, ServiceError> {
         request(&self.sender, |response| StoreCommand::BeginReviewAttempt {
             session_id,
+            actor_device_id,
             started_at_us,
             response,
         })
@@ -540,12 +551,14 @@ impl ServiceHandle {
     pub(crate) async fn grade_review_attempt(
         &self,
         attempt_id: String,
+        actor_device_id: Option<String>,
         answer: AnswerInput,
         answered_at_us: u64,
     ) -> Result<ReviewAttemptView, ServiceError> {
         let fuzz_sample = random_fuzz_sample()?;
         request(&self.sender, |response| StoreCommand::GradeReviewAttempt {
             attempt_id,
+            actor_device_id,
             answer,
             answered_at_us,
             fuzz_sample,
@@ -558,10 +571,12 @@ impl ServiceHandle {
     pub(crate) async fn override_review_attempt(
         &self,
         attempt_id: String,
+        actor_device_id: Option<String>,
     ) -> Result<ReviewAttemptView, ServiceError> {
         request(&self.sender, |response| {
             StoreCommand::OverrideReviewAttempt {
                 attempt_id,
+                actor_device_id,
                 response,
             }
         })
@@ -572,10 +587,12 @@ impl ServiceHandle {
     pub(crate) async fn toggle_attempt_suspension(
         &self,
         attempt_id: String,
+        actor_device_id: Option<String>,
     ) -> Result<ReviewAttemptView, ServiceError> {
         request(&self.sender, |response| {
             StoreCommand::ToggleAttemptSuspension {
                 attempt_id,
+                actor_device_id,
                 response,
             }
         })
@@ -586,12 +603,127 @@ impl ServiceHandle {
     pub(crate) async fn commit_review_attempt(
         &self,
         attempt_id: String,
+        actor_device_id: Option<String>,
         committed_at_us: u64,
     ) -> Result<String, ServiceError> {
         request(&self.sender, |response| StoreCommand::CommitReviewAttempt {
             attempt_id,
+            actor_device_id,
             committed_at_us,
             response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn create_review_pack(
+        &self,
+        format_version: u32,
+        source: ReviewSource,
+        target_count: Option<u32>,
+        device_id: String,
+        issued_at_us: u64,
+    ) -> Result<ReviewPackView, ServiceError> {
+        let source = source.validate().map_err(ServiceError::Review)?;
+        let target_count = Some(target_count.unwrap_or(100));
+        if !target_count.is_some_and(|count| (1..=500).contains(&count)) {
+            return Err(ServiceError::Review(super::ReviewError::Target));
+        }
+        request(&self.sender, |response| StoreCommand::CreateReviewPack {
+            format_version,
+            source,
+            target_count,
+            device_id,
+            issued_at_us,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn review_pack(
+        &self,
+        pack_id: String,
+        device_id: Option<String>,
+    ) -> Result<Option<ReviewPackView>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::GetReviewPack {
+            pack_id,
+            device_id,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn active_review_pack(
+        &self,
+        device_id: Option<String>,
+    ) -> Result<Option<ReviewPackView>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::GetActiveReviewPack {
+            device_id,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn review_pack_asset(
+        &self,
+        pack_id: String,
+        device_id: Option<String>,
+        logical_path: &str,
+        digest: &str,
+    ) -> Result<Option<(ReviewPackAsset, Vec<u8>)>, ServiceError> {
+        let Some(pack) = self.review_pack(pack_id, device_id).await? else {
+            return Ok(None);
+        };
+        let Some(asset) = pack
+            .assets
+            .into_iter()
+            .find(|asset| asset.logical_path == logical_path && asset.content_sha256 == digest)
+        else {
+            return Ok(None);
+        };
+        let bytes = self.blobs.read(&asset.content_sha256)?;
+        if bytes.len() as u64 != asset.size_bytes {
+            return Err(ServiceError::Corrupt);
+        }
+        Ok(Some((asset, bytes)))
+    }
+
+    pub(crate) async fn abandon_review_pack(
+        &self,
+        pack_id: String,
+        device_id: Option<String>,
+        ended_at_us: u64,
+    ) -> Result<ReviewPackView, ServiceError> {
+        request(&self.sender, |response| StoreCommand::AbandonReviewPack {
+            pack_id,
+            device_id,
+            ended_at_us,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn reconcile_offline_operation(
+        &self,
+        format_version: u32,
+        operation: OfflineReviewOperation,
+        canonical_payload: String,
+        device_id: Option<String>,
+        received_at_us: u64,
+    ) -> Result<OfflineReviewResult, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ReconcileOfflineOperation {
+                format_version,
+                operation: Box::new(operation),
+                canonical_payload,
+                device_id,
+                received_at_us,
+                response,
+            }
         })
         .await?
         .map_err(ServiceError::Store)
@@ -898,29 +1030,35 @@ enum StoreCommand {
     CreateReviewSession {
         source: ReviewSource,
         target_count: Option<u32>,
+        owner_device_id: Option<String>,
         started_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewSessionView>>,
     },
     ActiveReviewSession {
+        actor_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<Option<ReviewSessionView>>>,
     },
     ResumeReviewSession {
         session_id: String,
+        actor_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ReviewSessionView>>,
     },
     StopReviewSession {
         session_id: String,
+        actor_device_id: Option<String>,
         abort: bool,
         ended_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewSessionView>>,
     },
     BeginReviewAttempt {
         session_id: String,
+        actor_device_id: Option<String>,
         started_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
     GradeReviewAttempt {
         attempt_id: String,
+        actor_device_id: Option<String>,
         answer: AnswerInput,
         answered_at_us: u64,
         fuzz_sample: f64,
@@ -928,16 +1066,50 @@ enum StoreCommand {
     },
     OverrideReviewAttempt {
         attempt_id: String,
+        actor_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
     ToggleAttemptSuspension {
         attempt_id: String,
+        actor_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
     CommitReviewAttempt {
         attempt_id: String,
+        actor_device_id: Option<String>,
         committed_at_us: u64,
         response: oneshot::Sender<StoreResult<String>>,
+    },
+    CreateReviewPack {
+        format_version: u32,
+        source: ReviewSource,
+        target_count: Option<u32>,
+        device_id: String,
+        issued_at_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewPackView>>,
+    },
+    GetReviewPack {
+        pack_id: String,
+        device_id: Option<String>,
+        response: oneshot::Sender<StoreResult<Option<ReviewPackView>>>,
+    },
+    GetActiveReviewPack {
+        device_id: Option<String>,
+        response: oneshot::Sender<StoreResult<Option<ReviewPackView>>>,
+    },
+    AbandonReviewPack {
+        pack_id: String,
+        device_id: Option<String>,
+        ended_at_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewPackView>>,
+    },
+    ReconcileOfflineOperation {
+        format_version: u32,
+        operation: Box<OfflineReviewOperation>,
+        canonical_payload: String,
+        device_id: Option<String>,
+        received_at_us: u64,
+        response: oneshot::Sender<StoreResult<OfflineReviewResult>>,
     },
     CreateBackup {
         destination: PathBuf,
@@ -1213,61 +1385,145 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
         StoreCommand::CreateReviewSession {
             source,
             target_count,
+            owner_device_id,
             started_at_us,
             response,
         } => send(
             response,
-            store.create_review_session(&source, target_count, started_at_us),
+            store.create_review_session(
+                &source,
+                target_count,
+                owner_device_id.as_deref(),
+                started_at_us,
+            ),
         ),
-        StoreCommand::ActiveReviewSession { response } => {
-            send(response, store.active_review_session())
-        }
+        StoreCommand::ActiveReviewSession {
+            actor_device_id,
+            response,
+        } => send(
+            response,
+            store.active_review_session(actor_device_id.as_deref()),
+        ),
         StoreCommand::ResumeReviewSession {
             session_id,
+            actor_device_id,
             response,
-        } => send(response, store.resume_review_session(&session_id)),
+        } => send(
+            response,
+            store.resume_review_session(&session_id, actor_device_id.as_deref()),
+        ),
         StoreCommand::StopReviewSession {
             session_id,
+            actor_device_id,
             abort,
             ended_at_us,
             response,
         } => send(
             response,
-            store.stop_review_session(&session_id, abort, ended_at_us),
+            store.stop_review_session(&session_id, actor_device_id.as_deref(), abort, ended_at_us),
         ),
         StoreCommand::BeginReviewAttempt {
             session_id,
+            actor_device_id,
             started_at_us,
             response,
         } => send(
             response,
-            store.begin_review_attempt(&session_id, started_at_us),
+            store.begin_review_attempt(&session_id, actor_device_id.as_deref(), started_at_us),
         ),
         StoreCommand::GradeReviewAttempt {
             attempt_id,
+            actor_device_id,
             answer,
             answered_at_us,
             fuzz_sample,
             response,
         } => send(
             response,
-            store.grade_review_attempt(&attempt_id, &answer, answered_at_us, fuzz_sample),
+            store.grade_review_attempt(
+                &attempt_id,
+                actor_device_id.as_deref(),
+                &answer,
+                answered_at_us,
+                fuzz_sample,
+            ),
         ),
         StoreCommand::OverrideReviewAttempt {
             attempt_id,
+            actor_device_id,
             response,
-        } => send(response, store.override_review_attempt(&attempt_id)),
+        } => send(
+            response,
+            store.override_review_attempt(&attempt_id, actor_device_id.as_deref()),
+        ),
         StoreCommand::ToggleAttemptSuspension {
             attempt_id,
+            actor_device_id,
             response,
-        } => send(response, store.toggle_attempt_suspension(&attempt_id)),
+        } => send(
+            response,
+            store.toggle_attempt_suspension(&attempt_id, actor_device_id.as_deref()),
+        ),
         StoreCommand::CommitReviewAttempt {
             attempt_id,
+            actor_device_id,
             committed_at_us,
             response,
         } => send(
             response,
-            store.commit_review_attempt(&attempt_id, committed_at_us),
+            store.commit_review_attempt(&attempt_id, actor_device_id.as_deref(), committed_at_us),
+        ),
+        StoreCommand::CreateReviewPack {
+            format_version,
+            source,
+            target_count,
+            device_id,
+            issued_at_us,
+            response,
+        } => send(
+            response,
+            store.create_review_pack(
+                format_version,
+                &source,
+                target_count,
+                &device_id,
+                issued_at_us,
+            ),
+        ),
+        StoreCommand::GetReviewPack {
+            pack_id,
+            device_id,
+            response,
+        } => send(response, store.review_pack(&pack_id, device_id.as_deref())),
+        StoreCommand::GetActiveReviewPack {
+            device_id,
+            response,
+        } => send(response, store.active_review_pack(device_id.as_deref())),
+        StoreCommand::AbandonReviewPack {
+            pack_id,
+            device_id,
+            ended_at_us,
+            response,
+        } => send(
+            response,
+            store.abandon_review_pack(&pack_id, device_id.as_deref(), ended_at_us),
+        ),
+        StoreCommand::ReconcileOfflineOperation {
+            format_version,
+            operation,
+            canonical_payload,
+            device_id,
+            received_at_us,
+            response,
+        } => send(
+            response,
+            store.reconcile_offline_operation(
+                format_version,
+                &operation,
+                &canonical_payload,
+                device_id.as_deref(),
+                received_at_us,
+            ),
         ),
         StoreCommand::CreateBackup {
             destination,

@@ -28,7 +28,8 @@ mod review;
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_initial.sql");
 const SERVER_MIGRATION: &str = include_str!("migrations/0002_server.sql");
 const REMOTE_REVIEW_MIGRATION: &str = include_str!("migrations/0003_remote_review.sql");
-const SCHEMA_VERSION: u32 = 3;
+const OFFLINE_REVIEW_MIGRATION: &str = include_str!("migrations/0004_offline_review.sql");
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -42,6 +43,12 @@ pub(crate) enum StoreError {
     StaleAttempt,
     #[error("review operation is invalid in the current state")]
     InvalidReviewState,
+    #[error("review operation belongs to another device")]
+    ReviewOwnership,
+    #[error("operation identity was reused with a different payload")]
+    IdempotencyConflict,
+    #[error("device operation sequence has a gap: expected {expected}")]
+    DeviceSequence { expected: u64 },
     #[error("document path changes require a rename operation")]
     PathChange,
     #[error("document projection is invalid: {reason}")]
@@ -1848,6 +1855,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             .execute_batch(REMOTE_REVIEW_MIGRATION)
             .map_err(StoreError::storage)?;
     }
+    if found < 4 {
+        connection
+            .execute_batch(OFFLINE_REVIEW_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
     Ok(())
 }
 
@@ -2901,8 +2913,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        FailPoint, INITIAL_MIGRATION, SERVER_MIGRATION, SqliteStore, StoreError, migrate,
-        schema_version,
+        FailPoint, INITIAL_MIGRATION, REMOTE_REVIEW_MIGRATION, SERVER_MIGRATION, SqliteStore,
+        StoreError, migrate, schema_version,
     };
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
@@ -3028,7 +3040,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            3
+            4
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -3036,7 +3048,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            3
+            4
         );
     }
 
@@ -3049,12 +3061,15 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 3);
+        assert_eq!(schema_version(&connection).unwrap(), 4);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
             ("review_attempt", "parameters_json"),
             ("review_attempt", "fuzz_sample"),
+            ("review_session", "owner_device_id"),
+            ("review_session", "review_mode"),
+            ("device", "last_review_sequence"),
         ] {
             let present: bool = connection
                 .query_row(
@@ -3065,6 +3080,90 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}.{column}");
         }
+    }
+
+    #[test]
+    fn upgrades_populated_schema_v3_without_losing_rows_or_cursor_sequence() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(SERVER_MIGRATION).unwrap();
+        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
+        connection
+            .execute(
+                "INSERT INTO device(
+                     device_id, name, token_digest, scopes_json, created_at_us
+                 ) VALUES ('device', 'Device', ?1, '[\"review\"]', 1)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO review_session(
+                     session_id, source_kind, source_json, timezone, day_boundary_hour,
+                     scheduler_json, status, started_at_us
+                 ) VALUES (
+                     'session', 'manual', '{\"kind\":\"manual\",\"manual_ids\":[\"thema\"]}',
+                     'UTC', 0, '{}', 'active', 1
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO content_change(
+                     entity_kind, entity_id, revision, operation, created_at_us
+                 ) VALUES ('settings', 'settings', 1, 'update', 1)",
+                [],
+            )
+            .unwrap();
+        let old_cursor: i64 = connection
+            .query_row("SELECT max(cursor) FROM content_change", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let device: (i64, i64) = connection
+            .query_row(
+                "SELECT count(*), last_review_sequence FROM device WHERE device_id = 'device'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(device, (1, 0));
+        let session: (Option<String>, String) = connection
+            .query_row(
+                "SELECT owner_device_id, review_mode FROM review_session
+                 WHERE session_id = 'session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session, (None, "online".into()));
+        connection
+            .execute(
+                "INSERT INTO content_change(
+                     entity_kind, entity_id, revision, operation, created_at_us
+                 ) VALUES ('review', 'thema', 1, 'commit', 2)",
+                [],
+            )
+            .unwrap();
+        let new_cursor: i64 = connection
+            .query_row("SELECT max(cursor) FROM content_change", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(new_cursor, old_cursor + 1);
+        let violations: i64 = connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     #[test]
