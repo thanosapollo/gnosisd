@@ -46,6 +46,30 @@ fn migrates_v9_snapshot_without_changing_source() {
 }
 
 #[test]
+fn empty_legacy_review_image_is_absent() {
+    let directory = tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let target = directory.path().join("gnosis.sqlite");
+    create_legacy_database(&source, 9);
+    Connection::open(&source)
+        .unwrap()
+        .execute("UPDATE extras SET review_image = '\"\"' WHERE id = 7", [])
+        .unwrap();
+
+    migrate_legacy_database(&source, &target).unwrap();
+
+    let review_image: Option<String> = Connection::open(&target)
+        .unwrap()
+        .query_row(
+            "SELECT review_image FROM thema WHERE thema_id = '7'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(review_image, None);
+}
+
+#[test]
 fn refuses_to_replace_an_existing_target() {
     let directory = tempdir().unwrap();
     let source = directory.path().join("legacy.db");

@@ -484,7 +484,8 @@ fn import_themata(
         let source_guid = decode_optional_opaque(row.get(5)?, "source GUID")?;
         let archived_at_us: Option<i64> = row.get(6)?;
         let parathema = decode_optional(row.get(7)?, "parathema")?;
-        let review_image = decode_optional(row.get(8)?, "review image")?;
+        let review_image =
+            decode_optional(row.get(8)?, "review image")?.filter(|value| !value.is_empty());
         let hypothesis_json = serde_json::to_string(&hypothesis)?;
         let answer_json = serde_json::to_string(&answer)?;
         let digest = thema_digest(
