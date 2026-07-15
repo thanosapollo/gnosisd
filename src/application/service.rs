@@ -23,7 +23,7 @@ use super::{
     ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
     SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord, create_backup,
     persist_server_import, prepare_offline_document, prune_backups, retained_asset_paths_in_org,
-    token_digest, validate_restore, verify_backup,
+    token_digest, validate_asset_path, validate_restore, verify_backup,
 };
 use crate::{
     blob::{BlobError, BlobMeta, BlobStore},
@@ -270,13 +270,32 @@ impl ServiceHandle {
         &self,
         asset_path: String,
     ) -> Result<Option<(AssetHead, Vec<u8>)>, ServiceError> {
+        validate_asset_path(&asset_path)
+            .map_err(ApplicationError::InvalidContent)
+            .map_err(ServiceError::Application)?;
+        let expected_digest = asset_path
+            .split('/')
+            .nth(1)
+            .ok_or(ServiceError::AssetDigest)?
+            .to_owned();
         let head = request(&self.sender, |response| StoreCommand::AssetHead {
             asset_path,
             response,
         })
         .await?
         .map_err(ServiceError::Store)?;
-        read_asset_blob(&self.blobs, head)
+        let Some(head) = head.filter(|head| head.active) else {
+            return Ok(None);
+        };
+        let digest = head.blob_sha256.clone().ok_or(ServiceError::Corrupt)?;
+        if digest != expected_digest {
+            return Err(ServiceError::AssetDigest);
+        }
+        let blobs = self.blobs.clone();
+        let bytes = tokio::task::spawn_blocking(move || blobs.read(&digest))
+            .await
+            .map_err(|_| ServiceError::Stopped)??;
+        Ok(Some((head, bytes)))
     }
 
     pub(crate) async fn tombstone_asset(
@@ -1014,17 +1033,6 @@ fn read_document_blob(
     blobs: &BlobStore,
     head: Option<DocumentHead>,
 ) -> Result<Option<(DocumentHead, Vec<u8>)>, ServiceError> {
-    let Some(head) = head.filter(|head| head.active) else {
-        return Ok(None);
-    };
-    let digest = head.blob_sha256.as_deref().ok_or(ServiceError::Corrupt)?;
-    Ok(Some((head.clone(), blobs.read(digest)?)))
-}
-
-fn read_asset_blob(
-    blobs: &BlobStore,
-    head: Option<AssetHead>,
-) -> Result<Option<(AssetHead, Vec<u8>)>, ServiceError> {
     let Some(head) = head.filter(|head| head.active) else {
         return Ok(None);
     };

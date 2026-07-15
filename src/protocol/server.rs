@@ -7,6 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -23,11 +24,12 @@ use crate::{
         ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError, generate_device,
     },
     protocol::{
-        ActiveReviewSessionView, BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView,
-        DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
-        LocalReviewAttemptView, LocalReviewSessionView, MessageValidationError, PROTOCOL_VERSION,
-        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult,
-        ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo, ThemaView, frame,
+        ActiveReviewSessionView, AssetChunkView, BackupView, BackupsPrunedView, DeviceCreatedView,
+        DeviceView, DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult,
+        LegacyInfoView, LocalReviewAttemptView, LocalReviewSessionView, MessageValidationError,
+        PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope, ResponseEnvelope,
+        ResponseResult, ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo,
+        ThemaView, frame,
     },
     store::StoreError,
 };
@@ -266,10 +268,11 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
         Request::ReviewAttemptCommit { attempt_id } => {
             commit_review_attempt(state, attempt_id).await
         }
-        Request::AssetChunk { .. } => Err(ProtocolError::new(
-            ErrorCode::MalformedRequest,
-            "asset chunk method unavailable",
-        )),
+        Request::AssetChunk {
+            logical_path,
+            offset,
+            limit,
+        } => asset_chunk(state, logical_path, offset, limit).await,
         Request::DeviceCreate { name, scopes } => create_device(state, name, scopes).await,
         Request::DeviceList {} => list_devices(state).await,
         Request::DeviceRevoke { device_id } => revoke_device(state, device_id).await,
@@ -296,6 +299,39 @@ fn bounded_success(id: String, result: ResponseResult) -> ResponseEnvelope {
             ProtocolError::new(ErrorCode::Internal, "response exceeds protocol limit"),
         ),
     }
+}
+
+async fn asset_chunk(
+    state: ServerState,
+    logical_path: String,
+    offset: u64,
+    limit: u32,
+) -> Result<ResponseResult, ProtocolError> {
+    let (head, bytes) = state
+        .store
+        .asset(logical_path.clone())
+        .await
+        .map_err(actor_error)?
+        .ok_or_else(asset_not_found)?;
+    let total_size = u64::try_from(bytes.len()).map_err(|_| internal_error())?;
+    let start = usize::try_from(offset).map_err(|_| invalid_asset_offset())?;
+    if start > bytes.len() {
+        return Err(invalid_asset_offset());
+    }
+    let limit = usize::try_from(limit).map_err(|_| invalid_asset_offset())?;
+    let end = start
+        .checked_add(limit)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let content_sha256 = head.blob_sha256.ok_or_else(internal_error)?;
+    Ok(ResponseResult::AssetChunk(AssetChunkView {
+        logical_path,
+        content_sha256,
+        total_size,
+        offset,
+        chunk_base64: STANDARD.encode(&bytes[start..end]),
+        eof: end == bytes.len(),
+    }))
 }
 
 async fn legacy_info(state: ServerState) -> Result<ResponseResult, ProtocolError> {
@@ -723,6 +759,14 @@ fn not_found() -> ProtocolError {
 
 fn thema_not_found() -> ProtocolError {
     ProtocolError::new(ErrorCode::NotFound, "thema not found")
+}
+
+fn asset_not_found() -> ProtocolError {
+    ProtocolError::new(ErrorCode::NotFound, "managed asset not found")
+}
+
+fn invalid_asset_offset() -> ProtocolError {
+    ProtocolError::new(ErrorCode::MalformedRequest, "invalid asset offset")
 }
 
 fn invalid_legacy_query(_error: LegacyQueryError) -> ProtocolError {

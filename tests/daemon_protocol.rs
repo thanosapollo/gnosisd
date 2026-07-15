@@ -7,13 +7,15 @@ use std::{
     time::Duration,
 };
 
-use gnosis_core::migration::migrate_legacy_database;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use gnosis_core::migration::{migrate_legacy_database, migrate_legacy_server};
 use gnosis_core::protocol::{
-    DaemonConfig, DaemonServer, ErrorCode, PROTOCOL_VERSION, Request, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewAnswerInput, ReviewSourceInput,
-    ReviewSourceKindInput, ServerError, request,
+    DaemonConfig, DaemonServer, ErrorCode, MAX_ASSET_CHUNK_BYTES, PROTOCOL_VERSION, Request,
+    RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewAnswerInput,
+    ReviewSourceInput, ReviewSourceKindInput, ServerError, request,
 };
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::sync::{Barrier, oneshot};
 
@@ -89,12 +91,159 @@ impl RunningDaemon {
         }
     }
 
+    async fn start_asset_fixture() -> (Self, String, String, Vec<u8>) {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("legacy.db");
+        let notes = directory.path().join("Notes");
+        let socket = directory.path().join("gnosis.sock");
+        let database = directory.path().join("gnosis.sqlite");
+        let blobs = database.with_extension("blobs");
+        let bytes = (0..1024 * 1024)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let tombstoned = b"tombstoned asset";
+        let asset_path = canonical_test_asset_path(&bytes, "large.png");
+        let tombstoned_path = canonical_test_asset_path(tombstoned, "old.png");
+        fs::create_dir_all(notes.join("Pictures")).unwrap();
+        fs::write(notes.join("Pictures/large.png"), &bytes).unwrap();
+        fs::write(notes.join("Pictures/old.png"), tombstoned).unwrap();
+        fs::write(
+            notes.join("note.org"),
+            "#+TITLE: Assets\n[[file:Pictures/large.png]]\n[[file:Pictures/old.png]]\n",
+        )
+        .unwrap();
+        create_review_fixture(&source);
+        migrate_legacy_server(&source, &database, &notes, &blobs).unwrap();
+        Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE managed_asset SET active = 0 WHERE asset_path = ?1",
+                [&tombstoned_path],
+            )
+            .unwrap();
+        let server = DaemonServer::bind(DaemonConfig::new(&socket, database))
+            .await
+            .unwrap();
+        let (shutdown, receiver) = oneshot::channel();
+        let task = tokio::spawn(server.run(async {
+            let _ = receiver.await;
+        }));
+        (
+            Self {
+                socket,
+                shutdown,
+                task,
+                _directory: directory,
+            },
+            asset_path,
+            tombstoned_path,
+            bytes,
+        )
+    }
+
     async fn stop(self) {
         let socket = self.socket.clone();
         self.shutdown.send(()).unwrap();
         self.task.await.unwrap().unwrap();
         assert!(!socket.exists());
     }
+}
+
+#[tokio::test]
+async fn managed_assets_are_served_as_bounded_verified_chunks() {
+    let (daemon, logical_path, tombstoned_path, bytes) = RunningDaemon::start_asset_fixture().await;
+    let first = asset_chunk(&daemon.socket, "asset-first", &logical_path, 0, 17).await;
+    let retry = asset_chunk(&daemon.socket, "asset-retry", &logical_path, 0, 17).await;
+    assert_eq!(first, retry);
+    assert_eq!(decode_chunk(&first), bytes[..17]);
+    assert!(!first.eof);
+
+    let middle = asset_chunk(&daemon.socket, "asset-middle", &logical_path, 401, 29).await;
+    assert_eq!(decode_chunk(&middle), bytes[401..430]);
+    assert_eq!(middle.offset, 401);
+    assert!(!middle.eof);
+
+    let maximum = asset_chunk(
+        &daemon.socket,
+        "asset-maximum",
+        &logical_path,
+        0,
+        MAX_ASSET_CHUNK_BYTES,
+    )
+    .await;
+    assert_eq!(
+        decode_chunk(&maximum),
+        bytes[..MAX_ASSET_CHUNK_BYTES as usize]
+    );
+    assert!(!maximum.eof);
+    let final_chunk = asset_chunk(
+        &daemon.socket,
+        "asset-final",
+        &logical_path,
+        u64::from(MAX_ASSET_CHUNK_BYTES),
+        MAX_ASSET_CHUNK_BYTES,
+    )
+    .await;
+    assert_eq!(
+        decode_chunk(&final_chunk),
+        bytes[MAX_ASSET_CHUNK_BYTES as usize..]
+    );
+    assert!(final_chunk.eof);
+
+    let terminal = asset_chunk(
+        &daemon.socket,
+        "asset-terminal",
+        &logical_path,
+        bytes.len() as u64,
+        1,
+    )
+    .await;
+    assert!(decode_chunk(&terminal).is_empty());
+    assert!(terminal.eof);
+    assert_eq!(terminal.total_size, bytes.len() as u64);
+    assert_eq!(
+        terminal.content_sha256,
+        format!("{:x}", Sha256::digest(&bytes))
+    );
+    assert_eq!(terminal.logical_path, logical_path);
+
+    assert_asset_error(
+        &daemon.socket,
+        "asset-past-eof",
+        &logical_path,
+        bytes.len() as u64 + 1,
+        1,
+        ErrorCode::MalformedRequest,
+    )
+    .await;
+    assert_asset_error(
+        &daemon.socket,
+        "asset-wrong-digest",
+        &format!("assets/{}/large.png", "0".repeat(64)),
+        0,
+        1,
+        ErrorCode::NotFound,
+    )
+    .await;
+    assert_asset_error(
+        &daemon.socket,
+        "asset-tombstoned",
+        &tombstoned_path,
+        0,
+        1,
+        ErrorCode::NotFound,
+    )
+    .await;
+    assert_asset_error(
+        &daemon.socket,
+        "asset-invalid-path",
+        "../../large.png",
+        0,
+        1,
+        ErrorCode::MalformedRequest,
+    )
+    .await;
+    daemon.stop().await;
 }
 
 #[tokio::test]
@@ -776,6 +925,70 @@ async fn successful_review_result(socket: &Path, id: &str, request: Request) -> 
         panic!("review request failed: {response:?}");
     };
     *result
+}
+
+async fn asset_chunk(
+    socket: &Path,
+    id: &str,
+    logical_path: &str,
+    offset: u64,
+    limit: u32,
+) -> gnosis_core::protocol::AssetChunkView {
+    let response = call(
+        socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: id.into(),
+            request: Request::AssetChunk {
+                logical_path: logical_path.into(),
+                offset,
+                limit,
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Success { result } = response.outcome else {
+        panic!("asset request failed: {response:?}");
+    };
+    let ResponseResult::AssetChunk(chunk) = *result else {
+        panic!("unexpected asset response");
+    };
+    chunk
+}
+
+async fn assert_asset_error(
+    socket: &Path,
+    id: &str,
+    logical_path: &str,
+    offset: u64,
+    limit: u32,
+    expected: ErrorCode,
+) {
+    let response = call(
+        socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: id.into(),
+            request: Request::AssetChunk {
+                logical_path: logical_path.into(),
+                offset,
+                limit,
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = response.outcome else {
+        panic!("asset request unexpectedly succeeded: {response:?}");
+    };
+    assert_eq!(error.code, expected);
+}
+
+fn decode_chunk(chunk: &gnosis_core::protocol::AssetChunkView) -> Vec<u8> {
+    STANDARD.decode(&chunk.chunk_base64).unwrap()
+}
+
+fn canonical_test_asset_path(bytes: &[u8], name: &str) -> String {
+    format!("assets/{:x}/{name}", Sha256::digest(bytes))
 }
 
 async fn begin_review(socket: &Path) -> String {
