@@ -3263,6 +3263,24 @@ mod tests {
                 .review_count,
             1
         );
+        let totals = store
+            .connection
+            .query_row(
+                "SELECT review_count, new_count, success_count, failure_count, override_count
+                 FROM review_day",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, u32>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(totals, (1, 1, 1, 0, 0));
     }
 
     #[test]
