@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::application::{
-    AnswerInput, ParametersSnapshot, PresentationSnapshot, ReviewAttemptView, ReviewSessionView,
-    ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
+    AnswerInput, ParametersSnapshot, PresentationSnapshot, ReviewAttemptOperationResult,
+    ReviewAttemptState, ReviewAttemptView, ReviewSessionView, ReviewSource, ReviewSourceKind,
+    ReviewStateSnapshot, TransitionSnapshot, valid_review_operation_id,
 };
 use crate::domain::{
     DocumentId, DocumentProjection, DueThema, LegacyDatabaseInfo, LegacyReviewState, LegacyThema,
@@ -85,6 +86,24 @@ pub enum Request {
     ReviewAttemptOverride { attempt_id: String },
     #[serde(rename = "review.attempt_suspension_toggle")]
     ReviewAttemptSuspensionToggle { attempt_id: String },
+    #[serde(rename = "review.attempt_state_v2")]
+    ReviewAttemptStateV2 { attempt_id: String },
+    #[serde(rename = "review.attempt_acceptance_set_v2")]
+    ReviewAttemptAcceptanceSetV2 {
+        operation_version: u32,
+        operation_id: String,
+        attempt_id: String,
+        expected_attempt_revision: u64,
+        accepted_success: bool,
+    },
+    #[serde(rename = "review.attempt_suspension_set_v2")]
+    ReviewAttemptSuspensionSetV2 {
+        operation_version: u32,
+        operation_id: String,
+        attempt_id: String,
+        expected_attempt_revision: u64,
+        desired_suspended: bool,
+    },
     #[serde(rename = "review.attempt_commit")]
     ReviewAttemptCommit { attempt_id: String },
     #[serde(rename = "asset.chunk")]
@@ -132,7 +151,30 @@ impl Request {
             Self::ReviewAttemptAnswer { attempt_id, .. }
             | Self::ReviewAttemptOverride { attempt_id }
             | Self::ReviewAttemptSuspensionToggle { attempt_id }
+            | Self::ReviewAttemptStateV2 { attempt_id }
             | Self::ReviewAttemptCommit { attempt_id } => require_review_id(attempt_id)?,
+            Self::ReviewAttemptAcceptanceSetV2 {
+                operation_version,
+                operation_id,
+                attempt_id,
+                expected_attempt_revision,
+                ..
+            }
+            | Self::ReviewAttemptSuspensionSetV2 {
+                operation_version,
+                operation_id,
+                attempt_id,
+                expected_attempt_revision,
+                ..
+            } => {
+                require_review_id(attempt_id)?;
+                if *operation_version != 1
+                    || !valid_review_operation_id(operation_id)
+                    || *expected_attempt_revision > i64::MAX as u64
+                {
+                    return Err(MessageValidationError::InvalidReviewRequest);
+                }
+            }
             Self::AssetChunk { limit, .. } if *limit == 0 || *limit > MAX_ASSET_CHUNK_BYTES => {
                 return Err(MessageValidationError::InvalidAssetChunk);
             }
@@ -325,6 +367,8 @@ pub enum ResponseResult {
     ReviewSession(LocalReviewSessionView),
     ActiveReviewSession(ActiveReviewSessionView),
     ReviewAttempt(Box<LocalReviewAttemptView>),
+    ReviewAttemptStateV2(Box<LocalReviewAttemptStateV2>),
+    ReviewAttemptMutationV2(Box<LocalReviewAttemptMutationV2>),
     ReviewEvent(ReviewEventView),
     AssetChunk(AssetChunkView),
     DeviceCreated(DeviceCreatedView),
@@ -532,6 +576,46 @@ impl From<ReviewAttemptView> for LocalReviewAttemptView {
             proposed_transition: value.proposed_transition.map(LocalTransitionView::from),
             desired_suspended: value.desired_suspended,
             status: value.status,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalReviewAttemptStateV2 {
+    pub version: u32,
+    pub attempt_revision: u64,
+    pub attempt: LocalReviewAttemptView,
+}
+
+impl From<ReviewAttemptState> for LocalReviewAttemptStateV2 {
+    fn from(value: ReviewAttemptState) -> Self {
+        Self {
+            version: 1,
+            attempt_revision: value.attempt_revision,
+            attempt: value.attempt.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalReviewAttemptMutationV2 {
+    pub version: u32,
+    pub operation_id: String,
+    pub changed: bool,
+    pub attempt_revision: u64,
+    pub attempt: LocalReviewAttemptView,
+}
+
+impl From<ReviewAttemptOperationResult> for LocalReviewAttemptMutationV2 {
+    fn from(value: ReviewAttemptOperationResult) -> Self {
+        Self {
+            version: 1,
+            operation_id: value.operation_id,
+            changed: value.changed,
+            attempt_revision: value.attempt_revision,
+            attempt: value.attempt.into(),
         }
     }
 }
@@ -887,6 +971,10 @@ pub enum ErrorCode {
     InvalidDocument,
     NotFound,
     Conflict,
+    RevisionConflict,
+    IdempotencyConflict,
+    StaleAttempt,
+    ReviewStateConflict,
     Busy,
     Internal,
 }
@@ -1040,11 +1128,35 @@ mod tests {
     }
 
     #[test]
+    fn desired_review_operations_have_separate_wire_identities() {
+        let requests = [
+            r#"{"version":1,"id":"correlation-1","method":"review.attempt_state_v2","params":{"attempt_id":"ATTEMPT"}}"#,
+            r#"{"version":1,"id":"correlation-2","method":"review.attempt_acceptance_set_v2","params":{"operation_version":1,"operation_id":"operation-1","attempt_id":"ATTEMPT","expected_attempt_revision":1,"accepted_success":false}}"#,
+            r#"{"version":1,"id":"correlation-3","method":"review.attempt_suspension_set_v2","params":{"operation_version":1,"operation_id":"operation-2","attempt_id":"ATTEMPT","expected_attempt_revision":2,"desired_suspended":true}}"#,
+        ];
+
+        for json in requests {
+            let request: RequestEnvelope = serde_json::from_str(json).unwrap();
+            request.validate().unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::from_str::<serde_json::Value>(json).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn local_review_requests_reject_invalid_inputs() {
         let invalid = [
             r#"{"version":1,"id":"x","method":"review.session_create","params":{"source":{"kind":"due","tags":["tag"],"exclude_tags":[],"topic_node_id":null,"topic_forward_depth":null,"topic_backward_depth":null,"manual_ids":[]},"target_count":null}}"#,
             r#"{"version":1,"id":"x","method":"review.session_resume","params":{"session_id":""}}"#,
             r#"{"version":1,"id":"x","method":"review.attempt_answer","params":{"attempt_id":"ATTEMPT","response":{"kind":"unknown","value":"answer"}}}"#,
+            r#"{"version":1,"id":"x","method":"review.attempt_acceptance_set_v2","params":{"operation_version":2,"operation_id":"operation","attempt_id":"ATTEMPT","expected_attempt_revision":1,"accepted_success":true}}"#,
+            r#"{"version":1,"id":"x","method":"review.attempt_suspension_set_v2","params":{"operation_version":1,"operation_id":"","attempt_id":"ATTEMPT","expected_attempt_revision":1,"desired_suspended":true}}"#,
+            r#"{"version":1,"id":"x","method":"review.attempt_suspension_set_v2","params":{"operation_version":1,"operation_id":"operation","attempt_id":"ATTEMPT","expected_attempt_revision":18446744073709551615,"desired_suspended":true}}"#,
+            r#"{"version":1,"id":"x","method":"review.attempt_suspension_set_v2","params":{"operation_version":1,"operation_id":"\u0000","attempt_id":"ATTEMPT","expected_attempt_revision":1,"desired_suspended":true}}"#,
+            r#"{"version":1,"id":"x","method":"review.attempt_suspension_set_v2","params":{"operation_version":1,"operation_id":"π","attempt_id":"ATTEMPT","expected_attempt_revision":1,"desired_suspended":true}}"#,
+            r#"{"version":1,"id":"x","method":"review.attempt_state_v2","params":{"attempt_id":"ATTEMPT","extra":true}}"#,
             r#"{"version":1,"id":"x","method":"asset.chunk","params":{"logical_path":"assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/name.png","offset":0,"limit":0}}"#,
             r#"{"version":1,"id":"x","method":"asset.chunk","params":{"logical_path":"assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/name.png","offset":18446744073709551616,"limit":1}}"#,
             r#"{"version":1,"id":"x","method":"review.session_active","params":{"extra":true}}"#,
@@ -1107,6 +1219,41 @@ mod tests {
         assert_eq!(
             value["result"]["value"]["presentation"]["parathema"],
             "Context"
+        );
+    }
+
+    #[test]
+    fn desired_review_results_expose_revision_without_changing_attempt_v1() {
+        let mutation = r#"{
+            "version":1,
+            "id":"correlation",
+            "status":"success",
+            "result":{"type":"review_attempt_mutation_v2","value":{
+                "version":1,
+                "operation_id":"operation",
+                "changed":true,
+                "attempt_revision":2,
+                "attempt":{
+                    "attempt_id":"ATTEMPT",
+                    "session_id":"SESSION",
+                    "thema_id":"7",
+                    "presentation":{"kind":"basic","keimenon":"Question","hypothesis":[],"answer":["Answer"],"source_guid":null,"parathema":null,"review_image":null,"tags":[]},
+                    "response":{"kind":"text","value":"Answer"},
+                    "detected_success":true,
+                    "accepted_success":false,
+                    "override_count":1,
+                    "proposed_transition":null,
+                    "desired_suspended":false,
+                    "status":"graded"
+                }
+            }}
+        }"#;
+
+        let response: ResponseEnvelope = serde_json::from_str(mutation).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::from_str::<serde_json::Value>(mutation).unwrap()
         );
     }
 }

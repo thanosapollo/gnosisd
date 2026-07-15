@@ -40,6 +40,12 @@ directly.
   daemon owns grading, scheduling transitions, session progress, suspension,
   daily totals, and immutable review events. Do not move that authority into a
   frontend.
+- Review attempt envelope IDs are disposable correlation IDs. Desired-state
+  mutations carry a separate durable operation ID and expected attempt
+  revision. Operation identity is scoped to the authenticated device or local
+  Unix actor. Exact retries return the retained result; competing revisions
+  and stale captures remain explicit. Legacy toggle methods are compatibility
+  adapters and advance the same monotonic attempt revision.
 - Replica bootstrap uses a device-bound immutable snapshot manifest captured at
   one content cursor. Cursorless retries reuse a resumable manifest. Clients
   must install every page atomically before promoting the terminal delta cursor.

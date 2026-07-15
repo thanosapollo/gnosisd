@@ -20,7 +20,8 @@ use super::{
     OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
     OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedNote, PreparedServerImport,
     PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
-    ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
+    ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
+    ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
     SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord, create_backup,
     persist_server_import, prepare_offline_document, prune_backups, retained_asset_paths_in_org,
     token_digest, validate_asset_path, validate_restore, verify_backup,
@@ -798,6 +799,38 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn review_attempt_state(
+        &self,
+        attempt_id: String,
+        actor_device_id: Option<String>,
+    ) -> Result<ReviewAttemptState, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ReviewAttemptState {
+            attempt_id,
+            actor_device_id,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn apply_review_attempt_operation(
+        &self,
+        operation: ReviewAttemptOperation,
+        authority: ReviewOperationAuthority,
+        operated_at_us: u64,
+    ) -> Result<ReviewAttemptOperationResult, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ApplyReviewAttemptOperation {
+                operation,
+                authority,
+                operated_at_us,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn commit_review_attempt(
         &self,
         attempt_id: String,
@@ -1370,6 +1403,17 @@ enum StoreCommand {
         request_sha256: String,
         operated_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
+    },
+    ReviewAttemptState {
+        attempt_id: String,
+        actor_device_id: Option<String>,
+        response: oneshot::Sender<StoreResult<ReviewAttemptState>>,
+    },
+    ApplyReviewAttemptOperation {
+        operation: ReviewAttemptOperation,
+        authority: ReviewOperationAuthority,
+        operated_at_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewAttemptOperationResult>>,
     },
     CommitReviewAttempt {
         attempt_id: String,
@@ -1962,6 +2006,23 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
                 &request_sha256,
                 operated_at_us,
             ),
+        ),
+        StoreCommand::ReviewAttemptState {
+            attempt_id,
+            actor_device_id,
+            response,
+        } => send(
+            response,
+            store.review_attempt_state(&attempt_id, actor_device_id.as_deref()),
+        ),
+        StoreCommand::ApplyReviewAttemptOperation {
+            operation,
+            authority,
+            operated_at_us,
+            response,
+        } => send(
+            response,
+            store.apply_review_attempt_operation(&operation, &authority, operated_at_us),
         ),
         StoreCommand::CommitReviewAttempt {
             attempt_id,
@@ -2712,13 +2773,16 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE local_review_replay;
+                "DROP TABLE review_attempt_operation;
+                 ALTER TABLE review_attempt DROP COLUMN mutation_revision;
+                 DROP TABLE local_review_replay;
                  DROP TABLE offline_asset_evidence;
                  DROP TABLE offline_asset_result;
                  DROP TABLE offline_asset_operation;
                  DROP TABLE staged_blob;
                  DROP TABLE document_revision_asset;
                  DROP TABLE document_asset;
+                 DELETE FROM schema_migration WHERE version = 11;
                  DELETE FROM schema_migration WHERE version = 10;
                  DELETE FROM schema_migration WHERE version = 9;
                  DELETE FROM schema_migration WHERE version = 8;

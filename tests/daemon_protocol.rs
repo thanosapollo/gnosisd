@@ -549,6 +549,98 @@ async fn online_review_toggle_retries_are_persistently_idempotent() {
 }
 
 #[tokio::test]
+async fn desired_review_operation_survives_restart_with_new_correlation_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let attempt_id = begin_and_answer_review(&socket).await;
+    let operation = Request::ReviewAttemptAcceptanceSetV2 {
+        operation_version: 1,
+        operation_id: "durable-operation".into(),
+        attempt_id: attempt_id.clone(),
+        expected_attempt_revision: 1,
+        accepted_success: false,
+    };
+    let first = review_attempt_mutation_v2(
+        successful_review_result(&socket, "correlation-before", operation.clone()).await,
+    );
+    assert_eq!(first.attempt_revision, 2);
+    assert_eq!(first.attempt.accepted_success, Some(false));
+    daemon.stop().await;
+
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let replay = review_attempt_mutation_v2(
+        successful_review_result(&socket, "correlation-after", operation).await,
+    );
+    assert_eq!(replay, first);
+    let state = successful_review_result(
+        &socket,
+        "state",
+        Request::ReviewAttemptStateV2 {
+            attempt_id: attempt_id.clone(),
+        },
+    )
+    .await;
+    let ResponseResult::ReviewAttemptStateV2(state) = state else {
+        panic!("unexpected review state response");
+    };
+    assert_eq!(state.attempt_revision, 2);
+
+    let reused = call(
+        &socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "correlation-reused".into(),
+            request: Request::ReviewAttemptAcceptanceSetV2 {
+                operation_version: 1,
+                operation_id: "durable-operation".into(),
+                attempt_id: attempt_id.clone(),
+                expected_attempt_revision: 2,
+                accepted_success: true,
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = reused.outcome else {
+        panic!("changed operation payload unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::IdempotencyConflict);
+
+    successful_review_result(
+        &socket,
+        "legacy-suspension",
+        Request::ReviewAttemptSuspensionToggle {
+            attempt_id: attempt_id.clone(),
+        },
+    )
+    .await;
+    let stale = call(
+        &socket,
+        RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "stale-correlation".into(),
+            request: Request::ReviewAttemptSuspensionSetV2 {
+                operation_version: 1,
+                operation_id: "stale-operation".into(),
+                attempt_id,
+                expected_attempt_revision: 2,
+                desired_suspended: false,
+            },
+        },
+    )
+    .await;
+    let ResponseOutcome::Failure { error } = stale.outcome else {
+        panic!("stale operation unexpectedly succeeded");
+    };
+    assert_eq!(error.code, ErrorCode::RevisionConflict);
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn online_review_rejects_a_different_second_answer() {
     let daemon = RunningDaemon::start_review_fixture().await;
     let attempt_id = begin_and_answer_review(&daemon.socket).await;
@@ -1032,6 +1124,15 @@ async fn begin_and_answer_review(socket: &Path) -> String {
 fn review_attempt_result(result: ResponseResult) -> gnosis_core::protocol::LocalReviewAttemptView {
     let ResponseResult::ReviewAttempt(attempt) = result else {
         panic!("unexpected review attempt response");
+    };
+    *attempt
+}
+
+fn review_attempt_mutation_v2(
+    result: ResponseResult,
+) -> gnosis_core::protocol::LocalReviewAttemptMutationV2 {
+    let ResponseResult::ReviewAttemptMutationV2(attempt) = result else {
+        panic!("unexpected review attempt mutation response");
     };
     *attempt
 }

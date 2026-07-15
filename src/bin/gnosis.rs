@@ -10,6 +10,7 @@ use gnosis_core::protocol::{
 };
 use serde::Serialize;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "gnosis")]
@@ -46,6 +47,27 @@ enum Command {
         limit: u16,
         #[arg(long)]
         after: Option<String>,
+    },
+    ReviewAttemptState {
+        attempt_id: String,
+    },
+    ReviewAttemptSetAccepted {
+        attempt_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long, action = clap::ArgAction::Set)]
+        accepted_success: bool,
+    },
+    ReviewAttemptSetSuspended {
+        attempt_id: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long, action = clap::ArgAction::Set)]
+        desired_suspended: bool,
     },
     DeviceCreate {
         name: String,
@@ -126,7 +148,7 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), RunError> {
     let envelope = RequestEnvelope {
         version: PROTOCOL_VERSION,
-        id: "gnosis-cli".to_owned(),
+        id: correlation_id(),
         request: command_request(cli.command)?,
     };
     let response = request(cli.socket, &envelope)
@@ -154,11 +176,42 @@ fn command_request(command: Command) -> Result<Request, CliError> {
         Command::GetThema { thema_id } => Ok(Request::ThemaGet { thema_id }),
         Command::DueThemata { day, limit } => Ok(Request::ReviewDue { day, limit }),
         Command::DuePage { day, limit, after } => Ok(Request::ReviewDuePage { day, limit, after }),
+        Command::ReviewAttemptState { attempt_id } => {
+            Ok(Request::ReviewAttemptStateV2 { attempt_id })
+        }
+        Command::ReviewAttemptSetAccepted {
+            attempt_id,
+            operation_id,
+            expected_revision,
+            accepted_success,
+        } => Ok(Request::ReviewAttemptAcceptanceSetV2 {
+            operation_version: 1,
+            operation_id,
+            attempt_id,
+            expected_attempt_revision: expected_revision,
+            accepted_success,
+        }),
+        Command::ReviewAttemptSetSuspended {
+            attempt_id,
+            operation_id,
+            expected_revision,
+            desired_suspended,
+        } => Ok(Request::ReviewAttemptSuspensionSetV2 {
+            operation_version: 1,
+            operation_id,
+            attempt_id,
+            expected_attempt_revision: expected_revision,
+            desired_suspended,
+        }),
         Command::DeviceCreate { name, scopes } => Ok(Request::DeviceCreate { name, scopes }),
         Command::DeviceList => Ok(Request::DeviceList {}),
         Command::DeviceRevoke { device_id } => Ok(Request::DeviceRevoke { device_id }),
         Command::Admin { command } => admin_request(command),
     }
+}
+
+fn correlation_id() -> String {
+    format!("gnosis-cli-{}", Uuid::now_v7())
 }
 
 fn admin_request(command: AdminCommand) -> Result<Request, CliError> {
@@ -227,6 +280,8 @@ fn write_result(result: &ResponseResult) -> Result<(), CliError> {
         ResponseResult::ReviewSession(value) => write_json(value),
         ResponseResult::ActiveReviewSession(value) => write_json(value),
         ResponseResult::ReviewAttempt(value) => write_json(value),
+        ResponseResult::ReviewAttemptStateV2(value) => write_json(value),
+        ResponseResult::ReviewAttemptMutationV2(value) => write_json(value),
         ResponseResult::ReviewEvent(value) => write_json(value),
         ResponseResult::AssetChunk(value) => write_json(value),
         ResponseResult::DeviceCreated(value) => write_json(value),
@@ -250,6 +305,10 @@ fn error_code(code: ErrorCode) -> &'static str {
         ErrorCode::InvalidDocument => "invalid_document",
         ErrorCode::NotFound => "not_found",
         ErrorCode::Conflict => "conflict",
+        ErrorCode::RevisionConflict => "revision_conflict",
+        ErrorCode::IdempotencyConflict => "idempotency_conflict",
+        ErrorCode::StaleAttempt => "stale_attempt",
+        ErrorCode::ReviewStateConflict => "review_state_conflict",
         ErrorCode::Busy => "busy",
         ErrorCode::Internal => "internal",
     }
@@ -261,4 +320,52 @@ enum RunError {
     Client(#[from] CliError),
     #[error("protocol request failed")]
     Protocol(ProtocolError),
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::{Cli, command_request, correlation_id};
+    use gnosis_core::protocol::Request;
+
+    #[test]
+    fn review_mutation_command_requires_durable_operation_identity() {
+        let cli = Cli::try_parse_from([
+            "gnosis",
+            "--socket",
+            "/tmp/gnosis.sock",
+            "review-attempt-set-accepted",
+            "attempt",
+            "--operation-id",
+            "operation",
+            "--expected-revision",
+            "7",
+            "--accepted-success",
+            "false",
+        ])
+        .unwrap();
+
+        let request = command_request(cli.command).unwrap();
+        assert!(matches!(
+            request,
+            Request::ReviewAttemptAcceptanceSetV2 {
+                operation_version: 1,
+                operation_id,
+                attempt_id,
+                expected_attempt_revision: 7,
+                accepted_success: false,
+            } if operation_id == "operation" && attempt_id == "attempt"
+        ));
+    }
+
+    #[test]
+    fn correlation_ids_are_fresh_and_not_operation_ids() {
+        let first = correlation_id();
+        let second = correlation_id();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("gnosis-cli-"));
+        assert!(first.len() <= gnosis_core::protocol::MAX_REQUEST_ID_LEN);
+    }
 }

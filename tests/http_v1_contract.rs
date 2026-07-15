@@ -1,6 +1,7 @@
 use gnosis_core::protocol::http_v1::{
     ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1,
-    ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
+    ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
+    ReviewAttemptStateResponseV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -109,4 +110,93 @@ fn public_capability_and_error_dtos_preserve_http_shapes() {
         "meta":{"snapshot_url":"/v1/sync/snapshot"}
     }});
     assert!(serde_json::from_value::<ApiErrorResponseV1>(mismatched).is_err());
+}
+
+#[test]
+fn public_review_operation_dtos_preserve_strict_v1_shapes() {
+    let acceptance = json!({
+        "version":1,
+        "operation_id":"operation",
+        "expected_attempt_revision":2,
+        "accepted_success":false
+    });
+    let suspension = json!({
+        "version":1,
+        "operation_id":"suspension",
+        "expected_attempt_revision":3,
+        "desired_suspended":true
+    });
+    let result = review_attempt_result();
+
+    let acceptance_dto: SetAcceptedSuccessRequestV1 =
+        serde_json::from_value(acceptance.clone()).unwrap();
+    let suspension_dto: SetSuspensionRequestV1 =
+        serde_json::from_value(suspension.clone()).unwrap();
+    let result_dto: ReviewAttemptOperationResponseV1 =
+        serde_json::from_value(result.clone()).unwrap();
+
+    assert_eq!(serde_json::to_value(acceptance_dto).unwrap(), acceptance);
+    assert_eq!(serde_json::to_value(suspension_dto).unwrap(), suspension);
+    assert_eq!(serde_json::to_value(result_dto).unwrap(), result);
+
+    let mut future = acceptance;
+    future["future"] = json!(true);
+    assert!(serde_json::from_value::<SetAcceptedSuccessRequestV1>(future).is_err());
+}
+
+#[test]
+fn public_review_state_dto_is_a_recovery_projection() {
+    let operation = review_attempt_result();
+    let state = json!({
+        "version":1,
+        "attempt_revision":operation["attempt_revision"].clone(),
+        "attempt":operation["attempt"].clone()
+    });
+
+    let state_dto: ReviewAttemptStateResponseV1 = serde_json::from_value(state.clone()).unwrap();
+
+    assert_eq!(serde_json::to_value(state_dto).unwrap(), state);
+}
+
+#[test]
+fn public_review_dtos_reject_unknown_attempt_discriminants() {
+    let mut unknown_kind = review_attempt_result();
+    unknown_kind["attempt"]["presentation"]["kind"] = json!("future");
+    assert!(serde_json::from_value::<ReviewAttemptOperationResponseV1>(unknown_kind).is_err());
+
+    let mut unknown_status = review_attempt_result();
+    unknown_status["attempt"]["status"] = json!("future");
+    assert!(serde_json::from_value::<ReviewAttemptOperationResponseV1>(unknown_status).is_err());
+}
+
+fn review_attempt_result() -> Value {
+    json!({
+        "version":1,
+        "operation_id":"operation",
+        "changed":true,
+        "attempt_revision":3,
+        "attempt":{
+            "attempt_id":"attempt",
+            "session_id":"session",
+            "thema_id":"thema",
+            "presentation":{
+                "kind":"basic",
+                "keimenon":"Question",
+                "hypothesis":[null],
+                "source_guid":null,
+                "review_image":null,
+                "tags":[]
+            },
+            "revealed_answer":["answer"],
+            "revealed_parathema":null,
+            "matcher_version":1,
+            "response":{"kind":"text","value":"answer"},
+            "detected_success":true,
+            "accepted_success":false,
+            "override_count":1,
+            "proposed_transition":null,
+            "desired_suspended":false,
+            "status":"graded"
+        }
+    })
 }

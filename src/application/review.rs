@@ -9,6 +9,8 @@ use crate::domain::{
 };
 
 const MAX_TOPIC_DEPTH: u32 = 32;
+const MAX_REVIEW_OPERATION_ID_BYTES: usize = 128;
+const MAX_PERSISTED_REVISION: u64 = i64::MAX as u64;
 pub(crate) const MAX_REVIEW_PACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -339,6 +341,151 @@ pub(crate) struct ReviewAttemptView {
     pub(crate) status: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReviewAttemptMutation {
+    AcceptedSuccess(bool),
+    Suspension(bool),
+}
+
+impl ReviewAttemptMutation {
+    pub(crate) const fn kind(self) -> &'static str {
+        match self {
+            Self::AcceptedSuccess(_) => "accepted_success_set",
+            Self::Suspension(_) => "suspension_set",
+        }
+    }
+
+    pub(crate) const fn desired_value(self) -> bool {
+        match self {
+            Self::AcceptedSuccess(value) | Self::Suspension(value) => value,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewAttemptOperation {
+    pub(crate) format_version: u32,
+    pub(crate) operation_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) expected_attempt_revision: u64,
+    pub(crate) mutation: ReviewAttemptMutation,
+}
+
+impl ReviewAttemptOperation {
+    pub(crate) fn new(
+        format_version: u32,
+        operation_id: String,
+        attempt_id: String,
+        expected_attempt_revision: u64,
+        mutation: ReviewAttemptMutation,
+    ) -> Result<Self, ReviewError> {
+        if format_version != 1
+            || !valid_review_operation_id(&operation_id)
+            || !valid_review_id(&attempt_id)
+            || expected_attempt_revision > MAX_PERSISTED_REVISION
+        {
+            return Err(ReviewError::Operation);
+        }
+        Ok(Self {
+            format_version,
+            operation_id,
+            attempt_id,
+            expected_attempt_revision,
+            mutation,
+        })
+    }
+}
+
+pub(crate) fn valid_review_operation_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value.len() <= MAX_REVIEW_OPERATION_ID_BYTES
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+}
+
+fn valid_review_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_REVIEW_OPERATION_ID_BYTES
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewOperationAuthority {
+    Local,
+    DeviceOwner(String),
+    DeviceAdministrator(String),
+}
+
+impl ReviewOperationAuthority {
+    pub(crate) fn device(device_id: String, administrative: bool) -> Self {
+        if administrative {
+            Self::DeviceAdministrator(device_id)
+        } else {
+            Self::DeviceOwner(device_id)
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::DeviceOwner(_) | Self::DeviceAdministrator(_) => "device",
+        }
+    }
+
+    pub(crate) fn device_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::DeviceOwner(device_id) | Self::DeviceAdministrator(device_id) => Some(device_id),
+        }
+    }
+
+    pub(crate) fn session_actor_device_id(&self) -> Option<&str> {
+        match self {
+            Self::DeviceOwner(device_id) => Some(device_id),
+            Self::Local | Self::DeviceAdministrator(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReviewAttemptOperationStatus {
+    Accepted,
+    RevisionConflict,
+    StaleAttempt,
+    StateConflict,
+}
+
+impl ReviewAttemptOperationStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::RevisionConflict => "revision_conflict",
+            Self::StaleAttempt => "stale_attempt",
+            Self::StateConflict => "state_conflict",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReviewAttemptOperationResult {
+    pub(crate) format_version: u32,
+    pub(crate) operation_id: String,
+    pub(crate) status: ReviewAttemptOperationStatus,
+    pub(crate) expected_attempt_revision: u64,
+    pub(crate) attempt_revision: u64,
+    pub(crate) changed: bool,
+    pub(crate) attempt: ReviewAttemptView,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReviewAttemptState {
+    pub(crate) attempt_revision: u64,
+    pub(crate) attempt: ReviewAttemptView,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReviewPackAsset {
@@ -664,13 +811,49 @@ pub(crate) enum ReviewError {
     Content,
     #[error("review clock settings are invalid")]
     Clock,
+    #[error("review attempt operation is invalid")]
+    Operation,
 }
 
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
 
-    use super::{ReviewSource, ReviewSourceKind, review_day_at};
+    use super::{
+        ReviewAttemptMutation, ReviewAttemptOperation, ReviewSource, ReviewSourceKind,
+        review_day_at,
+    };
+
+    #[test]
+    fn attempt_operations_reject_revisions_sqlite_cannot_store() {
+        assert!(
+            ReviewAttemptOperation::new(
+                1,
+                "operation".into(),
+                "attempt".into(),
+                u64::MAX,
+                ReviewAttemptMutation::Suspension(true),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attempt_operations_require_ascii_operation_ids() {
+        for operation_id in ["\0", "π", "-leading", "contains space"] {
+            assert!(
+                ReviewAttemptOperation::new(
+                    1,
+                    operation_id.into(),
+                    "attempt".into(),
+                    0,
+                    ReviewAttemptMutation::Suspension(true),
+                )
+                .is_err(),
+                "accepted {operation_id:?}"
+            );
+        }
+    }
 
     #[test]
     fn topic_sources_reject_unbounded_graph_depth() {

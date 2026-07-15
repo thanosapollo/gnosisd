@@ -11,6 +11,11 @@ use std::{borrow::Cow, collections::BTreeMap};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
+use crate::application::{
+    AnswerInput, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
+    TransitionSnapshot,
+};
+
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Server identity, durable cursor, and next device sequence used to bootstrap a replica.
@@ -242,6 +247,16 @@ impl ThemaKindV1 {
             Self::McCloze => "mc-cloze",
         }
     }
+
+    fn from_application(value: &str) -> Result<Self, ReviewAttemptWireError> {
+        match value {
+            "basic" => Ok(Self::Basic),
+            "cloze" => Ok(Self::Cloze),
+            "mcq" => Ok(Self::Mcq),
+            "mc-cloze" => Ok(Self::McCloze),
+            _ => Err(ReviewAttemptWireError::PresentationKind),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -421,6 +436,240 @@ pub struct ReviewStateV1 {
     pub gnosis_synolon: f64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetAcceptedSuccessRequestV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    )]
+    pub operation_id: String,
+    #[schemars(range(max = 9223372036854775807_u64))]
+    pub expected_attempt_revision: u64,
+    pub accepted_success: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetSuspensionRequestV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    )]
+    pub operation_id: String,
+    #[schemars(range(max = 9223372036854775807_u64))]
+    pub expected_attempt_revision: u64,
+    pub desired_suspended: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAttemptOperationResponseV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    )]
+    pub operation_id: String,
+    pub changed: bool,
+    pub attempt_revision: u64,
+    pub attempt: ReviewAttemptV1,
+}
+
+impl ReviewAttemptOperationResponseV1 {
+    pub(crate) fn from_application(
+        value: &ReviewAttemptOperationResult,
+    ) -> Result<Self, ReviewAttemptWireError> {
+        Ok(Self {
+            version: 1,
+            operation_id: value.operation_id.clone(),
+            changed: value.changed,
+            attempt_revision: value.attempt_revision,
+            attempt: ReviewAttemptV1::from_application(&value.attempt)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAttemptStateResponseV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub attempt_revision: u64,
+    pub attempt: ReviewAttemptV1,
+}
+
+impl ReviewAttemptStateResponseV1 {
+    pub(crate) fn from_application(
+        value: &ReviewAttemptState,
+    ) -> Result<Self, ReviewAttemptWireError> {
+        Ok(Self {
+            version: 1,
+            attempt_revision: value.attempt_revision,
+            attempt: ReviewAttemptV1::from_application(&value.attempt)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAttemptV1 {
+    pub attempt_id: String,
+    pub session_id: String,
+    pub thema_id: String,
+    pub presentation: ReviewPresentationV1,
+    pub revealed_answer: Option<Vec<String>>,
+    pub revealed_parathema: Option<String>,
+    pub matcher_version: u32,
+    pub response: Option<ReviewAnswerV1>,
+    pub detected_success: Option<bool>,
+    pub accepted_success: Option<bool>,
+    pub override_count: u32,
+    pub proposed_transition: Option<ReviewTransitionV1>,
+    pub desired_suspended: bool,
+    pub status: ReviewAttemptStatusV1,
+}
+
+impl ReviewAttemptV1 {
+    pub(crate) fn from_application(
+        value: &ReviewAttemptView,
+    ) -> Result<Self, ReviewAttemptWireError> {
+        let reveal = value.response.is_some();
+        Ok(Self {
+            attempt_id: value.attempt_id.clone(),
+            session_id: value.session_id.clone(),
+            thema_id: value.thema_id.clone(),
+            presentation: ReviewPresentationV1::from_application(value)?,
+            revealed_answer: reveal.then(|| value.presentation.answer.clone()),
+            revealed_parathema: reveal
+                .then(|| value.presentation.parathema.clone())
+                .flatten(),
+            matcher_version: value.matcher_version,
+            response: value.response.as_ref().map(ReviewAnswerV1::from),
+            detected_success: value.detected_success,
+            accepted_success: value.accepted_success,
+            override_count: value.override_count,
+            proposed_transition: value
+                .proposed_transition
+                .as_ref()
+                .map(ReviewTransitionV1::from),
+            desired_suspended: value.desired_suspended,
+            status: ReviewAttemptStatusV1::from_application(&value.status)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAttemptStatusV1 {
+    Pending,
+    Graded,
+    Committed,
+}
+
+impl ReviewAttemptStatusV1 {
+    fn from_application(value: &str) -> Result<Self, ReviewAttemptWireError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "graded" => Ok(Self::Graded),
+            "committed" => Ok(Self::Committed),
+            _ => Err(ReviewAttemptWireError::Status),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPresentationV1 {
+    pub kind: ThemaKindV1,
+    pub keimenon: String,
+    pub hypothesis: Vec<Option<String>>,
+    pub source_guid: Option<String>,
+    pub review_image: Option<String>,
+    pub tags: Vec<String>,
+}
+
+impl ReviewPresentationV1 {
+    fn from_application(value: &ReviewAttemptView) -> Result<Self, ReviewAttemptWireError> {
+        Ok(Self {
+            kind: ThemaKindV1::from_application(&value.presentation.kind)?,
+            keimenon: value.presentation.keimenon.clone(),
+            hypothesis: value.presentation.hypothesis.clone(),
+            source_guid: value.presentation.source_guid.clone(),
+            review_image: value.presentation.review_image.clone(),
+            tags: value.presentation.tags.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewAttemptWireError {
+    PresentationKind,
+    Status,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ReviewAnswerV1 {
+    Text(String),
+    Texts(Vec<String>),
+    Choice(String),
+}
+
+impl From<&AnswerInput> for ReviewAnswerV1 {
+    fn from(value: &AnswerInput) -> Self {
+        match value {
+            AnswerInput::Text(value) => Self::Text(value.clone()),
+            AnswerInput::Texts(value) => Self::Texts(value.clone()),
+            AnswerInput::Choice(value) => Self::Choice(value.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewTransitionV1 {
+    pub before: ReviewStateV1,
+    pub after: ReviewStateV1,
+    pub parameters: ParametersV1,
+    pub reviewed_at_us: u64,
+    pub review_day: u32,
+    pub success: bool,
+    pub first_review: bool,
+    pub elapsed_days: u32,
+    pub algorithm_interval_days: f64,
+    pub computed_interval_days: u32,
+    pub fuzz_delta: f64,
+}
+
+impl From<&TransitionSnapshot> for ReviewTransitionV1 {
+    fn from(value: &TransitionSnapshot) -> Self {
+        Self {
+            before: ReviewStateV1::from(&value.before),
+            after: ReviewStateV1::from(&value.after),
+            parameters: ParametersV1::from(&value.parameters),
+            reviewed_at_us: value.reviewed_at_us,
+            review_day: value.review_day,
+            success: value.success,
+            first_review: value.first_review,
+            elapsed_days: value.elapsed_days,
+            algorithm_interval_days: value.algorithm_interval_days,
+            computed_interval_days: value.computed_interval_days,
+            fuzz_delta: value.fuzz_delta,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiErrorCodeV1 {
@@ -446,6 +695,7 @@ pub enum ApiErrorCodeV1 {
     Busy,
     ActiveSession,
     StaleAttempt,
+    ReviewStateConflict,
     IdempotencyConflict,
     DeviceSequenceGap,
     BlobRequired,

@@ -21,15 +21,17 @@ use crate::{
     application::{
         ApplicationError, DueCursor, ImportDocument, ImportSummary, LegacyQueryError,
         PreparedImport, QueryDocument, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema,
-        ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError, generate_device,
+        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        ReviewAttemptOperationStatus, ReviewOperationAuthority, ServiceError, ServiceHandle,
+        ServiceRuntime, ServiceStartError, generate_device,
     },
     protocol::{
         ActiveReviewSessionView, AssetChunkView, BackupView, BackupsPrunedView, DeviceCreatedView,
         DeviceView, DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult,
-        LegacyInfoView, LocalReviewAttemptView, LocalReviewSessionView, MessageValidationError,
-        PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope, ResponseEnvelope,
-        ResponseResult, ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo,
-        ThemaView, frame,
+        LegacyInfoView, LocalReviewAttemptMutationV2, LocalReviewAttemptStateV2,
+        LocalReviewAttemptView, LocalReviewSessionView, MessageValidationError, PROTOCOL_VERSION,
+        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult,
+        ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo, ThemaView, frame,
     },
     store::StoreError,
 };
@@ -264,6 +266,43 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
         }
         Request::ReviewAttemptSuspensionToggle { attempt_id } => {
             toggle_review_suspension(state, attempt_id, id.clone(), request_sha256.clone()).await
+        }
+        Request::ReviewAttemptStateV2 { attempt_id } => {
+            review_attempt_state_v2(state, attempt_id).await
+        }
+        Request::ReviewAttemptAcceptanceSetV2 {
+            operation_version,
+            operation_id,
+            attempt_id,
+            expected_attempt_revision,
+            accepted_success,
+        } => {
+            apply_review_attempt_operation_v2(
+                state,
+                operation_version,
+                operation_id,
+                attempt_id,
+                expected_attempt_revision,
+                ReviewAttemptMutation::AcceptedSuccess(accepted_success),
+            )
+            .await
+        }
+        Request::ReviewAttemptSuspensionSetV2 {
+            operation_version,
+            operation_id,
+            attempt_id,
+            expected_attempt_revision,
+            desired_suspended,
+        } => {
+            apply_review_attempt_operation_v2(
+                state,
+                operation_version,
+                operation_id,
+                attempt_id,
+                expected_attempt_revision,
+                ReviewAttemptMutation::Suspension(desired_suspended),
+            )
+            .await
         }
         Request::ReviewAttemptCommit { attempt_id } => {
             commit_review_attempt(state, attempt_id).await
@@ -500,6 +539,80 @@ async fn toggle_review_suspension(
     Ok(ResponseResult::ReviewAttempt(Box::new(
         LocalReviewAttemptView::from(attempt),
     )))
+}
+
+async fn review_attempt_state_v2(
+    state: ServerState,
+    attempt_id: String,
+) -> Result<ResponseResult, ProtocolError> {
+    let attempt = state
+        .store
+        .review_attempt_state(attempt_id, None)
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::ReviewAttemptStateV2(Box::new(
+        LocalReviewAttemptStateV2::from(attempt),
+    )))
+}
+
+async fn apply_review_attempt_operation_v2(
+    state: ServerState,
+    operation_version: u32,
+    operation_id: String,
+    attempt_id: String,
+    expected_attempt_revision: u64,
+    mutation: ReviewAttemptMutation,
+) -> Result<ResponseResult, ProtocolError> {
+    let operation = ReviewAttemptOperation::new(
+        operation_version,
+        operation_id,
+        attempt_id,
+        expected_attempt_revision,
+        mutation,
+    )
+    .map_err(|_| invalid_review())?;
+    let result = state
+        .store
+        .apply_review_attempt_operation(
+            operation,
+            ReviewOperationAuthority::Local,
+            review_now_us()?,
+        )
+        .await
+        .map_err(attempt_operation_error)?;
+    desired_review_operation_result(result)
+}
+
+fn desired_review_operation_result(
+    result: ReviewAttemptOperationResult,
+) -> Result<ResponseResult, ProtocolError> {
+    match result.status {
+        ReviewAttemptOperationStatus::Accepted => Ok(ResponseResult::ReviewAttemptMutationV2(
+            Box::new(LocalReviewAttemptMutationV2::from(result)),
+        )),
+        ReviewAttemptOperationStatus::RevisionConflict => Err(ProtocolError::new(
+            ErrorCode::RevisionConflict,
+            "review attempt revision changed",
+        )),
+        ReviewAttemptOperationStatus::StaleAttempt => Err(ProtocolError::new(
+            ErrorCode::StaleAttempt,
+            "thema content or review state changed",
+        )),
+        ReviewAttemptOperationStatus::StateConflict => Err(ProtocolError::new(
+            ErrorCode::ReviewStateConflict,
+            "review attempt is not mutable",
+        )),
+    }
+}
+
+fn attempt_operation_error(error: ServiceError) -> ProtocolError {
+    match error {
+        ServiceError::Store(StoreError::IdempotencyConflict) => ProtocolError::new(
+            ErrorCode::IdempotencyConflict,
+            "operation identity was reused with different content",
+        ),
+        other => actor_error(other),
+    }
 }
 
 async fn commit_review_attempt(

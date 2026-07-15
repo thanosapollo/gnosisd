@@ -44,10 +44,12 @@ pub use query_legacy::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, Q
 pub(crate) use review::{
     AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,
     OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot,
-    PresentationSnapshot, ReconciliationStatus, ReviewAttemptView, ReviewError, ReviewPackAsset,
-    ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource,
-    ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation,
-    presentation_content, review_day_at,
+    PresentationSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
+    ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
+    ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
+    ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
+    ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation, presentation_content,
+    review_day_at, valid_review_operation_id,
 };
 pub(crate) use service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError};
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};

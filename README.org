@@ -46,6 +46,11 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" legacy-info
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   device-create phone --scope read --scope review
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  review-attempt-state ATTEMPT
+gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  review-attempt-set-accepted ATTEMPT --operation-id OPERATION \
+  --expected-revision 1 --accepted-success false
 #+end_src
 
 The Unix message format is a four-byte big-endian length followed by UTF-8
@@ -53,7 +58,11 @@ JSON. It is the privileged local and administrative transport. It provides
 local diagnostics, legacy read compatibility, online review sessions and
 attempts, bounded managed-asset reads, device token administration, and online
 backup commands. Stable errors never expose SQL, paths, dependency failures,
-or backtraces.
+or backtraces. Request envelope IDs correlate one response. Desired review
+mutations use a separate caller-owned operation ID that must be retained across
+retries and process restarts. Its idempotency namespace belongs to that device
+or to the privileged local Unix actor, so clients cannot reserve each other's
+operation IDs.
 
 * HTTP API
 
@@ -77,17 +86,23 @@ Revisioned content and settings updates use ~If-Match~. A stale revision
 returns ~412~ with the current revision and leaves server state unchanged.
 Sequenced offline mutations instead use immutable operation IDs and contiguous
 device sequence numbers. Review answer and commit retries use retained attempt
-state. The current override and suspension toggle endpoints must not be retried
-after an ambiguous transport failure.
+state. Clients recover an attempt and its revision with
+~GET /v1/review/attempts/{id}~. They set correctness or suspension through
+~PUT /v1/review/attempts/{id}/accepted-success~ and
+~PUT /v1/review/attempts/{id}/suspension~ using a durable operation ID and
+expected attempt revision. Exact retries return the retained result. The
+legacy ~POST~ override and suspension toggles remain available but must not be
+retried after an ambiguous transport failure.
 
 The first attempt response hides the answer. Grading returns the detected
 result, revealed answer, matcher version, and proposed transition.
 
-The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap
-and stable error schemas are generated from the public Rust DTOs in
-~protocol::http_v1~, including exact cursor parameters, status sets, bearer
-security, and required ~read~ scope. The remaining endpoints are still a
-route-level catalogue and are not yet a complete client-generation contract.
+The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
+review attempt operations, and stable error schemas are generated from the
+public Rust DTOs in ~protocol::http_v1~, including exact bodies, responses,
+status sets, bearer security, and required scopes. The remaining endpoints are
+still a route-level catalogue and are not yet a complete client-generation
+contract.
 CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
 network boundary.
 
@@ -99,12 +114,14 @@ events.
 
 * Storage
 
-Schema v9 stores native themata, tags, node associations, scheduling state,
+Schema v11 stores native themata, tags, node associations, scheduling state,
 exact review history, sessions, attempts, devices, settings, documents, and
 the node graph. It also stores replica snapshots and feed revisions, review
 packs, immutable offline operations and results, device sequence state, and
-conflict evidence. Public IDs are opaque text. Imported numeric thema IDs are
-retained and new resources use UUIDv7.
+conflict evidence. Review attempts carry a monotonic mutation revision and an
+immutable journal of accepted or conflicting desired-state operations. Public
+IDs are opaque text. Imported numeric thema IDs are retained and new resources
+use UUIDv7.
 
 Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
 tracks logical paths, heads, revisions, renames, tombstones, and the monotonic

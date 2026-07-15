@@ -47,7 +47,9 @@ const DOCUMENT_ASSET_INTEGRITY_MIGRATION: &str =
     include_str!("migrations/0008_document_asset_integrity.sql");
 const OFFLINE_ASSET_PUT_MIGRATION: &str = include_str!("migrations/0009_offline_asset_put.sql");
 const LOCAL_REVIEW_REPLAY_MIGRATION: &str = include_str!("migrations/0010_local_review_replay.sql");
-const SCHEMA_VERSION: u32 = 10;
+const REVIEW_ATTEMPT_OPERATION_MIGRATION: &str =
+    include_str!("migrations/0011_review_attempt_operations.sql");
+const SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -3260,6 +3262,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             .execute_batch(LOCAL_REVIEW_REPLAY_MIGRATION)
             .map_err(StoreError::storage)?;
     }
+    if found < 11 {
+        connection
+            .execute_batch(REVIEW_ATTEMPT_OPERATION_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
     Ok(())
 }
 
@@ -4653,9 +4660,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        FailPoint, INITIAL_MIGRATION, OFFLINE_CONTENT_MIGRATION, OFFLINE_REVIEW_MIGRATION,
-        REMOTE_REVIEW_MIGRATION, REPLICA_SYNC_MIGRATION, SCHEMA_VERSION, SERVER_MIGRATION,
-        SqliteStore, StoreError, migrate, schema_version,
+        DOCUMENT_ASSET_INTEGRITY_MIGRATION, FailPoint, INITIAL_MIGRATION,
+        LOCAL_REVIEW_REPLAY_MIGRATION, OFFLINE_ASSET_PUT_MIGRATION, OFFLINE_CONTENT_MIGRATION,
+        OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION,
+        REPLICA_SYNC_MIGRATION, SCHEMA_VERSION, SERVER_MIGRATION, SqliteStore, StoreError, migrate,
+        schema_version,
     };
     use crate::application::{
         AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentMutation,
@@ -4871,6 +4880,178 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}.{column}");
         }
+    }
+
+    #[test]
+    fn upgrades_schema_v10_for_review_attempt_operations() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        for migration in [
+            INITIAL_MIGRATION,
+            SERVER_MIGRATION,
+            REMOTE_REVIEW_MIGRATION,
+            OFFLINE_REVIEW_MIGRATION,
+            REPLICA_SYNC_MIGRATION,
+            OFFLINE_CONTENT_MIGRATION,
+            OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION,
+            DOCUMENT_ASSET_INTEGRITY_MIGRATION,
+            OFFLINE_ASSET_PUT_MIGRATION,
+            LOCAL_REVIEW_REPLAY_MIGRATION,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        assert_eq!(schema_version(&connection).unwrap(), 10);
+        insert_v10_review_replay(&connection);
+
+        migrate(&connection).unwrap();
+
+        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert!(schema_column_exists(
+            &connection,
+            "review_attempt",
+            "mutation_revision"
+        ));
+        assert!(schema_table_exists(&connection, "review_attempt_operation"));
+        let revision: u64 = connection
+            .query_row(
+                "SELECT mutation_revision FROM review_attempt WHERE attempt_id = 'attempt'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 0);
+        let replay: String = connection
+            .query_row(
+                "SELECT result_json FROM local_review_replay WHERE request_id = 'legacy-request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&replay).unwrap()["attempt_id"],
+            "attempt"
+        );
+        assert_review_operation_is_immutable(&connection);
+        let mut store = SqliteStore { connection };
+        let replayed = store
+            .override_local_review_attempt("attempt", None, "legacy-request", &"b".repeat(64), 3)
+            .unwrap();
+        assert_eq!(replayed.attempt_id, "attempt");
+    }
+
+    fn insert_v10_review_replay(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "INSERT INTO thema(thema_id) VALUES ('thema');
+                 INSERT INTO review_session(
+                     session_id, source_kind, source_json, timezone, day_boundary_hour,
+                     scheduler_json, status, started_at_us
+                 ) VALUES ('session', 'manual', '{}', 'UTC', 0, '{}', 'active', 1);
+                 INSERT INTO review_session_item(session_id, position, thema_id)
+                 VALUES ('session', 0, 'thema');
+                 INSERT INTO review_attempt(
+                     attempt_id, session_id, session_position, thema_id, state_revision,
+                     content_sha256, presentation_json, matcher_version, desired_suspended,
+                     status, started_at_us
+                 ) VALUES (
+                     'attempt', 'session', 0, 'thema', 0,
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     '{}', 1, 0, 'pending', 1
+                 );
+                 ",
+            )
+            .unwrap();
+        let result = serde_json::json!({
+            "attempt_id":"attempt",
+            "session_id":"session",
+            "thema_id":"thema",
+            "presentation":{
+                "kind":"basic", "keimenon":"Question", "hypothesis":[], "answer":[],
+                "source_guid":null, "parathema":null, "review_image":null, "tags":[]
+            },
+            "matcher_version":1,
+            "response":null,
+            "detected_success":null,
+            "accepted_success":null,
+            "override_count":0,
+            "proposed_transition":null,
+            "desired_suspended":false,
+            "status":"pending"
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO local_review_replay(
+                     request_id, request_sha256, attempt_id, action, result_json, created_at_us
+                 ) VALUES ('legacy-request', ?1, 'attempt', 'override', ?2, 1)",
+                rusqlite::params!["b".repeat(64), result],
+            )
+            .unwrap();
+    }
+
+    fn assert_review_operation_is_immutable(connection: &rusqlite::Connection) {
+        connection
+            .execute(
+                "INSERT INTO review_attempt_operation(
+                     operation_id, format_version, actor_kind, attempt_id, operation_kind,
+                     expected_revision, desired_value, payload_sha256, payload_json,
+                     result_kind, result_json, created_at_us
+                 ) VALUES ('operation', 1, 'local', 'attempt', 'suspension_set', 0, 1,
+                     ?1, '{}', 'accepted', '{}', 2)",
+                ["c".repeat(64)],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE review_attempt_operation SET result_json = 'changed'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM review_attempt_operation", [])
+                .is_err()
+        );
+        for operation_id in ["\0", "a\0x", "π", "-leading", "contains space"] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO review_attempt_operation(
+                         operation_id, format_version, actor_kind, attempt_id, operation_kind,
+                         expected_revision, desired_value, payload_sha256, payload_json,
+                         result_kind, result_json, created_at_us
+                         ) VALUES (?1, 1, 'local', 'attempt', 'suspension_set', 0, 1,
+                         ?2, '{}', 'accepted', '{}', 3)",
+                        rusqlite::params![operation_id, "d".repeat(64)],
+                    )
+                    .is_err(),
+                "accepted {operation_id:?}"
+            );
+        }
+    }
+
+    fn schema_column_exists(connection: &rusqlite::Connection, table: &str, column: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                [table, column],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn schema_table_exists(connection: &rusqlite::Connection, table: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     #[test]

@@ -14,9 +14,11 @@ use crate::{
     application::{
         AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineConflictReason, OfflineReviewOperation,
         OfflineReviewResult, ParametersSnapshot, PresentationSnapshot, ReconciliationStatus,
-        ReviewAttemptView, ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode,
-        ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
-        presentation_content, review_day_at, validate_offline_thema_assets,
+        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        ReviewAttemptOperationStatus, ReviewAttemptState, ReviewAttemptView,
+        ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
+        ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot,
+        TransitionSnapshot, presentation_content, review_day_at, validate_offline_thema_assets,
     },
     domain::{GradeError, MATCHER_VERSION, compute_transition, fuzz_delta, grade},
 };
@@ -29,6 +31,20 @@ struct LocalReviewReplay<'a> {
     action: &'a str,
     created_at_us: u64,
 }
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAttemptOperationPayload<'a> {
+    format_version: u32,
+    operation_id: &'a str,
+    attempt_id: &'a str,
+    expected_attempt_revision: u64,
+    mutation: ReviewAttemptMutation,
+}
+
+const ATTEMPT_OPERATION_REPLAY_SQL: &str =
+    "SELECT payload_sha256, result_json FROM review_attempt_operation
+     WHERE operation_id = ?1 AND actor_kind = ?2 AND actor_device_id IS ?3";
 
 impl SqliteStore {
     pub(crate) fn create_review_session(
@@ -391,7 +407,8 @@ impl SqliteStore {
             .execute(
                 "UPDATE review_attempt SET response_json = ?2, detected_success = ?3,
                  accepted_success = ?3, proposed_transition_json = ?4, fuzz_sample = ?5,
-                 status = 'graded', answered_at_us = ?6 WHERE attempt_id = ?1",
+                 status = 'graded', answered_at_us = ?6,
+                 mutation_revision = mutation_revision + 1 WHERE attempt_id = ?1",
                 params![
                     attempt_id,
                     serde_json::to_string(response).map_err(StoreError::storage)?,
@@ -494,6 +511,45 @@ impl SqliteStore {
         )?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(attempt)
+    }
+
+    pub(crate) fn apply_review_attempt_operation(
+        &mut self,
+        operation: &ReviewAttemptOperation,
+        authority: &ReviewOperationAuthority,
+        operated_at_us: u64,
+    ) -> Result<ReviewAttemptOperationResult, StoreError> {
+        let payload = canonical_attempt_operation(operation)?;
+        let digest = format!("{:x}", Sha256::digest(payload.as_bytes()));
+        let transaction = self.write_transaction()?;
+        let result = reconcile_attempt_operation(
+            &transaction,
+            operation,
+            authority,
+            &payload,
+            &digest,
+            operated_at_us,
+        )?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(result)
+    }
+
+    pub(crate) fn review_attempt_state(
+        &self,
+        attempt_id: &str,
+        actor_device_id: Option<&str>,
+    ) -> Result<ReviewAttemptState, StoreError> {
+        let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
+        require_session_actor(
+            &self.connection,
+            &row.session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
+        Ok(ReviewAttemptState {
+            attempt_revision: row.mutation_revision,
+            attempt: load_attempt(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?,
+        })
     }
 
     pub(crate) fn commit_review_attempt(
@@ -918,6 +974,7 @@ fn offline_attempt_row(
         transition: Some(transition),
         desired_suspended: operation.desired_suspended,
         status: "graded".into(),
+        mutation_revision: 0,
     }
 }
 
@@ -1985,6 +2042,7 @@ struct AttemptRow {
     transition: Option<TransitionSnapshot>,
     desired_suspended: bool,
     status: String,
+    mutation_revision: u64,
 }
 
 fn load_attempt_row(
@@ -1996,7 +2054,7 @@ fn load_attempt_row(
             "SELECT attempt_id, session_id, thema_id, thema_revision, state_revision, content_sha256,
                 presentation_json, parameters_json, matcher_version, response_json, detected_success,
                 accepted_success, override_count, fuzz_sample, proposed_transition_json,
-                desired_suspended, status
+                desired_suspended, status, mutation_revision
          FROM review_attempt WHERE attempt_id = ?1",
             [attempt_id],
             |row| {
@@ -2018,6 +2076,7 @@ fn load_attempt_row(
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, bool>(15)?,
                     row.get::<_, String>(16)?,
+                    row.get::<_, i64>(17)?,
                 ))
             },
         )
@@ -2044,6 +2103,7 @@ type RawAttemptRow = (
     Option<String>,
     bool,
     String,
+    i64,
 );
 
 fn materialize_attempt_row(row: RawAttemptRow) -> Result<AttemptRow, StoreError> {
@@ -2073,6 +2133,7 @@ fn materialize_attempt_row(row: RawAttemptRow) -> Result<AttemptRow, StoreError>
             .map_err(StoreError::storage)?,
         desired_suspended: row.15,
         status: row.16,
+        mutation_revision: to_u64(row.17, "attempt mutation revision")?,
     })
 }
 
@@ -2110,7 +2171,8 @@ fn override_review_attempt_in(
     connection
         .execute(
             "UPDATE review_attempt SET accepted_success = ?2,
-             override_count = override_count + 1, proposed_transition_json = ?3
+             override_count = override_count + 1, proposed_transition_json = ?3,
+             mutation_revision = mutation_revision + 1
              WHERE attempt_id = ?1",
             params![
                 attempt_id,
@@ -2137,7 +2199,8 @@ fn toggle_attempt_suspension_in(
     )?;
     let changed = connection
         .execute(
-            "UPDATE review_attempt SET desired_suspended = 1 - desired_suspended
+            "UPDATE review_attempt SET desired_suspended = 1 - desired_suspended,
+             mutation_revision = mutation_revision + 1
              WHERE attempt_id = ?1 AND status IN ('pending', 'graded')",
             [attempt_id],
         )
@@ -2203,6 +2266,304 @@ fn insert_local_review_replay(
                 action,
                 serde_json::to_string(attempt).map_err(StoreError::storage)?,
                 u64_to_i64(created_at_us, "local replay timestamp")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn canonical_attempt_operation(operation: &ReviewAttemptOperation) -> Result<String, StoreError> {
+    serde_json::to_string(&StoredAttemptOperationPayload {
+        format_version: operation.format_version,
+        operation_id: &operation.operation_id,
+        attempt_id: &operation.attempt_id,
+        expected_attempt_revision: operation.expected_attempt_revision,
+        mutation: operation.mutation,
+    })
+    .map_err(StoreError::storage)
+}
+
+fn reconcile_attempt_operation(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    authority: &ReviewOperationAuthority,
+    payload: &str,
+    digest: &str,
+    operated_at_us: u64,
+) -> Result<ReviewAttemptOperationResult, StoreError> {
+    if let Some(result) = replayed_attempt_operation(connection, operation, authority, digest)? {
+        return Ok(result);
+    }
+    let result =
+        apply_new_attempt_operation(connection, operation, authority.session_actor_device_id())?;
+    insert_attempt_operation(
+        connection,
+        operation,
+        authority,
+        payload,
+        digest,
+        &result,
+        operated_at_us,
+    )?;
+    Ok(result)
+}
+
+fn replayed_attempt_operation(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    actor: &ReviewOperationAuthority,
+    payload_sha256: &str,
+) -> Result<Option<ReviewAttemptOperationResult>, StoreError> {
+    let stored = connection
+        .query_row(
+            ATTEMPT_OPERATION_REPLAY_SQL,
+            params![operation.operation_id, actor.kind(), actor.device_id()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    let Some((digest, result_json)) = stored else {
+        return Ok(None);
+    };
+    if digest != payload_sha256 {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    serde_json::from_str(&result_json)
+        .map(Some)
+        .map_err(StoreError::storage)
+}
+
+fn apply_new_attempt_operation(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    actor_device_id: Option<&str>,
+) -> Result<ReviewAttemptOperationResult, StoreError> {
+    let row = load_attempt_row(connection, &operation.attempt_id)?.ok_or(StoreError::NotFound)?;
+    require_session_actor(
+        connection,
+        &row.session_id,
+        actor_device_id,
+        ReviewSessionMode::Online,
+    )?;
+    if let Some(status) = attempt_operation_conflict(connection, operation, &row)? {
+        return attempt_operation_result(
+            connection,
+            operation,
+            status,
+            row.mutation_revision,
+            false,
+        );
+    }
+    let changed = apply_attempt_mutation(connection, operation, &row)?;
+    let revision = row
+        .mutation_revision
+        .checked_add(1)
+        .ok_or(StoreError::CorruptData {
+            field: "attempt mutation revision",
+        })?;
+    attempt_operation_result(
+        connection,
+        operation,
+        ReviewAttemptOperationStatus::Accepted,
+        revision,
+        changed,
+    )
+}
+
+fn attempt_operation_conflict(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    row: &AttemptRow,
+) -> Result<Option<ReviewAttemptOperationStatus>, StoreError> {
+    if row.mutation_revision != operation.expected_attempt_revision {
+        return Ok(Some(ReviewAttemptOperationStatus::RevisionConflict));
+    }
+    if !attempt_mutation_allowed(row, operation.mutation) {
+        return Ok(Some(ReviewAttemptOperationStatus::StateConflict));
+    }
+    match verify_live_attempt(connection, row) {
+        Ok(()) => Ok(None),
+        Err(StoreError::StaleAttempt) => Ok(Some(ReviewAttemptOperationStatus::StaleAttempt)),
+        Err(StoreError::InvalidReviewState) => {
+            Ok(Some(ReviewAttemptOperationStatus::StateConflict))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn attempt_mutation_allowed(row: &AttemptRow, mutation: ReviewAttemptMutation) -> bool {
+    match mutation {
+        ReviewAttemptMutation::AcceptedSuccess(_) => row.status == "graded",
+        ReviewAttemptMutation::Suspension(_) => matches!(row.status.as_str(), "pending" | "graded"),
+    }
+}
+
+fn apply_attempt_mutation(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    row: &AttemptRow,
+) -> Result<bool, StoreError> {
+    match operation.mutation {
+        ReviewAttemptMutation::AcceptedSuccess(value) => {
+            set_attempt_accepted_success(connection, row, value)
+        }
+        ReviewAttemptMutation::Suspension(value) => set_attempt_suspension(connection, row, value),
+    }
+}
+
+fn set_attempt_accepted_success(
+    connection: &Connection,
+    row: &AttemptRow,
+    accepted: bool,
+) -> Result<bool, StoreError> {
+    let current = row.accepted_success.ok_or(StoreError::InvalidReviewState)?;
+    if current == accepted {
+        advance_attempt_revision(connection, row)?;
+        return Ok(false);
+    }
+    let previous = row
+        .transition
+        .as_ref()
+        .ok_or(StoreError::InvalidReviewState)?;
+    let state = load_review_state(connection, &row.thema_id)?;
+    let transition = transition_with_sample(
+        &state,
+        &row.parameters.clone().into(),
+        accepted,
+        previous.review_day,
+        previous.reviewed_at_us,
+        row.fuzz_sample.ok_or(StoreError::InvalidReviewState)?,
+    )?;
+    update_attempt_acceptance(connection, row, accepted, &transition)?;
+    Ok(true)
+}
+
+fn update_attempt_acceptance(
+    connection: &Connection,
+    row: &AttemptRow,
+    accepted: bool,
+    transition: &crate::domain::Transition,
+) -> Result<(), StoreError> {
+    let changed = connection
+        .execute(
+            "UPDATE review_attempt SET accepted_success = ?2,
+             override_count = override_count + 1, proposed_transition_json = ?3,
+             mutation_revision = mutation_revision + 1
+             WHERE attempt_id = ?1 AND mutation_revision = ?4",
+            params![
+                row.attempt_id,
+                i64::from(accepted),
+                serde_json::to_string(&TransitionSnapshot::from(transition))
+                    .map_err(StoreError::storage)?,
+                u64_to_i64(row.mutation_revision, "attempt mutation revision")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    require_attempt_updated(connection, row, changed)
+}
+
+fn set_attempt_suspension(
+    connection: &Connection,
+    row: &AttemptRow,
+    suspended: bool,
+) -> Result<bool, StoreError> {
+    let changed_value = row.desired_suspended != suspended;
+    let changed = connection
+        .execute(
+            "UPDATE review_attempt SET desired_suspended = ?2,
+             mutation_revision = mutation_revision + 1
+             WHERE attempt_id = ?1 AND mutation_revision = ?3",
+            params![
+                row.attempt_id,
+                i64::from(suspended),
+                u64_to_i64(row.mutation_revision, "attempt mutation revision")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    require_attempt_updated(connection, row, changed)?;
+    Ok(changed_value)
+}
+
+fn advance_attempt_revision(connection: &Connection, row: &AttemptRow) -> Result<(), StoreError> {
+    let changed = connection
+        .execute(
+            "UPDATE review_attempt SET mutation_revision = mutation_revision + 1
+             WHERE attempt_id = ?1 AND mutation_revision = ?2",
+            params![
+                row.attempt_id,
+                u64_to_i64(row.mutation_revision, "attempt mutation revision")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    require_attempt_updated(connection, row, changed)
+}
+
+fn require_attempt_updated(
+    connection: &Connection,
+    row: &AttemptRow,
+    changed: usize,
+) -> Result<(), StoreError> {
+    if changed == 1 {
+        return Ok(());
+    }
+    Err(StoreError::Conflict {
+        expected: row.mutation_revision,
+        actual: load_attempt_row(connection, &row.attempt_id)?
+            .map(|attempt| attempt.mutation_revision),
+    })
+}
+
+fn attempt_operation_result(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    status: ReviewAttemptOperationStatus,
+    attempt_revision: u64,
+    changed: bool,
+) -> Result<ReviewAttemptOperationResult, StoreError> {
+    Ok(ReviewAttemptOperationResult {
+        format_version: 1,
+        operation_id: operation.operation_id.clone(),
+        status,
+        expected_attempt_revision: operation.expected_attempt_revision,
+        attempt_revision,
+        changed,
+        attempt: load_attempt(connection, &operation.attempt_id)?.ok_or(StoreError::NotFound)?,
+    })
+}
+
+fn insert_attempt_operation(
+    connection: &Connection,
+    operation: &ReviewAttemptOperation,
+    actor: &ReviewOperationAuthority,
+    payload_json: &str,
+    payload_sha256: &str,
+    result: &ReviewAttemptOperationResult,
+    created_at_us: u64,
+) -> Result<(), StoreError> {
+    connection
+        .execute(
+            "INSERT INTO review_attempt_operation(
+             operation_id, format_version, actor_kind, actor_device_id, attempt_id,
+             operation_kind, expected_revision, desired_value, payload_sha256,
+             payload_json, result_kind, result_json, created_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                operation.operation_id,
+                operation.format_version,
+                actor.kind(),
+                actor.device_id(),
+                operation.attempt_id,
+                operation.mutation.kind(),
+                u64_to_i64(
+                    operation.expected_attempt_revision,
+                    "expected attempt revision"
+                )?,
+                i64::from(operation.mutation.desired_value()),
+                payload_sha256,
+                payload_json,
+                result.status.as_str(),
+                serde_json::to_string(result).map_err(StoreError::storage)?,
+                u64_to_i64(created_at_us, "review operation timestamp")?,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -2418,10 +2779,19 @@ fn finish_attempt(
     _event_id: &str,
     committed_at_us: u64,
 ) -> Result<(), StoreError> {
-    transaction.execute(
-        "UPDATE review_attempt SET status = 'committed', committed_at_us = ?2 WHERE attempt_id = ?1",
-        params![row.attempt_id, u64_to_i64(committed_at_us, "commit timestamp")?],
-    ).map_err(StoreError::storage)?;
+    let changed = transaction
+        .execute(
+            "UPDATE review_attempt SET status = 'committed', committed_at_us = ?2,
+             mutation_revision = mutation_revision + 1
+             WHERE attempt_id = ?1 AND mutation_revision = ?3",
+            params![
+                row.attempt_id,
+                u64_to_i64(committed_at_us, "commit timestamp")?,
+                u64_to_i64(row.mutation_revision, "attempt mutation revision")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    require_attempt_updated(transaction, row, changed)?;
     transaction
         .execute(
             "UPDATE review_session_item SET completed_attempt_id = ?3
@@ -2484,11 +2854,15 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{MAX_REVIEW_PACK_ITEMS, SqliteStore, load_offline_result, load_review_pack};
+    use super::{
+        ATTEMPT_OPERATION_REPLAY_SQL, MAX_REVIEW_PACK_ITEMS, SqliteStore, load_offline_result,
+        load_review_pack,
+    };
     use crate::application::{
         AnswerInput, OfflineConflictReason, OfflineReviewOperation, ReconciliationStatus,
-        ReviewSource, ReviewSourceKind, generate_device, prepare_thema, presentation_content,
-        review_day_at, thema_content,
+        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationStatus,
+        ReviewOperationAuthority, ReviewSource, ReviewSourceKind, generate_device, prepare_thema,
+        presentation_content, review_day_at, thema_content,
     };
     use crate::store::sqlite::{
         INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION, SERVER_MIGRATION,
@@ -3504,5 +3878,351 @@ mod tests {
                 .unwrap()
                 .suspended
         );
+    }
+
+    #[test]
+    fn online_attempt_mutations_advance_one_revision() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let session = store
+            .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_000)
+            .unwrap();
+        let attempt = store
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
+            .unwrap();
+
+        store
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                1_752_600_000_001_000,
+                0.0,
+            )
+            .unwrap();
+        assert_eq!(attempt_revision(&store, &attempt.attempt_id), 1);
+
+        store
+            .override_review_attempt(&attempt.attempt_id, None)
+            .unwrap();
+        assert_eq!(attempt_revision(&store, &attempt.attempt_id), 2);
+
+        store
+            .toggle_attempt_suspension(&attempt.attempt_id, None)
+            .unwrap();
+        assert_eq!(attempt_revision(&store, &attempt.attempt_id), 3);
+
+        store
+            .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_002_000)
+            .unwrap();
+        assert_eq!(attempt_revision(&store, &attempt.attempt_id), 4);
+    }
+
+    #[test]
+    fn desired_acceptance_operation_replays_without_mutating_twice() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let session = store
+            .create_review_session(&manual_source("thema"), None, None, 1_752_600_000_000_000)
+            .unwrap();
+        let attempt = store
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_000_001)
+            .unwrap();
+        store
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                1_752_600_000_001_000,
+                0.0,
+            )
+            .unwrap();
+        let operation = ReviewAttemptOperation::new(
+            1,
+            "operation-1".into(),
+            attempt.attempt_id.clone(),
+            1,
+            ReviewAttemptMutation::AcceptedSuccess(false),
+        )
+        .unwrap();
+
+        let first = store
+            .apply_review_attempt_operation(
+                &operation,
+                &ReviewOperationAuthority::Local,
+                1_752_600_000_002_000,
+            )
+            .unwrap();
+        let replay = store
+            .apply_review_attempt_operation(
+                &operation,
+                &ReviewOperationAuthority::Local,
+                1_752_600_000_003_000,
+            )
+            .unwrap();
+
+        assert_eq!(first, replay);
+        assert_eq!(first.status, ReviewAttemptOperationStatus::Accepted);
+        assert!(first.changed);
+        assert_eq!(first.attempt_revision, 2);
+        assert_eq!(first.attempt.accepted_success, Some(false));
+        assert_eq!(first.attempt.override_count, 1);
+        assert_eq!(attempt_revision(&store, &attempt.attempt_id), 2);
+    }
+
+    #[test]
+    fn no_op_consumes_revision_and_competing_operation_is_retained() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let attempt_id = graded_online_attempt(&mut store);
+        let no_op = attempt_operation(
+            "no-op",
+            &attempt_id,
+            1,
+            ReviewAttemptMutation::Suspension(false),
+        );
+        let no_op_result = apply_local_operation(&mut store, &no_op, 2);
+        assert!(!no_op_result.changed);
+        assert_eq!(no_op_result.attempt_revision, 2);
+
+        let competing = attempt_operation(
+            "competing",
+            &attempt_id,
+            1,
+            ReviewAttemptMutation::Suspension(true),
+        );
+        let conflict = apply_local_operation(&mut store, &competing, 3);
+        assert_eq!(
+            conflict.status,
+            ReviewAttemptOperationStatus::RevisionConflict
+        );
+        assert_eq!(conflict.attempt_revision, 2);
+        assert!(!conflict.attempt.desired_suspended);
+
+        let later = attempt_operation(
+            "later",
+            &attempt_id,
+            2,
+            ReviewAttemptMutation::Suspension(true),
+        );
+        assert!(apply_local_operation(&mut store, &later, 4).changed);
+        assert_eq!(apply_local_operation(&mut store, &competing, 5), conflict);
+        assert_eq!(attempt_revision(&store, &attempt_id), 3);
+    }
+
+    #[test]
+    fn operation_identity_rejects_changed_payload() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let attempt_id = graded_online_attempt(&mut store);
+        let original = attempt_operation(
+            "operation",
+            &attempt_id,
+            1,
+            ReviewAttemptMutation::AcceptedSuccess(false),
+        );
+        apply_local_operation(&mut store, &original, 2);
+        let changed = attempt_operation(
+            "operation",
+            &attempt_id,
+            2,
+            ReviewAttemptMutation::AcceptedSuccess(true),
+        );
+
+        assert!(matches!(
+            store.apply_review_attempt_operation(&changed, &ReviewOperationAuthority::Local, 3),
+            Err(crate::store::StoreError::IdempotencyConflict)
+        ));
+        assert_eq!(attempt_revision(&store, &attempt_id), 2);
+    }
+
+    #[test]
+    fn operation_identity_is_scoped_to_the_authenticated_actor() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let attempt_id = graded_online_attempt(&mut store);
+        let device_id = add_device(&mut store, "device");
+        let local = attempt_operation(
+            "shared-operation",
+            &attempt_id,
+            1,
+            ReviewAttemptMutation::Suspension(true),
+        );
+        apply_local_operation(&mut store, &local, 2);
+        let device = attempt_operation(
+            "shared-operation",
+            &attempt_id,
+            2,
+            ReviewAttemptMutation::Suspension(false),
+        );
+
+        let result = store
+            .apply_review_attempt_operation(
+                &device,
+                &ReviewOperationAuthority::DeviceAdministrator(device_id),
+                3,
+            )
+            .unwrap();
+
+        assert_eq!(result.status, ReviewAttemptOperationStatus::Accepted);
+        assert_eq!(result.attempt_revision, 3);
+        assert!(!result.attempt.desired_suspended);
+    }
+
+    #[test]
+    fn operation_replay_lookup_uses_actor_identity_indexes() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for (kind, device_id, index) in [
+            ("local", None, "review_attempt_operation_local_identity"),
+            (
+                "device",
+                Some("device"),
+                "review_attempt_operation_device_identity",
+            ),
+        ] {
+            let plan = operation_replay_plan(&store, kind, device_id);
+            assert!(plan.iter().any(|line| line.contains(index)), "{plan:?}");
+        }
+    }
+
+    fn operation_replay_plan(
+        store: &SqliteStore,
+        actor_kind: &str,
+        actor_device_id: Option<&str>,
+    ) -> Vec<String> {
+        let sql = format!("EXPLAIN QUERY PLAN {ATTEMPT_OPERATION_REPLAY_SQL}");
+        let mut statement = store.connection.prepare(&sql).unwrap();
+        statement
+            .query_map(
+                rusqlite::params!["operation", actor_kind, actor_device_id],
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn stale_content_operation_is_replayable_and_changes_nothing() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let attempt_id = graded_online_attempt(&mut store);
+        add_thema(&mut store, "thema", "Changed", Some(1));
+        let operation = attempt_operation(
+            "stale",
+            &attempt_id,
+            1,
+            ReviewAttemptMutation::AcceptedSuccess(false),
+        );
+
+        let conflict = apply_local_operation(&mut store, &operation, 2);
+        assert_eq!(conflict.status, ReviewAttemptOperationStatus::StaleAttempt);
+        assert_eq!(conflict.attempt_revision, 1);
+        assert_eq!(conflict.attempt.accepted_success, Some(true));
+        assert_eq!(apply_local_operation(&mut store, &operation, 3), conflict);
+        assert_eq!(attempt_revision(&store, &attempt_id), 1);
+    }
+
+    #[test]
+    fn operation_replay_survives_store_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("review-operation.sqlite");
+        let (operation, first) = {
+            let mut store = SqliteStore::open(&path).unwrap();
+            let attempt_id = graded_online_attempt(&mut store);
+            let operation = attempt_operation(
+                "restart",
+                &attempt_id,
+                1,
+                ReviewAttemptMutation::Suspension(true),
+            );
+            let result = apply_local_operation(&mut store, &operation, 2);
+            (operation, result)
+        };
+        let mut reopened = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(apply_local_operation(&mut reopened, &operation, 3), first);
+    }
+
+    #[test]
+    fn failed_receipt_insert_rolls_back_attempt_mutation() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let attempt_id = graded_online_attempt(&mut store);
+        let operation = attempt_operation(
+            "rollback",
+            &attempt_id,
+            1,
+            ReviewAttemptMutation::AcceptedSuccess(false),
+        );
+
+        assert!(matches!(
+            store.apply_review_attempt_operation(
+                &operation,
+                &ReviewOperationAuthority::DeviceAdministrator("missing".into()),
+                2
+            ),
+            Err(crate::store::StoreError::Storage(_))
+        ));
+        assert_eq!(attempt_revision(&store, &attempt_id), 1);
+        let applied = apply_local_operation(&mut store, &operation, 3);
+        assert_eq!(applied.status, ReviewAttemptOperationStatus::Accepted);
+        assert_eq!(applied.attempt.accepted_success, Some(false));
+    }
+
+    fn graded_online_attempt(store: &mut SqliteStore) -> String {
+        add_thema(store, "thema", "Question", None);
+        let session = store
+            .create_review_session(&manual_source("thema"), None, None, 1)
+            .unwrap();
+        let attempt = store
+            .begin_review_attempt(&session.session_id, None, 2)
+            .unwrap();
+        store
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                3,
+                0.0,
+            )
+            .unwrap();
+        attempt.attempt_id
+    }
+
+    fn attempt_operation(
+        operation_id: &str,
+        attempt_id: &str,
+        expected_revision: u64,
+        mutation: ReviewAttemptMutation,
+    ) -> ReviewAttemptOperation {
+        ReviewAttemptOperation::new(
+            1,
+            operation_id.into(),
+            attempt_id.into(),
+            expected_revision,
+            mutation,
+        )
+        .unwrap()
+    }
+
+    fn apply_local_operation(
+        store: &mut SqliteStore,
+        operation: &ReviewAttemptOperation,
+        operated_at_us: u64,
+    ) -> crate::application::ReviewAttemptOperationResult {
+        store
+            .apply_review_attempt_operation(
+                operation,
+                &ReviewOperationAuthority::Local,
+                operated_at_us,
+            )
+            .unwrap()
+    }
+
+    fn attempt_revision(store: &SqliteStore, attempt_id: &str) -> u64 {
+        store
+            .connection
+            .query_row(
+                "SELECT mutation_revision FROM review_attempt WHERE attempt_id = ?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 }
