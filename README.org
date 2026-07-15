@@ -57,6 +57,8 @@ paths, dependency failures, or backtraces.
 
 The ~/v1~ API provides:
 
+- device-bound replica state, resumable snapshots, exact revision deltas, and
+  immutable blob downloads;
 - optimistic thema create, search, update, archive, and unarchive;
 - revisioned Org documents, renames, tombstones, and historical retrieval;
 - content-addressed managed assets;
@@ -65,7 +67,9 @@ The ~/v1~ API provides:
 - revisioned canonical review settings;
 - one active resumable review session with a persisted ordered queue;
 - captured attempts, grading, override, suspension, and idempotent atomic
-  commit.
+  commit;
+- bounded offline review packs and immutable review reconciliation;
+- sequenced offline document, lifecycle, and asset-create operations.
 
 Mutations use ~If-Match~. A stale revision returns ~412~ with the current
 revision and leaves server state unchanged. The first attempt response hides
@@ -78,9 +82,11 @@ boundary.
 
 * Storage
 
-Schema v3 stores native themata, tags, node associations, scheduling state,
+Schema v9 stores native themata, tags, node associations, scheduling state,
 exact review history, sessions, attempts, devices, settings, documents, and
-the node graph. Public IDs are opaque text. Imported numeric thema IDs are
+the node graph. It also stores replica snapshots and feed revisions, review
+packs, immutable offline operations and results, device sequence state, and
+conflict evidence. Public IDs are opaque text. Imported numeric thema IDs are
 retained and new resources use UUIDv7.
 
 Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
@@ -133,6 +139,40 @@ interval fuzz.
 
 Canonical timezone, day boundary, and tag rules are revisioned settings.
 Existing sessions keep their captured settings when canonical settings change.
+
+* Offline replicas
+
+An offline-capable client owns a real local SQLite replica. It contains
+downloaded projections and blobs, a durable server-bound cursor, installed
+review packs, and immutable review, content, and asset outboxes. A snapshot is
+staged page by page and becomes active only when its terminal page is complete.
+If a cursor expires or names a different server history, the client installs a
+new snapshot without deleting pending work or conflict evidence. SSE only
+wakes the client; correctness comes from pulling the durable delta feed.
+
+Review packs materialize one ordered session and capture every presentation,
+thema digest, scheduling revision, scheduler and matcher version, timezone, day
+boundary, resolved parameters, and required managed asset. One exclusive
+server lease prevents another device or online session from advancing that
+materialized session. A disconnected or abandoned client leaves the lease
+visible until it is explicitly recovered or abandoned; the daemon never
+chooses a winner by timestamp.
+
+Each offline answer is committed locally with its attempt ID and the next
+device sequence before the UI advances. Reconciliation verifies the captured
+content and base scheduling revision, recomputes the transition from the
+recorded versioned inputs, and atomically commits the event, scheduling state,
+session progress, suspension, and totals. Exact retries return the retained
+result. Stale attempts remain explicit conflicts and cannot change canonical
+scheduling state.
+
+Review, document, and asset operations share one contiguous per-device
+sequence. Document mutations retain submitted Org or captured lifecycle bases;
+invalid and stale revisions remain queryable without replacing the active head
+or node index. Tombstones flow through the replica feed and prevent deleted
+content from reappearing. Assets are SHA-256 addressed and deduplicated. An
+offline asset blob is uploaded and verified before its sequenced create
+operation, and dependent Org revisions remain behind it in the outbox.
 
 Check live Elisp parity read-only:
 

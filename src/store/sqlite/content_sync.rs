@@ -652,6 +652,7 @@ mod tests {
         },
         blob::BlobMeta,
         domain::{DocumentId, DocumentProjection, DocumentProjectionInput},
+        protocol::canonical_content_operation,
     };
 
     fn add_device(store: &mut SqliteStore) -> String {
@@ -1059,22 +1060,49 @@ mod tests {
     #[test]
     fn invalid_org_is_preserved_without_replacing_the_head() {
         let mut store = SqliteStore::open_in_memory().unwrap();
+        let original = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            ":PROPERTIES:\n:ID: root-id\n:END:\n#+title: Original\n\nSee [[id:target-id][Target]].\n\n* Target\n:PROPERTIES:\n:ID: target-id\n:END:\n".into(),
+            None,
+        )
+        .unwrap();
+        let original_blob = BlobMeta {
+            sha256: original.blob_sha256.clone(),
+            size_bytes: original.org.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store
+            .replace_note(&original, &original_blob, 1, None)
+            .unwrap();
         let device_id = add_device(&mut store);
+        let id = DocumentId::new("document").unwrap();
+        let head = store.document_head(&id).unwrap().unwrap();
         let operation = operation(
             &store,
             &device_id,
             "operation-invalid",
             1,
-            ContentBase::Absent,
+            ContentBase::Revision {
+                revision: head.revision,
+                content_sha256: head.blob_sha256.clone(),
+                predecessor_operation_id: None,
+            },
             "* [[id:broken\n",
         );
         assert!(prepare_offline_document(&operation).is_err());
-        let before = store.latest_content_cursor().unwrap();
+        let canonical_payload = canonical_content_operation(&operation).unwrap();
+        let root = store.get_node("root-id").unwrap();
+        let target = store.get_node("target-id").unwrap();
+        let links = store.graph_nodes("root-id", false, 10, None).unwrap();
+        let history = store.document_revisions(&id, 0, 10).unwrap();
+        let changes = store.content_changes(0, 10).unwrap();
+        let cursor = store.latest_content_cursor().unwrap();
         let result = store
             .reconcile_content_operation(
                 1,
                 &operation,
-                "invalid-org-operation",
+                &canonical_payload,
                 Some(&device_id),
                 100,
                 Err(OfflineContentConflictReason::InvalidContent),
@@ -1085,8 +1113,38 @@ mod tests {
             result.conflict_reason,
             Some(OfflineContentConflictReason::InvalidContent)
         );
-        assert!(result.authoritative.is_none());
-        assert_eq!(store.latest_content_cursor().unwrap(), before);
+        assert_eq!(
+            result.authoritative.as_ref().unwrap().revision,
+            head.revision
+        );
+        assert_eq!(store.document_head(&id).unwrap(), Some(head));
+        assert_eq!(store.get_node("root-id").unwrap(), root);
+        assert_eq!(store.get_node("target-id").unwrap(), target);
+        assert_eq!(
+            store.graph_nodes("root-id", false, 10, None).unwrap(),
+            links
+        );
+        assert_eq!(store.document_revisions(&id, 0, 10).unwrap(), history);
+        assert_eq!(store.content_changes(0, 10).unwrap(), changes);
+        assert_eq!(store.latest_content_cursor().unwrap(), cursor);
+        assert_eq!(
+            super::load_content_result(&store.connection, "operation-invalid").unwrap(),
+            Some(result)
+        );
+        let stored_payload = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM device_operation WHERE operation_id = ?1",
+                ["operation-invalid"],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(stored_payload, canonical_payload);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_payload).unwrap()["operation"]["mutation"]
+                ["org"],
+            "* [[id:broken\n"
+        );
         assert_eq!(
             store
                 .replica_state(&device_id)
