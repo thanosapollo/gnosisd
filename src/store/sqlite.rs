@@ -1,5 +1,10 @@
 use std::{
-    collections::HashSet, error::Error, fs, os::unix::fs::PermissionsExt, path::Path,
+    collections::{BTreeMap, HashSet},
+    error::Error,
+    fmt::Write as _,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
     time::Duration,
 };
 
@@ -7,6 +12,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::domain::{
     DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LegacyDatabaseInfo,
@@ -15,10 +21,12 @@ use crate::domain::{
 };
 use crate::{
     application::{
-        AssetHead, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
-        NewDevice, NodeRecord, PreparedAsset, PreparedNote, PreparedThema, SettingsInput,
-        SettingsRecord, TagRule, ThemaRecord, parse_stored_scopes, path_key, stored_scopes,
-        stored_thema_content, validate_org_path,
+        AssetHead, AssetRevision, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead,
+        DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision, NewDevice,
+        NodeRecord, PreparedAsset, PreparedNote, PreparedThema, ReplicaChange, ReplicaProjection,
+        ReplicaState, ReviewStateRevision, SettingsInput, SettingsRecord, SettingsRevision,
+        SnapshotPage, SnapshotPosition, TagRule, ThemaRecord, ThemaRevision, parse_stored_scopes,
+        path_key, stored_scopes, stored_thema_content, validate_org_path,
     },
     blob::BlobMeta,
 };
@@ -29,7 +37,8 @@ const INITIAL_MIGRATION: &str = include_str!("migrations/0001_initial.sql");
 const SERVER_MIGRATION: &str = include_str!("migrations/0002_server.sql");
 const REMOTE_REVIEW_MIGRATION: &str = include_str!("migrations/0003_remote_review.sql");
 const OFFLINE_REVIEW_MIGRATION: &str = include_str!("migrations/0004_offline_review.sql");
-const SCHEMA_VERSION: u32 = 4;
+const REPLICA_SYNC_MIGRATION: &str = include_str!("migrations/0005_replica_sync.sql");
+const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -49,6 +58,10 @@ pub(crate) enum StoreError {
     IdempotencyConflict,
     #[error("device operation sequence has a gap: expected {expected}")]
     DeviceSequence { expected: u64 },
+    #[error("replica cursor is outside the retained server feed")]
+    ReplicaCursor,
+    #[error("replica snapshot belongs to another server")]
+    ReplicaServer,
     #[error("document path changes require a rename operation")]
     PathChange,
     #[error("document projection is invalid: {reason}")]
@@ -114,6 +127,7 @@ impl SqliteStore {
             .busy_timeout(Duration::from_secs(5))
             .map_err(StoreError::storage)?;
         migrate(&connection)?;
+        backfill_current_replica_history(&connection)?;
         Ok(Self { connection })
     }
 
@@ -157,6 +171,7 @@ impl SqliteStore {
         load_due_legacy_themata(&self.connection, day, limit, after)
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_document(
         &mut self,
         document_id: &DocumentId,
@@ -184,21 +199,22 @@ impl SqliteStore {
             .map_err(StoreError::storage)?;
         let current = load_document(&transaction, &prepared.document_id)?;
         check_revision(prepared.expected_revision, current.as_ref())?;
-        if current.is_some()
-            && document_path(&transaction, &prepared.document_id)? != prepared.logical_path
+        let current_path = document_path(&transaction, &prepared.document_id)?;
+        if current_path
+            .as_deref()
+            .is_some_and(|path| path != prepared.logical_path)
         {
             return Err(StoreError::PathChange);
         }
         check_path_available(&transaction, prepared)?;
-        let current_active = load_document_head(&transaction, &prepared.document_id)?
-            .is_some_and(|head| head.active);
+        let current_head = load_document_head(&transaction, &prepared.document_id)?;
+        let current_blob_matches = current_head.is_some_and(|head| {
+            head.active && head.blob_sha256.as_deref() == Some(prepared.blob_sha256.as_str())
+        });
         if current.as_ref().is_some_and(|stored| {
             stored.projection() == &prepared.projection
-                && document_path(&transaction, &prepared.document_id)
-                    .ok()
-                    .as_deref()
-                    == Some(prepared.logical_path.as_str())
-        }) && current_active
+                && current_path.as_deref() == Some(prepared.logical_path.as_str())
+        }) && current_blob_matches
         {
             transaction.commit().map_err(StoreError::storage)?;
             return current.ok_or(StoreError::CorruptData { field: "document" });
@@ -222,6 +238,12 @@ impl SqliteStore {
             created_at_us,
             author_device_id,
         )?;
+        insert_document_projection_history(
+            &transaction,
+            &prepared.document_id,
+            revision,
+            &prepared.projection,
+        )?;
         insert_content_change(
             &transaction,
             "document",
@@ -240,6 +262,13 @@ impl SqliteStore {
             revision,
             projection: prepared.projection.clone(),
         })
+    }
+
+    pub(crate) fn document_logical_path(
+        &self,
+        document_id: &DocumentId,
+    ) -> Result<Option<String>, StoreError> {
+        document_path(&self.connection, document_id)
     }
 
     pub(crate) fn put_asset(
@@ -401,6 +430,39 @@ impl SqliteStore {
                 .map_err(StoreError::storage)?;
         }
         drop(insert);
+        let updated = transaction
+            .execute(
+                "UPDATE thema_revision SET
+                     kind = ?3, keimenon = ?4, hypothesis_json = ?5,
+                     answer_json = ?6, source_guid = ?7, parathema = ?8,
+                     review_image = ?9, tags_json = ?10, node_ids_json = ?11,
+                     asset_paths_json = ?12, content_sha256 = ?13,
+                     archived = ?14
+                 WHERE thema_id = ?1 AND revision = ?2",
+                params![
+                    record.thema_id,
+                    u64_to_i64(record.revision, "thema revision")?,
+                    record.content.kind.as_str(),
+                    record.content.keimenon,
+                    serde_json::to_string(&record.content.hypothesis)
+                        .map_err(StoreError::storage)?,
+                    serde_json::to_string(&record.content.answer).map_err(StoreError::storage)?,
+                    record.content.source_guid,
+                    record.content.parathema,
+                    record.content.review_image,
+                    serde_json::to_string(&record.tags).map_err(StoreError::storage)?,
+                    serde_json::to_string(&record.node_ids).map_err(StoreError::storage)?,
+                    serde_json::to_string(&record.asset_paths).map_err(StoreError::storage)?,
+                    record.content_sha256,
+                    i64::from(record.archived),
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        if updated != 1 {
+            return Err(StoreError::CorruptData {
+                field: "thema revision history",
+            });
+        }
         transaction.commit().map_err(StoreError::storage)
     }
 
@@ -498,6 +560,7 @@ impl SqliteStore {
         })?;
         let transaction = self.write_transaction()?;
         let current = load_document_head(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
+        let projection = load_document(&transaction, document_id)?.ok_or(StoreError::NotFound)?;
         check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
         check_document_path(&transaction, document_id, logical_path)?;
         let revision = current
@@ -522,6 +585,12 @@ impl SqliteStore {
             "rename",
             updated_at_us,
             author_device_id,
+        )?;
+        insert_document_projection_history(
+            &transaction,
+            document_id,
+            revision,
+            projection.projection(),
         )?;
         insert_content_change(
             &transaction,
@@ -680,7 +749,8 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT cursor, entity_kind, entity_id, revision, operation, created_at_us
+                "SELECT cursor, entity_kind, entity_id, revision, operation, created_at_us,
+                        feed_token
              FROM content_change WHERE cursor > ?1 ORDER BY cursor LIMIT ?2",
             )
             .map_err(StoreError::storage)?;
@@ -695,17 +765,197 @@ impl SqliteStore {
     }
 
     pub(crate) fn latest_content_cursor(&self) -> Result<u64, StoreError> {
-        let value = self
+        current_content_cursor(&self.connection)
+    }
+
+    pub(crate) fn replica_state(&self, device_id: &str) -> Result<ReplicaState, StoreError> {
+        let server_id = server_id(&self.connection)?;
+        let cursor = self.latest_content_cursor()?;
+        let cursor_token = replica_cursor_token(&self.connection, cursor)?;
+        let last_sequence = self
             .connection
             .query_row(
-                "SELECT coalesce(max(cursor), 0) FROM content_change",
+                "SELECT last_review_sequence FROM device
+                 WHERE device_id = ?1 AND revoked_at_us IS NULL",
+                [device_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(StoreError::storage)?
+            .ok_or(StoreError::ReviewOwnership)?;
+        let next_review_sequence = to_u64(last_sequence, "device sequence")?
+            .checked_add(1)
+            .ok_or(StoreError::CorruptData {
+                field: "device sequence",
+            })?;
+        Ok(ReplicaState {
+            server_id,
+            cursor,
+            cursor_token,
+            next_review_sequence,
+        })
+    }
+
+    pub(crate) fn replica_changes(
+        &self,
+        expected_server_id: &str,
+        after: u64,
+        after_token: &str,
+        limit: u16,
+    ) -> Result<(Vec<ReplicaChange>, u64, String), StoreError> {
+        validate_replica_cursor(&self.connection, expected_server_id, after, after_token)?;
+        let latest = current_content_cursor(&self.connection)?;
+        let latest_token = replica_cursor_token(&self.connection, latest)?;
+        let changes = self
+            .content_changes(after, limit)?
+            .into_iter()
+            .map(|change| {
+                Ok(ReplicaChange {
+                    cursor: change.cursor,
+                    cursor_token: change.feed_token,
+                    projection: load_replica_projection(
+                        &self.connection,
+                        &change.entity_kind,
+                        &change.entity_id,
+                        change.revision,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((changes, latest, latest_token))
+    }
+
+    pub(crate) fn create_replica_snapshot(
+        &mut self,
+        device_id: &str,
+        created_at_us: u64,
+        limit: u16,
+    ) -> Result<SnapshotPage, StoreError> {
+        let transaction = self.write_transaction()?;
+        require_active_device(&transaction, device_id)?;
+        let server_id = server_id(&transaction)?;
+        if let Some(position) = reusable_snapshot(&transaction, device_id, &server_id)? {
+            transaction.commit().map_err(StoreError::storage)?;
+            return self.replica_snapshot_page(device_id, &position, limit);
+        }
+        let snapshot_id = Uuid::now_v7().to_string();
+        let cut_cursor = current_content_cursor(&transaction)?;
+        let cut_token = replica_cursor_token(&transaction, cut_cursor)?;
+        transaction
+            .execute(
+                "DELETE FROM replica_snapshot WHERE device_id = ?1",
+                [device_id],
+            )
+            .map_err(StoreError::storage)?;
+        transaction
+            .execute(
+                "INSERT INTO replica_snapshot(
+                     snapshot_id, device_id, server_id, cut_cursor, cut_token,
+                     created_at_us
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    snapshot_id,
+                    device_id,
+                    server_id,
+                    u64_to_i64(cut_cursor, "content cursor")?,
+                    cut_token,
+                    u64_to_i64(created_at_us, "snapshot timestamp")?,
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        insert_snapshot_manifest(&transaction, &snapshot_id)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        self.replica_snapshot_page(
+            device_id,
+            &SnapshotPosition {
+                snapshot_id,
+                server_id,
+                cut_cursor,
+                cut_token,
+                after: 0,
+            },
+            limit,
+        )
+    }
+
+    pub(crate) fn replica_snapshot_page(
+        &self,
+        device_id: &str,
+        position: &SnapshotPosition,
+        limit: u16,
+    ) -> Result<SnapshotPage, StoreError> {
+        validate_snapshot(&self.connection, device_id, position)?;
+        let pointers = snapshot_pointers(&self.connection, position, limit)?;
+        let items = pointers
+            .iter()
+            .map(|(_, kind, id, revision)| {
+                load_replica_projection(&self.connection, kind, id, *revision)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let last = pointers
+            .last()
+            .map(|(ordinal, _, _, _)| *ordinal)
+            .unwrap_or(position.after);
+        let next = snapshot_has_more(&self.connection, &position.snapshot_id, last)?.then(|| {
+            SnapshotPosition {
+                after: last,
+                ..position.clone()
+            }
+        });
+        Ok(SnapshotPage {
+            position: position.clone(),
+            items,
+            next,
+        })
+    }
+
+    pub(crate) fn blob_meta(&self, digest: &str) -> Result<Option<BlobMeta>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT content_sha256, size_bytes, media_type FROM blob
+                 WHERE content_sha256 = ?1",
+                [digest],
+                |row| {
+                    Ok(BlobMeta {
+                        sha256: row.get(0)?,
+                        size_bytes: row_u64(row, 1)?,
+                        media_type: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::storage)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_replica_changes_through(&mut self, cursor: u64) -> Result<(), StoreError> {
+        let transaction = self.write_transaction()?;
+        let latest = current_content_cursor(&transaction)?;
+        let floor = transaction
+            .query_row(
+                "SELECT retained_after_cursor FROM sync_feed_state WHERE id = 1",
                 [],
                 |row| row.get::<_, i64>(0),
             )
             .map_err(StoreError::storage)?;
-        u64::try_from(value).map_err(|_| StoreError::CorruptData {
-            field: "content cursor",
-        })
+        if cursor < to_u64(floor, "content cursor")? || cursor > latest {
+            return Err(StoreError::ReplicaCursor);
+        }
+        let token = replica_cursor_token(&transaction, cursor)?;
+        transaction
+            .execute(
+                "DELETE FROM content_change WHERE cursor <= ?1",
+                [u64_to_i64(cursor, "content cursor")?],
+            )
+            .map_err(StoreError::storage)?;
+        transaction
+            .execute(
+                "UPDATE sync_feed_state SET retained_after_cursor = ?1,
+                     retained_after_token = ?2 WHERE id = 1",
+                params![u64_to_i64(cursor, "content cursor")?, token],
+            )
+            .map_err(StoreError::storage)?;
+        transaction.commit().map_err(StoreError::storage)
     }
 
     pub(crate) fn backup_database(&self, path: &Path) -> Result<(), StoreError> {
@@ -755,6 +1005,7 @@ impl SqliteStore {
         input: &SettingsInput,
         expected_revision: u64,
         updated_at_us: i64,
+        author_device_id: Option<&str>,
     ) -> Result<SettingsRecord, StoreError> {
         let transaction = self.write_transaction()?;
         let current = transaction
@@ -795,6 +1046,14 @@ impl SqliteStore {
                     .map_err(StoreError::storage)?;
             }
         }
+        let settings = load_settings(&transaction)?;
+        insert_settings_history(
+            &transaction,
+            &settings,
+            "update",
+            updated_at_us,
+            author_device_id,
+        )?;
         insert_content_change(
             &transaction,
             "settings",
@@ -812,6 +1071,7 @@ impl SqliteStore {
         prepared: &PreparedThema,
         initial_review_day: u32,
         updated_at_us: i64,
+        author_device_id: Option<&str>,
     ) -> Result<ThemaRecord, StoreError> {
         let transaction = self.write_transaction()?;
         let current = thema_revision(&transaction, prepared.thema_id.as_str())?;
@@ -826,6 +1086,20 @@ impl SqliteStore {
         upsert_thema_row(&transaction, prepared, revision, updated_at_us)?;
         replace_thema_associations(&transaction, prepared)?;
         insert_initial_review_state(&transaction, prepared, initial_review_day)?;
+        let record =
+            load_thema(&transaction, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)?;
+        insert_thema_history(
+            &transaction,
+            &record,
+            if current.is_some() {
+                "update"
+            } else {
+                "create"
+            },
+            updated_at_us,
+            author_device_id,
+        )?;
+        insert_initial_review_state_history(&transaction, prepared, updated_at_us)?;
         insert_content_change(
             &transaction,
             "thema",
@@ -838,6 +1112,16 @@ impl SqliteStore {
             },
             updated_at_us,
         )?;
+        if current.is_none() {
+            insert_content_change(
+                &transaction,
+                "review",
+                prepared.thema_id.as_str(),
+                0,
+                "snapshot",
+                updated_at_us,
+            )?;
+        }
         transaction.commit().map_err(StoreError::storage)?;
         load_thema(&self.connection, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)
     }
@@ -852,6 +1136,7 @@ impl SqliteStore {
         expected_revision: u64,
         archived: bool,
         updated_at_us: i64,
+        author_device_id: Option<&str>,
     ) -> Result<ThemaRecord, StoreError> {
         let transaction = self.write_transaction()?;
         let current = thema_revision(&transaction, thema_id)?.ok_or(StoreError::NotFound)?;
@@ -869,6 +1154,14 @@ impl SqliteStore {
                 ],
             )
             .map_err(StoreError::storage)?;
+        let record = load_thema(&transaction, thema_id)?.ok_or(StoreError::NotFound)?;
+        insert_thema_history(
+            &transaction,
+            &record,
+            if archived { "archive" } else { "unarchive" },
+            updated_at_us,
+            author_device_id,
+        )?;
         insert_content_change(
             &transaction,
             "thema",
@@ -1118,6 +1411,7 @@ impl SqliteStore {
             .map_err(StoreError::storage)
     }
 
+    #[cfg(test)]
     fn replace(
         &mut self,
         document_id: &DocumentId,
@@ -1189,7 +1483,524 @@ fn content_change_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentChange
         revision: row_u64(row, 3)?,
         operation: row.get(4)?,
         created_at_us: row_u64(row, 5)?,
+        feed_token: row.get(6)?,
     })
+}
+
+fn server_id(connection: &Connection) -> Result<String, StoreError> {
+    connection
+        .query_row(
+            "SELECT server_id FROM server_identity WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)
+}
+
+fn current_content_cursor(connection: &Connection) -> Result<u64, StoreError> {
+    let cursor = connection
+        .query_row(
+            "SELECT coalesce(max(cursor), retained_after_cursor)
+             FROM sync_feed_state LEFT JOIN content_change ON true
+             WHERE sync_feed_state.id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::storage)?;
+    to_u64(cursor, "content cursor")
+}
+
+fn validate_replica_cursor(
+    connection: &Connection,
+    expected_server_id: &str,
+    after: u64,
+    after_token: &str,
+) -> Result<(), StoreError> {
+    if server_id(connection)? != expected_server_id {
+        return Err(StoreError::ReplicaServer);
+    }
+    let floor = connection
+        .query_row(
+            "SELECT retained_after_cursor FROM sync_feed_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::storage)?;
+    let floor = to_u64(floor, "content cursor")?;
+    let latest = current_content_cursor(connection)?;
+    if after < floor || after > latest || replica_cursor_token(connection, after)? != after_token {
+        Err(StoreError::ReplicaCursor)
+    } else {
+        Ok(())
+    }
+}
+
+fn replica_cursor_token(connection: &Connection, position: u64) -> Result<String, StoreError> {
+    let retained = connection
+        .query_row(
+            "SELECT retained_after_cursor, retained_after_token
+             FROM sync_feed_state WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(StoreError::storage)?;
+    if position == to_u64(retained.0, "content cursor")? {
+        return Ok(retained.1);
+    }
+    connection
+        .query_row(
+            "SELECT feed_token FROM content_change WHERE cursor = ?1",
+            [u64_to_i64(position, "content cursor")?],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)
+}
+
+fn reusable_snapshot(
+    connection: &Connection,
+    device_id: &str,
+    current_server_id: &str,
+) -> Result<Option<SnapshotPosition>, StoreError> {
+    let floor = connection
+        .query_row(
+            "SELECT retained_after_cursor FROM sync_feed_state WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::storage)?;
+    let snapshot = connection
+        .query_row(
+            "SELECT snapshot_id, server_id, cut_cursor, cut_token
+             FROM replica_snapshot WHERE device_id = ?1",
+            [device_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    let Some((snapshot_id, server_id, cut_cursor, cut_token)) = snapshot else {
+        return Ok(None);
+    };
+    let cut_cursor = to_u64(cut_cursor, "snapshot cursor")?;
+    if server_id != current_server_id || cut_cursor < to_u64(floor, "content cursor")? {
+        return Ok(None);
+    }
+    Ok(Some(SnapshotPosition {
+        snapshot_id,
+        server_id,
+        cut_cursor,
+        cut_token,
+        after: 0,
+    }))
+}
+
+fn require_active_device(connection: &Connection, device_id: &str) -> Result<(), StoreError> {
+    let active = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM device WHERE device_id = ?1 AND revoked_at_us IS NULL
+             )",
+            [device_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StoreError::storage)?;
+    if active {
+        Ok(())
+    } else {
+        Err(StoreError::ReviewOwnership)
+    }
+}
+
+fn insert_snapshot_manifest(
+    transaction: &Transaction<'_>,
+    snapshot_id: &str,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO replica_snapshot_item(
+                 snapshot_id, ordinal, entity_kind, entity_id, revision
+             )
+             SELECT ?1,
+                    row_number() OVER (ORDER BY sort_order, entity_id),
+                    entity_kind, entity_id, revision
+             FROM (
+                 SELECT 1 AS sort_order, 'document' AS entity_kind,
+                        document.document_id AS entity_id, document.revision
+                 FROM document
+                 WHERE EXISTS(
+                     SELECT 1 FROM document_revision AS revision
+                     WHERE revision.document_id = document.document_id
+                       AND revision.revision = document.revision
+                 )
+                 UNION ALL
+                 SELECT 2, 'asset', asset_path, revision FROM managed_asset
+                 UNION ALL
+                 SELECT 3, 'thema', thema_id, revision FROM thema
+                 UNION ALL
+                 SELECT 4, 'settings', 'canonical', revision FROM settings WHERE id = 1
+                 UNION ALL
+                 SELECT 5, 'review', thema_id, state_revision FROM review_state
+             )",
+            [snapshot_id],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn validate_snapshot(
+    connection: &Connection,
+    device_id: &str,
+    position: &SnapshotPosition,
+) -> Result<(), StoreError> {
+    require_active_device(connection, device_id)?;
+    let stored = connection
+        .query_row(
+            "SELECT snapshot.device_id, snapshot.server_id, snapshot.cut_cursor,
+                    snapshot.cut_token, coalesce(max(item.ordinal), 0)
+             FROM replica_snapshot AS snapshot
+             LEFT JOIN replica_snapshot_item AS item
+               ON item.snapshot_id = snapshot.snapshot_id
+             WHERE snapshot.snapshot_id = ?1
+             GROUP BY snapshot.snapshot_id",
+            [&position.snapshot_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)?;
+    let cut = to_u64(stored.2, "snapshot cursor")?;
+    if stored.0 != device_id {
+        return Err(StoreError::ReviewOwnership);
+    }
+    if stored.1 != position.server_id
+        || cut != position.cut_cursor
+        || stored.3 != position.cut_token
+    {
+        return Err(StoreError::ReplicaServer);
+    }
+    if position.after > to_u64(stored.4, "snapshot ordinal")? {
+        return Err(StoreError::ReplicaCursor);
+    }
+    Ok(())
+}
+
+type SnapshotPointer = (u64, String, String, u64);
+
+fn snapshot_pointers(
+    connection: &Connection,
+    position: &SnapshotPosition,
+    limit: u16,
+) -> Result<Vec<SnapshotPointer>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT ordinal, entity_kind, entity_id, revision
+             FROM replica_snapshot_item
+             WHERE snapshot_id = ?1 AND ordinal > ?2
+             ORDER BY ordinal LIMIT ?3",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map(
+            params![
+                position.snapshot_id,
+                u64_to_i64(position.after, "snapshot ordinal")?,
+                i64::from(limit),
+            ],
+            |row| Ok((row_u64(row, 0)?, row.get(1)?, row.get(2)?, row_u64(row, 3)?)),
+        )
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
+}
+
+fn snapshot_has_more(
+    connection: &Connection,
+    snapshot_id: &str,
+    after: u64,
+) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM replica_snapshot_item
+                 WHERE snapshot_id = ?1 AND ordinal > ?2
+             )",
+            params![snapshot_id, u64_to_i64(after, "snapshot ordinal")?],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)
+}
+
+fn load_replica_projection(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    revision: u64,
+) -> Result<ReplicaProjection, StoreError> {
+    match kind {
+        "document" => load_document_replica_revision(connection, id, revision)
+            .map(ReplicaProjection::Document),
+        "asset" => load_asset_revision(connection, id, revision).map(ReplicaProjection::Asset),
+        "thema" => load_thema_revision(connection, id, revision).map(ReplicaProjection::Thema),
+        "settings" => load_settings_revision(connection, revision).map(ReplicaProjection::Settings),
+        "review" => {
+            load_review_state_revision(connection, id, revision).map(ReplicaProjection::ReviewState)
+        }
+        _ => Err(StoreError::CorruptData {
+            field: "content change kind",
+        }),
+    }
+}
+
+fn load_document_replica_revision(
+    connection: &Connection,
+    id: &str,
+    revision: u64,
+) -> Result<DocumentReplicaRevision, StoreError> {
+    let document_id = DocumentId::new(id.to_owned()).map_err(|_| StoreError::CorruptData {
+        field: "document ID",
+    })?;
+    let revision_record = connection
+        .query_row(
+            "SELECT document_id, revision, logical_path, blob_sha256, operation,
+                    created_at_us, author_device_id
+             FROM document_revision WHERE document_id = ?1 AND revision = ?2",
+            params![
+                document_id.as_str(),
+                u64_to_i64(revision, "document revision")?
+            ],
+            document_revision_row,
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)?;
+    let projection = connection
+        .query_row(
+            "SELECT projection_json FROM document_projection_revision
+             WHERE document_id = ?1 AND revision = ?2",
+            params![
+                document_id.as_str(),
+                u64_to_i64(revision, "document revision")?
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .map(|json| serde_json::from_str(&json).map_err(StoreError::storage))
+        .transpose()?;
+    if revision_record.operation != "tombstone" && projection.is_none() {
+        return Err(StoreError::CorruptData {
+            field: "document projection history",
+        });
+    }
+    Ok(DocumentReplicaRevision {
+        revision: revision_record,
+        projection,
+    })
+}
+
+fn load_asset_revision(
+    connection: &Connection,
+    id: &str,
+    revision: u64,
+) -> Result<AssetRevision, StoreError> {
+    connection
+        .query_row(
+            "SELECT asset.asset_path, asset.revision, asset.blob_sha256,
+                    blob.size_bytes, blob.media_type, asset.operation,
+                    asset.created_at_us, asset.author_device_id
+             FROM asset_revision AS asset
+             LEFT JOIN blob ON blob.content_sha256 = asset.blob_sha256
+             WHERE asset.asset_path = ?1 AND asset.revision = ?2",
+            params![id, u64_to_i64(revision, "asset revision")?],
+            |row| {
+                Ok(AssetRevision {
+                    logical_path: row.get(0)?,
+                    revision: row_u64(row, 1)?,
+                    blob_sha256: row.get(2)?,
+                    size_bytes: row
+                        .get::<_, Option<i64>>(3)?
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                    media_type: row.get(4)?,
+                    operation: row.get(5)?,
+                    created_at_us: row_u64(row, 6)?,
+                    author_device_id: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)
+}
+
+fn load_thema_revision(
+    connection: &Connection,
+    id: &str,
+    revision: u64,
+) -> Result<ThemaRevision, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
+                    source_guid, parathema, review_image, tags_json, node_ids_json,
+                    asset_paths_json, content_sha256, archived, operation,
+                    created_at_us, author_device_id
+             FROM thema_revision WHERE thema_id = ?1 AND revision = ?2",
+            params![id, u64_to_i64(revision, "thema revision")?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, bool>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)?;
+    let content = stored_thema_content(
+        &row.2,
+        row.3,
+        serde_json::from_str(&row.4).map_err(StoreError::storage)?,
+        serde_json::from_str(&row.5).map_err(StoreError::storage)?,
+        row.6,
+        row.7,
+        row.8,
+    )
+    .map_err(|_| StoreError::CorruptData {
+        field: "thema content history",
+    })?;
+    Ok(ThemaRevision {
+        record: ThemaRecord {
+            thema_id: row.0,
+            revision: to_u64(row.1, "thema revision")?,
+            content,
+            tags: serde_json::from_str(&row.9).map_err(StoreError::storage)?,
+            node_ids: serde_json::from_str(&row.10).map_err(StoreError::storage)?,
+            asset_paths: serde_json::from_str(&row.11).map_err(StoreError::storage)?,
+            content_sha256: row.12,
+            archived: row.13,
+        },
+        operation: row.14,
+        created_at_us: to_u64(row.15, "thema revision timestamp")?,
+        author_device_id: row.16,
+    })
+}
+
+fn load_settings_revision(
+    connection: &Connection,
+    revision: u64,
+) -> Result<SettingsRevision, StoreError> {
+    let row = connection
+        .query_row(
+            "SELECT revision, timezone, day_boundary_hour, scheduler_version,
+                    scheduler_json, tag_rules_json, operation, created_at_us,
+                    author_device_id
+             FROM settings_revision WHERE revision = ?1",
+            [u64_to_i64(revision, "settings revision")?],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)?;
+    let mut scheduler: crate::application::ParametersSnapshot =
+        serde_json::from_str(&row.4).map_err(StoreError::storage)?;
+    scheduler.scheduler_version = to_u32(row.3, "scheduler version")?;
+    Ok(SettingsRevision {
+        settings: SettingsRecord {
+            revision: to_u64(row.0, "settings revision")?,
+            timezone: row.1,
+            day_boundary_hour: u8::try_from(row.2).map_err(|_| StoreError::CorruptData {
+                field: "day boundary",
+            })?,
+            scheduler,
+            tag_rules: serde_json::from_str::<BTreeMap<String, TagRule>>(&row.5)
+                .map_err(StoreError::storage)?,
+        },
+        operation: row.6,
+        created_at_us: to_u64(row.7, "settings revision timestamp")?,
+        author_device_id: row.8,
+    })
+}
+
+fn load_review_state_revision(
+    connection: &Connection,
+    id: &str,
+    revision: u64,
+) -> Result<ReviewStateRevision, StoreError> {
+    connection
+        .query_row(
+            "SELECT state_json, event_id, created_at_us
+             FROM review_state_revision
+             WHERE thema_id = ?1 AND state_revision = ?2",
+            params![id, u64_to_i64(revision, "state revision")?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .ok_or(StoreError::ReplicaCursor)
+        .and_then(|(json, event_id, created_at_us)| {
+            Ok(ReviewStateRevision {
+                thema_id: id.to_owned(),
+                state: serde_json::from_str(&json).map_err(StoreError::storage)?,
+                event_id,
+                created_at_us: to_u64(created_at_us, "review state timestamp")?,
+            })
+        })
 }
 
 fn load_settings(connection: &Connection) -> Result<SettingsRecord, StoreError> {
@@ -1363,6 +2174,28 @@ fn insert_document_history(
                 operation,
                 created_at_us,
                 author_device_id,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn insert_document_projection_history(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    revision: u64,
+    projection: &DocumentProjection,
+) -> Result<(), StoreError> {
+    let snapshot = DocumentProjectionSnapshot::from(projection);
+    transaction
+        .execute(
+            "INSERT INTO document_projection_revision(
+                 document_id, revision, projection_json
+             ) VALUES (?1, ?2, ?3)",
+            params![
+                document_id.as_str(),
+                u64_to_i64(revision, "document revision")?,
+                serde_json::to_string(&snapshot).map_err(StoreError::storage)?,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -1562,6 +2395,101 @@ fn insert_initial_review_state(
              0.35, 0.30, 1.3
          )",
             params![prepared.thema_id.as_str(), i64::from(initial_review_day)],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn insert_initial_review_state_history(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+    created_at_us: i64,
+) -> Result<(), StoreError> {
+    let state = review::load_review_state(transaction, prepared.thema_id.as_str())?;
+    let snapshot = crate::application::ReviewStateSnapshot::from(&state);
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO review_state_revision(
+                 thema_id, state_revision, state_json, event_id, created_at_us
+             ) VALUES (?1, ?2, ?3, NULL, ?4)",
+            params![
+                prepared.thema_id.as_str(),
+                u64_to_i64(snapshot.state_revision, "state revision")?,
+                serde_json::to_string(&snapshot).map_err(StoreError::storage)?,
+                created_at_us,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn insert_thema_history(
+    transaction: &Transaction<'_>,
+    record: &ThemaRecord,
+    operation: &str,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO thema_revision(
+                 thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
+                 source_guid, parathema, review_image, tags_json, node_ids_json,
+                 asset_paths_json, content_sha256, archived, operation,
+                 created_at_us, author_device_id
+             ) VALUES (
+                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                 ?13, ?14, ?15, ?16, ?17
+             )",
+            params![
+                record.thema_id,
+                u64_to_i64(record.revision, "thema revision")?,
+                record.content.kind.as_str(),
+                record.content.keimenon,
+                serde_json::to_string(&record.content.hypothesis).map_err(StoreError::storage)?,
+                serde_json::to_string(&record.content.answer).map_err(StoreError::storage)?,
+                record.content.source_guid,
+                record.content.parathema,
+                record.content.review_image,
+                serde_json::to_string(&record.tags).map_err(StoreError::storage)?,
+                serde_json::to_string(&record.node_ids).map_err(StoreError::storage)?,
+                serde_json::to_string(&record.asset_paths).map_err(StoreError::storage)?,
+                record.content_sha256,
+                i64::from(record.archived),
+                operation,
+                created_at_us,
+                author_device_id,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn insert_settings_history(
+    transaction: &Transaction<'_>,
+    settings: &SettingsRecord,
+    operation: &str,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO settings_revision(
+                 revision, timezone, day_boundary_hour, scheduler_version,
+                 scheduler_json, tag_rules_json, operation, created_at_us,
+                 author_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                u64_to_i64(settings.revision, "settings revision")?,
+                settings.timezone,
+                i64::from(settings.day_boundary_hour),
+                i64::from(settings.scheduler.scheduler_version),
+                serde_json::to_string(&settings.scheduler).map_err(StoreError::storage)?,
+                serde_json::to_string(&settings.tag_rules).map_err(StoreError::storage)?,
+                operation,
+                created_at_us,
+                author_device_id,
+            ],
         )
         .map_err(StoreError::storage)?;
     Ok(())
@@ -1858,6 +2786,218 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
     if found < 4 {
         connection
             .execute_batch(OFFLINE_REVIEW_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
+    if found < 5 {
+        connection
+            .execute_batch(REPLICA_SYNC_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
+    Ok(())
+}
+
+fn backfill_current_replica_history(connection: &Connection) -> Result<(), StoreError> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(StoreError::storage)?;
+    backfill_projection_only_documents(&transaction)?;
+    backfill_document_projections(&transaction)?;
+    backfill_thema_revisions(&transaction)?;
+    backfill_settings_revision(&transaction)?;
+    backfill_review_state_revisions(&transaction)?;
+    transaction.commit().map_err(StoreError::storage)
+}
+
+fn backfill_projection_only_documents(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT document_id, revision, logical_path, updated_at_us
+                 FROM document WHERE active = 1 AND NOT EXISTS(
+                     SELECT 1 FROM document_revision AS revision
+                     WHERE revision.document_id = document.document_id
+                       AND revision.revision = document.revision
+                 ) ORDER BY document_id",
+            )
+            .map_err(StoreError::storage)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)?
+    };
+    for (id, revision, stored_path, updated_at_us) in rows {
+        let document_id = DocumentId::new(id).map_err(|_| StoreError::CorruptData {
+            field: "document ID",
+        })?;
+        let logical_path = stored_path
+            .filter(|path| validate_org_path(path).is_ok())
+            .unwrap_or_else(|| legacy_projection_path(&document_id));
+        update_projection_only_path(transaction, &document_id, &logical_path)?;
+        insert_document_history(
+            transaction,
+            &document_id,
+            &logical_path,
+            None,
+            to_u64(revision, "document revision")?,
+            "snapshot",
+            updated_at_us.max(1),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn legacy_projection_path(document_id: &DocumentId) -> String {
+    let mut encoded = String::with_capacity(document_id.as_str().len() * 2);
+    for byte in document_id.as_str().as_bytes() {
+        write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    format!("legacy/{encoded}.org")
+}
+
+fn update_projection_only_path(
+    transaction: &Transaction<'_>,
+    document_id: &DocumentId,
+    logical_path: &str,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "UPDATE document SET logical_path = ?2, path_key = ?3 WHERE document_id = ?1",
+            params![document_id.as_str(), logical_path, path_key(logical_path)],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+fn backfill_document_projections(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT document.document_id FROM document
+                 JOIN document_revision USING(document_id, revision)
+                 WHERE document.active = 1 AND NOT EXISTS(
+                     SELECT 1 FROM document_projection_revision AS projection
+                     WHERE projection.document_id = document.document_id
+                       AND projection.revision = document.revision
+                 )
+                 ORDER BY document.document_id",
+            )
+            .map_err(StoreError::storage)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)?
+    };
+    for id in ids {
+        let document_id = DocumentId::new(id).map_err(|_| StoreError::CorruptData {
+            field: "document ID",
+        })?;
+        let document = load_document(transaction, &document_id)?.ok_or(StoreError::NotFound)?;
+        insert_document_projection_history(
+            transaction,
+            &document_id,
+            document.revision(),
+            document.projection(),
+        )?;
+    }
+    Ok(())
+}
+
+fn backfill_thema_revisions(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let rows = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT thema.thema_id, thema.updated_at_us FROM thema
+                 WHERE NOT EXISTS(
+                     SELECT 1 FROM thema_revision AS revision
+                     WHERE revision.thema_id = thema.thema_id
+                       AND revision.revision = thema.revision
+                 ) ORDER BY thema.thema_id",
+            )
+            .map_err(StoreError::storage)?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)?
+    };
+    for (id, created_at_us) in rows {
+        let record = load_thema(transaction, &id)?.ok_or(StoreError::NotFound)?;
+        insert_thema_history(transaction, &record, "snapshot", created_at_us, None)?;
+    }
+    Ok(())
+}
+
+fn backfill_settings_revision(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let missing = transaction
+        .query_row(
+            "SELECT NOT EXISTS(
+                 SELECT 1 FROM settings_revision AS revision
+                 JOIN settings ON settings.revision = revision.revision
+                 WHERE settings.id = 1
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StoreError::storage)?;
+    if missing {
+        let settings = load_settings(transaction)?;
+        let created_at_us = transaction
+            .query_row(
+                "SELECT updated_at_us FROM settings WHERE id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::storage)?;
+        insert_settings_history(transaction, &settings, "snapshot", created_at_us, None)?;
+    }
+    Ok(())
+}
+
+fn backfill_review_state_revisions(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    let ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT state.thema_id FROM review_state AS state
+                 WHERE NOT EXISTS(
+                     SELECT 1 FROM review_state_revision AS revision
+                     WHERE revision.thema_id = state.thema_id
+                       AND revision.state_revision = state.state_revision
+                 ) ORDER BY state.thema_id",
+            )
+            .map_err(StoreError::storage)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)?
+    };
+    for id in ids {
+        let state = review::load_review_state(transaction, &id)?;
+        let snapshot = crate::application::ReviewStateSnapshot::from(&state);
+        transaction
+            .execute(
+                "INSERT INTO review_state_revision(
+                     thema_id, state_revision, state_json, event_id, created_at_us
+                 ) VALUES (?1, ?2, ?3, NULL, ?4)",
+                params![
+                    id,
+                    u64_to_i64(snapshot.state_revision, "state revision")?,
+                    serde_json::to_string(&snapshot).map_err(StoreError::storage)?,
+                    snapshot.last_reviewed_at_us.unwrap_or(0),
+                ],
+            )
             .map_err(StoreError::storage)?;
     }
     Ok(())
@@ -2390,15 +3530,17 @@ fn check_path_available(
 }
 
 fn document_path(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     document_id: &DocumentId,
-) -> Result<String, StoreError> {
-    transaction
+) -> Result<Option<String>, StoreError> {
+    connection
         .query_row(
             "SELECT logical_path FROM document WHERE document_id = ?1",
             [document_id.as_str()],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
+        .optional()
+        .map(Option::flatten)
         .map_err(StoreError::storage)
 }
 
@@ -2510,7 +3652,7 @@ fn retire_removed_nodes(
         .iter()
         .map(|node| node.id().as_str())
         .collect::<HashSet<_>>();
-    let logical_path = document_path(transaction, &prepared.document_id).ok();
+    let logical_path = document_path(transaction, &prepared.document_id)?;
     let Some(logical_path) = logical_path else {
         return Ok(());
     };
@@ -2910,12 +4052,18 @@ fn to_usize(value: i64, field: &'static str) -> Result<usize, StoreError> {
 mod tests {
     use std::{fs, os::unix::fs::PermissionsExt};
 
+    use sha2::Digest as _;
     use tempfile::tempdir;
 
     use super::{
-        FailPoint, INITIAL_MIGRATION, REMOTE_REVIEW_MIGRATION, SERVER_MIGRATION, SqliteStore,
-        StoreError, migrate, schema_version,
+        FailPoint, INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION,
+        SERVER_MIGRATION, SqliteStore, StoreError, migrate, schema_version,
     };
+    use crate::application::{
+        ReplicaProjection, SettingsInput, generate_device, prepare_asset, prepare_note,
+        prepare_thema, thema_content,
+    };
+    use crate::blob::BlobMeta;
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
         SourceSpan, TitlePath,
@@ -2954,6 +4102,44 @@ mod tests {
             content_sha256: digest.into(),
         })
         .unwrap()
+    }
+
+    fn thema(question: &str, revision: Option<u64>) -> crate::application::PreparedThema {
+        prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                question.into(),
+                vec![None],
+                vec!["answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            vec![],
+            vec![],
+            vec![],
+            revision,
+        )
+        .unwrap()
+    }
+
+    fn update_timezone(store: &mut SqliteStore, revision: u64, timestamp: i64) {
+        let settings = store.settings().unwrap();
+        store
+            .update_settings(
+                &SettingsInput {
+                    timezone: "UTC".into(),
+                    day_boundary_hour: settings.day_boundary_hour,
+                    scheduler: settings.scheduler,
+                    tag_rules: settings.tag_rules,
+                },
+                revision,
+                timestamp,
+                None,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -3040,7 +4226,7 @@ mod tests {
         let path = directory.path().join("gnosis.db");
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            4
+            5
         );
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -3048,7 +4234,7 @@ mod tests {
         );
         assert_eq!(
             SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            4
+            5
         );
     }
 
@@ -3061,7 +4247,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 4);
+        assert_eq!(schema_version(&connection).unwrap(), 5);
         for (table, column) in [
             ("retired_node_edge", "source_id"),
             ("review_attempt", "thema_revision"),
@@ -3070,6 +4256,11 @@ mod tests {
             ("review_session", "owner_device_id"),
             ("review_session", "review_mode"),
             ("device", "last_review_sequence"),
+            ("server_identity", "server_id"),
+            ("replica_snapshot_item", "entity_kind"),
+            ("thema_revision", "content_sha256"),
+            ("settings_revision", "tag_rules_json"),
+            ("review_state_revision", "state_json"),
         ] {
             let present: bool = connection
                 .query_row(
@@ -3080,6 +4271,42 @@ mod tests {
                 .unwrap();
             assert!(present, "missing {table}.{column}");
         }
+    }
+
+    #[test]
+    fn upgrades_projection_only_unix_documents_into_snapshot_history() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("projection-only.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(SERVER_MIGRATION).unwrap();
+        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
+        connection.execute_batch(OFFLINE_REVIEW_MIGRATION).unwrap();
+        let mut old_store = SqliteStore { connection };
+        let document_id = DocumentId::new("../legacy/socket").unwrap();
+        old_store
+            .replace_document(&document_id, &projection("Legacy", "digest"), None)
+            .unwrap();
+        drop(old_store);
+
+        let mut store = SqliteStore::open(&path).unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let snapshot = store.create_replica_snapshot(&device_id, 2, 10).unwrap();
+        let document = snapshot
+            .items
+            .iter()
+            .find_map(|projection| match projection {
+                ReplicaProjection::Document(document) => Some(document),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(document.revision.operation, "snapshot");
+        assert!(document.revision.blob_sha256.is_none());
+        assert!(document.revision.logical_path.starts_with("legacy/"));
+        assert_eq!(document.projection.as_ref().unwrap().title, "Legacy");
     }
 
     #[test]
@@ -3164,6 +4391,342 @@ mod tests {
             })
             .unwrap();
         assert_eq!(violations, 0);
+    }
+
+    #[test]
+    fn upgrades_populated_schema_v4_with_replica_history_and_floor() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(SERVER_MIGRATION).unwrap();
+        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
+        connection.execute_batch(OFFLINE_REVIEW_MIGRATION).unwrap();
+        connection
+            .execute(
+                "INSERT INTO thema(
+                     thema_id, revision, kind, keimenon, hypothesis_json,
+                     answer_json, content_sha256, created_at_us, updated_at_us
+                 ) VALUES (?1, 1, 'basic', 'Question', '[null]', '[\"answer\"]', ?2, 1, 1)",
+                ("thema", "a".repeat(64)),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO review_state VALUES (
+                     'thema', 0, 0, 0, 0, NULL, NULL, 20260715, NULL,
+                     0, 0, 0, 0, 0, 0.35, 0.30, 1.3
+                 )",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO content_change(
+                     entity_kind, entity_id, revision, operation, created_at_us
+                 ) VALUES ('thema', 'thema', 1, 'create', 1)",
+                [],
+            )
+            .unwrap();
+        let old_cursor: i64 = connection
+            .query_row("SELECT max(cursor) FROM content_change", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        assert_eq!(schema_version(&connection).unwrap(), 5);
+        let floor: i64 = connection
+            .query_row(
+                "SELECT retained_after_cursor FROM sync_feed_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, old_cursor);
+        for table in [
+            "thema_revision",
+            "settings_revision",
+            "review_state_revision",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "missing {table} backfill");
+        }
+        let server_id: String = connection
+            .query_row("SELECT server_id FROM server_identity", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        migrate(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT server_id FROM server_identity", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            server_id
+        );
+    }
+
+    #[test]
+    fn replica_cursors_reject_other_servers_rollback_and_expiration() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+        update_timezone(&mut store, 1, 2);
+        let state = store.replica_state(&device_id).unwrap();
+        assert_eq!(state.cursor, 1);
+
+        assert!(matches!(
+            store.replica_changes("other-server", 1, &state.cursor_token, 10),
+            Err(StoreError::ReplicaServer)
+        ));
+        assert!(matches!(
+            store.replica_changes(&state.server_id, 2, &state.cursor_token, 10),
+            Err(StoreError::ReplicaCursor)
+        ));
+
+        store.expire_replica_changes_through(1).unwrap();
+        assert!(matches!(
+            store.replica_changes(&state.server_id, 0, &initial.cursor_token, 10),
+            Err(StoreError::ReplicaCursor)
+        ));
+        assert_eq!(
+            store
+                .replica_changes(&state.server_id, 1, &state.cursor_token, 10)
+                .unwrap(),
+            (vec![], 1, state.cursor_token)
+        );
+    }
+
+    #[test]
+    fn replica_cursor_token_rejects_a_reused_position_after_restore() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        update_timezone(&mut store, 1, 2);
+        update_timezone(&mut store, 2, 3);
+        let abandoned_branch = store.replica_state(&device_id).unwrap();
+        assert_eq!(abandoned_branch.cursor, 2);
+
+        store
+            .connection
+            .execute("DELETE FROM content_change WHERE cursor = 2", [])
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'content_change'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO content_change(
+                     entity_kind, entity_id, revision, operation, created_at_us
+                 ) VALUES ('settings', 'canonical', 2, 'update', 4)",
+                [],
+            )
+            .unwrap();
+        let restored_branch = store.replica_state(&device_id).unwrap();
+        assert_eq!(restored_branch.cursor, abandoned_branch.cursor);
+        assert_ne!(restored_branch.cursor_token, abandoned_branch.cursor_token);
+
+        assert!(matches!(
+            store.replica_changes(
+                &abandoned_branch.server_id,
+                abandoned_branch.cursor,
+                &abandoned_branch.cursor_token,
+                10,
+            ),
+            Err(StoreError::ReplicaCursor)
+        ));
+    }
+
+    #[test]
+    fn snapshot_manifest_is_fixed_and_delta_resolves_exact_revision() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let owner = generate_device("Owner".into(), vec!["read".into()]).unwrap();
+        let other = generate_device("Other".into(), vec!["read".into()]).unwrap();
+        let owner_id = owner.device_id.clone();
+        store.create_device(&owner, 1).unwrap();
+        store.create_device(&other, 2).unwrap();
+        store
+            .put_thema(&thema("Question", None), 20260715, 3, None)
+            .unwrap();
+
+        let first = store.create_replica_snapshot(&owner_id, 4, 1).unwrap();
+        let retry = store.create_replica_snapshot(&owner_id, 5, 1).unwrap();
+        assert_eq!(retry, first);
+        let cut = first.position.cut_cursor;
+        assert!(matches!(first.items[0], ReplicaProjection::Thema(_)));
+        let mut ahead = first.position.clone();
+        ahead.after = u64::MAX;
+        assert!(matches!(
+            store.replica_snapshot_page(&owner_id, &ahead, 1),
+            Err(StoreError::ReplicaCursor)
+        ));
+        update_timezone(&mut store, 1, 6);
+
+        let mut position = first.next.unwrap();
+        let mut remaining = Vec::new();
+        loop {
+            let page = store
+                .replica_snapshot_page(&owner_id, &position, 1)
+                .unwrap();
+            remaining.extend(page.items);
+            let Some(next) = page.next else {
+                break;
+            };
+            position = next;
+        }
+        let snapshot_settings = remaining
+            .iter()
+            .find_map(|item| match item {
+                ReplicaProjection::Settings(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(snapshot_settings.settings.revision, 1);
+        assert_eq!(snapshot_settings.settings.timezone, "UTC");
+
+        let (changes, latest, _) = store
+            .replica_changes(
+                &first.position.server_id,
+                cut,
+                &first.position.cut_token,
+                10,
+            )
+            .unwrap();
+        assert_eq!(latest, cut + 1);
+        let ReplicaProjection::Settings(delta) = &changes[0].projection else {
+            panic!("settings delta expected");
+        };
+        assert_eq!(delta.settings.revision, 2);
+        assert_eq!(delta.settings.timezone, "UTC");
+
+        assert!(matches!(
+            store.replica_snapshot_page(&other.device_id, &position, 1),
+            Err(StoreError::ReviewOwnership)
+        ));
+    }
+
+    #[test]
+    fn replica_feed_keeps_exact_revisions_and_tombstones() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: First\n".into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.org.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store.replace_note(&first, &first_blob, 2, None).unwrap();
+        let second = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Second\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.org.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store.replace_note(&second, &second_blob, 3, None).unwrap();
+        store
+            .tombstone_document(&DocumentId::new("document").unwrap(), 2, 4, None)
+            .unwrap();
+
+        let asset_bytes = b"asset";
+        let asset_digest = format!("{:x}", sha2::Sha256::digest(asset_bytes));
+        let asset_path = format!("assets/{asset_digest}/asset.png");
+        let prepared = prepare_asset(asset_path.clone(), "asset.png".into(), None).unwrap();
+        let asset_blob = BlobMeta {
+            sha256: asset_digest,
+            size_bytes: asset_bytes.len() as u64,
+            media_type: "image/png".into(),
+        };
+        store.put_asset(&prepared, &asset_blob, 5, None).unwrap();
+        store.tombstone_asset(&asset_path, 1, 6, None).unwrap();
+
+        store
+            .put_thema(&thema("First", None), 20260715, 7, None)
+            .unwrap();
+        store
+            .put_thema(&thema("Second", Some(1)), 20260715, 8, None)
+            .unwrap();
+
+        let state = store.replica_state(&device_id).unwrap();
+        let (changes, _, _) = store
+            .replica_changes(&state.server_id, 0, &initial.cursor_token, 20)
+            .unwrap();
+        let documents = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::Document(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(documents.len(), 3);
+        assert_eq!(documents[0].projection.as_ref().unwrap().title, "First");
+        assert_eq!(documents[1].projection.as_ref().unwrap().title, "Second");
+        assert_eq!(documents[2].revision.operation, "tombstone");
+        assert!(documents[2].projection.is_none());
+
+        let assets = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::Asset(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assets.len(), 2);
+        assert!(assets[0].blob_sha256.is_some());
+        assert_eq!(assets[1].operation, "tombstone");
+        assert!(assets[1].blob_sha256.is_none());
+
+        let themata = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::Thema(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(themata.len(), 2);
+        assert_eq!(themata[0].record.content.keimenon, "First");
+        assert_eq!(themata[1].record.content.keimenon, "Second");
+
+        let review_states = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::ReviewState(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(review_states.len(), 1);
+        assert_eq!(review_states[0].state.state_revision, 0);
     }
 
     #[test]

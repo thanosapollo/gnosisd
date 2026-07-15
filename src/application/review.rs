@@ -370,6 +370,8 @@ pub(crate) struct ReviewPackView {
     pub(crate) lease_id: String,
     pub(crate) status: String,
     pub(crate) cursor: u64,
+    pub(crate) cursor_server_id: String,
+    pub(crate) cursor_token: String,
     pub(crate) issued_at_us: u64,
     pub(crate) current_position: u32,
     pub(crate) timezone: String,
@@ -454,6 +456,8 @@ pub(crate) struct OfflineReviewResult {
     pub(crate) authoritative_state: ReviewStateSnapshot,
     pub(crate) session: ReviewSessionView,
     pub(crate) cursor: u64,
+    pub(crate) cursor_server_id: String,
+    pub(crate) cursor_token: String,
 }
 
 pub(crate) fn presentation_content(

@@ -321,12 +321,12 @@ async fn import_document(
 ) -> Result<ResponseResult, ProtocolError> {
     let command =
         ImportDocument::new(document_id, org, expected_revision).map_err(|_| invalid_document())?;
-    let prepared = tokio::task::spawn_blocking(move || command.prepare())
+    let prepared = tokio::task::spawn_blocking(move || command.prepare_server())
         .await
         .map_err(|_| internal_error())?
         .map_err(|_| invalid_document())?;
     let prepared = tokio::task::spawn_blocking(move || {
-        validate_response_size(&prepared)?;
+        validate_response_size(&prepared.prepared)?;
         Ok::<_, ProtocolError>(prepared)
     })
     .await

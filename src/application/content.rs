@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -52,6 +53,7 @@ pub(crate) struct PreparedThema {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ContentChange {
     pub(crate) cursor: u64,
+    pub(crate) feed_token: String,
     pub(crate) entity_kind: String,
     pub(crate) entity_id: String,
     pub(crate) revision: u64,
@@ -79,6 +81,94 @@ pub(crate) struct DocumentRevision {
     pub(crate) author_device_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionNode {
+    pub(crate) node_id: String,
+    pub(crate) title: String,
+    pub(crate) title_path: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) level: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionLinkOccurrence {
+    pub(crate) owner_id: String,
+    pub(crate) target_id: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectionEdge {
+    pub(crate) source_id: String,
+    pub(crate) target_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DocumentProjectionSnapshot {
+    pub(crate) title: String,
+    pub(crate) file_node_id: Option<String>,
+    pub(crate) file_tags: Vec<String>,
+    pub(crate) nodes: Vec<ProjectionNode>,
+    pub(crate) link_occurrences: Vec<ProjectionLinkOccurrence>,
+    pub(crate) semantic_edges: Vec<ProjectionEdge>,
+    pub(crate) compatibility_sha1: String,
+    pub(crate) content_sha256: String,
+}
+
+impl From<&DocumentProjection> for DocumentProjectionSnapshot {
+    fn from(value: &DocumentProjection) -> Self {
+        Self {
+            title: value.title().to_owned(),
+            file_node_id: value.file_node_id().map(ToString::to_string),
+            file_tags: value.file_tags().to_vec(),
+            nodes: value
+                .nodes()
+                .iter()
+                .map(|node| ProjectionNode {
+                    node_id: node.id().to_string(),
+                    title: node.title().to_owned(),
+                    title_path: node.title_path().parts().to_vec(),
+                    tags: node.tags().to_vec(),
+                    parent_id: node.parent_id().map(ToString::to_string),
+                    level: node.level(),
+                })
+                .collect(),
+            link_occurrences: value
+                .link_occurrences()
+                .iter()
+                .map(|link| ProjectionLinkOccurrence {
+                    owner_id: link.owner().to_string(),
+                    target_id: link.target().to_string(),
+                    start: link.span().start(),
+                    end: link.span().end(),
+                })
+                .collect(),
+            semantic_edges: value
+                .semantic_edges()
+                .iter()
+                .map(|edge| ProjectionEdge {
+                    source_id: edge.source().to_string(),
+                    target_id: edge.target().to_string(),
+                })
+                .collect(),
+            compatibility_sha1: value.compatibility_sha1().to_owned(),
+            content_sha256: value.content_sha256().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DocumentReplicaRevision {
+    pub(crate) revision: DocumentRevision,
+    pub(crate) projection: Option<DocumentProjectionSnapshot>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AssetHead {
     pub(crate) logical_path: String,
@@ -86,6 +176,18 @@ pub(crate) struct AssetHead {
     pub(crate) blob_sha256: Option<String>,
     pub(crate) media_type: Option<String>,
     pub(crate) active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AssetRevision {
+    pub(crate) logical_path: String,
+    pub(crate) revision: u64,
+    pub(crate) blob_sha256: Option<String>,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) media_type: Option<String>,
+    pub(crate) operation: String,
+    pub(crate) created_at_us: u64,
+    pub(crate) author_device_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +200,14 @@ pub(crate) struct ThemaRecord {
     pub(crate) node_ids: Vec<String>,
     pub(crate) asset_paths: Vec<String>,
     pub(crate) archived: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThemaRevision {
+    pub(crate) record: ThemaRecord,
+    pub(crate) operation: String,
+    pub(crate) created_at_us: u64,
+    pub(crate) author_device_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

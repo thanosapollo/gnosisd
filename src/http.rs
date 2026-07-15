@@ -32,8 +32,9 @@ use crate::{
     },
     domain::DocumentId,
     protocol::{
-        OfflineReviewSubmission, OfflineReviewWireError, active_review_pack_json,
-        offline_result_json, review_pack_json,
+        OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError, active_review_pack_json,
+        decode_cursor, decode_snapshot_cursor, offline_result_json, replica_changes_json,
+        replica_snapshot_json, replica_state_json, review_pack_json,
     },
     store::StoreError,
 };
@@ -41,6 +42,7 @@ use crate::{
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_OFFLINE_OPERATION_BODY: usize = MAX_REVIEW_PACK_BYTES + 2 * MAX_BODY;
 const MAX_PAGE: u16 = 500;
+const MAX_REPLICA_PAGE: u16 = 32;
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
@@ -129,6 +131,9 @@ where
 fn data_router() -> Router<HttpState> {
     Router::new()
         .route("/v1/changes", get(changes))
+        .route("/v1/sync/state", get(replica_state))
+        .route("/v1/sync/changes", get(replica_changes))
+        .route("/v1/sync/snapshot", get(replica_snapshot))
         .route("/v1/events", get(events))
         .route("/v1/settings", get(get_settings).put(update_settings))
         .route("/v1/notes", post(create_note))
@@ -143,6 +148,7 @@ fn data_router() -> Router<HttpState> {
             "/v1/assets/{digest}/{name}",
             get(get_asset).put(put_asset).delete(delete_asset),
         )
+        .route("/v1/blobs/{digest}", get(get_blob))
         .route("/v1/themata", post(create_thema).get(search_themata))
         .route("/v1/themata/{id}", get(get_thema).put(update_thema))
         .route("/v1/themata/{id}/archive", post(archive_thema))
@@ -233,6 +239,15 @@ fn page_limit(value: Option<u16>) -> Result<u16, ApiError> {
     }
 }
 
+fn replica_page_limit(value: Option<u16>) -> Result<u16, ApiError> {
+    let value = value.unwrap_or(16);
+    if (1..=MAX_REPLICA_PAGE).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("invalid replica page limit"))
+    }
+}
+
 async fn changes(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -253,6 +268,85 @@ async fn changes(
     let next = items.last().map(|item| item.cursor);
     Ok(Json(
         json!({"items": items.iter().map(change_json).collect::<Vec<_>>(), "next": next}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ReplicaChangesQuery {
+    cursor: String,
+    limit: Option<u16>,
+}
+
+async fn replica_state(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let replica = state
+        .service
+        .replica_state(principal.device_id)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        replica_state_json(&replica).map_err(ApiError::replica_wire)?,
+    ))
+}
+
+async fn replica_changes(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<ReplicaChangesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let (server_id, after, after_token) =
+        decode_cursor(&query.cursor).map_err(ApiError::replica_wire)?;
+    let (changes, latest, _) = state
+        .service
+        .replica_changes(
+            server_id.clone(),
+            after,
+            after_token.clone(),
+            replica_page_limit(query.limit)?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        replica_changes_json(&server_id, after, &after_token, latest, &changes)
+            .map_err(ApiError::replica_wire)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+async fn replica_snapshot(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let limit = replica_page_limit(query.limit)?;
+    let page = match query.cursor {
+        Some(cursor) => {
+            let position = decode_snapshot_cursor(&cursor).map_err(ApiError::replica_wire)?;
+            state
+                .service
+                .replica_snapshot_page(principal.device_id, position, limit)
+                .await
+        }
+        None => {
+            state
+                .service
+                .create_replica_snapshot(principal.device_id, now_us()?, limit)
+                .await
+        }
+    }
+    .map_err(ApiError::service)?;
+    Ok(Json(
+        replica_snapshot_json(&page).map_err(ApiError::replica_wire)?,
     ))
 }
 
@@ -534,6 +628,49 @@ async fn get_asset(
     Ok(response)
 }
 
+async fn get_blob(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(digest): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    validate_digest(&digest)?;
+    let (meta, bytes) = state
+        .service
+        .blob(digest.clone())
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        meta.media_type.parse().map_err(|_| ApiError::internal())?,
+    );
+    response.headers_mut().insert(
+        header::ETAG,
+        format!("\"{digest}\"")
+            .parse()
+            .map_err(|_| ApiError::internal())?,
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    Ok(response)
+}
+
+fn validate_digest(digest: &str) -> Result<(), ApiError> {
+    if digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("invalid content digest"))
+    }
+}
+
 async fn delete_asset(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -589,7 +726,12 @@ async fn create_thema(
     let settings = state.service.settings().await.map_err(ApiError::service)?;
     let record = state
         .service
-        .put_thema(prepared, settings_review_day(&settings)?, now_us_i64()?)
+        .put_thema(
+            prepared,
+            settings_review_day(&settings)?,
+            now_us_i64()?,
+            Some(principal.device_id),
+        )
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
@@ -608,7 +750,12 @@ async fn update_thema(
     let settings = state.service.settings().await.map_err(ApiError::service)?;
     let record = state
         .service
-        .put_thema(prepared, settings_review_day(&settings)?, now_us_i64()?)
+        .put_thema(
+            prepared,
+            settings_review_day(&settings)?,
+            now_us_i64()?,
+            Some(principal.device_id),
+        )
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
@@ -702,7 +849,13 @@ async fn set_archive(
     require(&principal, DeviceScope::ContentWrite)?;
     let record = state
         .service
-        .archive_thema(id, if_match(&headers)?, archived, now_us_i64()?)
+        .archive_thema(
+            id,
+            if_match(&headers)?,
+            archived,
+            now_us_i64()?,
+            Some(principal.device_id),
+        )
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
@@ -1134,7 +1287,12 @@ async fn update_settings(
     require(&principal, DeviceScope::SettingsWrite)?;
     let settings = state
         .service
-        .update_settings(input, if_match(&headers)?, now_us_i64()?)
+        .update_settings(
+            input,
+            if_match(&headers)?,
+            now_us_i64()?,
+            Some(principal.device_id),
+        )
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
@@ -1261,6 +1419,27 @@ impl ApiError {
             ),
         }
     }
+    fn replica_wire(error: ReplicaWireError) -> Self {
+        match error {
+            ReplicaWireError::Cursor | ReplicaWireError::Snapshot => {
+                Self::bad_request("replica cursor is invalid")
+            }
+            ReplicaWireError::PageTooLarge => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "replica_projection_too_large",
+                "stored projection exceeds the replica response budget",
+            ),
+            ReplicaWireError::Encode => Self::internal(),
+        }
+    }
+    fn snapshot_required() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "snapshot_required",
+            message: "replica cursor cannot be resumed from this server state",
+            meta: Some(json!({"snapshot_url":"/v1/sync/snapshot"})),
+        }
+    }
     fn conflict(expected: u64, actual: Option<u64>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
@@ -1300,6 +1479,9 @@ impl ApiError {
                 message: "device operation sequence is not contiguous",
                 meta: Some(json!({"expected_sequence":expected})),
             },
+            ServiceError::Store(StoreError::ReplicaCursor | StoreError::ReplicaServer) => {
+                Self::snapshot_required()
+            }
             ServiceError::Store(StoreError::InvalidReviewState) | ServiceError::Review(_) => {
                 Self::bad_request("review operation is invalid")
             }
@@ -1422,6 +1604,9 @@ fn openapi_error_response() -> Value {
 
 const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/changes", "get"),
+    ("/v1/sync/state", "get"),
+    ("/v1/sync/changes", "get"),
+    ("/v1/sync/snapshot", "get"),
     ("/v1/events", "get"),
     ("/v1/settings", "get"),
     ("/v1/settings", "put"),
@@ -1435,6 +1620,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/assets/{digest}/{name}", "get"),
     ("/v1/assets/{digest}/{name}", "put"),
     ("/v1/assets/{digest}/{name}", "delete"),
+    ("/v1/blobs/{digest}", "get"),
     ("/v1/themata", "get"),
     ("/v1/themata", "post"),
     ("/v1/themata/{id}", "get"),
@@ -1476,10 +1662,15 @@ mod tests {
     use super::{OPENAPI_OPERATIONS, attempt_json, openapi_document, router};
     use crate::application::{
         AnswerInput, OfflineReviewOperation, PresentationSnapshot, ReviewAttemptView,
-        ReviewPackView, ServiceRuntime, generate_device, prepare_asset, prepare_thema,
-        presentation_content, review_day_at, thema_content,
+        ReviewPackView, ServiceRuntime, SettingsInput, generate_device, prepare_asset,
+        prepare_thema, presentation_content, review_day_at, thema_content,
     };
-    use crate::domain::{compute_transition, fuzz_delta, grade};
+    use crate::domain::{
+        DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, fuzz_delta,
+        grade,
+    };
+    use crate::protocol::{MAX_REPLICA_PAGE_BYTES, decode_cursor, encode_cursor};
+    use crate::store::SqliteStore;
 
     #[test]
     fn openapi_covers_versioned_routes_and_bearer_security() {
@@ -1585,6 +1776,279 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replica_http_snapshot_delta_and_blob_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let owner = generate_device(
+            "owner".into(),
+            vec![
+                "read".into(),
+                "content:write".into(),
+                "settings:write".into(),
+            ],
+        )
+        .unwrap();
+        let other = generate_device("other".into(), vec!["read".into()]).unwrap();
+        let owner_id = owner.device_id.clone();
+        let owner_token = owner.token.clone();
+        let other_token = other.token.clone();
+        service.create_device(owner, 1).await.unwrap();
+        service.create_device(other, 2).await.unwrap();
+        let app = router(service.clone());
+
+        let note = json!({
+            "logical_path": "note.org",
+            "org": "#+title: Note\n\n* Heading\n:PROPERTIES:\n:ID: node\n:END:\nBody\n"
+        });
+        let created = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/notes",
+                &owner_token,
+                Body::from(serde_json::to_vec(&note).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let state = response_json(
+            app.clone()
+                .oneshot(authorized(
+                    "GET",
+                    "/v1/sync/state",
+                    &owner_token,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(state["version"], 1);
+        assert_eq!(state["snapshot_required"], true);
+        let server_id = state["server_id"].as_str().unwrap();
+
+        let first_request = app.clone().oneshot(authorized(
+            "GET",
+            "/v1/sync/snapshot?limit=1",
+            &owner_token,
+            Body::empty(),
+        ));
+        let retry_request = app.clone().oneshot(authorized(
+            "GET",
+            "/v1/sync/snapshot?limit=1",
+            &owner_token,
+            Body::empty(),
+        ));
+        let (first, retry) = tokio::join!(first_request, retry_request);
+        let first = response_json(first.unwrap()).await;
+        let retry = response_json(retry.unwrap()).await;
+        assert_eq!(retry["snapshot_id"], first["snapshot_id"]);
+        assert_eq!(first["items"][0]["entity_kind"], "document");
+        assert!(first["cursor"].is_null());
+        let mut next = first["next"].as_str().unwrap().to_owned();
+
+        let denied = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/sync/snapshot?cursor={next}&limit=1"),
+                &other_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let settings = service.settings().await.unwrap();
+        service
+            .update_settings(
+                SettingsInput {
+                    timezone: "UTC".into(),
+                    day_boundary_hour: settings.day_boundary_hour,
+                    scheduler: settings.scheduler,
+                    tag_rules: settings.tag_rules,
+                },
+                settings.revision,
+                3,
+                Some(owner_id),
+            )
+            .await
+            .unwrap();
+
+        let mut snapshot_settings = None;
+        let mut snapshot_cursor = None;
+        loop {
+            let page = response_json(
+                app.clone()
+                    .oneshot(authorized(
+                        "GET",
+                        &format!("/v1/sync/snapshot?cursor={next}&limit=1"),
+                        &owner_token,
+                        Body::empty(),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            if page["items"][0]["entity_kind"] == "settings" {
+                snapshot_settings = Some(page["items"][0]["projection"].clone());
+            }
+            if let Some(cursor) = page["cursor"].as_str() {
+                snapshot_cursor = Some(cursor.to_owned());
+            }
+            let Some(value) = page["next"].as_str() else {
+                break;
+            };
+            next = value.to_owned();
+        }
+        let snapshot_settings = snapshot_settings.unwrap();
+        let snapshot_cursor = snapshot_cursor.unwrap();
+        assert_eq!(snapshot_settings["revision"], 1);
+        assert_eq!(snapshot_settings["timezone"], "UTC");
+
+        let delta = response_json(
+            app.clone()
+                .oneshot(authorized(
+                    "GET",
+                    &format!("/v1/sync/changes?cursor={snapshot_cursor}&limit=10"),
+                    &owner_token,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(delta["items"][0]["entity_kind"], "settings");
+        assert_eq!(delta["items"][0]["projection"]["revision"], 2);
+        assert_eq!(delta["items"][0]["projection"]["timezone"], "UTC");
+
+        let (_, position, token) = decode_cursor(state["cursor"].as_str().unwrap()).unwrap();
+        let ahead = encode_cursor(server_id, position + 100, &token).unwrap();
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/sync/changes?cursor={ahead}"),
+                &owner_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "snapshot_required"
+        );
+
+        let bytes = b"shared asset".to_vec();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let path = super::canonical_asset_path(&digest, "asset.png").unwrap();
+        let head = service
+            .put_asset(
+                prepare_asset(path.clone(), "asset.png".into(), None).unwrap(),
+                bytes.clone(),
+                "image/png".into(),
+                4,
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .tombstone_asset(path, head.revision, 5, None)
+            .await
+            .unwrap();
+        let blob = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/blobs/{digest}"),
+                &owner_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blob.status(), StatusCode::OK);
+        assert_eq!(
+            blob.headers()["cache-control"],
+            "private, max-age=31536000, immutable"
+        );
+        assert_eq!(to_bytes(blob.into_body(), usize::MAX).await.unwrap(), bytes);
+
+        let before = service.latest_content_cursor().await.unwrap();
+        let invalid = json!({"logical_path":"invalid.org","org":"not org"});
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/notes",
+                &owner_token,
+                Body::from(serde_json::to_vec(&invalid).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(service.latest_content_cursor().await.unwrap(), before);
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replica_http_reports_an_unsyncable_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let mut store = SqliteStore::open(&database).unwrap();
+        let projection = DocumentProjection::new(DocumentProjectionInput {
+            title: "x".repeat(MAX_REPLICA_PAGE_BYTES),
+            file_node_id: None,
+            file_tags: vec![],
+            nodes: vec![],
+            link_occurrences: vec![],
+            compatibility_sha1: "a".repeat(40),
+            content_sha256: "b".repeat(64),
+        })
+        .unwrap();
+        store
+            .replace_document(&DocumentId::new("oversized").unwrap(), &projection, None)
+            .unwrap();
+        drop(store);
+
+        let runtime = ServiceRuntime::start(database, directory.path().join("blobs"), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("replica".into(), vec!["read".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let response = router(service.clone())
+            .oneshot(authorized(
+                "GET",
+                "/v1/sync/snapshot?limit=1",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "replica_projection_too_large"
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn offline_review_http_flow_is_versioned_owned_and_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
@@ -1641,6 +2105,7 @@ mod tests {
                 .unwrap(),
                 20260715,
                 5,
+                None,
             )
             .await
             .unwrap();
@@ -1669,10 +2134,16 @@ mod tests {
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
         let created = response_json(created).await;
-        assert_eq!(created["version"], 1);
-        let mut pack_json = created["pack"].clone();
-        pack_json["format_version"] = created["version"].clone();
-        let pack: ReviewPackView = serde_json::from_value(pack_json).unwrap();
+        assert_eq!(created["version"], 2);
+        assert!(created["pack"]["cursor"].is_string());
+        let pack = service
+            .review_pack(
+                created["pack"]["pack_id"].as_str().unwrap().to_owned(),
+                Some(owner_id.clone()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
         let tombstone = service
             .tombstone_asset(asset_path.clone(), asset_head.revision, 6, None)
             .await
@@ -1750,8 +2221,9 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.status(), StatusCode::OK);
         let accepted = response_json(accepted).await;
-        assert_eq!(accepted["version"], 1);
+        assert_eq!(accepted["version"], 2);
         assert_eq!(accepted["result"]["status"], "accepted");
+        assert!(accepted["result"]["cursor"].is_string());
         let replay = app
             .clone()
             .oneshot(authorized(

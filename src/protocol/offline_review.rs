@@ -1,3 +1,5 @@
+use std::io;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -7,8 +9,10 @@ use crate::application::{
     PresentationSnapshot, ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode,
     ReviewSessionView, ReviewSource, ReviewStateSnapshot, TransitionSnapshot,
 };
+use crate::protocol::replica::encode_cursor;
 
 pub(crate) const OFFLINE_REVIEW_VERSION: u32 = 1;
+const OFFLINE_REVIEW_RESPONSE_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,18 +74,18 @@ fn encode_v1_operation(
 
 pub(crate) fn review_pack_json(pack: &ReviewPackView) -> Result<Value, serde_json::Error> {
     serde_json::to_value(ReviewPackEnvelopeV1 {
-        version: pack.format_version,
-        pack: ReviewPackV1::from(pack),
+        version: OFFLINE_REVIEW_RESPONSE_VERSION,
+        pack: ReviewPackV1::try_from(pack)?,
     })
 }
 
 pub(crate) fn active_review_pack_json(
-    version: u32,
+    _version: u32,
     pack: Option<&ReviewPackView>,
 ) -> Result<Value, serde_json::Error> {
     serde_json::to_value(ActiveReviewPackEnvelopeV1 {
-        version,
-        pack: pack.map(ReviewPackV1::from),
+        version: OFFLINE_REVIEW_RESPONSE_VERSION,
+        pack: pack.map(ReviewPackV1::try_from).transpose()?,
     })
 }
 
@@ -89,8 +93,8 @@ pub(crate) fn offline_result_json(
     result: &OfflineReviewResult,
 ) -> Result<Value, serde_json::Error> {
     serde_json::to_value(OfflineResultEnvelopeV1 {
-        version: result.format_version,
-        result: OfflineResultV1::from(result),
+        version: OFFLINE_REVIEW_RESPONSE_VERSION,
+        result: OfflineResultV1::try_from(result)?,
     })
 }
 
@@ -445,7 +449,7 @@ struct ReviewPackV1 {
     device_id: String,
     lease_id: String,
     status: String,
-    cursor: u64,
+    cursor: String,
     issued_at_us: u64,
     current_position: u32,
     timezone: String,
@@ -454,22 +458,24 @@ struct ReviewPackV1 {
     assets: Vec<ReviewPackAssetV1>,
 }
 
-impl From<&ReviewPackView> for ReviewPackV1 {
-    fn from(value: &ReviewPackView) -> Self {
-        Self {
+impl TryFrom<&ReviewPackView> for ReviewPackV1 {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &ReviewPackView) -> Result<Self, Self::Error> {
+        Ok(Self {
             pack_id: value.pack_id.clone(),
             session_id: value.session_id.clone(),
             device_id: value.device_id.clone(),
             lease_id: value.lease_id.clone(),
             status: value.status.clone(),
-            cursor: value.cursor,
+            cursor: durable_cursor(&value.cursor_server_id, value.cursor, &value.cursor_token)?,
             issued_at_us: value.issued_at_us,
             current_position: value.current_position,
             timezone: value.timezone.clone(),
             day_boundary_hour: value.day_boundary_hour,
             items: value.items.iter().map(ReviewPackItemV1::from).collect(),
             assets: value.assets.iter().map(ReviewPackAssetV1::from).collect(),
-        }
+        })
     }
 }
 
@@ -535,21 +541,32 @@ struct OfflineResultV1 {
     event_id: Option<String>,
     authoritative_state: ReviewStateV1,
     session: ReviewSessionV1,
-    cursor: u64,
+    cursor: String,
 }
 
-impl From<&OfflineReviewResult> for OfflineResultV1 {
-    fn from(value: &OfflineReviewResult) -> Self {
-        Self {
+impl TryFrom<&OfflineReviewResult> for OfflineResultV1 {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &OfflineReviewResult) -> Result<Self, Self::Error> {
+        Ok(Self {
             attempt_id: value.attempt_id.clone(),
             status: value.status.as_str().into(),
             conflict_reason: value.conflict_reason.map(|reason| reason.as_str().into()),
             event_id: value.event_id.clone(),
             authoritative_state: (&value.authoritative_state).into(),
             session: (&value.session).into(),
-            cursor: value.cursor,
-        }
+            cursor: durable_cursor(&value.cursor_server_id, value.cursor, &value.cursor_token)?,
+        })
     }
+}
+
+fn durable_cursor(
+    server_id: &str,
+    position: u64,
+    token: &str,
+) -> Result<String, serde_json::Error> {
+    encode_cursor(server_id, position, token)
+        .map_err(|error| serde_json::Error::io(io::Error::other(error)))
 }
 
 #[derive(Serialize)]
@@ -647,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_submission_pack_and_result_match_the_golden_fixture() {
+    fn v1_submission_and_v2_responses_match_the_golden_fixture() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/protocol/offline-review-v1.json"
         ))
@@ -665,11 +682,17 @@ mod tests {
         );
 
         let mut pack = fixture["pack"]["pack"].clone();
+        pack["cursor"] = json!(4);
+        pack["cursor_server_id"] = json!("0123456789abcdef0123456789abcdef");
+        pack["cursor_token"] = json!("11111111111111111111111111111111");
         pack["format_version"] = json!(1);
         let pack: ReviewPackView = serde_json::from_value(pack).unwrap();
         assert_eq!(review_pack_json(&pack).unwrap(), fixture["pack"]);
 
         let mut result = fixture["result"]["result"].clone();
+        result["cursor"] = json!(5);
+        result["cursor_server_id"] = json!("0123456789abcdef0123456789abcdef");
+        result["cursor_token"] = json!("22222222222222222222222222222222");
         result["format_version"] = json!(1);
         let result: OfflineReviewResult = serde_json::from_value(result).unwrap();
         assert_eq!(offline_result_json(&result).unwrap(), fixture["result"]);

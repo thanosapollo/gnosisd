@@ -103,8 +103,9 @@ impl SqliteStore {
                 .map_err(StoreError::storage)?;
         let queue = bounded_queue(&self.connection, source, target_count, review_day)?;
         let ids = PackIds::new();
-        let cursor = self.latest_content_cursor()?;
         let transaction = self.write_transaction()?;
+        let cursor = latest_content_cursor(&transaction)?;
+        let (cursor_server_id, cursor_token) = cursor_identity(&transaction, cursor)?;
         insert_offline_session(
             &transaction,
             &ids,
@@ -120,7 +121,7 @@ impl SqliteStore {
             &ids,
             format_version,
             device_id,
-            cursor,
+            (cursor, &cursor_server_id, &cursor_token),
             issued_at_us,
         )?;
         capture_review_pack(&transaction, &ids, &queue)?;
@@ -486,6 +487,13 @@ impl SqliteStore {
             .map_err(StoreError::storage)?;
         commit_state(&transaction, &row, &transition)?;
         insert_review_event(&transaction, &row, &transition, &event_id)?;
+        insert_review_state_history(
+            &transaction,
+            &row.thema_id,
+            &transition.after,
+            &event_id,
+            committed_at_us,
+        )?;
         finish_attempt(&transaction, &row, &event_id, committed_at_us)?;
         update_review_day(&transaction, &transition, row.override_count)?;
         super::insert_content_change(
@@ -797,6 +805,7 @@ fn conflict_result(
     state: crate::domain::ReviewState,
     reason: OfflineConflictReason,
 ) -> Result<OfflineReviewResult, StoreError> {
+    let (cursor, cursor_server_id, cursor_token) = cursor_identity_at_head(connection)?;
     Ok(OfflineReviewResult {
         format_version,
         attempt_id: operation.attempt_id.clone(),
@@ -805,7 +814,9 @@ fn conflict_result(
         event_id: None,
         authoritative_state: (&state).into(),
         session,
-        cursor: latest_content_cursor(connection)?,
+        cursor,
+        cursor_server_id,
+        cursor_token,
     })
 }
 
@@ -823,6 +834,13 @@ fn accept_offline_operation(
     let event_id = Uuid::now_v7().to_string();
     commit_state(transaction, &row, &transition)?;
     insert_review_event(transaction, &row, &transition, &event_id)?;
+    insert_review_state_history(
+        transaction,
+        &row.thema_id,
+        &transition.after,
+        &event_id,
+        reconciled_at_us,
+    )?;
     finish_attempt(transaction, &row, &event_id, reconciled_at_us)?;
     update_review_day(transaction, &transition, operation.override_count)?;
     super::insert_content_change(
@@ -834,6 +852,7 @@ fn accept_offline_operation(
         u64_to_i64(reconciled_at_us, "reconciliation timestamp")?,
     )?;
     let session = load_session(transaction, &operation.session_id)?.ok_or(StoreError::NotFound)?;
+    let (cursor, cursor_server_id, cursor_token) = cursor_identity_at_head(transaction)?;
     Ok(OfflineReviewResult {
         format_version,
         attempt_id: operation.attempt_id.clone(),
@@ -842,7 +861,9 @@ fn accept_offline_operation(
         event_id: Some(event_id),
         authoritative_state: transition.after,
         session,
-        cursor: latest_content_cursor(transaction)?,
+        cursor,
+        cursor_server_id,
+        cursor_token,
     })
 }
 
@@ -963,8 +984,9 @@ fn insert_offline_result(
         .execute(
             "INSERT INTO offline_review_result(
                  attempt_id, format_version, status, conflict_reason, event_id,
-                 authoritative_state_json, session_json, cursor, reconciled_at_us
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 authoritative_state_json, session_json, cursor, reconciled_at_us,
+                 cursor_server_id, cursor_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 result.attempt_id,
                 i64::from(result.format_version),
@@ -974,7 +996,9 @@ fn insert_offline_result(
                 serde_json::to_string(&result.authoritative_state).map_err(StoreError::storage)?,
                 serde_json::to_string(&result.session).map_err(StoreError::storage)?,
                 u64_to_i64(result.cursor, "reconciliation cursor")?,
-                u64_to_i64(reconciled_at_us, "reconciliation timestamp")?
+                u64_to_i64(reconciled_at_us, "reconciliation timestamp")?,
+                result.cursor_server_id,
+                result.cursor_token,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -988,7 +1012,8 @@ fn load_offline_result(
     let row = connection
         .query_row(
             "SELECT format_version, status, conflict_reason, event_id,
-                    authoritative_state_json, session_json, cursor
+                    authoritative_state_json, session_json, cursor,
+                    cursor_server_id, cursor_token
              FROM offline_review_result WHERE attempt_id = ?1",
             [attempt_id],
             |row| {
@@ -1000,6 +1025,8 @@ fn load_offline_result(
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
@@ -1017,6 +1044,8 @@ type OfflineResultRow = (
     String,
     String,
     i64,
+    String,
+    String,
 );
 
 fn materialize_offline_result(
@@ -1032,6 +1061,8 @@ fn materialize_offline_result(
         authoritative_state: serde_json::from_str(&row.4).map_err(StoreError::storage)?,
         session: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
         cursor: to_u64(row.6, "reconciliation cursor")?,
+        cursor_server_id: row.7,
+        cursor_token: row.8,
     })
 }
 
@@ -1059,14 +1090,20 @@ fn parse_conflict_reason(value: &str) -> Result<OfflineConflictReason, StoreErro
 }
 
 fn latest_content_cursor(connection: &Connection) -> Result<u64, StoreError> {
-    let cursor: i64 = connection
-        .query_row(
-            "SELECT coalesce(max(cursor), 0) FROM content_change",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(StoreError::storage)?;
-    to_u64(cursor, "content cursor")
+    super::current_content_cursor(connection)
+}
+
+fn cursor_identity(connection: &Connection, cursor: u64) -> Result<(String, String), StoreError> {
+    Ok((
+        super::server_id(connection)?,
+        super::replica_cursor_token(connection, cursor)?,
+    ))
+}
+
+fn cursor_identity_at_head(connection: &Connection) -> Result<(u64, String, String), StoreError> {
+    let cursor = latest_content_cursor(connection)?;
+    let (server_id, token) = cursor_identity(connection, cursor)?;
+    Ok((cursor, server_id, token))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1162,23 +1199,26 @@ fn insert_review_pack(
     ids: &PackIds,
     format_version: u32,
     device_id: &str,
-    cursor: u64,
+    cursor: (u64, &str, &str),
     issued_at_us: u64,
 ) -> Result<(), StoreError> {
+    let (position, server_id, token) = cursor;
     transaction
         .execute(
             "INSERT INTO review_pack(
                  pack_id, format_version, session_id, device_id, lease_id,
-                 status, cursor, issued_at_us
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7)",
+                 status, cursor, issued_at_us, cursor_server_id, cursor_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9)",
             params![
                 ids.pack_id,
                 i64::from(format_version),
                 ids.session_id,
                 device_id,
                 ids.lease_id,
-                u64_to_i64(cursor, "review pack cursor")?,
-                u64_to_i64(issued_at_us, "review pack issue timestamp")?
+                u64_to_i64(position, "review pack cursor")?,
+                u64_to_i64(issued_at_us, "review pack issue timestamp")?,
+                server_id,
+                token,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -1601,6 +1641,8 @@ type PackRow = (
     i64,
     String,
     i64,
+    String,
+    String,
 );
 
 fn load_review_pack(
@@ -1611,7 +1653,8 @@ fn load_review_pack(
         .query_row(
             "SELECT pack.pack_id, pack.format_version, pack.session_id, pack.device_id,
                     pack.lease_id, pack.status, pack.cursor, pack.issued_at_us, session.current_position,
-                    session.timezone, session.day_boundary_hour
+                    session.timezone, session.day_boundary_hour,
+                    pack.cursor_server_id, pack.cursor_token
              FROM review_pack AS pack
              JOIN review_session AS session USING(session_id)
              WHERE pack.pack_id = ?1",
@@ -1629,6 +1672,8 @@ fn load_review_pack(
                     row.get(8)?,
                     row.get(9)?,
                     row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
                 ))
             },
         )
@@ -1652,6 +1697,8 @@ fn materialize_review_pack(
         lease_id: row.4,
         status: row.5,
         cursor: to_u64(row.6, "review pack cursor")?,
+        cursor_server_id: row.11,
+        cursor_token: row.12,
         issued_at_us: to_u64(row.7, "review pack issue timestamp")?,
         current_position: to_u32(row.8, "review pack position")?,
         timezone: row.9,
@@ -1786,7 +1833,7 @@ fn presentation(thema: &crate::application::ThemaRecord) -> PresentationSnapshot
     }
 }
 
-fn load_review_state(
+pub(super) fn load_review_state(
     connection: &Connection,
     thema_id: &str,
 ) -> Result<crate::domain::ReviewState, StoreError> {
@@ -2202,6 +2249,30 @@ fn insert_review_event(
     Ok(())
 }
 
+fn insert_review_state_history(
+    transaction: &Transaction<'_>,
+    thema_id: &str,
+    state: &ReviewStateSnapshot,
+    event_id: &str,
+    created_at_us: u64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO review_state_revision(
+                 thema_id, state_revision, state_json, event_id, created_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                thema_id,
+                u64_to_i64(state.state_revision, "state revision")?,
+                serde_json::to_string(state).map_err(StoreError::storage)?,
+                event_id,
+                u64_to_i64(created_at_us, "review state timestamp")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
 fn finish_attempt(
     transaction: &Transaction<'_>,
     row: &AttemptRow,
@@ -2270,13 +2341,19 @@ fn update_review_day(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::Connection;
+    use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{MAX_REVIEW_PACK_ITEMS, SqliteStore};
+    use super::{MAX_REVIEW_PACK_ITEMS, SqliteStore, load_offline_result, load_review_pack};
     use crate::application::{
         AnswerInput, OfflineConflictReason, OfflineReviewOperation, ReconciliationStatus,
         ReviewSource, ReviewSourceKind, generate_device, prepare_thema, presentation_content,
         review_day_at, thema_content,
+    };
+    use crate::store::sqlite::{
+        INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION, SERVER_MIGRATION,
+        migrate,
     };
 
     fn add_thema_with_tags(
@@ -2298,7 +2375,124 @@ mod tests {
         .unwrap();
         let prepared =
             prepare_thema(Some(id.into()), content, tags, vec![], vec![], revision).unwrap();
-        store.put_thema(&prepared, 20260715, 1).unwrap();
+        store.put_thema(&prepared, 20260715, 1, None).unwrap();
+    }
+
+    #[test]
+    fn v4_cursor_zero_review_records_upgrade_to_expired_durable_cursors() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        connection.execute_batch(INITIAL_MIGRATION).unwrap();
+        connection.execute_batch(SERVER_MIGRATION).unwrap();
+        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
+        connection.execute_batch(OFFLINE_REVIEW_MIGRATION).unwrap();
+        connection
+            .execute(
+                "INSERT INTO device(
+                     device_id, name, token_digest, scopes_json, created_at_us
+                 ) VALUES ('device', 'Device', ?1, '[\"review\"]', 1)",
+                ["a".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO review_session(
+                     session_id, source_kind, source_json, target_count, timezone,
+                     day_boundary_hour, scheduler_json, status, started_at_us,
+                     owner_device_id, review_mode
+                 ) VALUES (
+                     'session', 'manual', ?1, 1, 'UTC', 0, '{}', 'completed', 1,
+                     'device', 'offline'
+                 )",
+                [json!({
+                    "kind":"manual", "tags":[], "exclude_tags":[],
+                    "topic_node_id":null, "topic_forward_depth":null,
+                    "topic_backward_depth":null, "manual_ids":["thema"]
+                })
+                .to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO review_pack(
+                     pack_id, format_version, session_id, device_id, lease_id,
+                     status, cursor, issued_at_us
+                 ) VALUES ('pack', 1, 'session', 'device', 'lease', 'completed', 0, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO offline_review_operation(
+                     attempt_id, pack_id, device_id, device_sequence, format_version,
+                     payload_sha256, payload_json, received_at_us
+                 ) VALUES ('attempt', 'pack', 'device', 1, 1, ?1, '{}', 1)",
+                ["b".repeat(64)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO offline_review_result(
+                     attempt_id, format_version, status, conflict_reason, event_id,
+                     authoritative_state_json, session_json, cursor, reconciled_at_us
+                 ) VALUES ('attempt', 1, 'conflict', 'lease_ended', NULL, ?1, ?2, 0, 1)",
+                [review_state_json(), review_session_json()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO content_change(
+                     entity_kind, entity_id, revision, operation, created_at_us
+                 ) VALUES ('settings', 'canonical', 1, 'update', 2)",
+                [],
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let pack = load_review_pack(&connection, "pack").unwrap().unwrap();
+        let result = load_offline_result(&connection, "attempt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pack.cursor, 0);
+        assert_eq!(result.cursor, 0);
+        assert_eq!(pack.cursor_server_id, result.cursor_server_id);
+        assert_eq!(pack.cursor_token, result.cursor_token);
+        assert_eq!(pack.cursor_token.len(), 32);
+        assert!(
+            connection
+                .execute(
+                    "UPDATE review_pack SET cursor_token = NULL WHERE pack_id = 'pack'",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    fn review_state_json() -> String {
+        json!({
+            "state_revision":0, "review_count":0, "legacy_review_count":0,
+            "legacy_unclassified_count":0, "last_reviewed_at_us":null,
+            "last_review_day":null, "next_review_day":20260715,
+            "interval_days":null, "consecutive_successes":0, "total_successes":0,
+            "consecutive_failures":0, "total_failures":0, "suspended":false,
+            "gnosis_plus":0.35, "gnosis_minus":0.3, "gnosis_synolon":1.3
+        })
+        .to_string()
+    }
+
+    fn review_session_json() -> String {
+        json!({
+            "session_id":"session", "owner_device_id":"device", "mode":"offline",
+            "source":{"kind":"manual", "tags":[], "exclude_tags":[],
+                "topic_node_id":null, "topic_forward_depth":null,
+                "topic_backward_depth":null, "manual_ids":["thema"]},
+            "target_count":1, "status":"completed", "current_position":0,
+            "queue_length":0, "started_at_us":1
+        })
+        .to_string()
     }
 
     fn add_thema(store: &mut SqliteStore, id: &str, question: &str, revision: Option<u64>) {
@@ -2407,7 +2601,19 @@ mod tests {
         assert_eq!(result.status, ReconciliationStatus::Accepted);
         assert_eq!(result.authoritative_state.review_count, 1);
         assert_eq!(result.session.status, "completed");
-        assert_eq!(result.cursor, 2);
+        assert_eq!(result.cursor, 3);
+        assert_eq!(
+            store
+                .replica_changes(
+                    &result.cursor_server_id,
+                    result.cursor,
+                    &result.cursor_token,
+                    10,
+                )
+                .unwrap()
+                .0,
+            vec![]
+        );
         assert_eq!(
             reconcile(&mut store, &operation, &device_id, 1_752_600_000_003_000,).unwrap(),
             result
@@ -2419,6 +2625,17 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM review_state_revision WHERE thema_id = 'thema'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            2
         );
     }
 

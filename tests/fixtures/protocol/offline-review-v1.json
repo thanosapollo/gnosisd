@@ -102,14 +102,14 @@
     }
   },
   "pack": {
-    "version": 1,
+    "version": 2,
     "pack": {
       "pack_id": "pack",
       "session_id": "session",
       "device_id": "device",
       "lease_id": "lease",
       "status": "active",
-      "cursor": 4,
+      "cursor": "eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsInBvc2l0aW9uIjo0LCJ0b2tlbiI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0",
       "issued_at_us": 1,
       "current_position": 0,
       "timezone": "UTC",
@@ -165,7 +165,7 @@
     }
   },
   "result": {
-    "version": 1,
+    "version": 2,
     "result": {
       "attempt_id": "attempt",
       "status": "accepted",
@@ -208,7 +208,7 @@
         "queue_length": 1,
         "started_at_us": 1
       },
-      "cursor": 5
+      "cursor": "eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsInBvc2l0aW9uIjo1LCJ0b2tlbiI6IjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyIn0"
     }
   }
 }

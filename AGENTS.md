@@ -32,6 +32,12 @@ directly.
   writes use immutable attempts and events plus atomic scheduling transitions.
 - `src/protocol` owns the versioned wire DTOs, framing, Unix-socket server, and
   client. Public fields use opaque string IDs, never SQLite row IDs.
+- Replica bootstrap uses a device-bound immutable snapshot manifest captured at
+  one content cursor. Cursorless retries reuse a resumable manifest. Clients
+  must install every page atomically before promoting the terminal delta cursor.
+- Delta cursors bind the stable server identity, numeric position, and unique
+  feed token so restored branches cannot reuse a cursor silently. Every feed
+  row resolves to an exact immutable revision. SSE is only a wakeup.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` uses only protocol methods.
 
@@ -52,6 +58,8 @@ SIGTERM both enter graceful shutdown.
 Online reviews and device-bound offline review packs reconcile
 through immutable operations. The daemon remains authoritative, conflicts stay
 explicit, and review or content state must never use last-write-wins.
+Offline review v1 submissions remain accepted; v2 pack and result envelopes
+return durable replica cursors.
 
 ## Commands
 

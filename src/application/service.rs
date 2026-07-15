@@ -5,6 +5,7 @@ use std::{
         mpsc::{self, SyncSender, TrySendError},
     },
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use sha2::{Digest, Sha256};
@@ -14,14 +15,15 @@ use tokio::sync::oneshot;
 use super::{
     AnswerInput, ApplicationError, AssetHead, BackupError, BackupSummary, ContentChange,
     DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, NewDevice,
-    NodeRecord, OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedImport,
-    PreparedNote, PreparedThema, QueryDueThemata, QueryDueThemataPage, ReviewAttemptView,
-    ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource, SettingsInput,
-    SettingsRecord, ThemaRecord, create_backup, persist_import, prune_backups, token_digest,
-    validate_restore, verify_backup,
+    NodeRecord, OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedNote,
+    PreparedServerImport, PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange,
+    ReplicaState, ReviewAttemptView, ReviewPackAsset, ReviewPackView, ReviewSessionView,
+    ReviewSource, SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
+    create_backup, persist_server_import, prune_backups, token_digest, validate_restore,
+    verify_backup,
 };
 use crate::{
-    blob::{BlobError, BlobStore},
+    blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     store::{SqliteStore, StoreError, StoredDocument},
 };
@@ -35,10 +37,16 @@ pub(crate) struct ServiceHandle {
 impl ServiceHandle {
     pub(crate) async fn replace(
         &self,
-        prepared: PreparedImport,
+        prepared: PreparedServerImport,
     ) -> Result<ImportSummary, ServiceError> {
+        let blob = self
+            .blobs
+            .put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
+        let created_at_us = system_time_us()?;
         request(&self.sender, |response| StoreCommand::Replace {
             prepared: Box::new(prepared),
+            blob,
+            created_at_us,
             response,
         })
         .await?
@@ -285,6 +293,91 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn replica_state(
+        &self,
+        device_id: String,
+    ) -> Result<ReplicaState, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ReplicaState {
+            device_id,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn replica_changes(
+        &self,
+        server_id: String,
+        after: u64,
+        after_token: String,
+        limit: u16,
+    ) -> Result<(Vec<ReplicaChange>, u64, String), ServiceError> {
+        request(&self.sender, |response| StoreCommand::ReplicaChanges {
+            server_id,
+            after,
+            after_token,
+            limit,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn create_replica_snapshot(
+        &self,
+        device_id: String,
+        created_at_us: u64,
+        limit: u16,
+    ) -> Result<SnapshotPage, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::CreateReplicaSnapshot {
+                device_id,
+                created_at_us,
+                limit,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn replica_snapshot_page(
+        &self,
+        device_id: String,
+        position: SnapshotPosition,
+        limit: u16,
+    ) -> Result<SnapshotPage, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ReplicaSnapshotPage {
+            device_id,
+            position,
+            limit,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn blob(
+        &self,
+        digest: String,
+    ) -> Result<Option<(BlobMeta, Vec<u8>)>, ServiceError> {
+        let meta = request(&self.sender, |response| StoreCommand::BlobMeta {
+            digest,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)?;
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+        let blobs = self.blobs.clone();
+        let digest = meta.sha256.clone();
+        let bytes = tokio::task::spawn_blocking(move || blobs.read(&digest))
+            .await
+            .map_err(|_| ServiceError::Stopped)??;
+        Ok(Some((meta, bytes)))
+    }
+
     pub(crate) async fn settings(&self) -> Result<SettingsRecord, ServiceError> {
         request(&self.sender, |response| StoreCommand::GetSettings {
             response,
@@ -298,12 +391,14 @@ impl ServiceHandle {
         input: SettingsInput,
         expected_revision: u64,
         updated_at_us: i64,
+        author_device_id: Option<String>,
     ) -> Result<SettingsRecord, ServiceError> {
         let input = input.validate().map_err(ServiceError::Settings)?;
         request(&self.sender, |response| StoreCommand::UpdateSettings {
             input,
             expected_revision,
             updated_at_us,
+            author_device_id,
             response,
         })
         .await?
@@ -315,11 +410,13 @@ impl ServiceHandle {
         prepared: PreparedThema,
         initial_review_day: u32,
         updated_at_us: i64,
+        author_device_id: Option<String>,
     ) -> Result<ThemaRecord, ServiceError> {
         request(&self.sender, |response| StoreCommand::PutThema {
             prepared: Box::new(prepared),
             initial_review_day,
             updated_at_us,
+            author_device_id,
             response,
         })
         .await?
@@ -344,12 +441,14 @@ impl ServiceHandle {
         expected_revision: u64,
         archived: bool,
         updated_at_us: i64,
+        author_device_id: Option<String>,
     ) -> Result<ThemaRecord, ServiceError> {
         request(&self.sender, |response| StoreCommand::ArchiveThema {
             thema_id,
             expected_revision,
             archived,
             updated_at_us,
+            author_device_id,
             response,
         })
         .await?
@@ -875,7 +974,9 @@ type StoreResult<T> = Result<T, StoreError>;
 
 enum StoreCommand {
     Replace {
-        prepared: Box<PreparedImport>,
+        prepared: Box<PreparedServerImport>,
+        blob: BlobMeta,
+        created_at_us: i64,
         response: oneshot::Sender<Result<ImportSummary, ApplicationError>>,
     },
     Get {
@@ -960,6 +1061,33 @@ enum StoreCommand {
     LatestContentCursor {
         response: oneshot::Sender<StoreResult<u64>>,
     },
+    ReplicaState {
+        device_id: String,
+        response: oneshot::Sender<StoreResult<ReplicaState>>,
+    },
+    ReplicaChanges {
+        server_id: String,
+        after: u64,
+        after_token: String,
+        limit: u16,
+        response: oneshot::Sender<StoreResult<(Vec<ReplicaChange>, u64, String)>>,
+    },
+    CreateReplicaSnapshot {
+        device_id: String,
+        created_at_us: u64,
+        limit: u16,
+        response: oneshot::Sender<StoreResult<SnapshotPage>>,
+    },
+    ReplicaSnapshotPage {
+        device_id: String,
+        position: SnapshotPosition,
+        limit: u16,
+        response: oneshot::Sender<StoreResult<SnapshotPage>>,
+    },
+    BlobMeta {
+        digest: String,
+        response: oneshot::Sender<StoreResult<Option<BlobMeta>>>,
+    },
     GetSettings {
         response: oneshot::Sender<StoreResult<SettingsRecord>>,
     },
@@ -967,12 +1095,14 @@ enum StoreCommand {
         input: SettingsInput,
         expected_revision: u64,
         updated_at_us: i64,
+        author_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<SettingsRecord>>,
     },
     PutThema {
         prepared: Box<PreparedThema>,
         initial_review_day: u32,
         updated_at_us: i64,
+        author_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ThemaRecord>>,
     },
     GetThema {
@@ -984,6 +1114,7 @@ enum StoreCommand {
         expected_revision: u64,
         archived: bool,
         updated_at_us: i64,
+        author_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ThemaRecord>>,
     },
     SearchThemata {
@@ -1182,9 +1313,15 @@ fn store_actor(
 
 fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
     match command {
-        StoreCommand::Replace { prepared, response } => {
-            send(response, persist_import(store, &prepared))
-        }
+        StoreCommand::Replace {
+            prepared,
+            blob,
+            created_at_us,
+            response,
+        } => send(
+            response,
+            persist_server_import(store, &prepared, &blob, created_at_us),
+        ),
         StoreCommand::Get {
             document_id,
             response,
@@ -1307,24 +1444,69 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
         StoreCommand::LatestContentCursor { response } => {
             send(response, store.latest_content_cursor())
         }
+        StoreCommand::ReplicaState {
+            device_id,
+            response,
+        } => send(response, store.replica_state(&device_id)),
+        StoreCommand::ReplicaChanges {
+            server_id,
+            after,
+            after_token,
+            limit,
+            response,
+        } => send(
+            response,
+            store.replica_changes(&server_id, after, &after_token, limit),
+        ),
+        StoreCommand::CreateReplicaSnapshot {
+            device_id,
+            created_at_us,
+            limit,
+            response,
+        } => send(
+            response,
+            store.create_replica_snapshot(&device_id, created_at_us, limit),
+        ),
+        StoreCommand::ReplicaSnapshotPage {
+            device_id,
+            position,
+            limit,
+            response,
+        } => send(
+            response,
+            store.replica_snapshot_page(&device_id, &position, limit),
+        ),
+        StoreCommand::BlobMeta { digest, response } => send(response, store.blob_meta(&digest)),
         StoreCommand::GetSettings { response } => send(response, store.settings()),
         StoreCommand::UpdateSettings {
             input,
             expected_revision,
             updated_at_us,
+            author_device_id,
             response,
         } => send(
             response,
-            store.update_settings(&input, expected_revision, updated_at_us),
+            store.update_settings(
+                &input,
+                expected_revision,
+                updated_at_us,
+                author_device_id.as_deref(),
+            ),
         ),
         StoreCommand::PutThema {
             prepared,
             initial_review_day,
             updated_at_us,
+            author_device_id,
             response,
         } => send(
             response,
-            store.put_thema(&prepared, initial_review_day, updated_at_us),
+            store.put_thema(
+                &prepared,
+                initial_review_day,
+                updated_at_us,
+                author_device_id.as_deref(),
+            ),
         ),
         StoreCommand::GetThema { thema_id, response } => send(response, store.get_thema(&thema_id)),
         StoreCommand::ArchiveThema {
@@ -1332,10 +1514,17 @@ fn run_store_command(store: &mut SqliteStore, command: StoreCommand) {
             expected_revision,
             archived,
             updated_at_us,
+            author_device_id,
             response,
         } => send(
             response,
-            store.set_thema_archived(&thema_id, expected_revision, archived, updated_at_us),
+            store.set_thema_archived(
+                &thema_id,
+                expected_revision,
+                archived,
+                updated_at_us,
+                author_device_id.as_deref(),
+            ),
         ),
         StoreCommand::SearchThemata {
             query,
@@ -1601,6 +1790,14 @@ fn random_fuzz_sample() -> Result<f64, ServiceError> {
     Ok(2.0 * (f64::from(value) / 1000.0) - 1.0)
 }
 
+fn system_time_us() -> Result<i64, ServiceError> {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ServiceError::Corrupt)?
+        .as_micros();
+    i64::try_from(micros).map_err(|_| ServiceError::Corrupt)
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ServiceStartError {
     #[error("store service stopped during startup")]
@@ -1621,7 +1818,8 @@ mod tests {
 
     use super::{ServiceError, ServiceRuntime};
     use crate::application::{
-        ParametersSnapshot, SettingsInput, canonical_asset_path, prepare_asset, prepare_note,
+        ImportDocument, ParametersSnapshot, ReplicaProjection, SettingsInput, canonical_asset_path,
+        generate_device, prepare_asset, prepare_note,
     };
 
     async fn runtime(directory: &tempfile::TempDir) -> ServiceRuntime {
@@ -1730,6 +1928,40 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ServiceError::AssetDigest));
         assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_imports_enter_the_replica_feed_without_changing_the_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let prepared = ImportDocument::new("document", "#+TITLE: Synced\n".into(), None)
+            .unwrap()
+            .prepare_server()
+            .unwrap();
+        let summary = service.replace(prepared).await.unwrap();
+        assert_eq!(summary.revision, 1);
+
+        let device = generate_device("replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let snapshot = service
+            .create_replica_snapshot(device_id, 2, 10)
+            .await
+            .unwrap();
+        let document = snapshot
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ReplicaProjection::Document(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(document.revision.document_id, "document");
+        assert_eq!(document.projection.as_ref().unwrap().title, "Synced");
+        assert_eq!(service.latest_content_cursor().await.unwrap(), 1);
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -1887,7 +2119,7 @@ mod tests {
             },
             tag_rules: BTreeMap::new(),
         };
-        let updated = service.update_settings(input, 1, 10).await.unwrap();
+        let updated = service.update_settings(input, 1, 10, None).await.unwrap();
         assert_eq!(updated.revision, 2);
         assert_eq!(updated.timezone, "Europe/Sofia");
         assert_eq!(service.latest_content_cursor().await.unwrap(), 1);
