@@ -28,9 +28,9 @@ use crate::{
         AnswerInput, ApplicationError, AssetHead, ContentChange, DevicePrincipal, DeviceScope,
         DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NodeRecord, ReviewAttemptMutation,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-        ReviewAttemptView, ReviewOperationAuthority, ReviewSessionView, ReviewSource, ServiceError,
-        ServiceHandle, SettingsInput, SettingsRecord, ThemaRecord, canonical_asset_path,
-        prepare_asset, prepare_note, prepare_thema, review_day_at, thema_content,
+        ReviewAttemptView, ReviewOperationAuthority, ReviewSessionView, ReviewSource,
+        SettingsInput, SettingsRecord, ThemaRecord, canonical_asset_path, prepare_asset,
+        prepare_note, prepare_thema, review_day_at, thema_content,
     },
     domain::DocumentId,
     is_canonical_sha256,
@@ -49,6 +49,7 @@ use crate::{
         offline_content_result_json, offline_result_json, replica_change_page,
         replica_snapshot_page, replica_state_response, review_pack_json,
     },
+    service::{ServiceError, ServiceHandle},
     store::StoreError,
 };
 
@@ -2152,8 +2153,8 @@ mod tests {
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
         PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
-        ServiceError, ServiceRuntime, SettingsInput, generate_device, prepare_asset, prepare_thema,
-        presentation_content, review_day_at, thema_content,
+        SettingsInput, generate_device, prepare_asset, prepare_thema, presentation_content,
+        review_day_at, thema_content,
     };
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, fuzz_delta,
@@ -2166,6 +2167,7 @@ mod tests {
             ReplicaStateV1, ReviewAttemptV1,
         },
     };
+    use crate::service::{ServiceError, ServiceRuntime};
     use crate::store::{SqliteStore, StoreError};
 
     #[test]
@@ -2740,9 +2742,7 @@ mod tests {
         assert!(!device_id.is_empty());
     }
 
-    async fn online_attempt(
-        service: &crate::application::ServiceHandle,
-    ) -> (String, String, String) {
+    async fn online_attempt(service: &crate::service::ServiceHandle) -> (String, String, String) {
         let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
         let token = device.token.clone();
         let device_id = device.device_id.clone();

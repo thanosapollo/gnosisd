@@ -457,14 +457,14 @@ mod tests {
     use super::*;
     use crate::{
         application::{
-            ReviewSource, ReviewSourceKind, ServiceRuntime, generate_device, prepare_thema,
-            thema_content,
+            ReviewSource, ReviewSourceKind, generate_device, prepare_thema, thema_content,
         },
         client_replica::{LocalReplica, OfflineAnswer, OfflineResponse},
         protocol::{
             DaemonConfig, DaemonServer, offline_asset_capabilities, offline_content_capabilities,
             replica_snapshot_page, replica_state_response, review_pack_json,
         },
+        service::ServiceRuntime,
     };
 
     #[test]
@@ -589,7 +589,7 @@ mod tests {
         }
     }
 
-    async fn seed_thema(service: &crate::application::ServiceHandle) {
+    async fn seed_thema(service: &crate::service::ServiceHandle) {
         let content = thema_content(
             "basic",
             "Question".into(),

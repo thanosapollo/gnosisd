@@ -1886,9 +1886,8 @@ mod tests {
     };
     use crate::{
         application::{
-            NewDevice, ReviewSource, ReviewSourceKind, ServiceHandle, ServiceRuntime,
-            canonical_asset_path, generate_device, prepare_asset, prepare_note, prepare_thema,
-            thema_content,
+            NewDevice, ReviewSource, ReviewSourceKind, canonical_asset_path, generate_device,
+            prepare_asset, prepare_note, prepare_thema, thema_content,
         },
         protocol::{
             OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineContentSubmission,
@@ -1897,6 +1896,7 @@ mod tests {
             offline_content_capabilities, offline_content_result_json, offline_result_json,
             replica_change_page, replica_snapshot_page, replica_state_response, review_pack_json,
         },
+        service::{ServiceHandle, ServiceRuntime},
     };
 
     #[test]
@@ -2540,7 +2540,7 @@ mod tests {
         let missing = reconcile_asset_upload(&service, &upload, &device_id, 20).await;
         assert!(matches!(
             missing,
-            Err(crate::application::ServiceError::Store(
+            Err(crate::service::ServiceError::Store(
                 crate::store::StoreError::BlobRequired { .. }
             ))
         ));
@@ -2573,7 +2573,7 @@ mod tests {
         let missing_after_restart = reconcile_asset_upload(&service, &retry, &device_id, 22).await;
         assert!(matches!(
             missing_after_restart,
-            Err(crate::application::ServiceError::Store(
+            Err(crate::service::ServiceError::Store(
                 crate::store::StoreError::BlobRequired { .. }
             ))
         ));
@@ -3550,7 +3550,7 @@ mod tests {
         upload: &PendingAssetUpload,
         device_id: &str,
         received_at_us: u64,
-    ) -> Result<Value, crate::application::ServiceError> {
+    ) -> Result<Value, crate::service::ServiceError> {
         let submission: OfflineAssetSubmission =
             serde_json::from_value(upload.submission().unwrap()).unwrap();
         let decoded = submission.decode().unwrap();

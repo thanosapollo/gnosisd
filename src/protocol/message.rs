@@ -650,17 +650,6 @@ pub struct BackupView {
     pub blob_count: u64,
 }
 
-impl From<crate::application::BackupSummary> for BackupView {
-    fn from(summary: crate::application::BackupSummary) -> Self {
-        Self {
-            path: summary.path.to_string_lossy().into_owned(),
-            created_at_us: summary.created_at_us,
-            database_sha256: summary.database_sha256,
-            blob_count: summary.blob_count,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeviceCreatedView {
     pub device: DeviceView,

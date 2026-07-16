@@ -22,8 +22,7 @@ use crate::{
         ApplicationError, DueCursor, ImportDocument, ImportSummary, LegacyQueryError,
         PreparedImport, QueryDocument, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema,
         ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptOperationStatus, ReviewOperationAuthority, ServiceError, ServiceHandle,
-        ServiceRuntime, ServiceStartError, generate_device,
+        ReviewAttemptOperationStatus, ReviewOperationAuthority, generate_device,
     },
     protocol::{
         ActiveReviewSessionView, AssetChunkView, BackupView, BackupsPrunedView, DeviceCreatedView,
@@ -33,6 +32,7 @@ use crate::{
         ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult,
         ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo, ThemaView, frame,
     },
+    service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError},
     store::StoreError,
 };
 
@@ -748,7 +748,7 @@ async fn create_backup(
         .create_backup(destination.into(), created_at_us)
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::Backup(BackupView::from(summary)))
+    Ok(ResponseResult::Backup(backup_view(summary)))
 }
 
 async fn verify_backup(state: ServerState, path: String) -> Result<ResponseResult, ProtocolError> {
@@ -758,7 +758,7 @@ async fn verify_backup(state: ServerState, path: String) -> Result<ResponseResul
         .verify_backup(path.into())
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::Backup(BackupView::from(summary)))
+    Ok(ResponseResult::Backup(backup_view(summary)))
 }
 
 async fn prune_backups(
@@ -798,7 +798,16 @@ async fn validate_restore(
         .validate_restore(path.into(), temporary_directory.into())
         .await
         .map_err(actor_error)?;
-    Ok(ResponseResult::Backup(BackupView::from(summary)))
+    Ok(ResponseResult::Backup(backup_view(summary)))
+}
+
+fn backup_view(summary: crate::service::BackupSummary) -> BackupView {
+    BackupView {
+        path: summary.path.to_string_lossy().into_owned(),
+        created_at_us: summary.created_at_us,
+        database_sha256: summary.database_sha256,
+        blob_count: summary.blob_count,
+    }
 }
 
 fn require_path(path: &str) -> Result<(), ProtocolError> {
@@ -1145,8 +1154,9 @@ mod tests {
         validate_config,
     };
     use crate::{
-        application::{ApplicationError, ServiceError},
+        application::ApplicationError,
         protocol::{DueThemaView, ErrorCode, ResponseOutcome, ResponseResult},
+        service::ServiceError,
         store::StoreError,
     };
 

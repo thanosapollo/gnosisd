@@ -22,10 +22,11 @@ directly.
   write can enter the database queue.
 - `src/parser` is the concrete Org adapter. Do not add a parser trait until a
   second implementation creates a real substitution boundary.
-- `src/store` is the only SQLite adapter. One daemon-owned thread holds the
+- `src/store` is the only SQLite adapter. SQLite files are mode `0600`.
+- `src/service` is the concrete imperative shell for server imports, backups,
+  blobs, and persistence coordination. One daemon-owned thread holds the
   canonical connection and handles reads and atomic writes through a bounded
   queue. The concrete client replica store owns a separate local connection.
-  SQLite files are mode `0600`.
 - `src/migration.rs` owns the offline schema-v9 snapshot path. It must never
   modify or replace the source database, and it publishes only a fully checked
   target.
@@ -35,11 +36,12 @@ directly.
   client. Public fields use opaque string IDs, never SQLite row IDs.
   `src/protocol/http_v1.rs` is the client-facing HTTP contract kernel. Generate
   OpenAPI schemas from these DTOs instead of maintaining parallel JSON models.
-- Local online review DTOs remain in `src/protocol`, validation and orchestration
-  remain in `src/application`, and persistence remains in `src/store`. The
-  daemon owns grading, scheduling transitions, session progress, suspension,
-  daily totals, and immutable review events. Do not move that authority into a
-  frontend.
+- Local online review DTOs remain in `src/protocol`. Pure validation and
+  transition construction remain in `src/application`, concrete server
+  orchestration remains in `src/service`, and persistence remains in
+  `src/store`. The daemon owns grading, scheduling transitions, session
+  progress, suspension, daily totals, and immutable review events. Do not move
+  that authority into a frontend.
 - Review attempt envelope IDs are disposable correlation IDs. Desired-state
   mutations carry a separate durable operation ID and expected attempt
   revision. Operation identity is scoped to the authenticated device or local

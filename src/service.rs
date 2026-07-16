@@ -13,20 +13,26 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::oneshot;
 
-use super::{
-    AnswerInput, ApplicationError, AssetHead, BackupError, BackupSummary, ContentChange,
-    DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision, ImportSummary,
-    MAX_OFFLINE_ASSET_BYTES, NewDevice, NodeRecord, OfflineAssetOperation, OfflineAssetResult,
-    OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
-    OfflineReviewOperation, OfflineReviewResult, PreparedAsset, PreparedNote, PreparedServerImport,
-    PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
-    ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
-    ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
-    SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord, create_backup,
-    persist_server_import, prepare_offline_document, prune_backups, retained_asset_paths_in_org,
-    token_digest, validate_asset_path, validate_restore, verify_backup,
-};
+mod backup;
+mod import;
+
+pub(crate) use backup::BackupSummary;
+use backup::{BackupError, create_backup, prune_backups, validate_restore, verify_backup};
+use import::persist_server_import;
+
 use crate::{
+    application::{
+        AnswerInput, ApplicationError, AssetHead, ContentChange, DevicePrincipal, DeviceRecord,
+        DocumentHead, DocumentRevision, ImportSummary, MAX_OFFLINE_ASSET_BYTES, NewDevice,
+        NodeRecord, OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
+        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
+        PreparedAsset, PreparedNote, PreparedServerImport, PreparedThema, QueryDueThemata,
+        QueryDueThemataPage, ReplicaChange, ReplicaState, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewError,
+        ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
+        SettingsError, SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
+        prepare_offline_document, retained_asset_paths_in_org, token_digest, validate_asset_path,
+    },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     is_canonical_sha256,
@@ -626,7 +632,7 @@ impl ServiceHandle {
     ) -> Result<ReviewSessionView, ServiceError> {
         let source = source.validate().map_err(ServiceError::Review)?;
         if target_count == Some(0) {
-            return Err(ServiceError::Review(super::ReviewError::Target));
+            return Err(ServiceError::Review(ReviewError::Target));
         }
         request(&self.sender, |response| StoreCommand::CreateReviewSession {
             source,
@@ -852,7 +858,7 @@ impl ServiceHandle {
         let source = source.validate().map_err(ServiceError::Review)?;
         let target_count = Some(target_count.unwrap_or(100));
         if !target_count.is_some_and(|count| (1..=500).contains(&count)) {
-            return Err(ServiceError::Review(super::ReviewError::Target));
+            return Err(ServiceError::Review(ReviewError::Target));
         }
         request(&self.sender, |response| StoreCommand::CreateReviewPack {
             format_version,
@@ -2269,9 +2275,9 @@ pub(crate) enum ServiceError {
     #[error("application operation failed")]
     Application(#[source] ApplicationError),
     #[error("review request is invalid")]
-    Review(#[source] super::ReviewError),
+    Review(#[source] ReviewError),
     #[error("settings request is invalid")]
-    Settings(#[source] super::SettingsError),
+    Settings(#[source] SettingsError),
     #[error("backup operation failed")]
     Backup(#[source] BackupError),
 }
@@ -3143,7 +3149,7 @@ mod tests {
         let service = runtime.handle();
         let initial = service.settings().await.unwrap();
         assert_eq!(initial.timezone, "UTC");
-        assert!(initial.tag_rules.contains_key("tag-a"));
+        assert!(initial.tag_rules.is_empty());
         let input = SettingsInput {
             timezone: "Europe/Sofia".into(),
             day_boundary_hour: 4,
