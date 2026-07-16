@@ -14,7 +14,6 @@ use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
     redirect::Policy,
 };
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -32,7 +31,7 @@ use crate::{
         MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
         http_v1::{
             ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1,
-            ReplicaSnapshotPageV1, ReplicaStateV1, valid_bearer_token,
+            ReplicaSnapshotPageV1, ReplicaStateV1, StagedBlobV1, valid_bearer_token,
         },
     },
 };
@@ -285,13 +284,6 @@ fn decode_upload_result(
     (result.operation_id() == upload.operation_id())
         .then_some(result)
         .ok_or_else(invalid_response)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StagedBlobV1 {
-    content_sha256: String,
-    size_bytes: u64,
 }
 
 async fn execute_json<T: DeserializeOwned>(

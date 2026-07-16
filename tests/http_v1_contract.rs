@@ -1,7 +1,10 @@
 use gnosis_core::protocol::http_v1::{
-    ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1,
-    ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
-    ReviewAttemptStateResponseV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+    ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1,
+    ContentChangePageV1, DocumentHeadV1, DocumentRevisionPageV1, NodePageV1, NoteRenameRequestV1,
+    NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
+    ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, SetAcceptedSuccessRequestV1,
+    SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1,
+    UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -167,6 +170,121 @@ fn public_review_dtos_reject_unknown_attempt_discriminants() {
     let mut unknown_status = review_attempt_result();
     unknown_status["attempt"]["status"] = json!("future");
     assert!(serde_json::from_value::<ReviewAttemptOperationResponseV1>(unknown_status).is_err());
+}
+
+#[test]
+fn public_content_dtos_preserve_existing_resource_shapes() {
+    assert_round_trip::<ContentChangePageV1>(json!({
+        "items":[{"cursor":1,"entity_kind":"document","entity_id":"document",
+            "revision":2,"operation":"update","created_at_us":3}],
+        "next":1
+    }));
+    assert_round_trip::<ContentChangePageV1>(json!({
+        "items":[{"cursor":2,"entity_kind":"review","entity_id":"thema",
+            "revision":3,"operation":"commit","created_at_us":4}],
+        "next":2
+    }));
+    assert_round_trip::<DocumentHeadV1>(json!({
+        "document_id":"document","logical_path":"notes/example.org","revision":2,
+        "content_sha256":null,"active":false
+    }));
+    assert_round_trip::<DocumentRevisionPageV1>(json!({
+        "items":[{"document_id":"document","revision":2,
+            "logical_path":"notes/example.org","content_sha256":null,
+            "operation":"tombstone","created_at_us":3,"author_device_id":null}],
+        "next":2
+    }));
+    assert_round_trip::<AssetHeadV1>(json!({
+        "logical_path":format!("assets/{}/image.png", "a".repeat(64)),"revision":2,
+        "content_sha256":null,"media_type":null,"active":false
+    }));
+    assert_round_trip::<StagedBlobV1>(json!({
+        "content_sha256":"a".repeat(64),"size_bytes":12
+    }));
+    assert_round_trip::<ThemaPageV1>(json!({"items":[thema_wire()],"next":"thema"}));
+    assert_round_trip::<NodePageV1>(json!({
+        "items":[{"node_id":"node","document_id":"document",
+            "logical_path":"notes/example.org","title":"Node","title_path":["Parent"],
+            "tags":[],"level":2,"active":true,"thema_ids":["thema"]}],
+        "next":"node"
+    }));
+    assert_round_trip::<SettingsV1>(settings_wire(true));
+}
+
+#[test]
+fn public_content_requests_are_strict_and_preserve_defaults() {
+    let note = json!({"logical_path":"notes/example.org","org":"#+title: Example\n"});
+    assert_round_trip::<NoteWriteRequestV1>(note.clone());
+    let mut future = note;
+    future["future"] = json!(true);
+    assert!(serde_json::from_value::<NoteWriteRequestV1>(future).is_err());
+    assert_round_trip::<NoteRenameRequestV1>(json!({
+        "logical_path":"notes/renamed.org"
+    }));
+
+    let thema: ThemaWriteRequestV1 = serde_json::from_value(json!({
+        "kind":"basic","keimenon":"Question","answer":["Answer"]
+    }))
+    .unwrap();
+    assert!(thema.hypothesis.is_empty());
+    assert!(thema.tags.is_empty());
+    assert!(thema.node_ids.is_empty());
+    assert!(thema.asset_paths.is_empty());
+
+    let settings: UpdateSettingsRequestV1 = serde_json::from_value(settings_wire(false)).unwrap();
+    assert_eq!(settings.scheduler.scheduler_version, 0);
+    assert!(settings.tag_rules.is_empty());
+}
+
+#[test]
+fn public_content_responses_require_explicit_nullable_fields() {
+    let mut head = json!({
+        "document_id":"document","logical_path":"notes/example.org","revision":2,
+        "content_sha256":null,"active":false
+    });
+    head.as_object_mut().unwrap().remove("content_sha256");
+    assert!(serde_json::from_value::<DocumentHeadV1>(head).is_err());
+
+    let mut thema = thema_wire();
+    thema.as_object_mut().unwrap().remove("source_guid");
+    assert!(
+        serde_json::from_value::<ThemaPageV1>(json!({
+            "items":[thema],"next":null
+        }))
+        .is_err()
+    );
+}
+
+fn assert_round_trip<T>(wire: Value)
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let value: T = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(value).unwrap(), wire);
+}
+
+fn thema_wire() -> Value {
+    json!({
+        "thema_id":"thema","revision":1,"kind":"basic","keimenon":"Question",
+        "hypothesis":[null],"answer":["Answer"],"source_guid":null,"parathema":null,
+        "review_image":null,"tags":[],"node_ids":[],"asset_paths":[],
+        "content_sha256":"a".repeat(64),"archived":false
+    })
+}
+
+fn settings_wire(include_output_fields: bool) -> Value {
+    let mut value = json!({
+        "timezone":"UTC","day_boundary_hour":0,
+        "scheduler":{"amnesia":0.5,"epignosis":0.1,"agnoia":0.2,"anagnosis":3,
+            "lethe":2,"synolon_max":3.0,"interval_fuzz":0.1,"proto":[0,1,2]}
+    });
+    if include_output_fields {
+        value["revision"] = json!(1);
+        value["scheduler"]["scheduler_version"] = json!(1);
+        value["tag_rules"] = json!({"tag":{"amnesia":null,"epignosis":null,"agnoia":null,
+            "anagnosis":null,"lethe":null,"proto":null}});
+    }
+    value
 }
 
 fn review_attempt_result() -> Value {

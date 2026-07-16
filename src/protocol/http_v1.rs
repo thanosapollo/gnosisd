@@ -6,6 +6,15 @@
 //! `LocalReplica` performs cursor, identity, projection, and ordering validation
 //! before persistence.
 
+mod content;
+
+pub use content::{
+    AssetHeadV1, ContentChangePageV1, ContentChangeV1, ContentEntityKindV1, ContentOperationV1,
+    DocumentHeadV1, DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
+    NoteRenameRequestV1, NoteWriteRequestV1, SchedulerParametersInputV1, SettingsV1, StagedBlobV1,
+    TagRuleInputV1, ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+};
+
 use std::{borrow::Cow, collections::BTreeMap};
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
@@ -409,11 +418,23 @@ pub struct ParametersV1 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TagRuleV1 {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub amnesia: Option<f64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub epignosis: Option<f64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub agnoia: Option<f64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub anagnosis: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub lethe: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub proto: Option<Vec<u32>>,
 }
 

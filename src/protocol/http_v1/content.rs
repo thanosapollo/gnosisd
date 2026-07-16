@@ -1,0 +1,508 @@
+use std::collections::BTreeMap;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use super::{DocumentOperationV1, ParametersV1, TagRuleV1, ThemaKindV1};
+use crate::application::{
+    AssetHead, ContentChange, DocumentHead, DocumentRevision, NodeRecord, ParametersSnapshot,
+    SettingsInput, SettingsRecord, TagRule, ThemaRecord,
+};
+use crate::domain::ThemaKind;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentEntityKindV1 {
+    Document,
+    Asset,
+    Thema,
+    Settings,
+    #[serde(rename = "review")]
+    ReviewState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentOperationV1 {
+    Create,
+    Update,
+    Rename,
+    Snapshot,
+    Tombstone,
+    Archive,
+    Unarchive,
+    Commit,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentChangeV1 {
+    pub cursor: u64,
+    pub entity_kind: ContentEntityKindV1,
+    pub entity_id: String,
+    pub revision: u64,
+    pub operation: ContentOperationV1,
+    pub created_at_us: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentChangePageV1 {
+    #[schemars(length(max = 500))]
+    pub items: Vec<ContentChangeV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub next: Option<u64>,
+}
+
+impl ContentChangePageV1 {
+    pub(crate) fn from_application(items: &[ContentChange]) -> Result<Self, ContentWireError> {
+        Ok(Self {
+            items: items
+                .iter()
+                .map(ContentChangeV1::from_application)
+                .collect::<Result<_, _>>()?,
+            next: items.last().map(|item| item.cursor),
+        })
+    }
+}
+
+impl ContentChangeV1 {
+    fn from_application(value: &ContentChange) -> Result<Self, ContentWireError> {
+        Ok(Self {
+            cursor: value.cursor,
+            entity_kind: content_kind(&value.entity_kind)?,
+            entity_id: value.entity_id.clone(),
+            revision: value.revision,
+            operation: content_operation(&value.operation)?,
+            created_at_us: value.created_at_us,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoteWriteRequestV1 {
+    pub logical_path: String,
+    pub org: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NoteRenameRequestV1 {
+    pub logical_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentHeadV1 {
+    pub document_id: String,
+    pub logical_path: String,
+    pub revision: u64,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub content_sha256: Option<String>,
+    pub active: bool,
+}
+
+impl DocumentHeadV1 {
+    pub(crate) fn from_application(value: &DocumentHead) -> Self {
+        Self {
+            document_id: value.document_id.clone(),
+            logical_path: value.logical_path.clone(),
+            revision: value.revision,
+            content_sha256: value.blob_sha256.clone(),
+            active: value.active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentRevisionSummaryV1 {
+    pub document_id: String,
+    pub revision: u64,
+    pub logical_path: String,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub content_sha256: Option<String>,
+    pub operation: DocumentOperationV1,
+    pub created_at_us: u64,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub author_device_id: Option<String>,
+}
+
+impl DocumentRevisionSummaryV1 {
+    pub(crate) fn from_application(value: &DocumentRevision) -> Result<Self, ContentWireError> {
+        Ok(Self {
+            document_id: value.document_id.clone(),
+            revision: value.revision,
+            logical_path: value.logical_path.clone(),
+            content_sha256: value.blob_sha256.clone(),
+            operation: document_operation(&value.operation)?,
+            created_at_us: value.created_at_us,
+            author_device_id: value.author_device_id.clone(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentRevisionPageV1 {
+    #[schemars(length(max = 500))]
+    pub items: Vec<DocumentRevisionSummaryV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub next: Option<u64>,
+}
+
+impl DocumentRevisionPageV1 {
+    pub(crate) fn from_application(items: &[DocumentRevision]) -> Result<Self, ContentWireError> {
+        Ok(Self {
+            items: items
+                .iter()
+                .map(DocumentRevisionSummaryV1::from_application)
+                .collect::<Result<_, _>>()?,
+            next: items.last().map(|item| item.revision),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssetHeadV1 {
+    pub logical_path: String,
+    pub revision: u64,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub content_sha256: Option<String>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub media_type: Option<String>,
+    pub active: bool,
+}
+
+impl AssetHeadV1 {
+    pub(crate) fn from_application(value: &AssetHead) -> Self {
+        Self {
+            logical_path: value.logical_path.clone(),
+            revision: value.revision,
+            content_sha256: value.blob_sha256.clone(),
+            media_type: value.media_type.clone(),
+            active: value.active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedBlobV1 {
+    pub content_sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaWriteRequestV1 {
+    #[schemars(regex(pattern = "^(basic|cloze|mcq|mc-cloze)$"))]
+    pub kind: String,
+    pub keimenon: String,
+    #[serde(default)]
+    #[schemars(default)]
+    pub hypothesis: Vec<Option<String>>,
+    pub answer: Vec<String>,
+    #[schemars(default)]
+    pub source_guid: Option<String>,
+    #[schemars(default)]
+    pub parathema: Option<String>,
+    #[schemars(default)]
+    pub review_image: Option<String>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub node_ids: Vec<String>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub asset_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaV1 {
+    pub thema_id: String,
+    pub revision: u64,
+    pub kind: ThemaKindV1,
+    pub keimenon: String,
+    pub hypothesis: Vec<Option<String>>,
+    pub answer: Vec<String>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub source_guid: Option<String>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub parathema: Option<String>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub review_image: Option<String>,
+    pub tags: Vec<String>,
+    pub node_ids: Vec<String>,
+    pub asset_paths: Vec<String>,
+    pub content_sha256: String,
+    pub archived: bool,
+}
+
+impl ThemaV1 {
+    pub(crate) fn from_application(value: &ThemaRecord) -> Self {
+        Self {
+            thema_id: value.thema_id.clone(),
+            revision: value.revision,
+            kind: thema_kind(value.content.kind),
+            keimenon: value.content.keimenon.clone(),
+            hypothesis: value.content.hypothesis.clone(),
+            answer: value.content.answer.clone(),
+            source_guid: value.content.source_guid.clone(),
+            parathema: value.content.parathema.clone(),
+            review_image: value.content.review_image.clone(),
+            tags: value.tags.clone(),
+            node_ids: value.node_ids.clone(),
+            asset_paths: value.asset_paths.clone(),
+            content_sha256: value.content_sha256.clone(),
+            archived: value.archived,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaPageV1 {
+    #[schemars(length(max = 500))]
+    pub items: Vec<ThemaV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub next: Option<String>,
+}
+
+impl ThemaPageV1 {
+    pub(crate) fn from_application(items: &[ThemaRecord]) -> Self {
+        Self {
+            items: items.iter().map(ThemaV1::from_application).collect(),
+            next: items.last().map(|item| item.thema_id.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeV1 {
+    pub node_id: String,
+    pub document_id: String,
+    pub logical_path: String,
+    pub title: String,
+    pub title_path: Vec<String>,
+    pub tags: Vec<String>,
+    pub level: u32,
+    pub active: bool,
+    pub thema_ids: Vec<String>,
+}
+
+impl NodeV1 {
+    pub(crate) fn from_application(value: &NodeRecord) -> Self {
+        Self {
+            node_id: value.node_id.clone(),
+            document_id: value.document_id.clone(),
+            logical_path: value.logical_path.clone(),
+            title: value.title.clone(),
+            title_path: value.title_path.clone(),
+            tags: value.tags.clone(),
+            level: value.level,
+            active: value.active,
+            thema_ids: value.thema_ids.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodePageV1 {
+    #[schemars(length(max = 500))]
+    pub items: Vec<NodeV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub next: Option<String>,
+}
+
+impl NodePageV1 {
+    pub(crate) fn from_application(items: &[NodeRecord]) -> Self {
+        Self {
+            items: items.iter().map(NodeV1::from_application).collect(),
+            next: items.last().map(|item| item.node_id.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsV1 {
+    pub revision: u64,
+    pub timezone: String,
+    #[schemars(range(max = 23))]
+    pub day_boundary_hour: u8,
+    pub scheduler: ParametersV1,
+    pub tag_rules: BTreeMap<String, TagRuleV1>,
+}
+
+impl SettingsV1 {
+    pub(crate) fn from_application(value: &SettingsRecord) -> Self {
+        Self {
+            revision: value.revision,
+            timezone: value.timezone.clone(),
+            day_boundary_hour: value.day_boundary_hour,
+            scheduler: ParametersV1::from(&value.scheduler),
+            tag_rules: value
+                .tag_rules
+                .iter()
+                .map(|(tag, rule)| (tag.clone(), TagRuleV1::from(rule)))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerParametersInputV1 {
+    #[serde(default)]
+    #[schemars(default)]
+    pub scheduler_version: u32,
+    pub amnesia: f64,
+    pub epignosis: f64,
+    pub agnoia: f64,
+    pub anagnosis: u64,
+    pub lethe: u64,
+    pub synolon_max: f64,
+    pub interval_fuzz: f64,
+    pub proto: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TagRuleInputV1 {
+    #[schemars(default)]
+    pub amnesia: Option<f64>,
+    #[schemars(default)]
+    pub epignosis: Option<f64>,
+    #[schemars(default)]
+    pub agnoia: Option<f64>,
+    #[schemars(default)]
+    pub anagnosis: Option<u64>,
+    #[schemars(default)]
+    pub lethe: Option<u64>,
+    #[schemars(default)]
+    pub proto: Option<Vec<u32>>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSettingsRequestV1 {
+    pub timezone: String,
+    #[schemars(range(max = 23))]
+    pub day_boundary_hour: u8,
+    pub scheduler: SchedulerParametersInputV1,
+    #[serde(default)]
+    #[schemars(default)]
+    pub tag_rules: BTreeMap<String, TagRuleInputV1>,
+}
+
+impl UpdateSettingsRequestV1 {
+    pub(crate) fn into_application(self) -> SettingsInput {
+        SettingsInput {
+            timezone: self.timezone,
+            day_boundary_hour: self.day_boundary_hour,
+            scheduler: self.scheduler.into_application(),
+            tag_rules: self
+                .tag_rules
+                .into_iter()
+                .map(|(tag, rule)| (tag, rule.into_application()))
+                .collect(),
+        }
+    }
+}
+
+impl SchedulerParametersInputV1 {
+    fn into_application(self) -> ParametersSnapshot {
+        ParametersSnapshot {
+            scheduler_version: self.scheduler_version,
+            amnesia: self.amnesia,
+            epignosis: self.epignosis,
+            agnoia: self.agnoia,
+            anagnosis: self.anagnosis,
+            lethe: self.lethe,
+            synolon_max: self.synolon_max,
+            interval_fuzz: self.interval_fuzz,
+            proto: self.proto,
+        }
+    }
+}
+
+impl TagRuleInputV1 {
+    fn into_application(self) -> TagRule {
+        TagRule {
+            amnesia: self.amnesia,
+            epignosis: self.epignosis,
+            agnoia: self.agnoia,
+            anagnosis: self.anagnosis,
+            lethe: self.lethe,
+            proto: self.proto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ContentWireError;
+
+fn content_kind(value: &str) -> Result<ContentEntityKindV1, ContentWireError> {
+    match value {
+        "document" => Ok(ContentEntityKindV1::Document),
+        "asset" => Ok(ContentEntityKindV1::Asset),
+        "thema" => Ok(ContentEntityKindV1::Thema),
+        "settings" => Ok(ContentEntityKindV1::Settings),
+        "review" => Ok(ContentEntityKindV1::ReviewState),
+        _ => Err(ContentWireError),
+    }
+}
+
+fn content_operation(value: &str) -> Result<ContentOperationV1, ContentWireError> {
+    match value {
+        "create" => Ok(ContentOperationV1::Create),
+        "update" => Ok(ContentOperationV1::Update),
+        "rename" => Ok(ContentOperationV1::Rename),
+        "snapshot" => Ok(ContentOperationV1::Snapshot),
+        "tombstone" => Ok(ContentOperationV1::Tombstone),
+        "archive" => Ok(ContentOperationV1::Archive),
+        "unarchive" => Ok(ContentOperationV1::Unarchive),
+        "commit" => Ok(ContentOperationV1::Commit),
+        _ => Err(ContentWireError),
+    }
+}
+
+fn document_operation(value: &str) -> Result<DocumentOperationV1, ContentWireError> {
+    match value {
+        "create" => Ok(DocumentOperationV1::Create),
+        "update" => Ok(DocumentOperationV1::Update),
+        "rename" => Ok(DocumentOperationV1::Rename),
+        "snapshot" => Ok(DocumentOperationV1::Snapshot),
+        "tombstone" => Ok(DocumentOperationV1::Tombstone),
+        _ => Err(ContentWireError),
+    }
+}
+
+const fn thema_kind(value: ThemaKind) -> ThemaKindV1 {
+    match value {
+        ThemaKind::Basic => ThemaKindV1::Basic,
+        ThemaKind::Cloze => ThemaKindV1::Cloze,
+        ThemaKind::Mcq => ThemaKindV1::Mcq,
+        ThemaKind::McCloze => ThemaKindV1::McCloze,
+    }
+}

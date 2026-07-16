@@ -98,11 +98,12 @@ The first attempt response hides the answer. Grading returns the detected
 result, revealed answer, matcher version, and proposed transition.
 
 The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
-review attempt operations, and stable error schemas are generated from the
-public Rust DTOs in ~protocol::http_v1~, including exact bodies, responses,
-status sets, bearer security, and required scopes. The remaining endpoints are
-still a route-level catalogue and are not yet a complete client-generation
-contract.
+direct content resources, review attempt operations, and stable errors are
+generated from the public Rust DTOs in ~protocol::http_v1~. Content schemas
+distinguish request defaults from required response fields and describe scopes,
+conditional headers, pagination, raw media, and tombstone responses. Review
+session, pack, and offline reconciliation envelopes remain a route-level
+catalogue and are not yet a complete client-generation contract.
 CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
 network boundary.
 

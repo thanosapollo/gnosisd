@@ -25,11 +25,10 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 
 use crate::{
     application::{
-        AnswerInput, ApplicationError, AssetHead, ContentChange, DevicePrincipal, DeviceScope,
-        DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NodeRecord, ReviewAttemptMutation,
-        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-        ReviewAttemptView, ReviewOperationAuthority, ReviewSessionView, ReviewSource,
-        SettingsInput, SettingsRecord, ThemaRecord, canonical_asset_path, prepare_asset,
+        AnswerInput, ApplicationError, DevicePrincipal, DeviceScope, MAX_OFFLINE_ASSET_BYTES,
+        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        ReviewAttemptOperationStatus, ReviewAttemptView, ReviewOperationAuthority,
+        ReviewSessionView, ReviewSource, SettingsRecord, canonical_asset_path, prepare_asset,
         prepare_note, prepare_thema, review_day_at, thema_content,
     },
     domain::DocumentId,
@@ -41,9 +40,12 @@ use crate::{
         decode_snapshot_cursor,
         http_v1::{
             ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1,
+            DocumentHeadV1, DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
             ReplicaStateV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, valid_bearer_token,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
+            ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
         offline_content_result_json, offline_result_json, replica_change_page,
@@ -284,7 +286,7 @@ async fn changes(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ContentChangePageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let after = query
         .after
@@ -297,9 +299,8 @@ async fn changes(
         .changes(after, page_limit(query.limit)?)
         .await
         .map_err(ApiError::service)?;
-    let next = items.last().map(|item| item.cursor);
     Ok(Json(
-        json!({"items": items.iter().map(change_json).collect::<Vec<_>>(), "next": next}),
+        ContentChangePageV1::from_application(&items).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -425,23 +426,11 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
-fn change_json(change: &ContentChange) -> Value {
-    json!({"cursor":change.cursor,"entity_kind":change.entity_kind,"entity_id":change.entity_id,
-        "revision":change.revision,"operation":change.operation,"created_at_us":change.created_at_us})
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NoteInput {
-    logical_path: String,
-    org: String,
-}
-
 async fn create_note(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-    ApiJson(input): ApiJson<NoteInput>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    ApiJson(input): ApiJson<NoteWriteRequestV1>,
+) -> Result<(StatusCode, Json<DocumentHeadV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let prepared = prepare_note(None, input.logical_path, input.org, None)
         .map_err(ApiError::invalid_content)?;
@@ -451,7 +440,10 @@ async fn create_note(
         .await
         .map_err(note_write_error)?;
     announce(&state).await;
-    Ok((StatusCode::CREATED, Json(head_json(&head))))
+    Ok((
+        StatusCode::CREATED,
+        Json(DocumentHeadV1::from_application(&head)),
+    ))
 }
 
 async fn update_note(
@@ -459,8 +451,8 @@ async fn update_note(
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    ApiJson(input): ApiJson<NoteInput>,
-) -> Result<Json<Value>, ApiError> {
+    ApiJson(input): ApiJson<NoteWriteRequestV1>,
+) -> Result<Json<DocumentHeadV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let revision = if_match(&headers)?;
     let prepared = prepare_note(
@@ -476,7 +468,7 @@ async fn update_note(
         .await
         .map_err(|error| conflict_with(error, revision))?;
     announce(&state).await;
-    Ok(Json(head_json(&head)))
+    Ok(Json(DocumentHeadV1::from_application(&head)))
 }
 
 async fn get_note(
@@ -505,19 +497,13 @@ async fn get_note(
     Ok(response)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RenameInput {
-    logical_path: String,
-}
-
 async fn rename_note(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    ApiJson(input): ApiJson<RenameInput>,
-) -> Result<Json<Value>, ApiError> {
+    ApiJson(input): ApiJson<NoteRenameRequestV1>,
+) -> Result<Json<DocumentHeadV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let id = DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
     let head = state
@@ -532,7 +518,7 @@ async fn rename_note(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(head_json(&head)))
+    Ok(Json(DocumentHeadV1::from_application(&head)))
 }
 
 async fn delete_note(
@@ -540,7 +526,7 @@ async fn delete_note(
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<DocumentHeadV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let id = DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
     let head = state
@@ -554,12 +540,7 @@ async fn delete_note(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(head_json(&head)))
-}
-
-fn head_json(head: &DocumentHead) -> Value {
-    json!({"document_id":head.document_id,"logical_path":head.logical_path,"revision":head.revision,
-        "content_sha256":head.blob_sha256,"active":head.active})
+    Ok(Json(DocumentHeadV1::from_application(&head)))
 }
 
 async fn note_revisions(
@@ -567,7 +548,7 @@ async fn note_revisions(
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<DocumentRevisionPageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let id = DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
     let after = query
@@ -581,10 +562,9 @@ async fn note_revisions(
         .note_revisions(id, after, page_limit(query.limit)?)
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(json!({
-        "items": items.iter().map(revision_json).collect::<Vec<_>>(),
-        "next": items.last().map(|item| item.revision)
-    })))
+    Ok(Json(
+        DocumentRevisionPageV1::from_application(&items).map_err(|_| ApiError::internal())?,
+    ))
 }
 
 async fn note_revision(
@@ -601,7 +581,9 @@ async fn note_revision(
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
     if record.blob_sha256.is_none() {
-        return Ok((StatusCode::GONE, Json(revision_json(&record))).into_response());
+        let revision = DocumentRevisionSummaryV1::from_application(&record)
+            .map_err(|_| ApiError::internal())?;
+        return Ok((StatusCode::GONE, Json(revision)).into_response());
     }
     let mut response = bytes.into_response();
     response.headers_mut().insert(
@@ -619,25 +601,13 @@ async fn note_revision(
     Ok(response)
 }
 
-fn revision_json(record: &DocumentRevision) -> Value {
-    json!({
-        "document_id": record.document_id,
-        "revision": record.revision,
-        "logical_path": record.logical_path,
-        "content_sha256": record.blob_sha256,
-        "operation": record.operation,
-        "created_at_us": record.created_at_us,
-        "author_device_id": record.author_device_id
-    })
-}
-
 async fn put_asset(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path((digest, name)): Path<(String, String)>,
     headers: HeaderMap,
     ApiBytes(body): ApiBytes,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<AssetHeadV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let path = canonical_asset_path(&digest, &name).map_err(ApiError::invalid_content)?;
     let expected = optional_if_match(&headers)?;
@@ -659,7 +629,10 @@ async fn put_asset(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok((StatusCode::CREATED, Json(asset_json(&head))))
+    Ok((
+        StatusCode::CREATED,
+        Json(AssetHeadV1::from_application(&head)),
+    ))
 }
 
 async fn stage_blob(
@@ -668,7 +641,7 @@ async fn stage_blob(
     Path(digest): Path<String>,
     headers: HeaderMap,
     ApiBytes(body): ApiBytes,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<StagedBlobV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let media_type = headers
         .get(header::CONTENT_TYPE)
@@ -682,10 +655,10 @@ async fn stage_blob(
         .map_err(ApiError::service)?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({
-            "content_sha256": blob.sha256,
-            "size_bytes": blob.size_bytes
-        })),
+        Json(StagedBlobV1 {
+            content_sha256: blob.sha256,
+            size_bytes: blob.size_bytes,
+        }),
     ))
 }
 
@@ -761,7 +734,7 @@ async fn delete_asset(
     Extension(principal): Extension<DevicePrincipal>,
     Path((digest, name)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<AssetHeadV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let path = canonical_asset_path(&digest, &name).map_err(ApiError::invalid_content)?;
     let head = state
@@ -775,37 +748,14 @@ async fn delete_asset(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(asset_json(&head)))
-}
-
-fn asset_json(head: &AssetHead) -> Value {
-    json!({"logical_path":head.logical_path,"revision":head.revision,"content_sha256":head.blob_sha256,"media_type":head.media_type,"active":head.active})
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ThemaInput {
-    kind: String,
-    keimenon: String,
-    #[serde(default)]
-    hypothesis: Vec<Option<String>>,
-    answer: Vec<String>,
-    source_guid: Option<String>,
-    parathema: Option<String>,
-    review_image: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    #[serde(default)]
-    node_ids: Vec<String>,
-    #[serde(default)]
-    asset_paths: Vec<String>,
+    Ok(Json(AssetHeadV1::from_application(&head)))
 }
 
 async fn create_thema(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-    ApiJson(input): ApiJson<ThemaInput>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    ApiJson(input): ApiJson<ThemaWriteRequestV1>,
+) -> Result<(StatusCode, Json<ThemaV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let prepared = prepared_thema(None, input, None)?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
@@ -820,7 +770,10 @@ async fn create_thema(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok((StatusCode::CREATED, Json(thema_json(&record))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ThemaV1::from_application(&record)),
+    ))
 }
 
 async fn update_thema(
@@ -828,8 +781,8 @@ async fn update_thema(
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    ApiJson(input): ApiJson<ThemaInput>,
-) -> Result<Json<Value>, ApiError> {
+    ApiJson(input): ApiJson<ThemaWriteRequestV1>,
+) -> Result<Json<ThemaV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let prepared = prepared_thema(Some(id), input, Some(if_match(&headers)?))?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
@@ -844,12 +797,12 @@ async fn update_thema(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(thema_json(&record)))
+    Ok(Json(ThemaV1::from_application(&record)))
 }
 
 fn prepared_thema(
     id: Option<String>,
-    input: ThemaInput,
+    input: ThemaWriteRequestV1,
     revision: Option<u64>,
 ) -> Result<crate::application::PreparedThema, ApiError> {
     let content = thema_content(
@@ -877,7 +830,7 @@ async fn get_thema(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ThemaV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let record = state
         .service
@@ -885,14 +838,14 @@ async fn get_thema(
         .await
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(thema_json(&record)))
+    Ok(Json(ThemaV1::from_application(&record)))
 }
 
 async fn search_themata(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ThemaPageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let items = state
         .service
@@ -903,9 +856,7 @@ async fn search_themata(
         )
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(
-        json!({"items":items.iter().map(thema_json).collect::<Vec<_>>(),"next":items.last().map(|item| &item.thema_id)}),
-    ))
+    Ok(Json(ThemaPageV1::from_application(&items)))
 }
 
 async fn archive_thema(
@@ -913,7 +864,7 @@ async fn archive_thema(
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ThemaV1>, ApiError> {
     set_archive(state, principal, path, headers, true).await
 }
 async fn unarchive_thema(
@@ -921,7 +872,7 @@ async fn unarchive_thema(
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ThemaV1>, ApiError> {
     set_archive(state, principal, path, headers, false).await
 }
 async fn set_archive(
@@ -930,7 +881,7 @@ async fn set_archive(
     Path(id): Path<String>,
     headers: HeaderMap,
     archived: bool,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ThemaV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let record = state
         .service
@@ -944,18 +895,14 @@ async fn set_archive(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(thema_json(&record)))
-}
-
-fn thema_json(record: &ThemaRecord) -> Value {
-    json!({"thema_id":record.thema_id,"revision":record.revision,"kind":record.content.kind.as_str(),"keimenon":record.content.keimenon,"hypothesis":record.content.hypothesis,"answer":record.content.answer,"source_guid":record.content.source_guid,"parathema":record.content.parathema,"review_image":record.content.review_image,"tags":record.tags,"node_ids":record.node_ids,"asset_paths":record.asset_paths,"content_sha256":record.content_sha256,"archived":record.archived})
+    Ok(Json(ThemaV1::from_application(&record)))
 }
 
 async fn get_node(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodeV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let node = state
         .service
@@ -963,13 +910,13 @@ async fn get_node(
         .await
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(node_json(&node)))
+    Ok(Json(NodeV1::from_application(&node)))
 }
 async fn search_nodes(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Query(query): Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodePageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let items = state
         .service
@@ -980,16 +927,14 @@ async fn search_nodes(
         )
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(
-        json!({"items":items.iter().map(node_json).collect::<Vec<_>>(),"next":items.last().map(|n|&n.node_id)}),
-    ))
+    Ok(Json(NodePageV1::from_application(&items)))
 }
 async fn inbound_nodes(
     state: State<HttpState>,
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
     query: Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodePageV1>, ApiError> {
     graph(state, principal, path, query, true).await
 }
 async fn outbound_nodes(
@@ -997,7 +942,7 @@ async fn outbound_nodes(
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
     query: Query<PageQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodePageV1>, ApiError> {
     graph(state, principal, path, query, false).await
 }
 async fn graph(
@@ -1006,19 +951,14 @@ async fn graph(
     Path(id): Path<String>,
     Query(query): Query<PageQuery>,
     inbound: bool,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodePageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let items = state
         .service
         .graph_nodes(id, inbound, page_limit(query.limit)?, query.after)
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(
-        json!({"items":items.iter().map(node_json).collect::<Vec<_>>(),"next":items.last().map(|n|&n.node_id)}),
-    ))
-}
-fn node_json(node: &NodeRecord) -> Value {
-    json!({"node_id":node.node_id,"document_id":node.document_id,"logical_path":node.logical_path,"title":node.title,"title_path":node.title_path,"tags":node.tags,"level":node.level,"active":node.active,"thema_ids":node.thema_ids})
+    Ok(Json(NodePageV1::from_application(&items)))
 }
 
 #[derive(Deserialize)]
@@ -1497,34 +1437,46 @@ fn optional_if_match(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
         .map(|v| {
             v.to_str()
                 .ok()
-                .and_then(|v| v.trim_matches('"').parse().ok())
+                .and_then(parse_if_match)
                 .ok_or_else(|| ApiError::bad_request("invalid If-Match"))
         })
         .transpose()
 }
 
+fn parse_if_match(value: &str) -> Option<u64> {
+    let revision = if let Some(value) = value.strip_prefix('"') {
+        value.strip_suffix('"')?
+    } else if value.ends_with('"') {
+        return None;
+    } else {
+        value
+    };
+    if revision.is_empty() || !revision.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    revision.parse().ok()
+}
+
 async fn get_settings(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<SettingsV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
-    Ok(Json(
-        serde_json::to_value(settings).map_err(|_| ApiError::internal())?,
-    ))
+    Ok(Json(SettingsV1::from_application(&settings)))
 }
 
 async fn update_settings(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     headers: HeaderMap,
-    ApiJson(input): ApiJson<SettingsInput>,
-) -> Result<Json<Value>, ApiError> {
+    ApiJson(input): ApiJson<UpdateSettingsRequestV1>,
+) -> Result<Json<SettingsV1>, ApiError> {
     require(&principal, DeviceScope::SettingsWrite)?;
     let settings = state
         .service
         .update_settings(
-            input,
+            input.into_application(),
             if_match(&headers)?,
             now_us_i64()?,
             Some(principal.device_id),
@@ -1532,9 +1484,7 @@ async fn update_settings(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(
-        serde_json::to_value(settings).map_err(|_| ApiError::internal())?,
-    ))
+    Ok(Json(SettingsV1::from_application(&settings)))
 }
 
 fn now_us() -> Result<u64, ApiError> {
@@ -1866,6 +1816,9 @@ fn openapi_operation(path: &str, method: &str) -> Value {
     if let Some(operation) = openapi_sync_operation(path, method) {
         return operation;
     }
+    if let Some(operation) = openapi_content_operation(path, method) {
+        return operation;
+    }
     if let Some(operation) = openapi_review_attempt_operation(path, method) {
         return operation;
     }
@@ -1879,6 +1832,376 @@ fn openapi_operation(path: &str, method: &str) -> Value {
         operation["requestBody"] = body;
     }
     operation
+}
+
+fn openapi_content_operation(path: &str, method: &str) -> Option<Value> {
+    if let Some(responses) = content_raw_responses(path, method) {
+        return Some(content_operation(path, method, "read", responses));
+    }
+    let contract = content_json_contract(path, method)?;
+    let mut operation = content_operation(
+        path,
+        method,
+        contract.scope,
+        content_json_responses(
+            contract.success_status,
+            contract.response,
+            contract.error_statuses,
+        ),
+    );
+    if let Some(body) = content_request_body(path, method, contract.request) {
+        operation["requestBody"] = body;
+    }
+    Some(operation)
+}
+
+fn content_operation(path: &str, method: &str, scope: &str, responses: Value) -> Value {
+    json!({
+        "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
+        "security":[{"bearerAuth":[]}],
+        "x-gnosis-required-scopes":[scope],
+        "parameters":content_parameters(path, method),
+        "responses":responses
+    })
+}
+
+struct ContentJsonContract {
+    scope: &'static str,
+    request: Option<&'static str>,
+    success_status: &'static str,
+    response: &'static str,
+    error_statuses: &'static [&'static str],
+}
+
+fn json_contract(
+    scope: &'static str,
+    request: Option<&'static str>,
+    success_status: &'static str,
+    response: &'static str,
+    error_statuses: &'static [&'static str],
+) -> ContentJsonContract {
+    ContentJsonContract {
+        scope,
+        request,
+        success_status,
+        response,
+        error_statuses,
+    }
+}
+
+fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract> {
+    match (path, method) {
+        ("/v1/changes", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "ContentChangePageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/settings", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "SettingsV1",
+            &["401", "403", "408", "500", "503"],
+        )),
+        ("/v1/settings", "put") => Some(json_contract(
+            "settings:write",
+            Some("UpdateSettingsRequestV1"),
+            "200",
+            "SettingsV1",
+            &[
+                "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
+            ],
+        )),
+        ("/v1/notes", "post") => Some(json_contract(
+            "content:write",
+            Some("NoteWriteRequestV1"),
+            "201",
+            "DocumentHeadV1",
+            &["401", "403", "408", "412", "413", "422", "500", "503"],
+        )),
+        ("/v1/notes/{id}", "put") => Some(json_contract(
+            "content:write",
+            Some("NoteWriteRequestV1"),
+            "200",
+            "DocumentHeadV1",
+            &[
+                "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
+            ],
+        )),
+        ("/v1/notes/{id}", "delete") => Some(json_contract(
+            "content:write",
+            None,
+            "200",
+            "DocumentHeadV1",
+            &[
+                "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+            ],
+        )),
+        ("/v1/notes/{id}/rename", "post") => Some(json_contract(
+            "content:write",
+            Some("NoteRenameRequestV1"),
+            "200",
+            "DocumentHeadV1",
+            &[
+                "400", "401", "403", "404", "408", "412", "413", "422", "428", "500", "503",
+            ],
+        )),
+        ("/v1/notes/{id}/revisions", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "DocumentRevisionPageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/sync/blobs/{digest}", "put") => Some(json_contract(
+            "content:write",
+            None,
+            "201",
+            "StagedBlobV1",
+            &[
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/assets/{digest}/{name}", "put") => Some(json_contract(
+            "content:write",
+            None,
+            "201",
+            "AssetHeadV1",
+            &[
+                "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/assets/{digest}/{name}", "delete") => Some(json_contract(
+            "content:write",
+            None,
+            "200",
+            "AssetHeadV1",
+            &[
+                "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+            ],
+        )),
+        ("/v1/themata", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "ThemaPageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/themata", "post") => Some(json_contract(
+            "content:write",
+            Some("ThemaWriteRequestV1"),
+            "201",
+            "ThemaV1",
+            &["401", "403", "404", "408", "413", "422", "500", "503"],
+        )),
+        ("/v1/themata/{id}", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "ThemaV1",
+            &["401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/themata/{id}", "put") => Some(json_contract(
+            "content:write",
+            Some("ThemaWriteRequestV1"),
+            "200",
+            "ThemaV1",
+            &[
+                "400", "401", "403", "404", "408", "412", "413", "422", "428", "500", "503",
+            ],
+        )),
+        ("/v1/themata/{id}/archive", "post") | ("/v1/themata/{id}/unarchive", "post") => {
+            Some(json_contract(
+                "content:write",
+                None,
+                "200",
+                "ThemaV1",
+                &[
+                    "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                ],
+            ))
+        }
+        ("/v1/nodes", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "NodePageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/nodes/{id}", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "NodeV1",
+            &["401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/nodes/{id}/inbound", "get") | ("/v1/nodes/{id}/outbound", "get") => {
+            Some(json_contract(
+                "read",
+                None,
+                "200",
+                "NodePageV1",
+                &["400", "401", "403", "404", "408", "500", "503"],
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn content_request_body(path: &str, method: &str, schema: Option<&str>) -> Option<Value> {
+    if method == "put"
+        && matches!(
+            path,
+            "/v1/sync/blobs/{digest}" | "/v1/assets/{digest}/{name}"
+        )
+    {
+        return Some(json!({
+            "required":true,
+            "content":{"*/*":{"schema":{"type":"string","format":"binary"}}}
+        }));
+    }
+    schema.map(openapi_json_request)
+}
+
+fn content_json_responses(status: &str, schema: &str, error_statuses: &[&str]) -> Value {
+    let mut responses = serde_json::Map::new();
+    responses.insert(status.into(), openapi_json_response("Success", schema));
+    add_content_errors(&mut responses, error_statuses);
+    Value::Object(responses)
+}
+
+fn content_raw_responses(path: &str, method: &str) -> Option<Value> {
+    if method != "get" {
+        return None;
+    }
+    let mut responses = serde_json::Map::new();
+    let error_statuses: &[&str] = match path {
+        "/v1/events" => {
+            responses.insert(
+                "200".into(),
+                media_response("Event stream", "text/event-stream", false, &[]),
+            );
+            &["401", "403", "408", "500", "503"]
+        }
+        "/v1/notes/{id}" => {
+            responses.insert(
+                "200".into(),
+                media_response("Org document", "text/org", false, &["ETag"]),
+            );
+            &["400", "401", "403", "404", "408", "500", "503"]
+        }
+        "/v1/notes/{id}/revisions/{revision}" => {
+            responses.insert(
+                "200".into(),
+                media_response("Org revision", "text/org", false, &["ETag"]),
+            );
+            responses.insert(
+                "410".into(),
+                openapi_json_response("Tombstone", "DocumentRevisionSummaryV1"),
+            );
+            &["400", "401", "403", "404", "408", "500", "503"]
+        }
+        "/v1/assets/{digest}/{name}" => {
+            responses.insert(
+                "200".into(),
+                media_response("Asset bytes", "*/*", true, &["ETag"]),
+            );
+            &["401", "403", "404", "408", "422", "500", "503"]
+        }
+        "/v1/blobs/{digest}" => {
+            responses.insert(
+                "200".into(),
+                media_response("Immutable blob", "*/*", true, &["ETag", "Cache-Control"]),
+            );
+            &["400", "401", "403", "404", "408", "500", "503"]
+        }
+        _ => return None,
+    };
+    add_content_errors(&mut responses, error_statuses);
+    Some(Value::Object(responses))
+}
+
+fn media_response(description: &str, media_type: &str, binary: bool, headers: &[&str]) -> Value {
+    let schema = if binary {
+        json!({"type":"string","format":"binary"})
+    } else {
+        json!({"type":"string"})
+    };
+    let headers = headers
+        .iter()
+        .map(|name| ((*name).to_owned(), json!({"schema":{"type":"string"}})))
+        .collect::<serde_json::Map<_, _>>();
+    json!({"description":description,"headers":headers,"content":{media_type:{"schema":schema}}})
+}
+
+fn add_content_errors(responses: &mut serde_json::Map<String, Value>, statuses: &[&str]) {
+    for status in statuses {
+        responses.insert((*status).into(), openapi_error_response());
+    }
+}
+
+fn content_parameters(path: &str, method: &str) -> Vec<Value> {
+    let mut parameters = openapi_path_parameters(path);
+    parameters.extend(content_query_parameters(path));
+    if content_requires_if_match(path, method) {
+        parameters.push(if_match_parameter(true));
+    } else if path == "/v1/assets/{digest}/{name}" && method == "put" {
+        parameters.push(if_match_parameter(false));
+    }
+    parameters
+}
+
+fn content_query_parameters(path: &str) -> Vec<Value> {
+    let paged = matches!(
+        path,
+        "/v1/changes"
+            | "/v1/notes/{id}/revisions"
+            | "/v1/themata"
+            | "/v1/nodes"
+            | "/v1/nodes/{id}/inbound"
+            | "/v1/nodes/{id}/outbound"
+    );
+    if !paged {
+        return Vec::new();
+    }
+    let numeric = matches!(path, "/v1/changes" | "/v1/notes/{id}/revisions");
+    let mut parameters = vec![
+        content_after_parameter(numeric),
+        json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
+    ];
+    if matches!(path, "/v1/themata" | "/v1/nodes") {
+        parameters
+            .push(json!({"name":"q","in":"query","required":false,"schema":{"type":"string"}}));
+    }
+    parameters
+}
+
+fn content_after_parameter(numeric: bool) -> Value {
+    let schema = if numeric {
+        json!({"type":"string","pattern":"^[0-9]+$","default":"0"})
+    } else {
+        json!({"type":"string"})
+    };
+    json!({"name":"after","in":"query","required":false,"schema":schema})
+}
+
+fn content_requires_if_match(path: &str, method: &str) -> bool {
+    matches!(
+        (path, method),
+        ("/v1/settings", "put")
+            | ("/v1/notes/{id}", "put" | "delete")
+            | ("/v1/notes/{id}/rename", "post")
+            | ("/v1/assets/{digest}/{name}", "delete")
+            | ("/v1/themata/{id}", "put")
+            | ("/v1/themata/{id}/archive", "post")
+            | ("/v1/themata/{id}/unarchive", "post")
+    )
+}
+
+fn if_match_parameter(required: bool) -> Value {
+    json!({"name":"If-Match","in":"header","required":required,"schema":{"type":"string","pattern":"^(?:[0-9]+|\"[0-9]+\")$"}})
 }
 
 fn openapi_review_attempt_operation(path: &str, method: &str) -> Option<Value> {
@@ -2007,23 +2330,45 @@ fn openapi_json_response(description: &str, schema: &str) -> Value {
 }
 
 fn http_v1_schemas() -> serde_json::Map<String, Value> {
-    let settings = SchemaSettings::draft2020_12().with(|settings| {
-        settings.definitions_path = "/components/schemas".into();
-        settings.meta_schema = None;
-    });
-    let mut generator = settings.for_serialize().into_generator();
+    let mut generator = openapi_schema_settings().for_serialize().into_generator();
     generator.subschema_for::<ReplicaStateV1>();
     generator.subschema_for::<ContentCapabilitiesV1>();
     generator.subschema_for::<AssetCapabilitiesV1>();
     generator.subschema_for::<ReplicaChangePageV1>();
     generator.subschema_for::<ReplicaSnapshotPageV1>();
+    generator.subschema_for::<ContentChangePageV1>();
+    generator.subschema_for::<DocumentHeadV1>();
+    generator.subschema_for::<DocumentRevisionPageV1>();
+    generator.subschema_for::<DocumentRevisionSummaryV1>();
+    generator.subschema_for::<AssetHeadV1>();
+    generator.subschema_for::<StagedBlobV1>();
+    generator.subschema_for::<ThemaPageV1>();
+    generator.subschema_for::<ThemaV1>();
+    generator.subschema_for::<NodePageV1>();
+    generator.subschema_for::<NodeV1>();
+    generator.subschema_for::<SettingsV1>();
     generator.subschema_for::<ReviewAttemptStateResponseV1>();
     generator.subschema_for::<ReviewAttemptOperationResponseV1>();
-    generator.subschema_for::<SetAcceptedSuccessRequestV1>();
-    generator.subschema_for::<SetSuspensionRequestV1>();
     generator.subschema_for::<ApiErrorCodeV1>();
     generator.subschema_for::<ApiErrorResponseV1>();
-    generator.take_definitions(true)
+    let mut definitions = generator.take_definitions(true);
+
+    let mut requests = openapi_schema_settings().for_deserialize().into_generator();
+    requests.subschema_for::<NoteWriteRequestV1>();
+    requests.subschema_for::<NoteRenameRequestV1>();
+    requests.subschema_for::<ThemaWriteRequestV1>();
+    requests.subschema_for::<UpdateSettingsRequestV1>();
+    requests.subschema_for::<SetAcceptedSuccessRequestV1>();
+    requests.subschema_for::<SetSuspensionRequestV1>();
+    definitions.extend(requests.take_definitions(true));
+    definitions
+}
+
+fn openapi_schema_settings() -> SchemaSettings {
+    SchemaSettings::draft2020_12().with(|settings| {
+        settings.definitions_path = "/components/schemas".into();
+        settings.meta_schema = None;
+    })
 }
 
 fn openapi_path_parameters(path: &str) -> Vec<Value> {
@@ -2143,13 +2488,15 @@ mod tests {
 
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{HeaderMap, Request, StatusCode},
     };
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
 
-    use super::{ApiError, OPENAPI_OPERATIONS, attempt_json, openapi_document, router};
+    use super::{
+        ApiError, OPENAPI_OPERATIONS, attempt_json, openapi_document, optional_if_match, router,
+    };
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
         PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
@@ -2199,6 +2546,28 @@ mod tests {
                 current_revision: Some(9),
             }),
         );
+    }
+
+    #[test]
+    fn if_match_parser_accepts_only_bare_or_balanced_revisions() {
+        for (value, revision) in [("7", 7), ("\"7\"", 7)] {
+            assert_eq!(
+                optional_if_match(&if_match_headers(value)).unwrap(),
+                Some(revision)
+            );
+        }
+        for value in ["+7", "\"+7\"", "\"7", "7\"", "\"\"7\"\""] {
+            assert!(
+                optional_if_match(&if_match_headers(value)).is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    fn if_match_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("if-match", value.parse().unwrap());
+        headers
     }
 
     #[test]
@@ -2436,6 +2805,452 @@ mod tests {
         assert_local_refs_resolve(&api, &api);
     }
 
+    #[test]
+    fn openapi_types_content_resources_exactly() {
+        let api = openapi_document();
+        let contracts = [
+            expected_json_contract(
+                "/v1/changes",
+                "get",
+                "read",
+                None,
+                "200",
+                "ContentChangePageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/settings",
+                "get",
+                "read",
+                None,
+                "200",
+                "SettingsV1",
+                &["200", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/settings",
+                "put",
+                "settings:write",
+                Some("UpdateSettingsRequestV1"),
+                "200",
+                "SettingsV1",
+                &[
+                    "200", "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/notes",
+                "post",
+                "content:write",
+                Some("NoteWriteRequestV1"),
+                "201",
+                "DocumentHeadV1",
+                &[
+                    "201", "401", "403", "408", "412", "413", "422", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/notes/{id}",
+                "put",
+                "content:write",
+                Some("NoteWriteRequestV1"),
+                "200",
+                "DocumentHeadV1",
+                &[
+                    "200", "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/notes/{id}",
+                "delete",
+                "content:write",
+                None,
+                "200",
+                "DocumentHeadV1",
+                &[
+                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/notes/{id}/rename",
+                "post",
+                "content:write",
+                Some("NoteRenameRequestV1"),
+                "200",
+                "DocumentHeadV1",
+                &[
+                    "200", "400", "401", "403", "404", "408", "412", "413", "422", "428", "500",
+                    "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/notes/{id}/revisions",
+                "get",
+                "read",
+                None,
+                "200",
+                "DocumentRevisionPageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/sync/blobs/{digest}",
+                "put",
+                "content:write",
+                None,
+                "201",
+                "StagedBlobV1",
+                &[
+                    "201", "400", "401", "403", "408", "409", "413", "422", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/assets/{digest}/{name}",
+                "put",
+                "content:write",
+                None,
+                "201",
+                "AssetHeadV1",
+                &[
+                    "201", "400", "401", "403", "404", "408", "409", "412", "413", "422", "500",
+                    "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/assets/{digest}/{name}",
+                "delete",
+                "content:write",
+                None,
+                "200",
+                "AssetHeadV1",
+                &[
+                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/themata",
+                "get",
+                "read",
+                None,
+                "200",
+                "ThemaPageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/themata",
+                "post",
+                "content:write",
+                Some("ThemaWriteRequestV1"),
+                "201",
+                "ThemaV1",
+                &[
+                    "201", "401", "403", "404", "408", "413", "422", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/themata/{id}",
+                "get",
+                "read",
+                None,
+                "200",
+                "ThemaV1",
+                &["200", "401", "403", "404", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/themata/{id}",
+                "put",
+                "content:write",
+                Some("ThemaWriteRequestV1"),
+                "200",
+                "ThemaV1",
+                &[
+                    "200", "400", "401", "403", "404", "408", "412", "413", "422", "428", "500",
+                    "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/themata/{id}/archive",
+                "post",
+                "content:write",
+                None,
+                "200",
+                "ThemaV1",
+                &[
+                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/themata/{id}/unarchive",
+                "post",
+                "content:write",
+                None,
+                "200",
+                "ThemaV1",
+                &[
+                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/nodes",
+                "get",
+                "read",
+                None,
+                "200",
+                "NodePageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/nodes/{id}",
+                "get",
+                "read",
+                None,
+                "200",
+                "NodeV1",
+                &["200", "401", "403", "404", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/nodes/{id}/inbound",
+                "get",
+                "read",
+                None,
+                "200",
+                "NodePageV1",
+                &["200", "400", "401", "403", "404", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/nodes/{id}/outbound",
+                "get",
+                "read",
+                None,
+                "200",
+                "NodePageV1",
+                &["200", "400", "401", "403", "404", "408", "500", "503"],
+            ),
+        ];
+        for contract in contracts {
+            assert_json_operation(&api, &contract);
+        }
+
+        assert_required_header(&api, "/v1/settings", "put", "If-Match");
+        assert_required_header(&api, "/v1/notes/{id}", "put", "If-Match");
+        assert_required_header(&api, "/v1/notes/{id}", "delete", "If-Match");
+        assert_required_header(&api, "/v1/notes/{id}/rename", "post", "If-Match");
+        assert_optional_header(&api, "/v1/assets/{digest}/{name}", "put", "If-Match");
+        assert_required_header(&api, "/v1/assets/{digest}/{name}", "delete", "If-Match");
+        assert_required_header(&api, "/v1/themata/{id}", "put", "If-Match");
+        assert_required_header(&api, "/v1/themata/{id}/archive", "post", "If-Match");
+        assert_required_header(&api, "/v1/themata/{id}/unarchive", "post", "If-Match");
+        assert_eq!(
+            operation_parameter(&api["paths"]["/v1/settings"]["put"], "If-Match")["schema"]["pattern"],
+            "^(?:[0-9]+|\"[0-9]+\")$"
+        );
+
+        let changes = &api["paths"]["/v1/changes"]["get"];
+        let after = operation_parameter(changes, "after");
+        assert_eq!(after["schema"]["pattern"], "^[0-9]+$");
+        assert_eq!(after["schema"]["default"], "0");
+        let limit = operation_parameter(changes, "limit");
+        assert_eq!(limit["schema"]["maximum"], 500);
+        assert_eq!(limit["schema"]["default"], 100);
+
+        let revision = &api["paths"]["/v1/notes/{id}/revisions/{revision}"]["get"];
+        assert_eq!(
+            revision["responses"]["200"]["content"]["text/org"]["schema"]["type"],
+            "string"
+        );
+        assert_eq!(
+            revision["responses"]["200"]["headers"]["ETag"]["schema"]["type"],
+            "string"
+        );
+        assert_eq!(
+            revision["responses"]["410"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DocumentRevisionSummaryV1"
+        );
+        let note = &api["paths"]["/v1/notes/{id}"]["get"]["responses"]["200"];
+        assert_eq!(note["content"]["text/org"]["schema"]["type"], "string");
+        assert_eq!(note["headers"]["ETag"]["schema"]["type"], "string");
+        assert_binary_request(&api, "/v1/sync/blobs/{digest}");
+        assert_binary_request(&api, "/v1/assets/{digest}/{name}");
+        assert_binary_response(&api, "/v1/assets/{digest}/{name}");
+        assert_binary_response(&api, "/v1/blobs/{digest}");
+        assert_eq!(
+            api["paths"]["/v1/events"]["get"]["responses"]["200"]["content"]["text/event-stream"]["schema"]
+                ["type"],
+            "string"
+        );
+        let schemas = &api["components"]["schemas"];
+        assert_eq!(
+            schemas["ThemaWriteRequestV1"]["properties"]["kind"]["pattern"],
+            "^(basic|cloze|mcq|mc-cloze)$"
+        );
+        assert_eq!(
+            schemas["SchedulerParametersInputV1"]["properties"]["scheduler_version"]["default"],
+            0
+        );
+        assert_eq!(
+            schemas["ContentChangePageV1"]["properties"]["items"]["maxItems"],
+            500
+        );
+        let thema_required = schemas["ThemaWriteRequestV1"]["required"]
+            .as_array()
+            .unwrap();
+        for optional in [
+            "hypothesis",
+            "source_guid",
+            "parathema",
+            "review_image",
+            "tags",
+            "node_ids",
+            "asset_paths",
+        ] {
+            assert!(!thema_required.contains(&json!(optional)), "{optional}");
+        }
+        assert!(
+            schemas["TagRuleInputV1"]
+                .get("required")
+                .is_none_or(|required| required.as_array().is_some_and(Vec::is_empty))
+        );
+        assert_raw_content_response_statuses(&api);
+        assert_local_refs_resolve(&api, &api);
+    }
+
+    struct ExpectedJsonContract<'a> {
+        path: &'a str,
+        method: &'a str,
+        scope: &'a str,
+        request: Option<&'a str>,
+        success_status: &'a str,
+        response: &'a str,
+        statuses: &'a [&'a str],
+    }
+
+    const fn expected_json_contract<'a>(
+        path: &'a str,
+        method: &'a str,
+        scope: &'a str,
+        request: Option<&'a str>,
+        success_status: &'a str,
+        response: &'a str,
+        statuses: &'a [&'a str],
+    ) -> ExpectedJsonContract<'a> {
+        ExpectedJsonContract {
+            path,
+            method,
+            scope,
+            request,
+            success_status,
+            response,
+            statuses,
+        }
+    }
+
+    fn assert_json_operation(api: &serde_json::Value, contract: &ExpectedJsonContract<'_>) {
+        let operation = &api["paths"][contract.path][contract.method];
+        assert_eq!(
+            operation["x-gnosis-required-scopes"],
+            json!([contract.scope]),
+            "{} {}",
+            contract.method,
+            contract.path
+        );
+        if let Some(request) = contract.request {
+            assert_eq!(
+                operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{request}"),
+                "{} {}",
+                contract.method,
+                contract.path
+            );
+        }
+        assert_eq!(
+            operation["responses"][contract.success_status]["content"]["application/json"]["schema"]
+                ["$ref"],
+            format!("#/components/schemas/{}", contract.response),
+            "{} {}",
+            contract.method,
+            contract.path
+        );
+        assert_eq!(
+            response_statuses(operation),
+            set(contract.statuses),
+            "{} {}",
+            contract.method,
+            contract.path
+        );
+    }
+
+    fn assert_required_header(api: &serde_json::Value, path: &str, method: &str, name: &str) {
+        let header = operation_parameter(&api["paths"][path][method], name);
+        assert_eq!(header["in"], "header");
+        assert_eq!(header["required"], true);
+    }
+
+    fn assert_optional_header(api: &serde_json::Value, path: &str, method: &str, name: &str) {
+        let header = operation_parameter(&api["paths"][path][method], name);
+        assert_eq!(header["in"], "header");
+        assert_eq!(header["required"], false);
+    }
+
+    fn operation_parameter<'a>(
+        operation: &'a serde_json::Value,
+        name: &str,
+    ) -> &'a serde_json::Value {
+        operation["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == name)
+            .unwrap()
+    }
+
+    fn assert_binary_request(api: &serde_json::Value, path: &str) {
+        let schema = &api["paths"][path]["put"]["requestBody"]["content"]["*/*"]["schema"];
+        assert_eq!(schema, &json!({"type":"string","format":"binary"}));
+    }
+
+    fn assert_binary_response(api: &serde_json::Value, path: &str) {
+        let schema = &api["paths"][path]["get"]["responses"]["200"]["content"]["*/*"]["schema"];
+        assert_eq!(schema, &json!({"type":"string","format":"binary"}));
+    }
+
+    fn assert_raw_content_response_statuses(api: &serde_json::Value) {
+        let contracts: &[(&str, &str, &[&str])] = &[
+            (
+                "/v1/notes/{id}",
+                "get",
+                &["200", "400", "401", "403", "404", "408", "500", "503"],
+            ),
+            (
+                "/v1/notes/{id}/revisions/{revision}",
+                "get",
+                &[
+                    "200", "400", "401", "403", "404", "408", "410", "500", "503",
+                ],
+            ),
+            (
+                "/v1/assets/{digest}/{name}",
+                "get",
+                &["200", "401", "403", "404", "408", "422", "500", "503"],
+            ),
+            (
+                "/v1/blobs/{digest}",
+                "get",
+                &["200", "400", "401", "403", "404", "408", "500", "503"],
+            ),
+            (
+                "/v1/events",
+                "get",
+                &["200", "401", "403", "408", "500", "503"],
+            ),
+        ];
+        for (path, method, statuses) in contracts {
+            assert_eq!(
+                response_statuses(&api["paths"][path][method]),
+                set(statuses),
+                "{method} {path}"
+            );
+        }
+    }
+
     fn response_statuses(operation: &serde_json::Value) -> BTreeSet<&str> {
         operation["responses"]
             .as_object()
@@ -2501,6 +3316,34 @@ mod tests {
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
 
+        let missing_revisions = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/notes/missing/revisions",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_revisions.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(missing_revisions).await,
+            json!({"items":[], "next":null})
+        );
+
+        let missing_graph = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/missing/inbound",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_graph.status(), StatusCode::NOT_FOUND);
+
         let mut settings = serde_json::to_value(service.settings().await.unwrap()).unwrap();
         settings.as_object_mut().unwrap().remove("revision");
         let settings = serde_json::to_vec(&settings).unwrap();
@@ -2552,6 +3395,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn asset_http_preserves_media_type_and_rejects_noncanonical_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device =
+            generate_device("asset".into(), vec!["read".into(), "content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+        let bytes = b"png bytes";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let path = format!("/v1/assets/{digest}/image.png");
+
+        let created = app
+            .clone()
+            .oneshot(authorized_with_type(
+                "PUT",
+                &path,
+                &token,
+                "image/png",
+                Body::from(bytes.to_vec()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let fetched = app
+            .clone()
+            .oneshot(authorized("GET", &path, &token, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        assert_eq!(fetched.headers()["content-type"], "image/png");
+        assert_eq!(
+            to_bytes(fetched.into_body(), usize::MAX).await.unwrap(),
+            bytes.as_slice()
+        );
+
+        let invalid = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/assets/not-a-digest/image.png",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(invalid).await["error"]["code"],
+            "invalid_content"
+        );
 
         drop(app);
         drop(service);
@@ -3386,7 +4295,7 @@ mod tests {
         .await
         .unwrap();
         let service = runtime.handle();
-        let owner = generate_device("owner".into(), vec!["review".into()]).unwrap();
+        let owner = generate_device("owner".into(), vec!["read".into(), "review".into()]).unwrap();
         let other = generate_device("other".into(), vec!["review".into()]).unwrap();
         let admin = generate_device("admin".into(), vec!["admin".into(), "review".into()]).unwrap();
         let owner_id = owner.device_id.clone();
@@ -3546,6 +4455,24 @@ mod tests {
         assert_eq!(accepted["version"], 2);
         assert_eq!(accepted["result"]["status"], "accepted");
         assert!(accepted["result"]["cursor"].is_string());
+        let changes = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/changes",
+                &owner_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(changes.status(), StatusCode::OK);
+        assert!(
+            response_json(changes).await["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|change| change["operation"] == "commit")
+        );
         let replay = app
             .clone()
             .oneshot(authorized(
