@@ -43,18 +43,13 @@ impl ServiceHandle {
         &self,
         prepared: PreparedServerImport,
     ) -> Result<ImportSummary, ServiceError> {
-        let blob = self
-            .blobs
-            .put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
         let created_at_us = system_time_us()?;
         request(&self.sender, |response| StoreCommand::Replace {
             prepared: Box::new(prepared),
-            blob,
             created_at_us,
             response,
         })
         .await?
-        .map_err(ServiceError::Application)
     }
 
     pub(crate) async fn get(
@@ -119,18 +114,13 @@ impl ServiceHandle {
         created_at_us: i64,
         author_device_id: Option<String>,
     ) -> Result<DocumentHead, ServiceError> {
-        let blob = self
-            .blobs
-            .put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
         request(&self.sender, |response| StoreCommand::ReplaceNote {
             prepared: Box::new(prepared),
-            blob,
             created_at_us,
             author_device_id,
             response,
         })
         .await?
-        .map_err(ServiceError::Store)
     }
 
     pub(crate) async fn note(
@@ -143,7 +133,12 @@ impl ServiceHandle {
         })
         .await?
         .map_err(ServiceError::Store)?;
-        read_document_blob(&self.blobs, head)
+        let Some(head) = head.filter(|head| head.active) else {
+            return Ok(None);
+        };
+        let digest = head.blob_sha256.clone().ok_or(ServiceError::Corrupt)?;
+        let bytes = read_blob(self.blobs.clone(), digest).await?;
+        Ok(Some((head, bytes)))
     }
 
     pub(crate) async fn note_revisions(
@@ -174,7 +169,14 @@ impl ServiceHandle {
         })
         .await?
         .map_err(ServiceError::Store)?;
-        read_revision_blob(&self.blobs, record)
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let Some(digest) = record.blob_sha256.clone() else {
+            return Ok(Some((record, Vec::new())));
+        };
+        let bytes = read_blob(self.blobs.clone(), digest).await?;
+        Ok(Some((record, bytes)))
     }
 
     pub(crate) async fn rename_note(
@@ -232,16 +234,15 @@ impl ServiceHandle {
         if actual_digest != expected_digest {
             return Err(ServiceError::AssetDigest);
         }
-        let blob = self.blobs.put(&bytes, &media_type)?;
         request(&self.sender, |response| StoreCommand::PutAsset {
             prepared,
-            blob,
+            bytes,
+            media_type,
             created_at_us,
             author_device_id,
             response,
         })
         .await?
-        .map_err(ServiceError::Store)
     }
 
     pub(crate) async fn stage_blob(
@@ -256,15 +257,13 @@ impl ServiceHandle {
         if actual_digest != expected_digest {
             return Err(ServiceError::AssetDigest);
         }
-        let blob = self.blobs.put(&bytes, &media_type)?;
         request(&self.sender, |response| StoreCommand::StageBlob {
-            blob: blob.clone(),
+            bytes,
+            media_type,
             created_at_us,
             response,
         })
         .await?
-        .map_err(ServiceError::Store)?;
-        Ok(blob)
     }
 
     pub(crate) async fn asset(
@@ -292,10 +291,7 @@ impl ServiceHandle {
         if digest != expected_digest {
             return Err(ServiceError::AssetDigest);
         }
-        let blobs = self.blobs.clone();
-        let bytes = tokio::task::spawn_blocking(move || blobs.read(&digest))
-            .await
-            .map_err(|_| ServiceError::Stopped)??;
+        let bytes = read_blob(self.blobs.clone(), digest).await?;
         Ok(Some((head, bytes)))
     }
 
@@ -428,11 +424,8 @@ impl ServiceHandle {
         let Some(meta) = meta else {
             return Ok(None);
         };
-        let blobs = self.blobs.clone();
         let digest = meta.sha256.clone();
-        let bytes = tokio::task::spawn_blocking(move || blobs.read(&digest))
-            .await
-            .map_err(|_| ServiceError::Stopped)??;
+        let bytes = read_blob(self.blobs.clone(), digest).await?;
         Ok(Some((meta, bytes)))
     }
 
@@ -915,7 +908,7 @@ impl ServiceHandle {
         else {
             return Ok(None);
         };
-        let bytes = self.blobs.read(&asset.content_sha256)?;
+        let bytes = read_blob(self.blobs.clone(), asset.content_sha256.clone()).await?;
         if bytes.len() as u64 != asset.size_bytes {
             return Err(ServiceError::Corrupt);
         }
@@ -1062,28 +1055,11 @@ impl ServiceHandle {
     }
 }
 
-fn read_document_blob(
-    blobs: &BlobStore,
-    head: Option<DocumentHead>,
-) -> Result<Option<(DocumentHead, Vec<u8>)>, ServiceError> {
-    let Some(head) = head.filter(|head| head.active) else {
-        return Ok(None);
-    };
-    let digest = head.blob_sha256.as_deref().ok_or(ServiceError::Corrupt)?;
-    Ok(Some((head.clone(), blobs.read(digest)?)))
-}
-
-fn read_revision_blob(
-    blobs: &BlobStore,
-    revision: Option<DocumentRevision>,
-) -> Result<Option<(DocumentRevision, Vec<u8>)>, ServiceError> {
-    let Some(revision) = revision else {
-        return Ok(None);
-    };
-    let Some(digest) = revision.blob_sha256.as_deref() else {
-        return Ok(Some((revision, Vec::new())));
-    };
-    Ok(Some((revision.clone(), blobs.read(digest)?)))
+async fn read_blob(blobs: Arc<BlobStore>, digest: String) -> Result<Vec<u8>, ServiceError> {
+    tokio::task::spawn_blocking(move || blobs.read(&digest))
+        .await
+        .map_err(|_| ServiceError::Stopped)?
+        .map_err(ServiceError::Blob)
 }
 
 pub(crate) struct ServiceRuntime {
@@ -1150,9 +1126,8 @@ enum PreparedContentOperation {
 enum StoreCommand {
     Replace {
         prepared: Box<PreparedServerImport>,
-        blob: BlobMeta,
         created_at_us: i64,
-        response: oneshot::Sender<Result<ImportSummary, ApplicationError>>,
+        response: oneshot::Sender<Result<ImportSummary, ServiceError>>,
     },
     Get {
         document_id: DocumentId,
@@ -1175,10 +1150,9 @@ enum StoreCommand {
     },
     ReplaceNote {
         prepared: Box<PreparedNote>,
-        blob: crate::blob::BlobMeta,
         created_at_us: i64,
         author_device_id: Option<String>,
-        response: oneshot::Sender<StoreResult<DocumentHead>>,
+        response: oneshot::Sender<Result<DocumentHead, ServiceError>>,
     },
     DocumentHead {
         document_id: DocumentId,
@@ -1212,15 +1186,17 @@ enum StoreCommand {
     },
     PutAsset {
         prepared: PreparedAsset,
-        blob: crate::blob::BlobMeta,
+        bytes: Vec<u8>,
+        media_type: String,
         created_at_us: i64,
         author_device_id: Option<String>,
-        response: oneshot::Sender<StoreResult<AssetHead>>,
+        response: oneshot::Sender<Result<AssetHead, ServiceError>>,
     },
     StageBlob {
-        blob: BlobMeta,
+        bytes: Vec<u8>,
+        media_type: String,
         created_at_us: i64,
-        response: oneshot::Sender<StoreResult<()>>,
+        response: oneshot::Sender<Result<BlobMeta, ServiceError>>,
     },
     AssetHead {
         asset_path: String,
@@ -1624,16 +1600,84 @@ fn reconcile_content_command(
     )
 }
 
+fn replace_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    prepared: &PreparedServerImport,
+    created_at_us: i64,
+) -> Result<ImportSummary, ServiceError> {
+    let blob = blobs.put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
+    persist_server_import(store, prepared, &blob, created_at_us).map_err(ServiceError::Application)
+}
+
+fn replace_note_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    prepared: &PreparedNote,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<DocumentHead, ServiceError> {
+    let blob = blobs.put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
+    store
+        .replace_note(prepared, &blob, created_at_us, author_device_id)
+        .map_err(ServiceError::Store)?;
+    store
+        .document_head(&prepared.document_id)
+        .map_err(ServiceError::Store)?
+        .ok_or(ServiceError::Store(StoreError::NotFound))
+}
+
+struct AssetWrite<'a> {
+    prepared: &'a PreparedAsset,
+    bytes: &'a [u8],
+    media_type: &'a str,
+    created_at_us: i64,
+    author_device_id: Option<&'a str>,
+}
+
+fn put_asset_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    write: AssetWrite<'_>,
+) -> Result<AssetHead, ServiceError> {
+    let blob = blobs.put(write.bytes, write.media_type)?;
+    store
+        .put_asset(
+            write.prepared,
+            &blob,
+            write.created_at_us,
+            write.author_device_id,
+        )
+        .map_err(ServiceError::Store)?;
+    store
+        .asset_head(&write.prepared.logical_path)
+        .map_err(ServiceError::Store)?
+        .ok_or(ServiceError::Store(StoreError::NotFound))
+}
+
+fn stage_blob_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    bytes: &[u8],
+    media_type: &str,
+    created_at_us: i64,
+) -> Result<BlobMeta, ServiceError> {
+    let blob = blobs.put(bytes, media_type)?;
+    store
+        .stage_blob(&blob, created_at_us)
+        .map_err(ServiceError::Store)?;
+    Ok(blob)
+}
+
 fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreCommand) {
     match command {
         StoreCommand::Replace {
             prepared,
-            blob,
             created_at_us,
             response,
         } => send(
             response,
-            persist_server_import(store, &prepared, &blob, created_at_us),
+            replace_command(store, blobs, &prepared, created_at_us),
         ),
         StoreCommand::Get {
             document_id,
@@ -1650,20 +1694,19 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         StoreCommand::DueThemataPage { query, response } => run_due_page(store, query, response),
         StoreCommand::ReplaceNote {
             prepared,
-            blob,
             created_at_us,
             author_device_id,
             response,
-        } => {
-            let result = store
-                .replace_note(&prepared, &blob, created_at_us, author_device_id.as_deref())
-                .and_then(|_| {
-                    store
-                        .document_head(&prepared.document_id)?
-                        .ok_or(StoreError::NotFound)
-                });
-            send(response, result);
-        }
+        } => send(
+            response,
+            replace_note_command(
+                store,
+                blobs,
+                &prepared,
+                created_at_us,
+                author_device_id.as_deref(),
+            ),
+        ),
         StoreCommand::DocumentHead {
             document_id,
             response,
@@ -1716,25 +1759,34 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         ),
         StoreCommand::PutAsset {
             prepared,
-            blob,
+            bytes,
+            media_type,
             created_at_us,
             author_device_id,
             response,
-        } => {
-            let result = store
-                .put_asset(&prepared, &blob, created_at_us, author_device_id.as_deref())
-                .and_then(|_| {
-                    store
-                        .asset_head(&prepared.logical_path)?
-                        .ok_or(StoreError::NotFound)
-                });
-            send(response, result);
-        }
+        } => send(
+            response,
+            put_asset_command(
+                store,
+                blobs,
+                AssetWrite {
+                    prepared: &prepared,
+                    bytes: &bytes,
+                    media_type: &media_type,
+                    created_at_us,
+                    author_device_id: author_device_id.as_deref(),
+                },
+            ),
+        ),
         StoreCommand::StageBlob {
-            blob,
+            bytes,
+            media_type,
             created_at_us,
             response,
-        } => send(response, store.stage_blob(&blob, created_at_us)),
+        } => send(
+            response,
+            stage_blob_command(store, blobs, &bytes, &media_type, created_at_us),
+        ),
         StoreCommand::AssetHead {
             asset_path,
             response,
@@ -2283,11 +2335,16 @@ pub(crate) enum ServiceStartError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, mpsc},
+        thread,
+    };
 
     use sha2::Digest as _;
+    use tokio::sync::oneshot;
 
-    use super::{ServiceError, ServiceRuntime};
+    use super::{ServiceError, ServiceHandle, ServiceRuntime, StoreCommand, store_actor};
     use crate::application::{
         AssetReconciliationStatus, ImportDocument, OfflineAssetConflictReason,
         OfflineAssetOperation, ParametersSnapshot, ReplicaProjection, SettingsInput,
@@ -2306,6 +2363,64 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn full_queue_rejects_blob_before_durable_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob_path = directory.path().join("blobs");
+        let blobs = Arc::new(BlobStore::open(&blob_path).unwrap());
+        let (sender, _receiver) = mpsc::sync_channel(0);
+        let service = ServiceHandle { sender, blobs };
+        let bytes = b"not accepted".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+
+        let result = service
+            .stage_blob(&digest, bytes, "application/octet-stream".into(), 1)
+            .await;
+
+        assert!(matches!(result, Err(ServiceError::Busy)));
+        assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[test]
+    fn accepted_blob_write_survives_dropped_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_path = directory.path().join("blobs");
+        let blobs = Arc::new(BlobStore::open(&blob_path).unwrap());
+        let bytes = b"accepted before disconnect".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (response, response_receiver) = oneshot::channel();
+        let command = StoreCommand::StageBlob {
+            bytes: bytes.clone(),
+            media_type: "application/octet-stream".into(),
+            created_at_us: 1,
+            response,
+        };
+        assert!(sender.try_send(command).is_ok());
+        drop(response_receiver);
+
+        let (ready, readiness) = mpsc::sync_channel(1);
+        let actor_blobs = blobs.clone();
+        let actor_database = database.clone();
+        let actor =
+            thread::spawn(move || store_actor(actor_database, actor_blobs, receiver, ready));
+        readiness.recv().unwrap().unwrap();
+        drop(sender);
+        actor.join().unwrap();
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let staged_size = connection
+            .query_row(
+                "SELECT size_bytes FROM staged_blob WHERE content_sha256 = ?1",
+                [&digest],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(staged_size, bytes.len() as u64);
+        assert!(blob_path.join(&digest[..2]).join(digest).exists());
     }
 
     #[tokio::test]
