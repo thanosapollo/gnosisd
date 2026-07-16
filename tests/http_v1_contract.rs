@@ -3,8 +3,9 @@ use gnosis_core::protocol::http_v1::{
     ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
     NodePageV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
-    ReviewAttemptStateResponseV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1,
-    StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewSessionRequestV1,
+    ReviewSessionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
+    ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -195,6 +196,49 @@ fn public_review_operation_dtos_preserve_strict_v1_shapes() {
     let mut future = acceptance;
     future["future"] = json!(true);
     assert!(serde_json::from_value::<SetAcceptedSuccessRequestV1>(future).is_err());
+}
+
+#[test]
+fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
+    let source = json!({
+        "kind":"due",
+        "tags":[],
+        "exclude_tags":[],
+        "topic_node_id":null,
+        "topic_forward_depth":null,
+        "topic_backward_depth":null,
+        "manual_ids":[]
+    });
+    let request = json!({"source":source.clone(),"target_count":null});
+    let session = json!({
+        "session_id":"session",
+        "owner_device_id":"device",
+        "mode":"online",
+        "source":source,
+        "target_count":null,
+        "status":"active",
+        "current_position":0,
+        "queue_length":1,
+        "started_at_us":1
+    });
+    let attempt = review_attempt_result()["attempt"].clone();
+    let committed = json!({"event_id":"event"});
+
+    assert_round_trip::<ReviewSessionRequestV1>(request);
+    assert_round_trip::<ReviewSessionV1>(session);
+    assert_round_trip::<ReviewAttemptV1>(attempt);
+    assert_round_trip::<ReviewCommitResponseV1>(committed);
+
+    let mut future = review_attempt_result()["attempt"].clone();
+    future["future"] = json!(true);
+    assert!(serde_json::from_value::<ReviewAttemptV1>(future).is_err());
+
+    let mut missing_null = review_attempt_result()["attempt"].clone();
+    missing_null
+        .as_object_mut()
+        .unwrap()
+        .remove("revealed_answer");
+    assert!(serde_json::from_value::<ReviewAttemptV1>(missing_null).is_err());
 }
 
 #[test]

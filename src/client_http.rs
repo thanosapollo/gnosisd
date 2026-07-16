@@ -30,9 +30,13 @@ use crate::{
         MAX_OFFLINE_REVIEW_OPERATION_BYTES, MAX_OFFLINE_REVIEW_RESULT_BYTES,
         MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
         http_v1::{
-            ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1,
-            DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
-            ReplicaSnapshotPageV1, ReplicaStateV1, StagedBlobV1, valid_bearer_token,
+            ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
+            ContentCapabilitiesV1, DocumentMutationResultV1, NoteRenameRequestV1,
+            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
+            ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
+            ReviewAttemptV1, ReviewCommitResponseV1, ReviewSessionModeV1, ReviewSessionRequestV1,
+            ReviewSessionStatusV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
+            SetSuspensionRequestV1, StagedBlobV1, valid_bearer_token,
         },
     },
 };
@@ -233,6 +237,124 @@ impl HttpClient {
         execute_document_mutation(request, operation_id, Some(document_id)).await
     }
 
+    pub async fn create_review_session(
+        &self,
+        input: &ReviewSessionRequestV1,
+    ) -> Result<ReviewSessionV1, HttpClientError> {
+        let request = self.post_review_json("v1/review/sessions", input)?;
+        let session = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_online_session(session, None)
+    }
+
+    pub async fn active_review_session(&self) -> Result<ActiveReviewSessionV1, HttpClientError> {
+        let active: ActiveReviewSessionV1 = self.get_json("v1/review/sessions/active").await?;
+        if active.session.as_ref().is_none_or(valid_online_session) {
+            Ok(active)
+        } else {
+            Err(invalid_response())
+        }
+    }
+
+    pub async fn resume_review_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ReviewSessionV1, HttpClientError> {
+        self.review_session_action(session_id, "resume").await
+    }
+
+    pub async fn quit_review_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ReviewSessionV1, HttpClientError> {
+        self.review_session_action(session_id, "quit").await
+    }
+
+    pub async fn abort_review_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ReviewSessionV1, HttpClientError> {
+        self.review_session_action(session_id, "abort").await
+    }
+
+    pub async fn begin_review_attempt(
+        &self,
+        session_id: &str,
+    ) -> Result<ReviewAttemptV1, HttpClientError> {
+        require_review_id(session_id)?;
+        let url = self.review_resource_endpoint("sessions", session_id, Some("attempts"))?;
+        let attempt = execute_json(self.client.post(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_attempt(attempt, None, Some(session_id))
+    }
+
+    pub async fn answer_review_attempt(
+        &self,
+        attempt_id: &str,
+        answer: &ReviewAnswerV1,
+    ) -> Result<ReviewAttemptV1, HttpClientError> {
+        require_review_id(attempt_id)?;
+        let url = self.review_resource_endpoint("attempts", attempt_id, Some("answer"))?;
+        let body = encode_review_body(answer)?;
+        let request = json_request(self.client.post(url), body);
+        let attempt = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_attempt(attempt, Some(attempt_id), None)
+    }
+
+    pub async fn review_attempt_state(
+        &self,
+        attempt_id: &str,
+    ) -> Result<ReviewAttemptStateResponseV1, HttpClientError> {
+        require_review_id(attempt_id)?;
+        let url = self.review_resource_endpoint("attempts", attempt_id, None)?;
+        let state = execute_json(self.client.get(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_attempt_state(state, attempt_id)
+    }
+
+    pub async fn set_review_accepted_success(
+        &self,
+        attempt_id: &str,
+        input: &SetAcceptedSuccessRequestV1,
+    ) -> Result<ReviewAttemptOperationResponseV1, HttpClientError> {
+        self.set_review_attempt_state(
+            attempt_id,
+            "accepted-success",
+            input.version,
+            &input.operation_id,
+            input.expected_attempt_revision,
+            input,
+        )
+        .await
+    }
+
+    pub async fn set_review_suspension(
+        &self,
+        attempt_id: &str,
+        input: &SetSuspensionRequestV1,
+    ) -> Result<ReviewAttemptOperationResponseV1, HttpClientError> {
+        self.set_review_attempt_state(
+            attempt_id,
+            "suspension",
+            input.version,
+            &input.operation_id,
+            input.expected_attempt_revision,
+            input,
+        )
+        .await
+    }
+
+    pub async fn commit_review_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<ReviewCommitResponseV1, HttpClientError> {
+        require_review_id(attempt_id)?;
+        let url = self.review_resource_endpoint("attempts", attempt_id, Some("commit"))?;
+        let result: ReviewCommitResponseV1 =
+            execute_json(self.client.post(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        require_review_id(&result.event_id)
+            .is_ok()
+            .then_some(result)
+            .ok_or_else(invalid_response)
+    }
+
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, HttpClientError> {
         let url = self.endpoint(path)?;
         execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
@@ -262,6 +384,64 @@ impl HttpClient {
         url.path_segments_mut()
             .map_err(|_| HttpClientError::InvalidBaseUrl)?
             .push(action);
+        Ok(url)
+    }
+
+    fn post_review_json(
+        &self,
+        path: &str,
+        input: &impl Serialize,
+    ) -> Result<RequestBuilder, HttpClientError> {
+        let url = self.endpoint(path)?;
+        Ok(json_request(
+            self.client.post(url),
+            encode_review_body(input)?,
+        ))
+    }
+
+    async fn review_session_action(
+        &self,
+        session_id: &str,
+        action: &str,
+    ) -> Result<ReviewSessionV1, HttpClientError> {
+        require_review_id(session_id)?;
+        let url = self.review_resource_endpoint("sessions", session_id, Some(action))?;
+        let session: ReviewSessionV1 =
+            execute_json(self.client.post(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_online_session(session, Some(session_id))
+    }
+
+    async fn set_review_attempt_state(
+        &self,
+        attempt_id: &str,
+        action: &str,
+        version: u32,
+        operation_id: &str,
+        expected_revision: u64,
+        input: &impl Serialize,
+    ) -> Result<ReviewAttemptOperationResponseV1, HttpClientError> {
+        require_review_operation(attempt_id, version, operation_id, expected_revision)?;
+        let url = self.review_resource_endpoint("attempts", attempt_id, Some(action))?;
+        let request = json_request(self.client.put(url), encode_review_body(input)?);
+        let result = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_attempt_operation(result, operation_id, attempt_id, expected_revision)
+    }
+
+    fn review_resource_endpoint(
+        &self,
+        collection: &str,
+        id: &str,
+        action: Option<&str>,
+    ) -> Result<Url, HttpClientError> {
+        let mut url = self.endpoint("v1/review/")?;
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?;
+        segments.pop_if_empty().push(collection).push(id);
+        if let Some(action) = action {
+            segments.push(action);
+        }
+        drop(segments);
         Ok(url)
     }
 }
@@ -347,6 +527,126 @@ fn encode_document_mutation(input: &impl Serialize) -> Result<Vec<u8>, HttpClien
         return Err(HttpClientError::InvalidMutation);
     }
     Ok(body)
+}
+
+fn encode_review_body(input: &impl Serialize) -> Result<Vec<u8>, HttpClientError> {
+    let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidReview)?;
+    if body.len() > MAX_OFFLINE_REVIEW_OPERATION_BYTES {
+        return Err(HttpClientError::InvalidReview);
+    }
+    Ok(body)
+}
+
+fn json_request(request: RequestBuilder, body: Vec<u8>) -> RequestBuilder {
+    request
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(body)
+}
+
+fn require_review_id(value: &str) -> Result<(), HttpClientError> {
+    (!value.is_empty() && value.len() <= 128 && !value.contains('\0'))
+        .then_some(())
+        .ok_or(HttpClientError::InvalidReview)
+}
+
+fn require_review_operation(
+    attempt_id: &str,
+    version: u32,
+    operation_id: &str,
+    expected_revision: u64,
+) -> Result<(), HttpClientError> {
+    require_review_id(attempt_id)?;
+    if version == 1 && valid_operation_id(operation_id) && i64::try_from(expected_revision).is_ok()
+    {
+        Ok(())
+    } else {
+        Err(HttpClientError::InvalidReview)
+    }
+}
+
+fn checked_online_session(
+    session: ReviewSessionV1,
+    expected_id: Option<&str>,
+) -> Result<ReviewSessionV1, HttpClientError> {
+    if valid_online_session(&session)
+        && expected_id.is_none_or(|expected| session.session_id == expected)
+    {
+        Ok(session)
+    } else {
+        Err(invalid_response())
+    }
+}
+
+fn valid_online_session(session: &ReviewSessionV1) -> bool {
+    require_review_id(&session.session_id).is_ok()
+        && session.mode == ReviewSessionModeV1::Online
+        && valid_session_position(session)
+        && session.started_at_us > 0
+}
+
+fn valid_session_position(session: &ReviewSessionV1) -> bool {
+    match session.status {
+        ReviewSessionStatusV1::Active => session.current_position < session.queue_length,
+        ReviewSessionStatusV1::Completed => session.current_position == session.queue_length,
+        ReviewSessionStatusV1::Quit | ReviewSessionStatusV1::Aborted => {
+            session.current_position <= session.queue_length
+        }
+    }
+}
+
+fn checked_attempt(
+    attempt: ReviewAttemptV1,
+    attempt_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<ReviewAttemptV1, HttpClientError> {
+    if valid_attempt(&attempt)
+        && attempt_id.is_none_or(|expected| attempt.attempt_id == expected)
+        && session_id.is_none_or(|expected| attempt.session_id == expected)
+    {
+        Ok(attempt)
+    } else {
+        Err(invalid_response())
+    }
+}
+
+fn valid_attempt(attempt: &ReviewAttemptV1) -> bool {
+    require_review_id(&attempt.attempt_id).is_ok()
+        && require_review_id(&attempt.session_id).is_ok()
+        && require_review_id(&attempt.thema_id).is_ok()
+}
+
+fn checked_attempt_state(
+    state: ReviewAttemptStateResponseV1,
+    attempt_id: &str,
+) -> Result<ReviewAttemptStateResponseV1, HttpClientError> {
+    if state.version == 1
+        && i64::try_from(state.attempt_revision).is_ok()
+        && valid_attempt(&state.attempt)
+        && state.attempt.attempt_id == attempt_id
+    {
+        Ok(state)
+    } else {
+        Err(invalid_response())
+    }
+}
+
+fn checked_attempt_operation(
+    result: ReviewAttemptOperationResponseV1,
+    operation_id: &str,
+    attempt_id: &str,
+    expected_revision: u64,
+) -> Result<ReviewAttemptOperationResponseV1, HttpClientError> {
+    if result.version == 1
+        && result.operation_id == operation_id
+        && expected_revision.checked_add(1) == Some(result.attempt_revision)
+        && i64::try_from(result.attempt_revision).is_ok()
+        && valid_attempt(&result.attempt)
+        && result.attempt.attempt_id == attempt_id
+    {
+        Ok(result)
+    } else {
+        Err(invalid_response())
+    }
 }
 
 async fn execute_document_mutation(
@@ -596,6 +896,8 @@ pub enum HttpClientError {
     InvalidOperationId,
     #[error("Gnosis document mutation is invalid")]
     InvalidMutation,
+    #[error("Gnosis review request is invalid")]
+    InvalidReview,
     #[error("Gnosis HTTP client initialization failed")]
     ClientBuild(#[source] reqwest::Error),
     #[error("Gnosis TLS provider initialization failed")]

@@ -23,7 +23,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::application::{
     AnswerInput, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
-    TransitionSnapshot,
+    ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, TransitionSnapshot,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -455,9 +455,15 @@ pub struct ReviewStateV1 {
     pub review_count: u64,
     pub legacy_review_count: u64,
     pub legacy_unclassified_count: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub last_reviewed_at_us: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub last_review_day: Option<u32>,
     pub next_review_day: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub interval_days: Option<u32>,
     pub consecutive_successes: u64,
     pub total_successes: u64,
@@ -467,6 +473,207 @@ pub struct ReviewStateV1 {
     pub gnosis_plus: f64,
     pub gnosis_minus: f64,
     pub gnosis_synolon: f64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSourceKindV1 {
+    Due,
+    Overdue,
+    DueWithoutOverdue,
+    Tag,
+    DueTag,
+    Topic,
+    Manual,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceInputV1 {
+    pub kind: ReviewSourceKindV1,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub exclude_tags: Vec<String>,
+    pub topic_node_id: Option<String>,
+    pub topic_forward_depth: Option<u32>,
+    pub topic_backward_depth: Option<u32>,
+    #[serde(default)]
+    pub manual_ids: Vec<String>,
+}
+
+impl ReviewSourceInputV1 {
+    fn into_application(self) -> ReviewSource {
+        ReviewSource {
+            kind: self.kind.into(),
+            tags: self.tags,
+            exclude_tags: self.exclude_tags,
+            topic_node_id: self.topic_node_id,
+            topic_forward_depth: self.topic_forward_depth,
+            topic_backward_depth: self.topic_backward_depth,
+            manual_ids: self.manual_ids,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSourceV1 {
+    pub kind: ReviewSourceKindV1,
+    pub tags: Vec<String>,
+    pub exclude_tags: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub topic_node_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub topic_forward_depth: Option<u32>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub topic_backward_depth: Option<u32>,
+    pub manual_ids: Vec<String>,
+}
+
+impl From<&ReviewSource> for ReviewSourceV1 {
+    fn from(value: &ReviewSource) -> Self {
+        Self {
+            kind: (&value.kind).into(),
+            tags: value.tags.clone(),
+            exclude_tags: value.exclude_tags.clone(),
+            topic_node_id: value.topic_node_id.clone(),
+            topic_forward_depth: value.topic_forward_depth,
+            topic_backward_depth: value.topic_backward_depth,
+            manual_ids: value.manual_ids.clone(),
+        }
+    }
+}
+
+impl From<&ReviewSourceKind> for ReviewSourceKindV1 {
+    fn from(value: &ReviewSourceKind) -> Self {
+        match value {
+            ReviewSourceKind::Due => Self::Due,
+            ReviewSourceKind::Overdue => Self::Overdue,
+            ReviewSourceKind::DueWithoutOverdue => Self::DueWithoutOverdue,
+            ReviewSourceKind::Tag => Self::Tag,
+            ReviewSourceKind::DueTag => Self::DueTag,
+            ReviewSourceKind::Topic => Self::Topic,
+            ReviewSourceKind::Manual => Self::Manual,
+        }
+    }
+}
+
+impl From<ReviewSourceKindV1> for ReviewSourceKind {
+    fn from(value: ReviewSourceKindV1) -> Self {
+        match value {
+            ReviewSourceKindV1::Due => Self::Due,
+            ReviewSourceKindV1::Overdue => Self::Overdue,
+            ReviewSourceKindV1::DueWithoutOverdue => Self::DueWithoutOverdue,
+            ReviewSourceKindV1::Tag => Self::Tag,
+            ReviewSourceKindV1::DueTag => Self::DueTag,
+            ReviewSourceKindV1::Topic => Self::Topic,
+            ReviewSourceKindV1::Manual => Self::Manual,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSessionRequestV1 {
+    pub source: ReviewSourceInputV1,
+    pub target_count: Option<u32>,
+}
+
+impl ReviewSessionRequestV1 {
+    pub(crate) fn into_application(self) -> (ReviewSource, Option<u32>) {
+        (self.source.into_application(), self.target_count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSessionModeV1 {
+    Online,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSessionStatusV1 {
+    Active,
+    Completed,
+    Quit,
+    Aborted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewSessionV1 {
+    pub session_id: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub owner_device_id: Option<String>,
+    pub mode: ReviewSessionModeV1,
+    pub source: ReviewSourceV1,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub target_count: Option<u32>,
+    pub status: ReviewSessionStatusV1,
+    pub current_position: u32,
+    pub queue_length: u32,
+    pub started_at_us: u64,
+}
+
+impl ReviewSessionV1 {
+    pub(crate) fn from_application(
+        value: &ReviewSessionView,
+    ) -> Result<Self, ReviewAttemptWireError> {
+        Ok(Self {
+            session_id: value.session_id.clone(),
+            owner_device_id: value.owner_device_id.clone(),
+            mode: value.mode.into(),
+            source: (&value.source).into(),
+            target_count: value.target_count,
+            status: ReviewSessionStatusV1::from_application(&value.status)?,
+            current_position: value.current_position,
+            queue_length: value.queue_length,
+            started_at_us: value.started_at_us,
+        })
+    }
+}
+
+impl From<ReviewSessionMode> for ReviewSessionModeV1 {
+    fn from(value: ReviewSessionMode) -> Self {
+        match value {
+            ReviewSessionMode::Online => Self::Online,
+            ReviewSessionMode::Offline => Self::Offline,
+        }
+    }
+}
+
+impl ReviewSessionStatusV1 {
+    fn from_application(value: &str) -> Result<Self, ReviewAttemptWireError> {
+        match value {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "quit" => Ok(Self::Quit),
+            "aborted" => Ok(Self::Aborted),
+            _ => Err(ReviewAttemptWireError::SessionStatus),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveReviewSessionV1 {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub session: Option<ReviewSessionV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewCommitResponseV1 {
+    pub event_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -556,13 +763,25 @@ pub struct ReviewAttemptV1 {
     pub session_id: String,
     pub thema_id: String,
     pub presentation: ReviewPresentationV1,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub revealed_answer: Option<Vec<String>>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub revealed_parathema: Option<String>,
     pub matcher_version: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub response: Option<ReviewAnswerV1>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub detected_success: Option<bool>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub accepted_success: Option<bool>,
     pub override_count: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub proposed_transition: Option<ReviewTransitionV1>,
     pub desired_suspended: bool,
     pub status: ReviewAttemptStatusV1,
@@ -622,7 +841,11 @@ pub struct ReviewPresentationV1 {
     pub kind: ThemaKindV1,
     pub keimenon: String,
     pub hypothesis: Vec<Option<String>>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub source_guid: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub review_image: Option<String>,
     pub tags: Vec<String>,
 }
@@ -643,6 +866,7 @@ impl ReviewPresentationV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewAttemptWireError {
     PresentationKind,
+    SessionStatus,
     Status,
 }
 
@@ -665,6 +889,16 @@ impl From<&AnswerInput> for ReviewAnswerV1 {
             AnswerInput::Text(value) => Self::Text(value.clone()),
             AnswerInput::Texts(value) => Self::Texts(value.clone()),
             AnswerInput::Choice(value) => Self::Choice(value.clone()),
+        }
+    }
+}
+
+impl From<ReviewAnswerV1> for AnswerInput {
+    fn from(value: ReviewAnswerV1) -> Self {
+        match value {
+            ReviewAnswerV1::Text(value) => Self::Text(value),
+            ReviewAnswerV1::Texts(value) => Self::Texts(value),
+            ReviewAnswerV1::Choice(value) => Self::Choice(value),
         }
     }
 }

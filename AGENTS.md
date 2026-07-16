@@ -9,10 +9,10 @@ product named emacs-gnosis. Its established UI and behavior are the
 compatibility contract for the migration. Coordinated frontend changes are
 expected when a core operation lands.
 
-The deployed daemon exclusively owns
-`~/.local/share/gnosis/gnosis.sqlite`. The Emacs frontend connects through
-`$XDG_RUNTIME_DIR/gnosis/gnosis.sock`; it must never open the core database
-directly.
+The deployed daemon exclusively owns the configured SQLite database. Ordinary
+clients use authenticated HTTP `/v1`; the Unix socket is the privileged local
+trust, administration, recovery, and temporary compatibility boundary. No
+client may open the core database directly.
 
 ## Architecture
 
@@ -32,8 +32,8 @@ directly.
   target.
 - Legacy themata remain exposed through a read-only adapter. Normalized review
   writes use immutable attempts and events plus atomic scheduling transitions.
-- `src/protocol` owns the versioned wire DTOs, framing, Unix-socket server, and
-  client. Public fields use opaque string IDs, never SQLite row IDs.
+- `src/protocol` owns the versioned wire DTOs, HTTP API, and privileged Unix
+  framing. Public fields use opaque string IDs, never SQLite row IDs.
   `src/protocol/http_v1.rs` is the client-facing HTTP contract kernel. Generate
   OpenAPI schemas from these DTOs instead of maintaining parallel JSON models.
 - Local online review DTOs remain in `src/protocol`. Pure validation and
@@ -66,7 +66,9 @@ directly.
   review operations, results, or device sequence state. Reconciliation cursors
   are hints and must never fast-forward the replica feed cursor.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
-  `src/bin/gnosis.rs` uses only protocol methods.
+  `src/bin/gnosis.rs` currently combines operator commands and compatibility
+  methods; ordinary commands must migrate to `HttpClient` before the Unix
+  compatibility methods are removed.
 
 Keep textual link occurrences, unique semantic node edges, and `ThemaConcept`
 learning associations separate. Node titles are local values; title paths

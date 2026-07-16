@@ -14,6 +14,8 @@ use gnosis_core::{
         ResponseResult, ServerError,
         http_v1::{
             ApiErrorCodeV1, DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            ReviewAnswerV1, ReviewSessionRequestV1, ReviewSourceInputV1, ReviewSourceKindV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, ThemaWriteRequestV1,
         },
         request,
     },
@@ -156,6 +158,129 @@ async fn client_authenticates_and_decodes_replica_bootstrap() {
     assert_eq!(device_id.len(), 36);
 
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn client_runs_the_typed_online_review_lifecycle() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let thema_id = create_review_thema(&daemon.base_url, &raw_token).await;
+    let request = ReviewSessionRequestV1 {
+        source: ReviewSourceInputV1 {
+            kind: ReviewSourceKindV1::Manual,
+            tags: Vec::new(),
+            exclude_tags: Vec::new(),
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: vec![thema_id],
+        },
+        target_count: None,
+    };
+
+    let session = client.create_review_session(&request).await.unwrap();
+    assert_eq!(
+        client
+            .active_review_session()
+            .await
+            .unwrap()
+            .session
+            .as_ref(),
+        Some(&session)
+    );
+    assert_eq!(
+        client
+            .resume_review_session(&session.session_id)
+            .await
+            .unwrap(),
+        session
+    );
+    let pending = client
+        .begin_review_attempt(&session.session_id)
+        .await
+        .unwrap();
+    let graded = client
+        .answer_review_attempt(&pending.attempt_id, &ReviewAnswerV1::Text("Answer".into()))
+        .await
+        .unwrap();
+    assert_eq!(graded.detected_success, Some(true));
+
+    let state = client
+        .review_attempt_state(&pending.attempt_id)
+        .await
+        .unwrap();
+    let accepted = client
+        .set_review_accepted_success(
+            &pending.attempt_id,
+            &SetAcceptedSuccessRequestV1 {
+                version: 1,
+                operation_id: "accept-review".into(),
+                expected_attempt_revision: state.attempt_revision,
+                accepted_success: false,
+            },
+        )
+        .await
+        .unwrap();
+    let suspended = client
+        .set_review_suspension(
+            &pending.attempt_id,
+            &SetSuspensionRequestV1 {
+                version: 1,
+                operation_id: "suspend-review".into(),
+                expected_attempt_revision: accepted.attempt_revision,
+                desired_suspended: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(suspended.attempt.desired_suspended);
+    assert!(
+        !client
+            .commit_review_attempt(&pending.attempt_id)
+            .await
+            .unwrap()
+            .event_id
+            .is_empty()
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn review_operations_reject_mismatched_success_identities() {
+    for response in [
+        review_operation_json(2, "operation", "attempt", 2),
+        review_operation_json(1, "another-operation", "attempt", 2),
+        review_operation_json(1, "operation", "another-attempt", 2),
+        review_operation_json(1, "operation", "attempt", 3),
+    ] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        let error = client
+            .set_review_accepted_success(
+                "attempt",
+                &SetAcceptedSuccessRequestV1 {
+                    version: 1,
+                    operation_id: "operation".into(),
+                    expected_attempt_revision: 1,
+                    accepted_success: true,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HttpClientError::InvalidResponse {
+                delivery: DeliveryStatus::Unknown
+            }
+        ));
+        raw.task.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -780,6 +905,46 @@ async fn create_device(socket: &Path) -> (String, String) {
     (created.device.device_id, created.token)
 }
 
+fn review_thema_request() -> ThemaWriteRequestV1 {
+    ThemaWriteRequestV1 {
+        kind: "basic".into(),
+        keimenon: "Question".into(),
+        hypothesis: Vec::new(),
+        answer: vec!["Answer".into()],
+        source_guid: None,
+        parathema: None,
+        review_image: None,
+        tags: Vec::new(),
+        node_ids: Vec::new(),
+        asset_paths: Vec::new(),
+    }
+}
+
+async fn create_review_thema(base_url: &str, token: &str) -> String {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .no_proxy()
+        .tls_backend_rustls()
+        .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base_url}/v1/themata"))
+        .bearer_auth(token)
+        .header("content-type", "application/json")
+        .body(serde_json::to_vec(&review_thema_request()).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    serde_json::from_slice::<serde_json::Value>(&response.bytes().await.unwrap())
+        .unwrap()["thema_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 struct RawServer {
     base_url: String,
     task: tokio::task::JoinHandle<()>,
@@ -842,6 +1007,37 @@ async fn spawn_json_response(status: &'static str, value: serde_json::Value) -> 
         base_url: format!("http://{address}"),
         task,
     }
+}
+
+fn review_operation_json(
+    version: u32,
+    operation_id: &str,
+    attempt_id: &str,
+    attempt_revision: u64,
+) -> serde_json::Value {
+    json!({
+        "version":version,
+        "operation_id":operation_id,
+        "changed":true,
+        "attempt_revision":attempt_revision,
+        "attempt":{
+            "attempt_id":attempt_id,
+            "session_id":"session",
+            "thema_id":"thema",
+            "presentation":{"kind":"basic","keimenon":"Question","hypothesis":[],
+                "source_guid":null,"review_image":null,"tags":[]},
+            "revealed_answer":["Answer"],
+            "revealed_parathema":null,
+            "matcher_version":1,
+            "response":{"kind":"text","value":"Answer"},
+            "detected_success":true,
+            "accepted_success":true,
+            "override_count":0,
+            "proposed_transition":null,
+            "desired_suspended":false,
+            "status":"graded"
+        }
+    })
 }
 
 fn document_mutation_json(

@@ -25,13 +25,13 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 
 use crate::{
     application::{
-        AnswerInput, ApplicationError, DevicePrincipal, DeviceScope, MAX_OFFLINE_ASSET_BYTES,
+        ApplicationError, DevicePrincipal, DeviceScope, MAX_OFFLINE_ASSET_BYTES,
         PreparedDeviceDocumentLifecycleMutation, PreparedNote, ReviewAttemptMutation,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-        ReviewAttemptView, ReviewOperationAuthority, ReviewSessionView, ReviewSource,
-        SettingsRecord, canonical_asset_path, prepare_asset, prepare_device_document_mutation,
-        prepare_device_document_rename, prepare_device_document_tombstone, prepare_note,
-        prepare_thema, review_day_at, thema_content, validate_org_path,
+        ReviewOperationAuthority, SettingsRecord, canonical_asset_path, prepare_asset,
+        prepare_device_document_mutation, prepare_device_document_rename,
+        prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
+        thema_content, validate_org_path,
     },
     domain::DocumentId,
     is_canonical_sha256,
@@ -41,12 +41,13 @@ use crate::{
         OfflineReviewWireError, ReplicaWireError, active_review_pack_json, decode_cursor,
         decode_snapshot_cursor,
         http_v1::{
-            ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1,
-            DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+            ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1,
+            ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1,
+            ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
             DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
-            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
-            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
+            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
+            ReviewCommitResponseV1, ReviewSessionRequestV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
             ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
@@ -1079,68 +1080,67 @@ async fn graph(
     Ok(Json(NodePageV1::from_application(&items)))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SessionInput {
-    source: ReviewSource,
-    target_count: Option<u32>,
-}
 async fn create_session(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-    ApiJson(input): ApiJson<SessionInput>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    ApiJson(input): ApiJson<ReviewSessionRequestV1>,
+) -> Result<(StatusCode, Json<ReviewSessionV1>), ApiError> {
     require(&principal, DeviceScope::Review)?;
+    let (source, target_count) = input.into_application();
     let session = state
         .service
-        .create_review_session(
-            input.source,
-            input.target_count,
-            Some(principal.device_id),
-            now_us()?,
-        )
+        .create_review_session(source, target_count, Some(principal.device_id), now_us()?)
         .await
         .map_err(ApiError::service)?;
-    Ok((StatusCode::CREATED, Json(session_json(&session))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ReviewSessionV1::from_application(&session).map_err(|_| ApiError::internal())?),
+    ))
 }
 async fn active_session(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ActiveReviewSessionV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     let session = state
         .service
         .active_review_session(review_actor(&principal))
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(json!({"session":session.as_ref().map(session_json)})))
+    let session = session
+        .as_ref()
+        .map(ReviewSessionV1::from_application)
+        .transpose()
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(ActiveReviewSessionV1 { session }))
 }
 async fn resume_session(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewSessionV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    Ok(Json(session_json(
-        &state
-            .service
-            .resume_review_session(id, review_actor(&principal))
-            .await
-            .map_err(ApiError::service)?,
-    )))
+    let session = state
+        .service
+        .resume_review_session(id, review_actor(&principal))
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        ReviewSessionV1::from_application(&session).map_err(|_| ApiError::internal())?,
+    ))
 }
 async fn quit_session(
     state: State<HttpState>,
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewSessionV1>, ApiError> {
     stop_session(state, principal, path, false).await
 }
 async fn abort_session(
     state: State<HttpState>,
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewSessionV1>, ApiError> {
     stop_session(state, principal, path, true).await
 }
 async fn stop_session(
@@ -1148,43 +1148,48 @@ async fn stop_session(
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
     abort: bool,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewSessionV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    Ok(Json(session_json(
-        &state
-            .service
-            .stop_review_session(id, review_actor(&principal), abort, now_us()?)
-            .await
-            .map_err(ApiError::service)?,
-    )))
+    let session = state
+        .service
+        .stop_review_session(id, review_actor(&principal), abort, now_us()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        ReviewSessionV1::from_application(&session).map_err(|_| ApiError::internal())?,
+    ))
 }
 async fn begin_attempt(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<ReviewAttemptV1>), ApiError> {
     require(&principal, DeviceScope::Review)?;
     let attempt = state
         .service
         .begin_review_attempt(id, review_actor(&principal), now_us()?)
         .await
         .map_err(ApiError::service)?;
-    Ok((StatusCode::CREATED, Json(attempt_json(&attempt))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?),
+    ))
 }
 async fn answer_attempt(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-    ApiJson(answer): ApiJson<AnswerInput>,
-) -> Result<Json<Value>, ApiError> {
+    ApiJson(answer): ApiJson<ReviewAnswerV1>,
+) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    Ok(Json(attempt_json(
-        &state
-            .service
-            .grade_review_attempt(id, review_actor(&principal), answer, now_us()?)
-            .await
-            .map_err(ApiError::service)?,
-    )))
+    let attempt = state
+        .service
+        .grade_review_attempt(id, review_actor(&principal), answer.into(), now_us()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?,
+    ))
 }
 async fn get_attempt_state(
     State(state): State<HttpState>,
@@ -1226,29 +1231,31 @@ async fn override_attempt(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    Ok(Json(attempt_json(
-        &state
-            .service
-            .override_review_attempt(id, review_actor(&principal))
-            .await
-            .map_err(ApiError::service)?,
-    )))
+    let attempt = state
+        .service
+        .override_review_attempt(id, review_actor(&principal))
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?,
+    ))
 }
 async fn toggle_suspension(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    Ok(Json(attempt_json(
-        &state
-            .service
-            .toggle_attempt_suspension(id, review_actor(&principal))
-            .await
-            .map_err(ApiError::service)?,
-    )))
+    let attempt = state
+        .service
+        .toggle_attempt_suspension(id, review_actor(&principal))
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?,
+    ))
 }
 async fn set_suspension(
     State(state): State<HttpState>,
@@ -1319,7 +1326,7 @@ async fn commit_attempt(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewCommitResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     let event = state
         .service
@@ -1327,21 +1334,22 @@ async fn commit_attempt(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(json!({"event_id":event})))
+    Ok(Json(ReviewCommitResponseV1 { event_id: event }))
 }
 
 async fn create_pack(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-    ApiJson(input): ApiJson<SessionInput>,
+    ApiJson(input): ApiJson<ReviewSessionRequestV1>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     require(&principal, DeviceScope::Review)?;
+    let (source, target_count) = input.into_application();
     let pack = state
         .service
         .create_review_pack(
             crate::protocol::OFFLINE_REVIEW_VERSION,
-            input.source,
-            input.target_count,
+            source,
+            target_count,
             principal.device_id,
             now_us()?,
         )
@@ -1503,40 +1511,6 @@ async fn reconcile_asset(
 
 fn review_actor(principal: &DevicePrincipal) -> Option<String> {
     (!principal.scopes.contains(&DeviceScope::Admin)).then(|| principal.device_id.clone())
-}
-
-fn session_json(s: &ReviewSessionView) -> Value {
-    json!({"session_id":s.session_id,"owner_device_id":s.owner_device_id,"mode":s.mode,
-        "source":s.source,"target_count":s.target_count,"status":s.status,
-        "current_position":s.current_position,"queue_length":s.queue_length,
-        "started_at_us":s.started_at_us})
-}
-fn attempt_json(a: &ReviewAttemptView) -> Value {
-    let presentation = &a.presentation;
-    let reveal = a.response.is_some();
-    json!({
-        "attempt_id":a.attempt_id,
-        "session_id":a.session_id,
-        "thema_id":a.thema_id,
-        "presentation":{
-            "kind":presentation.kind,
-            "keimenon":presentation.keimenon,
-            "hypothesis":presentation.hypothesis,
-            "source_guid":presentation.source_guid,
-            "review_image":presentation.review_image,
-            "tags":presentation.tags
-        },
-        "revealed_answer":reveal.then_some(&presentation.answer),
-        "revealed_parathema":reveal.then_some(&presentation.parathema),
-        "matcher_version":a.matcher_version,
-        "response":a.response,
-        "detected_success":a.detected_success,
-        "accepted_success":a.accepted_success,
-        "override_count":a.override_count,
-        "proposed_transition":a.proposed_transition,
-        "desired_suspended":a.desired_suspended,
-        "status":a.status
-    })
 }
 
 fn require(principal: &DevicePrincipal, scope: DeviceScope) -> Result<(), ApiError> {
@@ -1951,6 +1925,9 @@ fn openapi_operation(path: &str, method: &str) -> Value {
         return operation;
     }
     if let Some(operation) = openapi_content_operation(path, method) {
+        return operation;
+    }
+    if let Some(operation) = openapi_online_review_operation(path, method) {
         return operation;
     }
     if let Some(operation) = openapi_review_attempt_operation(path, method) {
@@ -2400,6 +2377,100 @@ fn if_match_parameter(required: bool) -> Value {
     json!({"name":"If-Match","in":"header","required":required,"schema":{"type":"string","pattern":"^(?:[0-9]+|\"[0-9]+\")$"}})
 }
 
+fn openapi_online_review_operation(path: &str, method: &str) -> Option<Value> {
+    let contract = online_review_contract(path, method)?;
+    let mut operation = json!({
+        "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
+        "security":[{"bearerAuth":[]}],
+        "x-gnosis-required-scopes":["review"],
+        "parameters":openapi_path_parameters(path),
+        "responses":content_json_responses(
+            contract.success_status,
+            contract.response,
+            contract.error_statuses,
+        )
+    });
+    if let Some(request) = contract.request {
+        operation["requestBody"] = openapi_json_request(request);
+    }
+    Some(operation)
+}
+
+fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContract> {
+    match (path, method) {
+        ("/v1/review/sessions", "post") => Some(json_contract(
+            "review",
+            Some("ReviewSessionRequestV1"),
+            "201",
+            "ReviewSessionV1",
+            &[
+                "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/review/sessions/active", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ActiveReviewSessionV1",
+            &["401", "403", "408", "500", "503"],
+        )),
+        ("/v1/review/sessions/{id}/resume", "post") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewSessionV1",
+            &["400", "401", "403", "404", "408", "409", "500", "503"],
+        )),
+        ("/v1/review/sessions/{id}/quit", "post") | ("/v1/review/sessions/{id}/abort", "post") => {
+            Some(json_contract(
+                "review",
+                None,
+                "200",
+                "ReviewSessionV1",
+                &["400", "401", "403", "404", "408", "500", "503"],
+            ))
+        }
+        ("/v1/review/sessions/{id}/attempts", "post") => Some(json_contract(
+            "review",
+            None,
+            "201",
+            "ReviewAttemptV1",
+            &["400", "401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/review/attempts/{id}/answer", "post") => Some(json_contract(
+            "review",
+            Some("ReviewAnswerV1"),
+            "200",
+            "ReviewAttemptV1",
+            &[
+                "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/review/attempts/{id}/override", "post") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewAttemptV1",
+            &["400", "401", "403", "404", "408", "412", "500", "503"],
+        )),
+        ("/v1/review/attempts/{id}/suspension", "post") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewAttemptV1",
+            &["400", "401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/review/attempts/{id}/commit", "post") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewCommitResponseV1",
+            &["400", "401", "403", "404", "408", "412", "500", "503"],
+        )),
+        _ => None,
+    }
+}
+
 fn openapi_review_attempt_operation(path: &str, method: &str) -> Option<Value> {
     let (operation_id, response_schema, request_schema) = match (path, method) {
         ("/v1/review/attempts/{id}", "get") => (
@@ -2544,6 +2615,10 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<NodePageV1>();
     generator.subschema_for::<NodeV1>();
     generator.subschema_for::<SettingsV1>();
+    generator.subschema_for::<ActiveReviewSessionV1>();
+    generator.subschema_for::<ReviewSessionV1>();
+    generator.subschema_for::<ReviewAttemptV1>();
+    generator.subschema_for::<ReviewCommitResponseV1>();
     generator.subschema_for::<ReviewAttemptStateResponseV1>();
     generator.subschema_for::<ReviewAttemptOperationResponseV1>();
     generator.subschema_for::<ApiErrorCodeV1>();
@@ -2555,6 +2630,8 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<NoteRenameRequestV1>();
     requests.subschema_for::<ThemaWriteRequestV1>();
     requests.subschema_for::<UpdateSettingsRequestV1>();
+    requests.subschema_for::<ReviewSessionRequestV1>();
+    requests.subschema_for::<ReviewAnswerV1>();
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
     definitions.extend(requests.take_definitions(true));
@@ -2695,9 +2772,7 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
 
-    use super::{
-        ApiError, OPENAPI_OPERATIONS, attempt_json, openapi_document, optional_if_match, router,
-    };
+    use super::{ApiError, OPENAPI_OPERATIONS, openapi_document, optional_if_match, router};
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
         PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
@@ -2943,6 +3018,46 @@ mod tests {
     #[test]
     fn openapi_types_review_attempt_operations_exactly() {
         let api = openapi_document();
+        let sessions = &api["paths"]["/v1/review/sessions"]["post"];
+        assert_eq!(sessions["x-gnosis-required-scopes"], json!(["review"]));
+        assert_eq!(
+            sessions["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewSessionRequestV1"
+        );
+        assert_eq!(
+            sessions["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewSessionV1"
+        );
+        assert!(sessions["responses"]["404"].is_object());
+        let active = &api["paths"]["/v1/review/sessions/active"]["get"];
+        assert_eq!(
+            active["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ActiveReviewSessionV1"
+        );
+        let begin = &api["paths"]["/v1/review/sessions/{id}/attempts"]["post"];
+        assert_eq!(
+            begin["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewAttemptV1"
+        );
+        let answer = &api["paths"]["/v1/review/attempts/{id}/answer"]["post"];
+        assert_eq!(
+            answer["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewAnswerV1"
+        );
+        assert_eq!(
+            answer["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewAttemptV1"
+        );
+        assert!(answer["responses"]["412"].is_object());
+        assert!(
+            api["paths"]["/v1/review/attempts/{id}/override"]["post"]["responses"]["412"]
+                .is_object()
+        );
+        let commit = &api["paths"]["/v1/review/attempts/{id}/commit"]["post"];
+        assert_eq!(
+            commit["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewCommitResponseV1"
+        );
         let state = &api["paths"]["/v1/review/attempts/{id}"]["get"];
         assert_eq!(state["x-gnosis-required-scopes"], json!(["review"]));
         assert_eq!(
@@ -3004,6 +3119,60 @@ mod tests {
             json!(["basic", "cloze", "mcq", "mc-cloze"])
         );
         assert_local_refs_resolve(&api, &api);
+    }
+
+    #[test]
+    fn openapi_online_review_response_statuses_are_exact() {
+        let api = openapi_document();
+        let paths = &api["paths"];
+        assert_response_statuses(
+            &paths["/v1/review/sessions"]["post"],
+            &[
+                "201", "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/sessions/active"]["get"],
+            &["200", "401", "403", "408", "500", "503"],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/sessions/{id}/resume"]["post"],
+            &[
+                "200", "400", "401", "403", "404", "408", "409", "500", "503",
+            ],
+        );
+        for action in ["quit", "abort"] {
+            assert_response_statuses(
+                &paths[&format!("/v1/review/sessions/{{id}}/{action}")]["post"],
+                &["200", "400", "401", "403", "404", "408", "500", "503"],
+            );
+        }
+        assert_response_statuses(
+            &paths["/v1/review/sessions/{id}/attempts"]["post"],
+            &["201", "400", "401", "403", "404", "408", "500", "503"],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/attempts/{id}/answer"]["post"],
+            &[
+                "200", "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
+            ],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/attempts/{id}/override"]["post"],
+            &[
+                "200", "400", "401", "403", "404", "408", "412", "500", "503",
+            ],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/attempts/{id}/suspension"]["post"],
+            &["200", "400", "401", "403", "404", "408", "500", "503"],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/attempts/{id}/commit"]["post"],
+            &[
+                "200", "400", "401", "403", "404", "408", "412", "500", "503",
+            ],
+        );
     }
 
     #[test]
@@ -3930,37 +4099,115 @@ mod tests {
         assert!(!device_id.is_empty());
     }
 
+    #[tokio::test]
+    async fn online_review_recovery_errors_match_the_openapi_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
+        let token = device.token.clone();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+        let empty = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/sessions",
+                &token,
+                Body::from(review_session_body("missing")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+
+        put_review_thema(&service, "Question", None, 2).await;
+        let (session_id, pending_id) = pending_online_attempt(&service, &device_id, 3, 4).await;
+        put_review_thema(&service, "Changed", Some(1), 5).await;
+        let stale_answer = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{pending_id}/answer"),
+                &token,
+                Body::from(r#"{"kind":"text","value":"answer"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_answer.status(), StatusCode::PRECONDITION_FAILED);
+        let stale_toggle = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{pending_id}/suspension"),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_toggle.status(), StatusCode::OK);
+        assert_eq!(response_json(stale_toggle).await["desired_suspended"], true);
+        service
+            .stop_review_session(session_id, Some(device_id.clone()), true, 6)
+            .await
+            .unwrap();
+
+        let (_, graded_id) = pending_online_attempt(&service, &device_id, 7, 8).await;
+        service
+            .grade_review_attempt(
+                graded_id.clone(),
+                Some(device_id.clone()),
+                AnswerInput::Text("answer".into()),
+                9,
+            )
+            .await
+            .unwrap();
+        put_review_thema(&service, "Changed again", Some(2), 10).await;
+        let stale_override = app
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{graded_id}/override"),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_override.status(), StatusCode::PRECONDITION_FAILED);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
     async fn online_attempt(service: &crate::service::ServiceHandle) -> (String, String, String) {
         let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
         let token = device.token.clone();
         let device_id = device.device_id.clone();
         service.create_device(device, 1).await.unwrap();
+        put_review_thema(service, "Question", None, 1).await;
+        let (_, attempt_id) = pending_online_attempt(service, &device_id, 2, 3).await;
         service
-            .put_thema(
-                prepare_thema(
-                    Some("thema".into()),
-                    thema_content(
-                        "basic",
-                        "Question".into(),
-                        vec![None],
-                        vec!["answer".into()],
-                        None,
-                        None,
-                        None,
-                    )
-                    .unwrap(),
-                    vec![],
-                    vec![],
-                    vec![],
-                    None,
-                )
-                .unwrap(),
-                20260716,
-                1,
-                None,
+            .grade_review_attempt(
+                attempt_id.clone(),
+                Some(device_id.clone()),
+                AnswerInput::Text("answer".into()),
+                4,
             )
             .await
             .unwrap();
+        (token, device_id, attempt_id)
+    }
+
+    async fn pending_online_attempt(
+        service: &crate::service::ServiceHandle,
+        device_id: &str,
+        session_time: u64,
+        attempt_time: u64,
+    ) -> (String, String) {
         let session = service
             .create_review_session(
                 ReviewSource {
@@ -3973,25 +4220,78 @@ mod tests {
                     manual_ids: vec!["thema".into()],
                 },
                 None,
-                Some(device_id.clone()),
-                2,
+                Some(device_id.to_owned()),
+                session_time,
             )
             .await
             .unwrap();
+        let session_id = session.session_id;
         let attempt = service
-            .begin_review_attempt(session.session_id, Some(device_id.clone()), 3)
+            .begin_review_attempt(session_id.clone(), Some(device_id.to_owned()), attempt_time)
             .await
             .unwrap();
+        (session_id, attempt.attempt_id)
+    }
+
+    async fn put_review_thema(
+        service: &crate::service::ServiceHandle,
+        question: &str,
+        revision: Option<u64>,
+        updated_at: i64,
+    ) {
         service
-            .grade_review_attempt(
-                attempt.attempt_id.clone(),
-                Some(device_id.clone()),
-                AnswerInput::Text("answer".into()),
-                4,
+            .put_thema(
+                prepare_thema(
+                    Some("thema".into()),
+                    thema_content(
+                        "basic",
+                        question.into(),
+                        vec![None],
+                        vec!["answer".into()],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    revision,
+                )
+                .unwrap(),
+                20260716,
+                updated_at,
+                None,
             )
             .await
             .unwrap();
-        (token, device_id, attempt.attempt_id)
+    }
+
+    fn review_session_body(thema_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "source": {
+                "kind": "manual",
+                "tags": [],
+                "exclude_tags": [],
+                "topic_node_id": null,
+                "topic_forward_depth": null,
+                "topic_backward_depth": null,
+                "manual_ids": [thema_id]
+            },
+            "target_count": null
+        }))
+        .unwrap()
+    }
+
+    fn assert_response_statuses(operation: &serde_json::Value, expected: &[&str]) {
+        let mut actual = operation["responses"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -5283,19 +5583,14 @@ mod tests {
             desired_suspended: false,
             status: "pending".into(),
         };
-        let pending = attempt_json(&attempt);
+        let pending =
+            serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap();
         assert!(pending["revealed_answer"].is_null());
         assert!(pending["presentation"].get("answer").is_none());
-        assert_eq!(
-            serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap(),
-            pending
-        );
         attempt.response = Some(AnswerInput::Text("answer".into()));
-        assert_eq!(attempt_json(&attempt)["revealed_answer"], json!(["secret"]));
-        assert_eq!(
-            serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap(),
-            attempt_json(&attempt)
-        );
+        let graded =
+            serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap();
+        assert_eq!(graded["revealed_answer"], json!(["secret"]));
     }
 
     fn authorized(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {

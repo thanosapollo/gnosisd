@@ -6,9 +6,11 @@ local administration protocol and an authenticated HTTP API.
 
 * Ownership and trust boundary
 
-~gnosisd~ is the only process that opens the database. Clients use the Unix
-socket or HTTP API and never send SQL. The daemon is single-user and creates
-its socket and SQLite database with mode ~0600~. HTTP binds only to loopback by default. Remote access belongs behind a
+~gnosisd~ is the only process that opens the database. Ordinary clients use the
+authenticated HTTP API and never send SQL. The Unix socket is reserved for
+local trust bootstrap, administration, recovery, and temporary compatibility.
+The daemon is single-user and creates its socket and SQLite database with mode
+~0600~. HTTP binds only to loopback by default. Remote access belongs behind a
 trusted authenticated proxy or private network boundary.
 
 Every ~/v1~ data endpoint requires a per-device bearer token. Tokens carry
@@ -39,30 +41,21 @@ cargo run --bin gnosisd -- \
   --http-listen 127.0.0.1:7842
 #+end_src
 
-The diagnostic client uses protocol version 1:
+The operator client uses local protocol version 1:
 
 #+begin_src sh
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" legacy-info
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   device-create phone --scope read --scope review
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  review-attempt-state ATTEMPT
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  review-attempt-set-accepted ATTEMPT --operation-id OPERATION \
-  --expected-revision 1 --accepted-success false
 #+end_src
 
 The Unix message format is a four-byte big-endian length followed by UTF-8
-JSON. It is the privileged local and administrative transport. It provides
-local diagnostics, legacy read compatibility, online review sessions and
-attempts, bounded managed-asset reads, device token administration, and online
-backup commands. Stable errors never expose SQL, paths, dependency failures,
-or backtraces. Request envelope IDs correlate one response. Desired review
-mutations use a separate caller-owned operation ID that must be retained across
-retries and process restarts. Its idempotency namespace belongs to that device
-or to the privileged local Unix actor, so clients cannot reserve each other's
-operation IDs.
+JSON. It is the privileged local and administrative transport for diagnostics,
+legacy inspection, device token administration, and backup commands. Online
+review and managed-asset methods remain only as temporary Emacs compatibility
+operations. Stable errors never expose SQL, paths, dependency failures, or
+backtraces.
 
 * HTTP API
 
@@ -104,13 +97,20 @@ retried after an ambiguous transport failure.
 The first attempt response hides the answer. Grading returns the detected
 result, revealed answer, matcher version, and proposed transition.
 
+~client_http::HttpClient~ is the reference native transport. It disables
+redirects, proxies, and automatic retries; bounds every response; validates
+resource and operation identities; and treats a timeout or invalid mutation
+response as unknown delivery. New clients recover session state through the
+active-session and attempt-state resources instead of replaying legacy toggles.
+
 The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
-direct content resources, review attempt operations, and stable errors are
-generated from the public Rust DTOs in ~protocol::http_v1~. Content schemas
-distinguish request defaults from required response fields and describe scopes,
-conditional headers, pagination, raw media, and tombstone responses. Review
-session, pack, and offline reconciliation envelopes remain a route-level
-catalogue and are not yet a complete client-generation contract.
+direct content resources, online review sessions and attempts, desired-state
+operations, and stable errors are generated from the public Rust DTOs in
+~protocol::http_v1~. Content schemas distinguish request defaults from required
+response fields and describe scopes, conditional headers, pagination, raw
+media, and tombstone responses. Review packs and offline reconciliation
+envelopes remain a route-level catalogue and are not yet a complete
+client-generation contract.
 CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
 network boundary.
 
