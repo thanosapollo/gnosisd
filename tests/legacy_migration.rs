@@ -509,7 +509,7 @@ fn assert_source_is_unchanged(path: &Path) {
 
 fn assert_target_is_normalized(path: &Path) {
     let connection = Connection::open(path).unwrap();
-    assert_eq!(user_version(&connection), 11);
+    assert_eq!(user_version(&connection), 12);
     assert_eq!(table_count(&connection, "themata"), 0);
     assert_eq!(table_count(&connection, "node_tag"), 1);
     assert_eq!(table_count(&connection, "thema"), 1);

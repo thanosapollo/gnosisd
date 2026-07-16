@@ -2932,7 +2932,8 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE review_attempt_operation;
+                "DROP TABLE device_mutation_receipt;
+                 DROP TABLE review_attempt_operation;
                  ALTER TABLE review_attempt DROP COLUMN mutation_revision;
                  DROP TABLE local_review_replay;
                  DROP TABLE offline_asset_evidence;
@@ -2941,6 +2942,7 @@ mod tests {
                  DROP TABLE staged_blob;
                  DROP TABLE document_revision_asset;
                  DROP TABLE document_asset;
+                 DELETE FROM schema_migration WHERE version = 12;
                  DELETE FROM schema_migration WHERE version = 11;
                  DELETE FROM schema_migration WHERE version = 10;
                  DELETE FROM schema_migration WHERE version = 9;

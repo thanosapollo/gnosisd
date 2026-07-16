@@ -49,7 +49,9 @@ const OFFLINE_ASSET_PUT_MIGRATION: &str = include_str!("migrations/0009_offline_
 const LOCAL_REVIEW_REPLAY_MIGRATION: &str = include_str!("migrations/0010_local_review_replay.sql");
 const REVIEW_ATTEMPT_OPERATION_MIGRATION: &str =
     include_str!("migrations/0011_review_attempt_operations.sql");
-const SCHEMA_VERSION: u32 = 11;
+const DEVICE_MUTATION_RECEIPT_MIGRATION: &str =
+    include_str!("migrations/0012_device_mutation_receipts.sql");
+const SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -3265,6 +3267,11 @@ fn migrate(connection: &Connection) -> Result<(), StoreError> {
             .execute_batch(REVIEW_ATTEMPT_OPERATION_MIGRATION)
             .map_err(StoreError::storage)?;
     }
+    if found < 12 {
+        connection
+            .execute_batch(DEVICE_MUTATION_RECEIPT_MIGRATION)
+            .map_err(StoreError::storage)?;
+    }
     Ok(())
 }
 
@@ -4628,8 +4635,8 @@ mod tests {
         DOCUMENT_ASSET_INTEGRITY_MIGRATION, FailPoint, INITIAL_MIGRATION,
         LOCAL_REVIEW_REPLAY_MIGRATION, OFFLINE_ASSET_PUT_MIGRATION, OFFLINE_CONTENT_MIGRATION,
         OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION,
-        REPLICA_SYNC_MIGRATION, SCHEMA_VERSION, SERVER_MIGRATION, SqliteStore, StoreError, migrate,
-        schema_version,
+        REPLICA_SYNC_MIGRATION, REVIEW_ATTEMPT_OPERATION_MIGRATION, SCHEMA_VERSION,
+        SERVER_MIGRATION, SqliteStore, StoreError, migrate, schema_version,
     };
     use crate::application::{
         AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentMutation,
@@ -4872,7 +4879,7 @@ mod tests {
 
         migrate(&connection).unwrap();
 
-        assert_eq!(schema_version(&connection).unwrap(), 11);
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
         assert!(schema_column_exists(
             &connection,
             "review_attempt",
@@ -4904,6 +4911,65 @@ mod tests {
             .override_local_review_attempt("attempt", None, "legacy-request", &"b".repeat(64), 3)
             .unwrap();
         assert_eq!(replayed.attempt_id, "attempt");
+    }
+
+    #[test]
+    fn upgrades_schema_v11_for_device_mutation_receipts() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("schema-v11.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .unwrap();
+        for migration in [
+            INITIAL_MIGRATION,
+            SERVER_MIGRATION,
+            REMOTE_REVIEW_MIGRATION,
+            OFFLINE_REVIEW_MIGRATION,
+            REPLICA_SYNC_MIGRATION,
+            OFFLINE_CONTENT_MIGRATION,
+            OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION,
+            DOCUMENT_ASSET_INTEGRITY_MIGRATION,
+            OFFLINE_ASSET_PUT_MIGRATION,
+            LOCAL_REVIEW_REPLAY_MIGRATION,
+            REVIEW_ATTEMPT_OPERATION_MIGRATION,
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        assert_eq!(schema_version(&connection).unwrap(), 11);
+        insert_receipt_devices(&connection);
+
+        migrate(&connection).unwrap();
+
+        assert_eq!(schema_version(&connection).unwrap(), 12);
+        assert!(schema_table_exists(&connection, "device_mutation_receipt"));
+        assert_device_mutation_receipt_contract(&connection);
+        drop(connection);
+
+        let reopened = rusqlite::Connection::open(path).unwrap();
+        reopened.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&reopened).unwrap();
+        assert_eq!(schema_version(&reopened).unwrap(), 12);
+        let receipt_count: u64 = reopened
+            .query_row("SELECT count(*) FROM device_mutation_receipt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(receipt_count, 3);
+        let foreign_key_errors: u64 = reopened
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let migration_count: u64 = reopened
+            .query_row(
+                "SELECT count(*) FROM schema_migration WHERE version = 12",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
     }
 
     fn insert_v10_review_replay(connection: &rusqlite::Connection) {
@@ -4995,6 +5061,175 @@ mod tests {
                     )
                     .is_err(),
                 "accepted {operation_id:?}"
+            );
+        }
+    }
+
+    fn insert_receipt_devices(connection: &rusqlite::Connection) {
+        connection
+            .execute(
+                "INSERT INTO device(
+                     device_id, name, token_digest, scopes_json, created_at_us
+                 ) VALUES
+                     ('device-a', 'Device A', ?1, '[\"write\"]', 1),
+                     ('device-b', 'Device B', ?2, '[\"write\"]', 1)",
+                rusqlite::params!["a".repeat(64), "b".repeat(64)],
+            )
+            .unwrap();
+    }
+
+    fn assert_device_mutation_receipt_contract(connection: &rusqlite::Connection) {
+        insert_device_mutation_receipt(connection, "device-a", "operation", "c");
+        insert_device_mutation_receipt(connection, "device-b", "operation", "d");
+        let boundary_id = format!("{}._:-", "x".repeat(124));
+        connection
+            .execute(
+                "INSERT INTO device_mutation_receipt(
+                     device_id, operation_id, format_version, mutation_kind,
+                     request_sha256, request_json, result_kind, result_json, created_at_us
+                 ) VALUES (
+                     'device-a', ?1, 1, 'settings_replace', ?2, '{}',
+                     'rejected', '{\"reason\":\"revision_conflict\"}', 2
+                 )",
+                rusqlite::params![boundary_id, "e".repeat(64)],
+            )
+            .unwrap();
+        let replay: (String, String) = connection
+            .query_row(
+                "SELECT result_kind, result_json FROM device_mutation_receipt
+                 WHERE device_id = 'device-a' AND operation_id = 'operation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(replay, ("applied".into(), "{}".into()));
+        assert!(
+            connection
+                .execute(
+                    "INSERT INTO device_mutation_receipt
+                     SELECT * FROM device_mutation_receipt
+                     WHERE device_id = 'device-a' AND operation_id = 'operation'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE device_mutation_receipt SET result_json = 'changed'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM device_mutation_receipt", [])
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM device WHERE device_id = 'device-a'", [],)
+                .is_err()
+        );
+        assert_receipt_rejects_invalid_rows(connection);
+    }
+
+    fn insert_device_mutation_receipt(
+        connection: &rusqlite::Connection,
+        device_id: &str,
+        operation_id: &str,
+        digest_character: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO device_mutation_receipt(
+                     device_id, operation_id, format_version, mutation_kind,
+                     request_sha256, request_json, result_kind, result_json, created_at_us
+                 ) VALUES (?1, ?2, 1, 'document_replace', ?3, '{}', 'applied', '{}', 2)",
+                rusqlite::params![device_id, operation_id, digest_character.repeat(64)],
+            )
+            .unwrap();
+    }
+
+    fn assert_receipt_rejects_invalid_rows(connection: &rusqlite::Connection) {
+        for operation_id in [
+            "",
+            "\0",
+            "a\0x",
+            "π",
+            "-leading",
+            "contains space",
+            &"x".repeat(129),
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO device_mutation_receipt(
+                             device_id, operation_id, format_version, mutation_kind,
+                             request_sha256, request_json, result_kind, result_json,
+                             created_at_us
+                         ) VALUES (
+                             'device-a', ?1, 1, 'document_replace', ?2, '{}',
+                             'rejected', '{}', 3
+                         )",
+                        rusqlite::params![operation_id, "e".repeat(64)],
+                    )
+                    .is_err(),
+                "accepted {operation_id:?}"
+            );
+        }
+        for statement in [
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'missing', 'orphan', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'bad-kind', 1, 'unknown',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'bad-digest', 1, 'document_replace', 'ABC',
+                 '{}', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'uppercase-digest', 1, 'document_replace',
+                 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+                 '{}', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'nonhex-digest', 1, 'document_replace',
+                 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg',
+                 '{}', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'bad-result', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'unknown', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'bad-version', 2, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'empty-request', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'empty-result', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'applied', '', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'malformed-request', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{', 'applied', '{}', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'malformed-result', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'applied', ']', 3)",
+            "INSERT INTO device_mutation_receipt VALUES (
+                 'device-a', 'bad-time', 1, 'document_replace',
+                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+                 '{}', 'applied', '{}', 0)",
+        ] {
+            assert!(
+                connection.execute(statement, []).is_err(),
+                "accepted {statement}"
             );
         }
     }
