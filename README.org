@@ -84,10 +84,13 @@ The ~/v1~ API provides:
 
 Existing revisioned content and settings updates use ~If-Match~. A stale revision
 returns ~412~ with the current revision and leaves server state unchanged.
-Retry-safe document writes use ~/v1/document-mutations~, a device-scoped
-~Idempotency-Key~, and ~If-Match~ for replacement. Exact retries return the
-retained applied or rejected result and cursor. A stale base is a final typed
-rejection with HTTP ~200~; reusing a key for changed content returns ~409~.
+Retry-safe document create, replacement, rename, and tombstone operations use
+~/v1/document-mutations~, a device-scoped ~Idempotency-Key~, and ~If-Match~
+when a current document is required. Exact retries return the retained applied
+or rejected result and cursor. A stale base is a final typed rejection with
+HTTP ~200~; reusing a key for changed content returns ~409~. Rename path
+collisions remain explicit and no-op lifecycle requests do not advance the
+document revision or replica cursor.
 Sequenced offline mutations use immutable operation IDs and contiguous device
 sequence numbers. Review answer and commit retries use retained attempt state.
 Clients recover an attempt and its revision with

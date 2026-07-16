@@ -12,7 +12,9 @@ use gnosis_core::{
     protocol::{
         DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseOutcome,
         ResponseResult, ServerError,
-        http_v1::{ApiErrorCodeV1, DocumentMutationResultV1, NoteWriteRequestV1},
+        http_v1::{
+            ApiErrorCodeV1, DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1,
+        },
         request,
     },
 };
@@ -280,6 +282,70 @@ async fn client_replaces_documents_against_an_explicit_base_revision() {
             current_revision: Some(2),
         }
     );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn client_renames_and_tombstones_documents_with_durable_identities() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let created = client
+        .create_note("lifecycle-create", &note_request())
+        .await
+        .unwrap();
+    let DocumentMutationResultV1::Applied { authoritative, .. } = created else {
+        panic!("expected applied document mutation");
+    };
+    let rename = NoteRenameRequestV1 {
+        logical_path: "renamed.org".into(),
+    };
+
+    let renamed = client
+        .rename_note(
+            &authoritative.document_id,
+            "lifecycle-rename",
+            authoritative.revision,
+            &rename,
+        )
+        .await
+        .unwrap();
+    let rename_retry = client
+        .rename_note(
+            &authoritative.document_id,
+            "lifecycle-rename",
+            authoritative.revision,
+            &rename,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rename_retry, renamed);
+    let DocumentMutationResultV1::Applied { authoritative, .. } = renamed else {
+        panic!("expected applied rename");
+    };
+    assert_eq!(authoritative.logical_path, "renamed.org");
+
+    let deleted = client
+        .tombstone_note(
+            &authoritative.document_id,
+            "lifecycle-delete",
+            authoritative.revision,
+        )
+        .await
+        .unwrap();
+    let delete_retry = client
+        .tombstone_note(
+            &authoritative.document_id,
+            "lifecycle-delete",
+            authoritative.revision,
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_retry, deleted);
+    let DocumentMutationResultV1::Applied { authoritative, .. } = deleted else {
+        panic!("expected applied tombstone");
+    };
+    assert!(!authoritative.active);
     daemon.stop().await;
 }
 

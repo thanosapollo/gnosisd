@@ -24,9 +24,11 @@ pub(crate) use content::{
     validate_asset_path, validate_logical_path, validate_offline_thema_assets, validate_org_path,
 };
 pub(crate) use device_mutation::{
-    DeviceMutationCursor, DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
-    DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDocumentMutation,
-    prepare_device_document_mutation,
+    DeviceDocumentLifecycleMutation, DeviceMutationCursor, DeviceMutationIdentity,
+    DeviceMutationKind, DeviceMutationProjection, DeviceMutationRejection, DeviceMutationResult,
+    PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
+    prepare_device_document_mutation, prepare_device_document_rename,
+    prepare_device_document_tombstone,
 };
 pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
 pub(crate) use import_document::{PreparedServerImport, summarize_import};

@@ -86,6 +86,8 @@ pub(crate) enum StoreError {
     BlobMetadata,
     #[error("document path changes require a rename operation")]
     PathChange,
+    #[error("logical path belongs to another active resource")]
+    PathConflict,
     #[error("document projection is invalid: {reason}")]
     InvalidProjection { reason: &'static str },
     #[error("stored document contains invalid {field}")]
@@ -2455,9 +2457,7 @@ fn check_document_path(
     {
         Ok(())
     } else {
-        Err(StoreError::InvalidProjection {
-            reason: "logical path collides with another document",
-        })
+        Err(StoreError::PathConflict)
     }
 }
 
@@ -3972,9 +3972,7 @@ fn check_path_available(
     {
         Ok(())
     } else {
-        Err(StoreError::InvalidProjection {
-            reason: "logical path collides with another document",
-        })
+        Err(StoreError::PathConflict)
     }
 }
 

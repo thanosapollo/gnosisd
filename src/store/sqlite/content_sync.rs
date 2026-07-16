@@ -356,9 +356,7 @@ fn mutation_conflict_reason(
     };
     match available {
         Ok(()) => Ok(None),
-        Err(StoreError::InvalidProjection { .. }) => {
-            Ok(Some(OfflineContentConflictReason::PathConflict))
-        }
+        Err(StoreError::PathConflict) => Ok(Some(OfflineContentConflictReason::PathConflict)),
         Err(error) => Err(error),
     }
 }

@@ -14,7 +14,7 @@ use reqwest::{
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
     redirect::Policy,
 };
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -31,7 +31,7 @@ use crate::{
         MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
         http_v1::{
             ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1,
-            DocumentMutationResultV1, NoteWriteRequestV1, ReplicaChangePageV1,
+            DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, StagedBlobV1, valid_bearer_token,
         },
     },
@@ -197,6 +197,42 @@ impl HttpClient {
         execute_document_mutation(request, operation_id, Some(document_id)).await
     }
 
+    pub async fn rename_note(
+        &self,
+        document_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+        input: &NoteRenameRequestV1,
+    ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        let body = encode_document_mutation(input)?;
+        let url = self.document_mutation_action_endpoint(document_id, "rename")?;
+        let request = self
+            .client
+            .post(url)
+            .header("Idempotency-Key", operation_id)
+            .header("If-Match", expected_revision)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body);
+        execute_document_mutation(request, operation_id, Some(document_id)).await
+    }
+
+    pub async fn tombstone_note(
+        &self,
+        document_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        let url = self.document_mutation_endpoint(document_id)?;
+        let request = self
+            .client
+            .delete(url)
+            .header("Idempotency-Key", operation_id)
+            .header("If-Match", expected_revision);
+        execute_document_mutation(request, operation_id, Some(document_id)).await
+    }
+
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, HttpClientError> {
         let url = self.endpoint(path)?;
         execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
@@ -214,6 +250,18 @@ impl HttpClient {
             .map_err(|_| HttpClientError::InvalidBaseUrl)?
             .pop_if_empty()
             .push(document_id);
+        Ok(url)
+    }
+
+    fn document_mutation_action_endpoint(
+        &self,
+        document_id: &str,
+        action: &str,
+    ) -> Result<Url, HttpClientError> {
+        let mut url = self.document_mutation_endpoint(document_id)?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .push(action);
         Ok(url)
     }
 }
@@ -293,7 +341,7 @@ fn require_operation_id(operation_id: &str) -> Result<(), HttpClientError> {
         .ok_or(HttpClientError::InvalidOperationId)
 }
 
-fn encode_document_mutation(input: &NoteWriteRequestV1) -> Result<Vec<u8>, HttpClientError> {
+fn encode_document_mutation(input: &impl Serialize) -> Result<Vec<u8>, HttpClientError> {
     let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
     if body.len() > MAX_OFFLINE_CONTENT_OPERATION_BYTES {
         return Err(HttpClientError::InvalidMutation);

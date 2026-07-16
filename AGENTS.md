@@ -49,10 +49,11 @@ directly.
   and stale captures remain explicit. Legacy toggle methods are compatibility
   adapters and advance the same monotonic attempt revision.
 - Frozen direct note routes retain their original v1 status and response shapes.
-  Retry-safe direct document writes use the additive document-mutation routes,
-  device-scoped immutable receipts, exact request fingerprints, retained typed
-  results, and durable replica cursors. A changed operation key must fail before
-  blob I/O; rejected and no-op mutations must not publish unreferenced blobs.
+  Retry-safe direct document writes and lifecycle changes use the additive
+  document-mutation routes, device-scoped immutable receipts, exact request
+  fingerprints, retained typed results, and durable replica cursors. A changed
+  operation key must fail before blob I/O; rejected and no-op mutations must not
+  publish unreferenced blobs or advance document revisions and cursors.
 - Replica bootstrap uses a device-bound immutable snapshot manifest captured at
   one content cursor. Cursorless retries reuse a resumable manifest. Clients
   must install every page atomically before promoting the terminal delta cursor.

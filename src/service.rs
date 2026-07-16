@@ -26,13 +26,13 @@ use crate::{
         DocumentHead, DocumentRevision, ImportSummary, MAX_OFFLINE_ASSET_BYTES, NewDevice,
         NodeRecord, OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
         OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDocumentMutation, PreparedNote, PreparedServerImport,
-        PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
-        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
-        ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackView,
-        ReviewSessionView, ReviewSource, SettingsError, SettingsInput, SettingsRecord,
-        SnapshotPage, SnapshotPosition, ThemaRecord, prepare_offline_document,
-        retained_asset_paths_in_org, token_digest, validate_asset_path,
+        PreparedAsset, PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
+        PreparedNote, PreparedServerImport, PreparedThema, QueryDueThemata, QueryDueThemataPage,
+        ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewOperationAuthority,
+        ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource, SettingsError,
+        SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
+        prepare_offline_document, retained_asset_paths_in_org, token_digest, validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
@@ -140,6 +140,21 @@ impl ServiceHandle {
     ) -> Result<DeviceMutationExecution, ServiceError> {
         request(&self.sender, |response| {
             StoreCommand::ApplyDeviceDocumentMutation {
+                operation: Box::new(operation),
+                created_at_us,
+                response,
+            }
+        })
+        .await?
+    }
+
+    pub(crate) async fn apply_device_document_lifecycle_mutation(
+        &self,
+        operation: PreparedDeviceDocumentLifecycleMutation,
+        created_at_us: i64,
+    ) -> Result<DeviceMutationExecution, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ApplyDeviceDocumentLifecycleMutation {
                 operation: Box::new(operation),
                 created_at_us,
                 response,
@@ -1184,6 +1199,11 @@ enum StoreCommand {
         created_at_us: i64,
         response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
     },
+    ApplyDeviceDocumentLifecycleMutation {
+        operation: Box<PreparedDeviceDocumentLifecycleMutation>,
+        created_at_us: i64,
+        response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
+    },
     DocumentHead {
         document_id: DocumentId,
         response: oneshot::Sender<StoreResult<Option<DocumentHead>>>,
@@ -1761,6 +1781,16 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         } => send(
             response,
             apply_device_document_mutation_command(store, blobs, &operation, created_at_us),
+        ),
+        StoreCommand::ApplyDeviceDocumentLifecycleMutation {
+            operation,
+            created_at_us,
+            response,
+        } => send(
+            response,
+            store
+                .apply_device_document_lifecycle_mutation(&operation, created_at_us)
+                .map_err(ServiceError::Store),
         ),
         StoreCommand::DocumentHead {
             document_id,

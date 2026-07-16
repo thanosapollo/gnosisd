@@ -131,6 +131,7 @@ pub enum DocumentMutationRejectionV1 {
     },
     NotFound,
     InvalidContent,
+    PathConflict,
     RenameRequired,
 }
 
@@ -212,6 +213,7 @@ fn mutation_rejection(value: &DeviceMutationRejection) -> DocumentMutationReject
         }
         DeviceMutationRejection::NotFound => DocumentMutationRejectionV1::NotFound,
         DeviceMutationRejection::InvalidContent => DocumentMutationRejectionV1::InvalidContent,
+        DeviceMutationRejection::PathConflict => DocumentMutationRejectionV1::PathConflict,
         DeviceMutationRejection::RenameRequired => DocumentMutationRejectionV1::RenameRequired,
     }
 }

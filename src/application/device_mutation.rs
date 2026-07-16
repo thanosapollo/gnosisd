@@ -2,20 +2,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{PreparedNote, valid_operation_id};
+use super::{PreparedNote, valid_operation_id, validate_org_path};
+use crate::domain::DocumentId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum DeviceMutationKind {
-    DocumentCreate,
-    DocumentReplace,
+    #[serde(rename = "document_create")]
+    Create,
+    #[serde(rename = "document_replace")]
+    Replace,
+    #[serde(rename = "document_rename")]
+    Rename,
+    #[serde(rename = "document_tombstone")]
+    Tombstone,
 }
 
 impl DeviceMutationKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::DocumentCreate => "document_create",
-            Self::DocumentReplace => "document_replace",
+            Self::Create => "document_create",
+            Self::Replace => "document_replace",
+            Self::Rename => "document_rename",
+            Self::Tombstone => "document_tombstone",
         }
     }
 }
@@ -35,6 +43,56 @@ pub(crate) struct DeviceMutationIdentity {
 pub(crate) struct PreparedDeviceDocumentMutation {
     pub(crate) identity: DeviceMutationIdentity,
     pub(crate) prepared: PreparedNote,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedDeviceDocumentLifecycleMutation {
+    pub(crate) identity: DeviceMutationIdentity,
+    pub(crate) document_id: DocumentId,
+    pub(crate) expected_revision: u64,
+    pub(crate) mutation: DeviceDocumentLifecycleMutation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceDocumentLifecycleMutation {
+    Rename { logical_path: String },
+    Tombstone,
+}
+
+impl DeviceDocumentLifecycleMutation {
+    pub(crate) const fn kind(&self) -> DeviceMutationKind {
+        match self {
+            Self::Rename { .. } => DeviceMutationKind::Rename,
+            Self::Tombstone => DeviceMutationKind::Tombstone,
+        }
+    }
+
+    pub(crate) fn logical_path(&self) -> Option<&str> {
+        match self {
+            Self::Rename { logical_path } => Some(logical_path),
+            Self::Tombstone => None,
+        }
+    }
+}
+
+impl PreparedDeviceDocumentLifecycleMutation {
+    pub(crate) fn validate(&self) -> Result<(), DeviceMutationError> {
+        validate_lifecycle_identity(
+            self.identity.format_version,
+            &self.identity.operation_id,
+            &self.identity.device_id,
+            self.expected_revision,
+        )?;
+        validate_lifecycle_mutation(&self.mutation)?;
+        let request = lifecycle_request_json(
+            self.identity.format_version,
+            self.mutation.kind(),
+            &self.document_id,
+            self.mutation.logical_path(),
+            self.expected_revision,
+        )?;
+        validate_lifecycle_request(self, &request)
+    }
 }
 
 impl PreparedDeviceDocumentMutation {
@@ -87,6 +145,7 @@ pub(crate) enum DeviceMutationRejection {
     },
     NotFound,
     InvalidContent,
+    PathConflict,
     RenameRequired,
 }
 
@@ -203,6 +262,15 @@ struct DocumentMutationPayload<'a> {
     expected_revision: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct DocumentLifecycleMutationPayload<'a> {
+    format_version: u32,
+    mutation_kind: DeviceMutationKind,
+    document_id: &'a str,
+    logical_path: Option<&'a str>,
+    expected_revision: u64,
+}
+
 pub(crate) fn prepare_device_document_mutation(
     format_version: u32,
     operation_id: String,
@@ -229,6 +297,88 @@ pub(crate) fn prepare_device_document_mutation(
     })
 }
 
+pub(crate) fn prepare_device_document_rename(
+    format_version: u32,
+    operation_id: String,
+    device_id: String,
+    document_id: DocumentId,
+    logical_path: String,
+    expected_revision: u64,
+) -> Result<PreparedDeviceDocumentLifecycleMutation, DeviceMutationError> {
+    validate_lifecycle_identity(format_version, &operation_id, &device_id, expected_revision)?;
+    lifecycle_operation(
+        format_version,
+        operation_id,
+        device_id,
+        document_id,
+        DeviceDocumentLifecycleMutation::Rename { logical_path },
+        expected_revision,
+    )
+}
+
+pub(crate) fn prepare_device_document_tombstone(
+    format_version: u32,
+    operation_id: String,
+    device_id: String,
+    document_id: DocumentId,
+    expected_revision: u64,
+) -> Result<PreparedDeviceDocumentLifecycleMutation, DeviceMutationError> {
+    validate_lifecycle_identity(format_version, &operation_id, &device_id, expected_revision)?;
+    lifecycle_operation(
+        format_version,
+        operation_id,
+        device_id,
+        document_id,
+        DeviceDocumentLifecycleMutation::Tombstone,
+        expected_revision,
+    )
+}
+
+fn lifecycle_operation(
+    format_version: u32,
+    operation_id: String,
+    device_id: String,
+    document_id: DocumentId,
+    mutation: DeviceDocumentLifecycleMutation,
+    expected_revision: u64,
+) -> Result<PreparedDeviceDocumentLifecycleMutation, DeviceMutationError> {
+    validate_lifecycle_mutation(&mutation)?;
+    let mutation_kind = mutation.kind();
+    let request_json = lifecycle_request_json(
+        format_version,
+        mutation_kind,
+        &document_id,
+        mutation.logical_path(),
+        expected_revision,
+    )?;
+    let request_sha256 = format!("{:x}", Sha256::digest(request_json.as_bytes()));
+    Ok(PreparedDeviceDocumentLifecycleMutation {
+        identity: DeviceMutationIdentity {
+            format_version,
+            operation_id,
+            device_id,
+            mutation_kind,
+            target_id: Some(document_id.to_string()),
+            request_sha256,
+            request_json,
+        },
+        document_id,
+        expected_revision,
+        mutation,
+    })
+}
+
+fn validate_lifecycle_mutation(
+    mutation: &DeviceDocumentLifecycleMutation,
+) -> Result<(), DeviceMutationError> {
+    match mutation {
+        DeviceDocumentLifecycleMutation::Rename { logical_path } => {
+            validate_org_path(logical_path).map_err(|_| DeviceMutationError::Identity)
+        }
+        DeviceDocumentLifecycleMutation::Tombstone => Ok(()),
+    }
+}
+
 fn validate_identity(
     format_version: u32,
     operation_id: &str,
@@ -251,11 +401,46 @@ fn validate_identity(
     }
 }
 
+fn validate_lifecycle_identity(
+    format_version: u32,
+    operation_id: &str,
+    device_id: &str,
+    expected_revision: u64,
+) -> Result<(), DeviceMutationError> {
+    if format_version == 1
+        && valid_operation_id(operation_id)
+        && !device_id.is_empty()
+        && device_id.len() <= 128
+        && !device_id.contains('\0')
+        && i64::try_from(expected_revision).is_ok()
+    {
+        Ok(())
+    } else {
+        Err(DeviceMutationError::Identity)
+    }
+}
+
+fn validate_lifecycle_request(
+    operation: &PreparedDeviceDocumentLifecycleMutation,
+    request: &str,
+) -> Result<(), DeviceMutationError> {
+    let digest = format!("{:x}", Sha256::digest(request.as_bytes()));
+    if operation.identity.mutation_kind == operation.mutation.kind()
+        && operation.identity.target_id.as_deref() == Some(operation.document_id.as_str())
+        && operation.identity.request_json == request
+        && operation.identity.request_sha256 == digest
+    {
+        Ok(())
+    } else {
+        Err(DeviceMutationError::Identity)
+    }
+}
+
 fn mutation_kind(prepared: &PreparedNote) -> DeviceMutationKind {
     if prepared.expected_revision.is_some() {
-        DeviceMutationKind::DocumentReplace
+        DeviceMutationKind::Replace
     } else {
-        DeviceMutationKind::DocumentCreate
+        DeviceMutationKind::Create
     }
 }
 
@@ -278,6 +463,23 @@ fn document_request_json(
     .map_err(|_| DeviceMutationError::Encoding)
 }
 
+fn lifecycle_request_json(
+    format_version: u32,
+    mutation_kind: DeviceMutationKind,
+    document_id: &DocumentId,
+    logical_path: Option<&str>,
+    expected_revision: u64,
+) -> Result<String, DeviceMutationError> {
+    serde_json::to_string(&DocumentLifecycleMutationPayload {
+        format_version,
+        mutation_kind,
+        document_id: document_id.as_str(),
+        logical_path,
+        expected_revision,
+    })
+    .map_err(|_| DeviceMutationError::Encoding)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum DeviceMutationError {
     #[error("device mutation identity is invalid")]
@@ -295,8 +497,12 @@ mod tests {
     use super::{
         DeviceMutationCursor, DeviceMutationError, DeviceMutationKind, DeviceMutationProjection,
         DeviceMutationRejection, DeviceMutationResult, prepare_device_document_mutation,
+        prepare_device_document_rename, prepare_device_document_tombstone,
     };
-    use crate::application::{DocumentHead, prepare_note};
+    use crate::{
+        application::{DocumentHead, prepare_note},
+        domain::DocumentId,
+    };
 
     #[test]
     fn document_create_fingerprint_is_stable_and_excludes_generated_identity() {
@@ -323,10 +529,7 @@ mod tests {
              \"expected_revision\":null}}"
         );
 
-        assert_eq!(
-            first.identity.mutation_kind,
-            DeviceMutationKind::DocumentCreate
-        );
+        assert_eq!(first.identity.mutation_kind, DeviceMutationKind::Create);
         assert_eq!(first.identity.request_json, expected);
         assert_eq!(first.identity.request_json, second.identity.request_json);
         assert_eq!(
@@ -347,7 +550,7 @@ mod tests {
 
         assert_eq!(
             operation.identity.mutation_kind,
-            DeviceMutationKind::DocumentReplace
+            DeviceMutationKind::Replace
         );
         assert!(
             operation
@@ -360,6 +563,51 @@ mod tests {
                 .identity
                 .request_json
                 .contains("\"expected_revision\":7")
+        );
+    }
+
+    #[test]
+    fn document_rename_fingerprint_captures_target_path_and_revision() {
+        let operation = prepare_device_document_rename(
+            1,
+            "rename".into(),
+            "device".into(),
+            DocumentId::new("document").unwrap(),
+            "renamed.org".into(),
+            7,
+        )
+        .unwrap();
+
+        assert_eq!(operation.identity.mutation_kind, DeviceMutationKind::Rename);
+        assert_eq!(operation.identity.target_id.as_deref(), Some("document"));
+        assert_eq!(
+            operation.identity.request_json,
+            "{\"format_version\":1,\"mutation_kind\":\"document_rename\",\
+             \"document_id\":\"document\",\"logical_path\":\"renamed.org\",\
+             \"expected_revision\":7}"
+        );
+    }
+
+    #[test]
+    fn document_tombstone_fingerprint_captures_target_and_revision() {
+        let operation = prepare_device_document_tombstone(
+            1,
+            "tombstone".into(),
+            "device".into(),
+            DocumentId::new("document").unwrap(),
+            9,
+        )
+        .unwrap();
+
+        assert_eq!(
+            operation.identity.mutation_kind,
+            DeviceMutationKind::Tombstone
+        );
+        assert_eq!(
+            operation.identity.request_json,
+            "{\"format_version\":1,\"mutation_kind\":\"document_tombstone\",\
+             \"document_id\":\"document\",\"logical_path\":null,\
+             \"expected_revision\":9}"
         );
     }
 

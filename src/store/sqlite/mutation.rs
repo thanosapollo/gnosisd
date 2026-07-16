@@ -3,12 +3,15 @@ use sha2::{Digest, Sha256};
 
 use super::{
     NoteWriteDecision, SqliteStore, StoreError, current_content_cursor, load_document_head,
-    note_write_decision, replace_note_in, replica_cursor_token, server_id,
+    note_write_decision, rename_document_in, replace_note_in, replica_cursor_token, server_id,
+    tombstone_document_in,
 };
 use crate::{
     application::{
-        DeviceMutationCursor, DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
-        DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDocumentMutation,
+        DeviceDocumentLifecycleMutation, DeviceMutationCursor, DeviceMutationIdentity,
+        DeviceMutationKind, DeviceMutationProjection, DeviceMutationRejection,
+        DeviceMutationResult, PreparedDeviceDocumentLifecycleMutation,
+        PreparedDeviceDocumentMutation,
     },
     blob::BlobMeta,
 };
@@ -59,6 +62,31 @@ impl SqliteStore {
             document_mutation_preflight(&self.connection, operation)?,
             DocumentMutationPreflight::Write
         ))
+    }
+
+    pub(crate) fn apply_device_document_lifecycle_mutation(
+        &mut self,
+        operation: &PreparedDeviceDocumentLifecycleMutation,
+        created_at_us: i64,
+    ) -> Result<DeviceMutationExecution, StoreError> {
+        operation.validate().map_err(|_| StoreError::CorruptData {
+            field: "device document lifecycle mutation",
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::storage)?;
+        if let Some(replay) = replayed_device_mutation(&transaction, &operation.identity)? {
+            transaction.commit().map_err(StoreError::storage)?;
+            return Ok(replay);
+        }
+        let result = apply_new_document_lifecycle(&transaction, operation, created_at_us)?;
+        insert_receipt(&transaction, &operation.identity, &result, created_at_us)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(DeviceMutationExecution {
+            result,
+            replayed: false,
+        })
     }
 }
 
@@ -195,7 +223,7 @@ fn document_mutation_preflight(
     operation: &PreparedDeviceDocumentMutation,
 ) -> Result<DocumentMutationPreflight, StoreError> {
     let before = load_document_head(connection, &operation.prepared.document_id)?;
-    if operation.identity.mutation_kind == DeviceMutationKind::DocumentCreate && before.is_some() {
+    if operation.identity.mutation_kind == DeviceMutationKind::Create && before.is_some() {
         return Ok(DocumentMutationPreflight::Rejected(
             DeviceMutationRejection::RevisionConflict {
                 expected: None,
@@ -275,7 +303,155 @@ fn document_rejection(error: &StoreError) -> Option<DeviceMutationRejection> {
         }
         StoreError::NotFound => Some(DeviceMutationRejection::InvalidContent),
         StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
+        StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
         StoreError::PathChange => Some(DeviceMutationRejection::RenameRequired),
+        _ => None,
+    }
+}
+
+fn apply_new_document_lifecycle(
+    transaction: &Transaction<'_>,
+    operation: &PreparedDeviceDocumentLifecycleMutation,
+    created_at_us: i64,
+) -> Result<DeviceMutationResult, StoreError> {
+    match document_lifecycle_preflight(transaction, operation)? {
+        DocumentLifecyclePreflight::Rejected(rejection) => {
+            return rejected_result(transaction, &operation.identity, rejection);
+        }
+        DocumentLifecyclePreflight::Unchanged(head) => {
+            return Ok(DeviceMutationResult::applied(
+                &operation.identity,
+                false,
+                DeviceMutationProjection::Document(head),
+                mutation_cursor(transaction)?,
+            ));
+        }
+        DocumentLifecyclePreflight::Write => {}
+    }
+    apply_document_lifecycle_write(transaction, operation, created_at_us)
+}
+
+enum DocumentLifecyclePreflight {
+    Rejected(DeviceMutationRejection),
+    Unchanged(crate::application::DocumentHead),
+    Write,
+}
+
+fn document_lifecycle_preflight(
+    connection: &Connection,
+    operation: &PreparedDeviceDocumentLifecycleMutation,
+) -> Result<DocumentLifecyclePreflight, StoreError> {
+    let Some(head) = load_document_head(connection, &operation.document_id)? else {
+        return Ok(DocumentLifecyclePreflight::Rejected(
+            DeviceMutationRejection::NotFound,
+        ));
+    };
+    if head.revision != operation.expected_revision {
+        return Ok(DocumentLifecyclePreflight::Rejected(
+            DeviceMutationRejection::RevisionConflict {
+                expected: Some(operation.expected_revision),
+                actual: Some(head.revision),
+            },
+        ));
+    }
+    Ok(lifecycle_state_preflight(operation, head))
+}
+
+fn lifecycle_state_preflight(
+    operation: &PreparedDeviceDocumentLifecycleMutation,
+    head: crate::application::DocumentHead,
+) -> DocumentLifecyclePreflight {
+    match &operation.mutation {
+        DeviceDocumentLifecycleMutation::Rename { .. } if !head.active => {
+            DocumentLifecyclePreflight::Rejected(DeviceMutationRejection::NotFound)
+        }
+        DeviceDocumentLifecycleMutation::Rename { logical_path }
+            if logical_path == &head.logical_path =>
+        {
+            DocumentLifecyclePreflight::Unchanged(head)
+        }
+        DeviceDocumentLifecycleMutation::Tombstone if !head.active => {
+            DocumentLifecyclePreflight::Unchanged(head)
+        }
+        DeviceDocumentLifecycleMutation::Rename { .. }
+        | DeviceDocumentLifecycleMutation::Tombstone => DocumentLifecyclePreflight::Write,
+    }
+}
+
+fn apply_document_lifecycle_write(
+    transaction: &Transaction<'_>,
+    operation: &PreparedDeviceDocumentLifecycleMutation,
+    created_at_us: i64,
+) -> Result<DeviceMutationResult, StoreError> {
+    transaction
+        .execute_batch("SAVEPOINT device_mutation_apply")
+        .map_err(StoreError::storage)?;
+    let result = match &operation.mutation {
+        DeviceDocumentLifecycleMutation::Rename { logical_path } => rename_document_in(
+            transaction,
+            &operation.document_id,
+            logical_path,
+            operation.expected_revision,
+            created_at_us,
+            Some(&operation.identity.device_id),
+        ),
+        DeviceDocumentLifecycleMutation::Tombstone => tombstone_document_in(
+            transaction,
+            &operation.document_id,
+            operation.expected_revision,
+            created_at_us,
+            Some(&operation.identity.device_id),
+        ),
+    };
+    finish_document_lifecycle_write(transaction, operation, result)
+}
+
+fn finish_document_lifecycle_write(
+    transaction: &Transaction<'_>,
+    operation: &PreparedDeviceDocumentLifecycleMutation,
+    result: Result<crate::application::DocumentHead, StoreError>,
+) -> Result<DeviceMutationResult, StoreError> {
+    match result {
+        Ok(head) => {
+            transaction
+                .execute_batch("RELEASE device_mutation_apply")
+                .map_err(StoreError::storage)?;
+            Ok(DeviceMutationResult::applied(
+                &operation.identity,
+                true,
+                DeviceMutationProjection::Document(head),
+                mutation_cursor(transaction)?,
+            ))
+        }
+        Err(error) => rejected_document_lifecycle(transaction, &operation.identity, error),
+    }
+}
+
+fn rejected_document_lifecycle(
+    transaction: &Transaction<'_>,
+    identity: &DeviceMutationIdentity,
+    error: StoreError,
+) -> Result<DeviceMutationResult, StoreError> {
+    let Some(rejection) = lifecycle_rejection(&error) else {
+        return Err(error);
+    };
+    transaction
+        .execute_batch("ROLLBACK TO device_mutation_apply; RELEASE device_mutation_apply")
+        .map_err(StoreError::storage)?;
+    rejected_result(transaction, identity, rejection)
+}
+
+fn lifecycle_rejection(error: &StoreError) -> Option<DeviceMutationRejection> {
+    match error {
+        StoreError::Conflict { expected, actual } => {
+            Some(DeviceMutationRejection::RevisionConflict {
+                expected: Some(*expected),
+                actual: *actual,
+            })
+        }
+        StoreError::NotFound => Some(DeviceMutationRejection::NotFound),
+        StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
+        StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
         _ => None,
     }
 }
@@ -340,9 +516,10 @@ mod tests {
         application::{
             DeviceMutationProjection, DeviceMutationRejection, DeviceMutationResult,
             PreparedDeviceDocumentMutation, generate_device, prepare_device_document_mutation,
-            prepare_note,
+            prepare_device_document_rename, prepare_device_document_tombstone, prepare_note,
         },
         blob::BlobMeta,
+        domain::DocumentId,
     };
 
     #[test]
@@ -412,6 +589,32 @@ mod tests {
     }
 
     #[test]
+    fn document_create_retains_an_explicit_path_conflict() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        let first = operation(&device, "first", "first", "note.org", "First", None);
+        let second = operation(&device, "second", "second", "note.org", "Second", None);
+        store
+            .apply_device_document_mutation(&first, Some(&blob(&first)), 2)
+            .unwrap();
+
+        let result = store
+            .apply_device_document_mutation(&second, None, 3)
+            .unwrap();
+
+        assert!(matches!(
+            result.result,
+            DeviceMutationResult::Rejected {
+                rejection: DeviceMutationRejection::PathConflict,
+                ..
+            }
+        ));
+        assert_eq!(row_count(&store, "document_revision"), 1);
+        assert_eq!(row_count(&store, "content_change"), 1);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 2);
+    }
+
+    #[test]
     fn document_mutation_replay_survives_restart() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("gnosis.sqlite");
@@ -433,6 +636,201 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.result, first.result);
         assert_eq!(row_count(&reopened, "document_revision"), 1);
+    }
+
+    #[test]
+    fn document_rename_replays_without_advancing_twice() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        let create = operation(&device, "create", "document", "note.org", "Note", None);
+        store
+            .apply_device_document_mutation(&create, Some(&blob(&create)), 2)
+            .unwrap();
+        let rename = prepare_device_document_rename(
+            1,
+            "rename".into(),
+            device,
+            DocumentId::new("document").unwrap(),
+            "renamed.org".into(),
+            1,
+        )
+        .unwrap();
+
+        let first = store
+            .apply_device_document_lifecycle_mutation(&rename, 3)
+            .unwrap();
+        let retry = store
+            .apply_device_document_lifecycle_mutation(&rename, 4)
+            .unwrap();
+
+        assert!(!first.replayed);
+        assert!(retry.replayed);
+        assert_eq!(retry.result, first.result);
+        assert_applied_document(&first.result, "document", 2, true);
+        assert_eq!(row_count(&store, "document_revision"), 2);
+        assert_eq!(row_count(&store, "content_change"), 2);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 2);
+    }
+
+    #[test]
+    fn document_tombstone_replays_without_advancing_twice() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        let create = operation(&device, "create", "document", "note.org", "Note", None);
+        store
+            .apply_device_document_mutation(&create, Some(&blob(&create)), 2)
+            .unwrap();
+        let tombstone = prepare_device_document_tombstone(
+            1,
+            "tombstone".into(),
+            device,
+            DocumentId::new("document").unwrap(),
+            1,
+        )
+        .unwrap();
+
+        let first = store
+            .apply_device_document_lifecycle_mutation(&tombstone, 3)
+            .unwrap();
+        let retry = store
+            .apply_device_document_lifecycle_mutation(&tombstone, 4)
+            .unwrap();
+
+        assert!(!first.replayed);
+        assert!(retry.replayed);
+        assert_eq!(retry.result, first.result);
+        let DeviceMutationResult::Applied { authoritative, .. } = &first.result else {
+            panic!("expected applied tombstone");
+        };
+        let DeviceMutationProjection::Document(head) = authoritative;
+        assert_eq!(head.revision, 2);
+        assert!(!head.active);
+        assert_eq!(row_count(&store, "document_revision"), 2);
+        assert_eq!(row_count(&store, "content_change"), 2);
+    }
+
+    #[test]
+    fn document_tombstone_noop_retains_the_current_projection_and_cursor() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        let create = operation(&device, "create", "document", "note.org", "Note", None);
+        store
+            .apply_device_document_mutation(&create, Some(&blob(&create)), 2)
+            .unwrap();
+        let first = prepare_device_document_tombstone(
+            1,
+            "first-tombstone".into(),
+            device.clone(),
+            DocumentId::new("document").unwrap(),
+            1,
+        )
+        .unwrap();
+        store
+            .apply_device_document_lifecycle_mutation(&first, 3)
+            .unwrap();
+        let noop = prepare_device_document_tombstone(
+            1,
+            "tombstone-noop".into(),
+            device,
+            DocumentId::new("document").unwrap(),
+            2,
+        )
+        .unwrap();
+
+        let result = store
+            .apply_device_document_lifecycle_mutation(&noop, 4)
+            .unwrap();
+        let retry = store
+            .apply_device_document_lifecycle_mutation(&noop, 5)
+            .unwrap();
+
+        assert!(!result.replayed);
+        assert!(retry.replayed);
+        assert_eq!(retry.result, result.result);
+        assert_applied_document(&result.result, "document", 2, false);
+        let DeviceMutationResult::Applied { cursor, .. } = result.result else {
+            panic!("expected applied no-op");
+        };
+        assert_eq!(cursor.position, 2);
+        assert_eq!(row_count(&store, "document_revision"), 2);
+        assert_eq!(row_count(&store, "content_change"), 2);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+    }
+
+    #[test]
+    fn document_rename_retains_an_explicit_path_conflict() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        for (operation_id, document_id, path) in [
+            ("first", "first-document", "first.org"),
+            ("second", "second-document", "second.org"),
+        ] {
+            let create = operation(&device, operation_id, document_id, path, operation_id, None);
+            store
+                .apply_device_document_mutation(&create, Some(&blob(&create)), 2)
+                .unwrap();
+        }
+        let rename = prepare_device_document_rename(
+            1,
+            "collision".into(),
+            device,
+            DocumentId::new("first-document").unwrap(),
+            "second.org".into(),
+            1,
+        )
+        .unwrap();
+
+        let result = store
+            .apply_device_document_lifecycle_mutation(&rename, 3)
+            .unwrap();
+
+        assert!(matches!(
+            result.result,
+            DeviceMutationResult::Rejected {
+                rejection: DeviceMutationRejection::PathConflict,
+                ..
+            }
+        ));
+        assert_eq!(row_count(&store, "document_revision"), 2);
+        assert_eq!(row_count(&store, "content_change"), 2);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+    }
+
+    #[test]
+    fn document_rename_noop_retains_the_current_projection_and_cursor() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        let create = operation(&device, "create", "document", "note.org", "Note", None);
+        store
+            .apply_device_document_mutation(&create, Some(&blob(&create)), 2)
+            .unwrap();
+        let rename = prepare_device_document_rename(
+            1,
+            "rename-noop".into(),
+            device,
+            DocumentId::new("document").unwrap(),
+            "note.org".into(),
+            1,
+        )
+        .unwrap();
+
+        let first = store
+            .apply_device_document_lifecycle_mutation(&rename, 3)
+            .unwrap();
+        let retry = store
+            .apply_device_document_lifecycle_mutation(&rename, 4)
+            .unwrap();
+
+        assert!(retry.replayed);
+        assert_eq!(retry.result, first.result);
+        assert_applied_document(&first.result, "document", 1, false);
+        let DeviceMutationResult::Applied { cursor, .. } = first.result else {
+            panic!("expected applied no-op");
+        };
+        assert_eq!(cursor.position, 1);
+        assert_eq!(row_count(&store, "document_revision"), 1);
+        assert_eq!(row_count(&store, "content_change"), 1);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 2);
     }
 
     #[test]

@@ -142,8 +142,15 @@ fn public_document_mutation_results_are_exclusive_and_strict() {
         },
         "cursor":"cursor"
     });
+    let path_conflict = json!({
+        "status":"rejected",
+        "format_version":1,
+        "operation_id":"rename",
+        "rejection":{"reason":"path_conflict"},
+        "cursor":"cursor"
+    });
 
-    for wire in [applied, rejected] {
+    for wire in [applied, rejected, path_conflict] {
         let result: DocumentMutationResultV1 = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(result).unwrap(), wire);
     }

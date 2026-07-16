@@ -954,6 +954,7 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::BlobRequired { .. }
         | StoreError::BlobMetadata
         | StoreError::PathChange
+        | StoreError::PathConflict
         | StoreError::InvalidProjection { .. }
         | StoreError::CorruptData { .. }
         | StoreError::UnsupportedSchemaVersion { .. }
