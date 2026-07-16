@@ -2633,6 +2633,23 @@ async fn spawn_drop_operation_response_proxy(upstream: SocketAddr) -> DropPathRe
     spawn_drop_path_response_proxy(upstream, "/v1/content/offline-operations", 1).await
 }
 
+#[test]
+fn forwarded_proxy_responses_close_the_client_connection() {
+    let response =
+        b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\n\xff\x00\x01";
+
+    let closed = close_forwarded_response(response.to_vec());
+
+    assert!(closed.starts_with(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"));
+    assert!(
+        closed
+            .windows(19)
+            .any(|value| value == b"Connection: close\r\n")
+    );
+    assert!(!closed.windows(10).any(|value| value == b"keep-alive"));
+    assert!(closed.ends_with(b"\xff\x00\x01"));
+}
+
 async fn spawn_drop_path_response_proxy(
     upstream: SocketAddr,
     path: &'static str,
@@ -2705,8 +2722,29 @@ async fn spawn_snapshot_required_proxy(upstream: SocketAddr) -> SnapshotRequired
 }
 
 async fn forward_http_request(upstream: SocketAddr, client: &mut TcpStream, request: &[u8]) {
-    let response = upstream_http_response(upstream, request).await;
+    let response = close_forwarded_response(upstream_http_response(upstream, request).await);
     client.write_all(&response).await.unwrap();
+}
+
+fn close_forwarded_response(response: Vec<u8>) -> Vec<u8> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+    let mut closed = Vec::with_capacity(response.len() + 19);
+    for line in headers.lines().filter(|line| !is_connection_header(line)) {
+        closed.extend_from_slice(line.as_bytes());
+        closed.extend_from_slice(b"\r\n");
+    }
+    closed.extend_from_slice(b"Connection: close\r\n\r\n");
+    closed.extend_from_slice(&response[header_end + 4..]);
+    closed
+}
+
+fn is_connection_header(line: &str) -> bool {
+    line.split_once(':')
+        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("connection"))
 }
 
 async fn upstream_http_response(upstream: SocketAddr, request: &[u8]) -> Vec<u8> {
