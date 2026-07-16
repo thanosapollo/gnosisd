@@ -9,6 +9,7 @@ use gnosis_core::{
         DeviceUploadKind, LocalReplica, OfflineAssetCreate, OfflineDocumentEdit,
         PendingDeviceUpload,
     },
+    client_sync::{ReplicaSync, ReplicaSyncError},
     protocol::{
         DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseOutcome,
         ResponseResult, ServerError,
@@ -646,6 +647,242 @@ async fn client_pages_compose_with_the_durable_replica() {
 }
 
 #[tokio::test]
+async fn replica_sync_bootstraps_and_drains_a_restarted_outbox_in_sequence() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let replica_path = daemon._directory.path().join("coordinated-replica.sqlite");
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let sync = ReplicaSync::new(&client);
+
+    let bootstrap = sync.synchronize(&mut replica).await.unwrap();
+    assert!(bootstrap.snapshot_pages > 0);
+    let asset = replica
+        .record_asset(OfflineAssetCreate {
+            operation_id: "coordinated-asset".into(),
+            original_name: "image.png".into(),
+            media_type: "image/png".into(),
+            bytes: b"coordinated image".to_vec(),
+            authored_at_us: 10,
+        })
+        .unwrap();
+    replica
+        .record_document(OfflineDocumentEdit {
+            operation_id: "coordinated-document".into(),
+            document_id: "coordinated-document".into(),
+            logical_path: "coordinated.org".into(),
+            org: format!("#+title: Coordinated\n[[file:{}]]\n", asset.logical_path),
+            authored_at_us: 11,
+        })
+        .unwrap();
+    drop(replica);
+
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let reconciled = sync.synchronize(&mut replica).await.unwrap();
+    assert_eq!(reconciled.uploaded_operations, 2);
+    assert_eq!(reconciled.staged_upload_blobs, 1);
+    assert!(replica.next_device_upload().unwrap().is_none());
+    assert!(
+        replica
+            .projection("document", "coordinated-document")
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        replica.asset(&asset.logical_path).unwrap(),
+        gnosis_core::client_replica::ReplicaAssetState::Available(_)
+    ));
+
+    let settled = sync.synchronize(&mut replica).await.unwrap();
+    assert_eq!(settled.snapshot_pages, 0);
+    assert_eq!(settled.uploaded_operations, 0);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn replica_sync_recovers_an_expired_delta_cursor_with_a_fresh_snapshot() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let direct = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let replica_path = daemon._directory.path().join("recovering-replica.sqlite");
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    ReplicaSync::new(&direct)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+
+    let proxy = spawn_snapshot_required_proxy(daemon.http_addr).await;
+    let client = HttpClient::new(&proxy.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let report = ReplicaSync::new(&client)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+
+    assert_eq!(report.snapshot_recoveries, 1);
+    assert!(report.snapshot_pages > 0);
+    assert_eq!(proxy.stop().await, 1);
+    assert!(replica.status().unwrap().cursor.is_some());
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn replica_sync_recovers_when_snapshot_cursor_expires_before_delta_pull() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let replica_path = daemon
+        ._directory
+        .path()
+        .join("expired-snapshot-replica.sqlite");
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let proxy = spawn_snapshot_required_proxy(daemon.http_addr).await;
+    let client = HttpClient::new(&proxy.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+
+    let report = ReplicaSync::new(&client)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+
+    assert_eq!(report.snapshot_recoveries, 1);
+    assert!(report.snapshot_pages >= 2);
+    assert_eq!(proxy.stop().await, 1);
+    assert!(replica.status().unwrap().cursor.is_some());
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn replica_sync_stops_on_unknown_delivery_and_replays_the_same_operation() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let direct = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let replica_path = daemon._directory.path().join("uncertain-replica.sqlite");
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    ReplicaSync::new(&direct)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+    replica
+        .record_document(OfflineDocumentEdit {
+            operation_id: "uncertain-operation".into(),
+            document_id: "uncertain-document".into(),
+            logical_path: "uncertain.org".into(),
+            org: "#+title: Uncertain\n".into(),
+            authored_at_us: 10,
+        })
+        .unwrap();
+
+    let proxy = spawn_drop_operation_response_proxy(daemon.http_addr).await;
+    let client = HttpClient::new(&proxy.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let error = ReplicaSync::new(&client)
+        .synchronize(&mut replica)
+        .await
+        .unwrap_err();
+    let ReplicaSyncError::Upload {
+        operation,
+        delivery,
+        ..
+    } = error
+    else {
+        panic!("unexpected synchronization error: {error:?}");
+    };
+    assert_eq!(operation.operation_id, "uncertain-operation");
+    assert_eq!(operation.device_sequence, 1);
+    assert_eq!(delivery, DeliveryStatus::Unknown);
+    assert_eq!(proxy.stop().await, 1);
+    assert_eq!(
+        replica
+            .next_device_upload()
+            .unwrap()
+            .unwrap()
+            .operation_id(),
+        "uncertain-operation"
+    );
+    drop(replica);
+
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let recovered = ReplicaSync::new(&direct)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+    assert_eq!(recovered.uploaded_operations, 1);
+    assert!(replica.next_device_upload().unwrap().is_none());
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn replica_sync_resumes_an_interrupted_snapshot_after_replica_restart() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let direct = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let mut expected_document = None;
+    for index in 0..20 {
+        let result = direct
+            .create_note(
+                &format!("snapshot-seed-{index}"),
+                &NoteWriteRequestV1 {
+                    logical_path: format!("snapshot-{index}.org"),
+                    org: format!("#+title: Snapshot {index}\n"),
+                },
+            )
+            .await
+            .unwrap();
+        if expected_document.is_none() {
+            let DocumentMutationResultV1::Applied { authoritative, .. } = result else {
+                panic!("seed document was not applied");
+            };
+            expected_document = Some(authoritative.document_id);
+        }
+    }
+    let expected_document = expected_document.unwrap();
+    let replica_path = daemon._directory.path().join("resumable-replica.sqlite");
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let proxy = spawn_drop_path_response_proxy(daemon.http_addr, "/v1/sync/snapshot", 2).await;
+    let client = HttpClient::new(&proxy.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+
+    assert!(
+        ReplicaSync::new(&client)
+            .synchronize(&mut replica)
+            .await
+            .is_err()
+    );
+    assert!(replica.status().unwrap().snapshot_next.is_some());
+    assert!(
+        replica
+            .projection("document", &expected_document)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(proxy.stop().await, 2);
+    drop(replica);
+
+    let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let report = ReplicaSync::new(&direct)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+    assert!(report.snapshot_pages > 0);
+    assert!(replica.status().unwrap().snapshot_next.is_none());
+    assert!(
+        replica
+            .projection("document", &expected_document)
+            .unwrap()
+            .is_some()
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn client_rejects_noncanonical_blob_digests_before_transport() {
     let client = HttpClient::new("http://127.0.0.1:9", token()).unwrap();
     for digest in ["short", &"A".repeat(64), &format!("{}!", "a".repeat(63))] {
@@ -953,6 +1190,126 @@ struct RawServer {
 struct DropResponseProxy {
     base_url: String,
     task: tokio::task::JoinHandle<Vec<u8>>,
+}
+
+struct SnapshotRequiredProxy {
+    base_url: String,
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<usize>,
+}
+
+struct DropPathResponseProxy {
+    base_url: String,
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<usize>,
+}
+
+impl DropPathResponseProxy {
+    async fn stop(self) -> usize {
+        self.shutdown.send(()).unwrap();
+        self.task.await.unwrap()
+    }
+}
+
+async fn spawn_drop_operation_response_proxy(upstream: SocketAddr) -> DropPathResponseProxy {
+    spawn_drop_path_response_proxy(upstream, "/v1/content/offline-operations", 1).await
+}
+
+async fn spawn_drop_path_response_proxy(
+    upstream: SocketAddr,
+    path: &'static str,
+    drop_match: usize,
+) -> DropPathResponseProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, mut receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut matches = 0;
+        loop {
+            tokio::select! {
+                _ = &mut receiver => return matches,
+                accepted = listener.accept() => {
+                    let (mut client, _) = accepted.unwrap();
+                    let request = read_http_request(&mut client).await;
+                    if request_target(&request).contains(path) {
+                        matches += 1;
+                    }
+                    if matches == drop_match && request_target(&request).contains(path) {
+                        upstream_http_response(upstream, &request).await;
+                    } else {
+                        forward_http_request(upstream, &mut client, &request).await;
+                    }
+                }
+            }
+        }
+    });
+    DropPathResponseProxy {
+        base_url: format!("http://{address}"),
+        shutdown,
+        task,
+    }
+}
+
+impl SnapshotRequiredProxy {
+    async fn stop(self) -> usize {
+        self.shutdown.send(()).unwrap();
+        self.task.await.unwrap()
+    }
+}
+
+async fn spawn_snapshot_required_proxy(upstream: SocketAddr) -> SnapshotRequiredProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, mut receiver) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut intercepted = 0;
+        loop {
+            tokio::select! {
+                _ = &mut receiver => return intercepted,
+                accepted = listener.accept() => {
+                    let (mut client, _) = accepted.unwrap();
+                    let request = read_http_request(&mut client).await;
+                    if intercepted == 0 && request_target(&request).contains("/v1/sync/changes") {
+                        client.write_all(snapshot_required_response()).await.unwrap();
+                        intercepted += 1;
+                    } else {
+                        forward_http_request(upstream, &mut client, &request).await;
+                    }
+                }
+            }
+        }
+    });
+    SnapshotRequiredProxy {
+        base_url: format!("http://{address}"),
+        shutdown,
+        task,
+    }
+}
+
+async fn forward_http_request(upstream: SocketAddr, client: &mut TcpStream, request: &[u8]) {
+    let response = upstream_http_response(upstream, request).await;
+    client.write_all(&response).await.unwrap();
+}
+
+async fn upstream_http_response(upstream: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut server = TcpStream::connect(upstream).await.unwrap();
+    server.write_all(request).await.unwrap();
+    read_http_request(&mut server).await
+}
+
+fn request_target(request: &[u8]) -> &str {
+    std::str::from_utf8(request)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+}
+
+fn snapshot_required_response() -> &'static [u8] {
+    b"HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: 123\r\nConnection: close\r\n\r\n{\"error\":{\"code\":\"snapshot_required\",\"message\":\"replica snapshot is required\",\"meta\":{\"snapshot_url\":\"/v1/sync/snapshot\"}}}"
 }
 
 async fn spawn_drop_response_proxy(upstream: SocketAddr) -> DropResponseProxy {

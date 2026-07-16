@@ -65,6 +65,11 @@ client may open the core database directly.
   projections, and snapshot recovery never deletes review packs, content or
   review operations, results, or device sequence state. Reconciliation cursors
   are hints and must never fast-forward the replica feed cursor.
+- `src/client_sync.rs` is the concrete HTTP replica coordinator. It observes
+  server identity, resumes or recovers snapshots, pulls durable deltas, fetches
+  required blobs, and drains the shared outbox strictly by device sequence.
+  Unknown mutation delivery stops synchronization with the operation identity
+  intact; the next explicit run replays that exact immutable operation.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` currently combines operator commands and compatibility
   methods; ordinary commands must migrate to `HttpClient` before the Unix

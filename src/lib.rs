@@ -4,6 +4,7 @@ mod application;
 mod blob;
 pub mod client_http;
 pub mod client_replica;
+pub mod client_sync;
 mod domain;
 mod http;
 pub mod migration;

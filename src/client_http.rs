@@ -914,6 +914,19 @@ pub enum HttpClientError {
     Server(HttpServerError),
 }
 
+impl HttpClientError {
+    pub const fn delivery(&self) -> DeliveryStatus {
+        match self {
+            Self::Timeout { delivery }
+            | Self::Transport { delivery }
+            | Self::ResponseTooLarge { delivery }
+            | Self::InvalidResponse { delivery } => *delivery,
+            Self::Server(error) => error.delivery(),
+            _ => DeliveryStatus::NotSent,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

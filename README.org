@@ -116,9 +116,13 @@ network boundary.
 
 A complete offline-review replica needs both ~read~ and ~review~ scopes.
 ~review~ alone supports the bounded pack flow but cannot bootstrap a full
-~LocalReplica~. SSE cursor announcements are advisory wakeups. A replica runner
-must also synchronize periodically because Unix-socket writes do not emit HTTP
-events.
+~LocalReplica~. ~client_sync::ReplicaSync~ is the reference coordinator. It
+resumes snapshots, pulls durable deltas, downloads required blobs, and drains
+the shared content, asset, and review outbox strictly by device sequence. It
+does not retry unknown mutation delivery. The next explicit synchronization
+replays the same immutable operation and receives its retained result. SSE
+cursor announcements are advisory wakeups, so callers must also synchronize
+periodically because Unix-socket writes do not emit HTTP events.
 
 * Storage
 
