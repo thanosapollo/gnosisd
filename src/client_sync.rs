@@ -172,7 +172,7 @@ impl<'a> ReplicaSync<'a> {
         replica: &mut LocalReplica,
         report: &mut ReplicaSyncReport,
     ) -> Result<(), ReplicaSyncError> {
-        for digest in replica.missing_blobs()? {
+        for digest in replica.missing_projection_blobs()? {
             let bytes = self.client.blob(&digest).await?;
             replica.install_blob(&digest, &bytes)?;
             report.downloaded_blobs += 1;
@@ -240,4 +240,115 @@ fn snapshot_required(error: &ReplicaSyncError) -> bool {
         ReplicaSyncError::Http(HttpClientError::Server(server))
             if server.body().error.code() == ApiErrorCodeV1::SnapshotRequired
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+    use sha2::{Digest as _, Sha256};
+    use tokio::sync::oneshot;
+
+    use super::ReplicaSync;
+    use crate::{
+        application::{canonical_asset_path, generate_device, prepare_asset},
+        client_http::{HttpClient, SecretToken},
+        client_replica::LocalReplica,
+        http::router,
+        protocol::http_v1::ReviewPackEnvelopeV2,
+        service::{ServiceHandle, ServiceRuntime},
+    };
+
+    #[tokio::test]
+    async fn periodic_sync_deduplicates_projections_and_skips_pack_assets() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("server.sqlite"),
+            directory.path().join("server-blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "offline".into(),
+            vec!["read".into(), "review".into(), "content:write".into()],
+        )
+        .unwrap();
+        let device_id = device.device_id.clone();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        add_duplicate_blob_projections(&service, &device_id).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown, receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(service.clone()))
+                .with_graceful_shutdown(async {
+                    let _ = receiver.await;
+                })
+                .await
+                .unwrap();
+            service
+        });
+        let client = HttpClient::new(&base_url, SecretToken::new(token).unwrap()).unwrap();
+        let mut replica =
+            LocalReplica::open(directory.path().join("replica.sqlite"), &device_id).unwrap();
+        let bootstrap = ReplicaSync::new(&client)
+            .synchronize(&mut replica)
+            .await
+            .unwrap();
+        assert_eq!(bootstrap.downloaded_blobs, 1);
+
+        let digest = format!("{:x}", Sha256::digest(b"pack-only"));
+        let state = client.replica_state().await.unwrap();
+        replica
+            .install_review_pack(pack_only_asset(&device_id, &state.cursor, &digest))
+            .unwrap();
+        let report = ReplicaSync::new(&client)
+            .synchronize(&mut replica)
+            .await
+            .unwrap();
+        assert_eq!(report.downloaded_blobs, 0);
+        assert!(replica.blob(&digest).unwrap().is_none());
+
+        shutdown.send(()).unwrap();
+        let service = server.await.unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    async fn add_duplicate_blob_projections(service: &ServiceHandle, device_id: &str) {
+        let bytes = b"shared projection blob";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        for (offset, name) in ["first.png", "second.png"].into_iter().enumerate() {
+            let path = canonical_asset_path(&digest, name).unwrap();
+            let prepared = prepare_asset(path, name.into(), None).unwrap();
+            service
+                .put_asset(
+                    prepared,
+                    bytes.to_vec(),
+                    "image/png".into(),
+                    1_752_600_000_000_000 + offset as i64,
+                    Some(device_id.into()),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    fn pack_only_asset(device_id: &str, cursor: &str, digest: &str) -> ReviewPackEnvelopeV2 {
+        let mut fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/protocol/offline-review-v1.json"
+        ))
+        .unwrap();
+        fixture["pack"]["pack"]["device_id"] = json!(device_id);
+        fixture["pack"]["pack"]["cursor"] = json!(cursor);
+        fixture["pack"]["pack"]["assets"] = json!([{
+            "logical_path": format!("assets/{digest}/image.png"),
+            "content_sha256": digest,
+            "size_bytes": 9,
+            "media_type": "image/png"
+        }]);
+        serde_json::from_value(fixture["pack"].clone()).unwrap()
+    }
 }

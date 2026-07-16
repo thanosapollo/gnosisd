@@ -22,7 +22,7 @@ use crate::{
         decode_replica_state, decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
         http_v1::{
             AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1,
+            ReplicaStateV1, ReviewPackEnvelopeV2,
         },
     },
     store::{
@@ -662,9 +662,9 @@ impl LocalReplica {
         Ok(has_more)
     }
 
-    pub fn install_review_pack(&mut self, value: Value) -> Result<String, Error> {
-        let cursor = string_field(&value, &["pack", "cursor"])?;
-        let pack = decode_review_pack(value)?;
+    pub fn install_review_pack(&mut self, response: ReviewPackEnvelopeV2) -> Result<String, Error> {
+        let cursor = response.pack.cursor.clone();
+        let pack = decode_review_pack(response)?;
         let id = pack.pack_id.clone();
         self.store.install_review_pack(&pack, &cursor)?;
         Ok(id)
@@ -673,6 +673,10 @@ impl LocalReplica {
     pub fn install_blob(&mut self, digest: &str, bytes: &[u8]) -> Result<(), Error> {
         self.store.install_blob(digest, bytes)?;
         Ok(())
+    }
+
+    pub(crate) fn missing_projection_blobs(&self) -> Result<Vec<String>, Error> {
+        Ok(self.store.missing_projection_blobs()?)
     }
 
     pub fn missing_blobs(&self) -> Result<Vec<String>, Error> {
@@ -2077,9 +2081,9 @@ mod tests {
             .await
             .unwrap();
         let pack_id = replica
-            .install_review_pack(review_pack_json(&pack).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&pack).unwrap()))
             .unwrap();
-        assert!(replica.missing_blobs().unwrap().is_empty());
+        assert!(replica.missing_projection_blobs().unwrap().is_empty());
         replica
             .answer(&pack_id, answer("attempt-1", 0, issued_at_us + 1_000))
             .unwrap();
@@ -2145,6 +2149,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_pack_assets_are_not_projection_sync_requirements() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("server.sqlite"),
+            directory.path().join("server-blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("offline".into(), vec!["review".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let state =
+            replica_state_response(&service.replica_state(device_id.clone()).await.unwrap())
+                .unwrap();
+        let mut replica =
+            LocalReplica::open(directory.path().join("replica.sqlite"), &device_id).unwrap();
+        replica.observe_state(state.clone()).unwrap();
+
+        let digest = format!("{:x}", Sha256::digest(b"pack-only"));
+        let mut pack: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/protocol/offline-review-v1.json"
+        ))
+        .unwrap();
+        pack["pack"]["pack"]["device_id"] = json!(device_id);
+        pack["pack"]["pack"]["cursor"] = json!(state.cursor);
+        pack["pack"]["pack"]["assets"] = json!([{
+            "logical_path": format!("assets/{digest}/image.png"),
+            "content_sha256": digest.clone(),
+            "size_bytes": 9,
+            "media_type": "image/png"
+        }]);
+        replica
+            .install_review_pack(typed_review_pack(pack["pack"].clone()))
+            .unwrap();
+
+        assert!(replica.blob(&digest).unwrap().is_none());
+        assert!(replica.missing_projection_blobs().unwrap().is_empty());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn replica_asset_resolution_is_verified_and_tracks_tombstones() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
@@ -2196,7 +2244,7 @@ mod tests {
             .await
             .unwrap();
         let pack_id = replica
-            .install_review_pack(review_pack_json(&pack).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&pack).unwrap()))
             .unwrap();
         let thema = service.thema("first".into()).await.unwrap().unwrap();
         service
@@ -3113,7 +3161,7 @@ mod tests {
             .await
             .unwrap();
         let pack_id = replica
-            .install_review_pack(review_pack_json(&pack).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&pack).unwrap()))
             .unwrap();
         replica
             .answer(&pack_id, answer("stale-attempt", 0, issued_at_us + 1_000))
@@ -3253,7 +3301,7 @@ mod tests {
             .await
             .unwrap();
         let pack_id = first
-            .install_review_pack(review_pack_json(&pack).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&pack).unwrap()))
             .unwrap();
         let mut stale = LocalReplica::open(&replica_path, &device_id).unwrap();
         assert_eq!(
@@ -3365,10 +3413,10 @@ mod tests {
             .await
             .unwrap();
         let active_id = replica
-            .install_review_pack(review_pack_json(&active).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&active).unwrap()))
             .unwrap();
         replica
-            .install_review_pack(review_pack_json(&historical).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&historical).unwrap()))
             .unwrap();
         assert_eq!(
             replica.active_review_pack().unwrap().unwrap().pack_id,
@@ -3399,31 +3447,39 @@ mod tests {
             .await
             .unwrap();
         let wire = review_pack_json(&pack).unwrap();
+        let mut invalid_version = typed_review_pack(wire.clone());
+        invalid_version.version = 1;
+        assert!(matches!(
+            replica.install_review_pack(invalid_version),
+            Err(Error::ReviewWire)
+        ));
         let mut exhausted = wire.clone();
         exhausted["pack"]["current_position"] = json!(1);
         assert!(matches!(
-            replica.install_review_pack(exhausted),
+            replica.install_review_pack(typed_review_pack(exhausted)),
             Err(Error::ReviewWire)
         ));
         let mut invalid_state = wire.clone();
         invalid_state["pack"]["items"][0]["review_state"]["review_count"] = json!(1);
         assert!(matches!(
-            replica.install_review_pack(invalid_state),
+            replica.install_review_pack(typed_review_pack(invalid_state)),
             Err(Error::ReviewWire)
         ));
         let mut invalid_asset = wire.clone();
         invalid_asset["pack"]["assets"][0]["content_sha256"] = json!("b".repeat(64));
         assert!(matches!(
-            replica.install_review_pack(invalid_asset),
+            replica.install_review_pack(typed_review_pack(invalid_asset)),
             Err(Error::ReviewWire)
         ));
         let mut missing_presentation_asset = wire.clone();
         missing_presentation_asset["pack"]["items"][0]["asset_paths"] = json!([]);
         assert!(matches!(
-            replica.install_review_pack(missing_presentation_asset),
+            replica.install_review_pack(typed_review_pack(missing_presentation_asset)),
             Err(Error::ReviewWire)
         ));
-        let pack_id = replica.install_review_pack(wire).unwrap();
+        let pack_id = replica
+            .install_review_pack(typed_review_pack(wire))
+            .unwrap();
         replica
             .answer(&pack_id, answer("attempt", 0, issued_at_us + 1_000))
             .unwrap();
@@ -3519,7 +3575,7 @@ mod tests {
             .await
             .unwrap();
         replica
-            .install_review_pack(review_pack_json(&pack).unwrap())
+            .install_review_pack(typed_review_pack(review_pack_json(&pack).unwrap()))
             .unwrap()
     }
 
@@ -3671,7 +3727,7 @@ mod tests {
     }
 
     async fn install_missing_blobs(replica: &mut LocalReplica, service: &ServiceHandle) {
-        for digest in replica.missing_blobs().unwrap() {
+        for digest in replica.missing_projection_blobs().unwrap() {
             let (_, bytes) = service.blob(digest.clone()).await.unwrap().unwrap();
             replica.install_blob(&digest, &bytes).unwrap();
         }
@@ -3863,6 +3919,10 @@ mod tests {
 
     fn asset_path() -> String {
         format!("assets/{}/image.png", "c".repeat(64))
+    }
+
+    fn typed_review_pack(value: Value) -> crate::protocol::http_v1::ReviewPackEnvelopeV2 {
+        serde_json::from_value(value).unwrap()
     }
 
     fn snapshot_page_count(path: &Path) -> u64 {

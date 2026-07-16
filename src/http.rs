@@ -3612,7 +3612,7 @@ mod tests {
         );
         let size = &schemas["ReviewPackAssetV2"]["properties"]["size_bytes"];
         assert_eq!(size["minimum"], 0);
-        assert!(size.get("maximum").is_none());
+        assert_eq!(size["maximum"], crate::application::MAX_OFFLINE_ASSET_BYTES);
         let results = schemas["OfflineReviewResultV2"]["oneOf"]
             .as_array()
             .unwrap();

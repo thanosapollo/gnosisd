@@ -9,22 +9,25 @@ use std::{
 use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
     client_replica::{
-        DeviceUploadKind, LocalReplica, OfflineAssetCreate, OfflineDocumentEdit,
-        PendingDeviceUpload,
+        DeviceUploadKind, LocalReplica, OfflineAnswer, OfflineAssetCreate, OfflineDocumentEdit,
+        OfflineResponse, PendingDeviceUpload,
     },
+    client_review::{ReviewPackAcquisition, ReviewPackAcquisitionError},
     client_sync::{ReplicaSync, ReplicaSyncError},
     protocol::{
         DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseOutcome,
         ResponseResult, ServerError,
         http_v1::{
             ApiErrorCodeV1, DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1,
-            ReviewAnswerV1, ReviewSessionRequestV1, ReviewSourceInputV1, ReviewSourceKindV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, ThemaWriteRequestV1,
+            ReviewAnswerV1, ReviewPackAssetV2, ReviewSessionRequestV1, ReviewSourceInputV1,
+            ReviewSourceKindV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+            ThemaWriteRequestV1,
         },
         request,
     },
 };
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -255,6 +258,139 @@ async fn client_runs_the_typed_online_review_lifecycle() {
 }
 
 #[tokio::test]
+async fn client_acquires_a_complete_review_pack_and_resumes_after_restart() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let asset = b"offline review asset".to_vec();
+    let asset_path = put_review_asset(&daemon.base_url, &raw_token, &asset).await;
+    let thema_id = create_review_thema_with_asset(&daemon.base_url, &raw_token, &asset_path).await;
+    let mut replica = bootstrap_replica(&daemon, &client, &device_id).await;
+    let replica_path = daemon._directory.path().join("replica.sqlite");
+    let request = ReviewSessionRequestV1 {
+        source: manual_source(thema_id),
+        target_count: None,
+    };
+
+    let proxy = spawn_drop_path_response_proxy(daemon.http_addr, "/assets/", 1).await;
+    let interrupted_client = HttpClient::new(
+        &proxy.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let error = ReviewPackAcquisition::new(&interrupted_client)
+        .create(&mut replica, &request)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ReviewPackAcquisitionError::Http(HttpClientError::Transport {
+            delivery: DeliveryStatus::Unknown
+        })
+    ));
+    let pack = replica.active_review_pack().unwrap().unwrap();
+    let pack_id = pack.pack_id.clone();
+    assert_eq!(pack.assets.len(), 1);
+    assert!(
+        replica
+            .blob(&pack.assets[0].content_sha256)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        replica.missing_blobs().unwrap(),
+        vec![pack.assets[0].content_sha256.clone()]
+    );
+    assert_eq!(proxy.stop().await, 1);
+
+    drop(replica);
+    let mut resumed = LocalReplica::open(replica_path, &device_id).unwrap();
+    let acquisition = ReviewPackAcquisition::new(&client);
+    assert_eq!(
+        acquisition.resume_active(&mut resumed).await.unwrap(),
+        Some(pack_id.clone())
+    );
+    assert_eq!(
+        resumed.blob(&pack.assets[0].content_sha256).unwrap(),
+        Some(asset)
+    );
+    assert_eq!(
+        resumed.active_review_pack().unwrap().unwrap().pack_id,
+        pack_id
+    );
+    assert_eq!(
+        client.review_pack(&pack_id).await.unwrap().pack.pack_id,
+        pack_id
+    );
+    resumed
+        .answer(
+            &pack_id,
+            OfflineAnswer {
+                attempt_id: "offline-pack-attempt".into(),
+                session_position: 0,
+                response: OfflineResponse::Text("Answer".into()),
+                accepted_success: None,
+                desired_suspended: false,
+                answered_at_us: pack.issued_at_us + 1,
+                fuzz_sample: 0.0,
+            },
+        )
+        .unwrap();
+    acquisition.abandon(&mut resumed, &pack_id).await.unwrap();
+    assert_eq!(
+        resumed.review_pack(&pack_id).unwrap().unwrap().status,
+        "abandoned"
+    );
+    assert_eq!(
+        resumed
+            .next_device_upload()
+            .unwrap()
+            .unwrap()
+            .operation_id(),
+        "offline-pack-attempt"
+    );
+    assert!(client.active_review_pack().await.unwrap().pack.is_none());
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn invalid_pack_capture_rolls_back_the_pack_and_session() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let media_type = format!("a/{}", "b".repeat(254));
+    assert_eq!(media_type.len(), 256);
+    let path = put_review_asset_with_media(
+        &daemon.base_url,
+        &raw_token,
+        b"invalid pack media",
+        &media_type,
+    )
+    .await;
+    let thema_id = create_review_thema_with_asset(&daemon.base_url, &raw_token, &path).await;
+    let request = ReviewSessionRequestV1 {
+        source: manual_source(thema_id),
+        target_count: None,
+    };
+
+    assert!(matches!(
+        client.create_review_pack(&request).await,
+        Err(HttpClientError::Server(_))
+    ));
+    assert!(client.active_review_pack().await.unwrap().pack.is_none());
+    assert_no_active_session(&daemon.socket).await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn cli_routes_review_recovery_and_mutations_through_http() {
     let daemon = RunningDaemon::start().await;
     let (_, raw_token) = create_device(&daemon.socket).await;
@@ -438,6 +574,120 @@ async fn review_operations_reject_mismatched_success_identities() {
         ));
         raw.task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn review_pack_client_rejects_mismatched_and_corrupt_responses() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
+    let raw = spawn_json_server(fixture["pack"].clone()).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert!(matches!(
+        client.review_pack("another-pack").await,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
+    raw.task.await.unwrap();
+
+    let mut inactive = fixture["pack"].clone();
+    inactive["pack"]["status"] = json!("abandoned");
+    let raw = spawn_json_response("201 Created", inactive).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    let request = ReviewSessionRequestV1 {
+        source: manual_source("thema".into()),
+        target_count: None,
+    };
+    assert!(matches!(
+        client.create_review_pack(&request).await,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
+    raw.task.await.unwrap();
+
+    let mut completed = fixture["pack"]["pack"].clone();
+    completed["status"] = json!("completed");
+    completed["current_position"] = json!(1);
+    let raw = spawn_json_server(json!({"version": 2, "pack": completed})).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert!(matches!(
+        client.active_review_pack().await,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
+    raw.task.await.unwrap();
+
+    let expected = b"asset";
+    let digest = format!("{:x}", Sha256::digest(expected));
+    let raw = spawn_raw_server(
+        b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 5\r\nConnection: close\r\n\r\nother",
+    )
+    .await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    let asset = ReviewPackAssetV2 {
+        logical_path: format!("assets/{digest}/image.png"),
+        content_sha256: digest,
+        size_bytes: 5,
+        media_type: "image/png".into(),
+    };
+    assert!(matches!(
+        client.review_pack_asset("pack", &asset).await,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
+    raw.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn review_pack_client_requires_exact_success_statuses() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
+    let request = ReviewSessionRequestV1 {
+        source: manual_source("thema".into()),
+        target_count: None,
+    };
+
+    let raw = spawn_json_server(fixture["pack"].clone()).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(client.create_review_pack(&request).await);
+    raw.task.await.unwrap();
+
+    let active = json!({"version": 2, "pack": fixture["pack"]["pack"].clone()});
+    let raw = spawn_json_response("201 Created", active).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(client.active_review_pack().await);
+    raw.task.await.unwrap();
+
+    let raw = spawn_json_response("201 Created", fixture["pack"].clone()).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(client.review_pack("pack").await);
+    raw.task.await.unwrap();
+
+    let mut abandoned = fixture["pack"].clone();
+    abandoned["pack"]["status"] = json!("abandoned");
+    let pack_id = abandoned["pack"]["pack_id"].as_str().unwrap().to_owned();
+    let raw = spawn_json_response("201 Created", abandoned).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(client.abandon_review_pack(&pack_id).await);
+    raw.task.await.unwrap();
+
+    let bytes = b"asset";
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let raw = spawn_raw_server(
+        b"HTTP/1.1 206 Partial Content\r\nContent-Type: image/png\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset",
+    )
+    .await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    let asset = ReviewPackAssetV2 {
+        logical_path: format!("assets/{digest}/image.png"),
+        content_sha256: digest,
+        size_bytes: 5,
+        media_type: "image/png".into(),
+    };
+    assert_invalid_response(client.review_pack_asset("pack", &asset).await);
+    raw.task.await.unwrap();
+}
+
+fn assert_invalid_response<T>(result: Result<T, HttpClientError>) {
+    assert!(matches!(
+        result,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
 }
 
 #[tokio::test]
@@ -1385,20 +1635,71 @@ fn review_thema_request() -> ThemaWriteRequestV1 {
     }
 }
 
-async fn create_review_thema(base_url: &str, token: &str) -> String {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .retry(reqwest::retry::never())
-        .no_proxy()
-        .tls_backend_rustls()
-        .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
-        .build()
+async fn put_review_asset(base_url: &str, token: &str, bytes: &[u8]) -> String {
+    put_review_asset_with_media(base_url, token, bytes, "image/png").await
+}
+
+async fn put_review_asset_with_media(
+    base_url: &str,
+    token: &str,
+    bytes: &[u8],
+    media_type: &str,
+) -> String {
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let path = format!("assets/{digest}/image.png");
+    let response = raw_http_client()
+        .put(format!("{base_url}/v1/assets/{digest}/image.png"))
+        .bearer_auth(token)
+        .header("content-type", media_type)
+        .body(bytes.to_vec())
+        .send()
+        .await
         .unwrap();
-    let response = client
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    path
+}
+
+async fn assert_no_active_session(socket: &Path) {
+    let response = request(
+        socket,
+        &RequestEnvelope {
+            version: PROTOCOL_VERSION,
+            id: "active-session".into(),
+            request: Request::ReviewSessionActive {},
+        },
+    )
+    .await
+    .unwrap();
+    let ResponseOutcome::Success { result } = response.outcome else {
+        panic!("active session query failed");
+    };
+    let ResponseResult::ActiveReviewSession(active) = *result else {
+        panic!("unexpected active session response");
+    };
+    assert!(active.session.is_none());
+}
+
+async fn create_review_thema_with_asset(base_url: &str, token: &str, asset_path: &str) -> String {
+    let mut input = review_thema_request();
+    input.review_image = Some(asset_path.to_owned());
+    input.asset_paths = vec![asset_path.to_owned()];
+    create_review_thema_from(base_url, token, &input).await
+}
+
+async fn create_review_thema(base_url: &str, token: &str) -> String {
+    create_review_thema_from(base_url, token, &review_thema_request()).await
+}
+
+async fn create_review_thema_from(
+    base_url: &str,
+    token: &str,
+    input: &ThemaWriteRequestV1,
+) -> String {
+    let response = raw_http_client()
         .post(format!("{base_url}/v1/themata"))
         .bearer_auth(token)
         .header("content-type", "application/json")
-        .body(serde_json::to_vec(&review_thema_request()).unwrap())
+        .body(serde_json::to_vec(input).unwrap())
         .send()
         .await
         .unwrap();
@@ -1408,6 +1709,17 @@ async fn create_review_thema(base_url: &str, token: &str) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn raw_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .no_proxy()
+        .tls_backend_rustls()
+        .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+        .build()
+        .unwrap()
 }
 
 struct RawServer {

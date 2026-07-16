@@ -84,6 +84,10 @@ client may open the core database directly.
   required blobs, and drains the shared outbox strictly by device sequence.
   Unknown mutation delivery stops synchronization with the operation identity
   intact; the next explicit run replays that exact immutable operation.
+- `src/client_review.rs` owns explicit review-pack acquisition. It persists the
+  typed pack before downloading its content-addressed assets, verifies every
+  asset, and resumes an incomplete download through the server's active-pack
+  resource after a client restart. Periodic replica sync never creates a pack.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` routes review attempt recovery and revisioned desired-state
   operations through `HttpClient`. Operator commands and remaining compatibility

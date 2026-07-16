@@ -19,7 +19,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    application::{MAX_OFFLINE_ASSET_BYTES, valid_operation_id},
+    application::{MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, valid_operation_id},
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
@@ -28,15 +28,16 @@ use crate::{
         MAX_OFFLINE_ASSET_OPERATION_BYTES, MAX_OFFLINE_ASSET_RESULT_BYTES,
         MAX_OFFLINE_CONTENT_OPERATION_BYTES, MAX_OFFLINE_CONTENT_RESULT_BYTES,
         MAX_OFFLINE_REVIEW_OPERATION_BYTES, MAX_OFFLINE_REVIEW_RESULT_BYTES,
-        MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
+        MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES, decode_review_pack,
         http_v1::{
-            ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
-            ContentCapabilitiesV1, DocumentMutationResultV1, NoteRenameRequestV1,
-            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
-            ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
-            ReviewAttemptV1, ReviewCommitResponseV1, ReviewSessionModeV1, ReviewSessionRequestV1,
-            ReviewSessionStatusV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
-            SetSuspensionRequestV1, StagedBlobV1, valid_bearer_token,
+            ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, DocumentMutationResultV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
+            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1,
+            ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2, ReviewSessionModeV1,
+            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, valid_bearer_token,
         },
     },
 };
@@ -101,6 +102,70 @@ impl HttpClient {
 
     pub async fn asset_capabilities(&self) -> Result<AssetCapabilitiesV1, HttpClientError> {
         self.get_json("v1/sync/asset-capabilities").await
+    }
+
+    pub async fn create_review_pack(
+        &self,
+        input: &ReviewSessionRequestV1,
+    ) -> Result<ReviewPackEnvelopeV2, HttpClientError> {
+        let request = self.post_review_json("v1/review/packs", input)?;
+        let response = execute_json_exact(
+            request,
+            MAX_OFFLINE_REVIEW_RESULT_BYTES,
+            StatusCode::CREATED,
+        )
+        .await?;
+        checked_review_pack(response, None, Some(ReviewPackStatusV2::Active))
+    }
+
+    pub async fn active_review_pack(&self) -> Result<ActiveReviewPackEnvelopeV2, HttpClientError> {
+        let url = self.endpoint("v1/review/packs/active")?;
+        let response = execute_json_exact(
+            self.client.get(url),
+            MAX_OFFLINE_REVIEW_RESULT_BYTES,
+            StatusCode::OK,
+        )
+        .await?;
+        checked_active_review_pack(response)
+    }
+
+    pub async fn review_pack(
+        &self,
+        pack_id: &str,
+    ) -> Result<ReviewPackEnvelopeV2, HttpClientError> {
+        let url = self.review_resource_endpoint("packs", pack_id, None)?;
+        let response = execute_json_exact(
+            self.client.get(url),
+            MAX_OFFLINE_REVIEW_RESULT_BYTES,
+            StatusCode::OK,
+        )
+        .await?;
+        checked_review_pack(response, Some(pack_id), None)
+    }
+
+    pub async fn abandon_review_pack(
+        &self,
+        pack_id: &str,
+    ) -> Result<ReviewPackEnvelopeV2, HttpClientError> {
+        let url = self.review_resource_endpoint("packs", pack_id, Some("abandon"))?;
+        let response = execute_json_exact(
+            self.client.post(url),
+            MAX_OFFLINE_REVIEW_RESULT_BYTES,
+            StatusCode::OK,
+        )
+        .await?;
+        checked_review_pack(response, Some(pack_id), Some(ReviewPackStatusV2::Abandoned))
+    }
+
+    pub async fn review_pack_asset(
+        &self,
+        pack_id: &str,
+        asset: &ReviewPackAssetV2,
+    ) -> Result<Vec<u8>, HttpClientError> {
+        let url = self.review_pack_asset_endpoint(pack_id, asset)?;
+        let limit = usize::try_from(asset.size_bytes).map_err(|_| invalid_response())?;
+        let bytes = execute_pack_asset(self.client.get(url), limit, &asset.media_type).await?;
+        checked_pack_asset(bytes, asset)
     }
 
     pub async fn snapshot(
@@ -444,6 +509,25 @@ impl HttpClient {
         drop(segments);
         Ok(url)
     }
+
+    fn review_pack_asset_endpoint(
+        &self,
+        pack_id: &str,
+        asset: &ReviewPackAssetV2,
+    ) -> Result<Url, HttpClientError> {
+        require_review_id(pack_id)?;
+        require_pack_asset(asset)?;
+        let name = asset_name(asset)?;
+        let mut url = self.endpoint("v1/review/packs/")?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .pop_if_empty()
+            .push(pack_id)
+            .push("assets")
+            .push(&asset.content_sha256)
+            .push(name);
+        Ok(url)
+    }
 }
 
 impl fmt::Debug for HttpClient {
@@ -561,6 +645,74 @@ fn require_review_operation(
         Ok(())
     } else {
         Err(HttpClientError::InvalidReview)
+    }
+}
+
+fn checked_review_pack(
+    response: ReviewPackEnvelopeV2,
+    expected_id: Option<&str>,
+    expected_status: Option<ReviewPackStatusV2>,
+) -> Result<ReviewPackEnvelopeV2, HttpClientError> {
+    if expected_id.is_some_and(|expected| response.pack.pack_id != expected)
+        || expected_status.is_some_and(|expected| response.pack.status != expected)
+        || decode_review_pack(response.clone()).is_err()
+    {
+        Err(invalid_response())
+    } else {
+        Ok(response)
+    }
+}
+
+fn checked_active_review_pack(
+    response: ActiveReviewPackEnvelopeV2,
+) -> Result<ActiveReviewPackEnvelopeV2, HttpClientError> {
+    let valid = response.pack.as_ref().is_none_or(|pack| {
+        checked_review_pack(
+            ReviewPackEnvelopeV2 {
+                version: response.version,
+                pack: pack.clone(),
+            },
+            None,
+            Some(ReviewPackStatusV2::Active),
+        )
+        .is_ok()
+    });
+    valid.then_some(response).ok_or_else(invalid_response)
+}
+
+fn require_pack_asset(asset: &ReviewPackAssetV2) -> Result<(), HttpClientError> {
+    let name = asset_name(asset)?;
+    let expected = canonical_asset_path(&asset.content_sha256, name)
+        .map_err(|_| HttpClientError::InvalidReview)?;
+    if expected == asset.logical_path
+        && asset.size_bytes <= MAX_OFFLINE_ASSET_BYTES
+        && HeaderValue::from_str(&asset.media_type).is_ok()
+    {
+        Ok(())
+    } else {
+        Err(HttpClientError::InvalidReview)
+    }
+}
+
+fn asset_name(asset: &ReviewPackAssetV2) -> Result<&str, HttpClientError> {
+    asset
+        .logical_path
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .filter(|name| !name.is_empty())
+        .ok_or(HttpClientError::InvalidReview)
+}
+
+fn checked_pack_asset(
+    bytes: Vec<u8>,
+    asset: &ReviewPackAssetV2,
+) -> Result<Vec<u8>, HttpClientError> {
+    let size = u64::try_from(bytes.len()).map_err(|_| invalid_response())?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if size == asset.size_bytes && digest == asset.content_sha256 {
+        Ok(bytes)
+    } else {
+        Err(invalid_response())
     }
 }
 
@@ -745,6 +897,22 @@ async fn execute_json<T: DeserializeOwned>(
     request: RequestBuilder,
     max_bytes: usize,
 ) -> Result<T, HttpClientError> {
+    execute_json_response(request, max_bytes, None).await
+}
+
+async fn execute_json_exact<T: DeserializeOwned>(
+    request: RequestBuilder,
+    max_bytes: usize,
+    expected: StatusCode,
+) -> Result<T, HttpClientError> {
+    execute_json_response(request, max_bytes, Some(expected)).await
+}
+
+async fn execute_json_response<T: DeserializeOwned>(
+    request: RequestBuilder,
+    max_bytes: usize,
+    expected: Option<StatusCode>,
+) -> Result<T, HttpClientError> {
     let response = request.send().await.map_err(transport_error)?;
     let status = response.status();
     if !is_json(&response) {
@@ -756,7 +924,9 @@ async fn execute_json<T: DeserializeOwned>(
         MAX_ERROR_BODY_BYTES
     };
     let bytes = read_bounded(response, limit).await?;
-    if status.is_success() {
+    if expected.is_some_and(|expected| status != expected) && status.is_success() {
+        Err(invalid_response())
+    } else if status.is_success() {
         serde_json::from_slice(&bytes).map_err(|_| invalid_response())
     } else {
         server_error(status, &bytes)
@@ -775,6 +945,40 @@ async fn execute_bytes(
         return Err(invalid_response());
     }
     let status = response.status();
+    let bytes = read_bounded(response, MAX_ERROR_BODY_BYTES).await?;
+    server_error(status, &bytes)
+}
+
+async fn execute_pack_asset(
+    request: RequestBuilder,
+    max_bytes: usize,
+    expected_media_type: &str,
+) -> Result<Vec<u8>, HttpClientError> {
+    let response = request.send().await.map_err(transport_error)?;
+    let status = response.status();
+    if status.is_success() && status != StatusCode::OK {
+        return Err(invalid_response());
+    }
+    if !status.is_success() {
+        return execute_error_response(response, status).await;
+    }
+    let media_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if !media_type.is_some_and(|value| value.eq_ignore_ascii_case(expected_media_type)) {
+        return Err(invalid_response());
+    }
+    read_bounded(response, max_bytes).await
+}
+
+async fn execute_error_response<T>(
+    response: Response,
+    status: StatusCode,
+) -> Result<T, HttpClientError> {
+    if !is_json(&response) {
+        return Err(invalid_response());
+    }
     let bytes = read_bounded(response, MAX_ERROR_BODY_BYTES).await?;
     server_error(status, &bytes)
 }
@@ -931,7 +1135,6 @@ impl HttpClientError {
 mod tests {
     use std::path::PathBuf;
 
-    use serde_json::Value;
     use tempfile::TempDir;
     use tokio::{io::AsyncReadExt as _, net::TcpListener, sync::oneshot, time::timeout};
 
@@ -943,7 +1146,7 @@ mod tests {
         client_replica::{LocalReplica, OfflineAnswer, OfflineResponse},
         protocol::{
             DaemonConfig, DaemonServer, offline_asset_capabilities, offline_content_capabilities,
-            replica_snapshot_page, replica_state_response, review_pack_json,
+            replica_snapshot_page, replica_state_response, review_pack_response,
         },
         service::ServiceRuntime,
     };
@@ -1030,7 +1233,7 @@ mod tests {
         token: String,
         state: ReplicaStateV1,
         snapshot: ReplicaSnapshotPageV1,
-        pack: Value,
+        pack: ReviewPackEnvelopeV2,
     }
 
     async fn prepare_review_fixture() -> ReviewFixture {
@@ -1066,7 +1269,7 @@ mod tests {
             token,
             state: replica_state_response(&state).unwrap(),
             snapshot: replica_snapshot_page(&snapshot).unwrap(),
-            pack: review_pack_json(&pack).unwrap(),
+            pack: review_pack_response(&pack).unwrap(),
         }
     }
 

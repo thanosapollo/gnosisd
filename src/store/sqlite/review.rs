@@ -12,19 +12,17 @@ use super::{
 };
 use crate::{
     application::{
-        AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineConflictReason, OfflineReviewOperation,
-        OfflineReviewResult, ParametersSnapshot, PresentationSnapshot, ReconciliationStatus,
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptOperationStatus, ReviewAttemptState, ReviewAttemptView,
-        ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
-        ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot,
-        TransitionSnapshot, presentation_content, review_day_at, review_question,
-        validate_offline_thema_assets,
+        AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, MAX_REVIEW_PACK_ITEMS,
+        OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot,
+        PresentationSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
+        ReviewAttemptView, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
+        ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
+        ReviewStateSnapshot, TransitionSnapshot, presentation_content, review_day_at,
+        review_question, validate_offline_thema_assets, validate_review_pack_projection,
     },
     domain::{GradeError, MATCHER_VERSION, compute_transition, fuzz_delta, grade},
 };
-
-const MAX_REVIEW_PACK_ITEMS: usize = 500;
 
 struct LocalReviewReplay<'a> {
     request_id: &'a str,
@@ -154,6 +152,7 @@ impl SqliteStore {
         )?;
         capture_review_pack(&transaction, &ids, &queue)?;
         let pack = load_review_pack(&transaction, &ids.pack_id)?.ok_or(StoreError::NotFound)?;
+        validate_review_pack_projection(&pack).map_err(|_| StoreError::InvalidReviewState)?;
         if serde_json::to_vec(&pack)
             .map_err(StoreError::storage)?
             .len()
@@ -1393,8 +1392,9 @@ fn insert_pack_assets(
                  )
                  SELECT ?1, asset.asset_path, asset.blob_sha256, blob.size_bytes, blob.media_type
                  FROM managed_asset AS asset JOIN blob ON blob.content_sha256 = asset.blob_sha256
-                 WHERE asset.asset_path = ?2 AND asset.active = 1",
-                params![pack_id, path],
+                 WHERE asset.asset_path = ?2 AND asset.active = 1
+                   AND blob.size_bytes <= ?3",
+                params![pack_id, path, MAX_OFFLINE_ASSET_BYTES],
             )
             .map_err(StoreError::storage)?;
         let captured: bool = transaction
@@ -2891,11 +2891,13 @@ mod tests {
         load_review_pack,
     };
     use crate::application::{
-        AnswerInput, OfflineConflictReason, OfflineReviewOperation, ReconciliationStatus,
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationStatus,
-        ReviewOperationAuthority, ReviewSource, ReviewSourceKind, generate_device, prepare_thema,
-        presentation_content, review_day_at, thema_content,
+        AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_ID_CHARS, OfflineConflictReason,
+        OfflineReviewOperation, ReconciliationStatus, ReviewAttemptMutation,
+        ReviewAttemptOperation, ReviewAttemptOperationStatus, ReviewOperationAuthority,
+        ReviewSource, ReviewSourceKind, canonical_asset_path, generate_device, prepare_asset,
+        prepare_thema, presentation_content, review_day_at, thema_content,
     };
+    use crate::blob::BlobMeta;
     use crate::store::sqlite::{
         INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION, SERVER_MIGRATION,
         migrate,
@@ -3597,6 +3599,81 @@ mod tests {
             store.create_review_pack(
                 1,
                 &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            ),
+            Err(crate::store::StoreError::InvalidReviewState)
+        ));
+        assert_eq!(store.active_review_pack(Some(&device_id)).unwrap(), None);
+        assert_eq!(store.active_review_session(Some(&device_id)).unwrap(), None);
+    }
+
+    #[test]
+    fn review_pack_rejects_oversized_assets_without_starting_a_session() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let digest = "a".repeat(64);
+        let path = canonical_asset_path(&digest, "image.png").unwrap();
+        let asset = prepare_asset(path.clone(), "image.png".into(), None).unwrap();
+        store
+            .put_asset(
+                &asset,
+                &BlobMeta {
+                    sha256: digest,
+                    size_bytes: MAX_OFFLINE_ASSET_BYTES + 1,
+                    media_type: "image/png".into(),
+                },
+                1,
+                None,
+            )
+            .unwrap();
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![None],
+            vec!["answer".into()],
+            None,
+            None,
+            Some(path.clone()),
+        )
+        .unwrap();
+        let thema = prepare_thema(
+            Some("thema".into()),
+            content,
+            vec![],
+            vec![],
+            vec![path],
+            None,
+        )
+        .unwrap();
+        store.put_thema(&thema, 20260715, 2, None).unwrap();
+        let device_id = add_device(&mut store, "offline");
+
+        assert!(matches!(
+            store.create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            ),
+            Err(crate::store::StoreError::InvalidReviewState)
+        ));
+        assert_eq!(store.active_review_pack(Some(&device_id)).unwrap(), None);
+        assert_eq!(store.active_review_session(Some(&device_id)).unwrap(), None);
+    }
+
+    #[test]
+    fn review_pack_rejects_overlong_thema_ids_without_starting_a_session() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let thema_id = "x".repeat(MAX_REVIEW_PACK_ID_CHARS + 1);
+        add_thema(&mut store, &thema_id, "Question", None);
+        let device_id = add_device(&mut store, "offline");
+
+        assert!(matches!(
+            store.create_review_pack(
+                1,
+                &manual_source(&thema_id),
                 Some(1),
                 &device_id,
                 1_752_600_000_000_000,

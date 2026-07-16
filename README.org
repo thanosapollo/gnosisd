@@ -155,6 +155,13 @@ replays the same immutable operation and receives its retained result. SSE
 cursor announcements are advisory wakeups, so callers must also synchronize
 periodically because Unix-socket writes do not emit HTTP events.
 
+~client_review::ReviewPackAcquisition~ is the explicit offline-review download
+path. It uses typed pack resources, persists the leased pack before fetching
+assets, verifies asset path, media type, size, and SHA-256, and resumes a
+partial download from ~/v1/review/packs/active~ after restart. Abandonment is
+applied to the replica's mutable progress while the captured pack remains
+immutable. Normal replica synchronization never creates a review pack.
+
 * Storage
 
 Schema v12 stores native themata, tags, node associations, scheduling state,

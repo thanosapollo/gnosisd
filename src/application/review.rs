@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Datelike, Duration, Utc};
 use chrono_tz::Tz;
 use regex::RegexBuilder;
@@ -8,6 +10,12 @@ use unicode_script::{Script, UnicodeScript};
 use crate::domain::{
     ReviewState, SchedulerParameters, StructuredResponse, ThemaContent, ThemaKind, Transition,
     compute_transition, fuzz_delta, grade,
+};
+use crate::is_canonical_sha256;
+
+use super::{
+    MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_ID_CHARS, MAX_REVIEW_PACK_ITEMS,
+    MAX_REVIEW_PACK_MEDIA_TYPE_CHARS, validate_asset_path,
 };
 
 const MAX_TOPIC_DEPTH: u32 = 32;
@@ -544,6 +552,77 @@ pub(crate) struct ReviewPackView {
     pub(crate) assets: Vec<ReviewPackAsset>,
 }
 
+pub(crate) fn validate_review_pack_projection(pack: &ReviewPackView) -> Result<(), ReviewError> {
+    if !valid_pack_header(pack) || !valid_pack_assets(pack) || !valid_pack_items(pack) {
+        return Err(ReviewError::Pack);
+    }
+    Ok(())
+}
+
+fn valid_pack_header(pack: &ReviewPackView) -> bool {
+    let ids = [
+        &pack.pack_id,
+        &pack.session_id,
+        &pack.device_id,
+        &pack.lease_id,
+    ];
+    let progress = match pack.status.as_str() {
+        "active" => (pack.current_position as usize) < pack.items.len(),
+        "completed" => pack.current_position as usize == pack.items.len(),
+        "abandoned" => pack.current_position as usize <= pack.items.len(),
+        _ => false,
+    };
+    pack.format_version == 1
+        && ids
+            .into_iter()
+            .all(|id| bounded_chars(id, MAX_REVIEW_PACK_ID_CHARS))
+        && !pack.cursor_server_id.is_empty()
+        && !pack.cursor_token.is_empty()
+        && pack.issued_at_us > 0
+        && pack.day_boundary_hour <= 23
+        && (1..=MAX_REVIEW_PACK_ITEMS).contains(&pack.items.len())
+        && progress
+}
+
+fn valid_pack_assets(pack: &ReviewPackView) -> bool {
+    let paths = pack
+        .assets
+        .iter()
+        .map(|asset| asset.logical_path.as_str())
+        .collect::<BTreeSet<_>>();
+    paths.len() == pack.assets.len()
+        && pack.assets.iter().all(|asset| {
+            is_canonical_sha256(&asset.content_sha256)
+                && asset.size_bytes <= MAX_OFFLINE_ASSET_BYTES
+                && bounded_chars(&asset.media_type, MAX_REVIEW_PACK_MEDIA_TYPE_CHARS)
+                && validate_asset_path(&asset.logical_path).is_ok()
+                && asset.logical_path.split('/').nth(1) == Some(asset.content_sha256.as_str())
+        })
+}
+
+fn valid_pack_items(pack: &ReviewPackView) -> bool {
+    let paths = pack
+        .assets
+        .iter()
+        .map(|asset| asset.logical_path.as_str())
+        .collect::<BTreeSet<_>>();
+    pack.items.iter().enumerate().all(|(position, item)| {
+        item.position as usize == position
+            && bounded_chars(&item.thema_id, MAX_REVIEW_PACK_ID_CHARS)
+            && is_canonical_sha256(&item.content_sha256)
+            && item.asset_paths.iter().collect::<BTreeSet<_>>().len() == item.asset_paths.len()
+            && item
+                .asset_paths
+                .iter()
+                .all(|path| paths.contains(path.as_str()))
+    })
+}
+
+fn bounded_chars(value: &str, maximum: usize) -> bool {
+    let length = value.chars().count();
+    (1..=maximum).contains(&length)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OfflineReviewOperation {
@@ -1015,6 +1094,8 @@ pub(crate) enum ReviewError {
     Clock,
     #[error("review attempt operation is invalid")]
     Operation,
+    #[error("review pack projection is invalid")]
+    Pack,
 }
 
 #[cfg(test)]

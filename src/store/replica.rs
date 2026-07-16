@@ -417,6 +417,23 @@ impl LocalReplicaStore {
         Ok(())
     }
 
+    pub(crate) fn missing_projection_blobs(&self) -> Result<Vec<String>, LocalReplicaError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT projection.content_sha256
+                 FROM replica_projection_blob AS projection
+                 LEFT JOIN replica_blob AS blob USING(content_sha256)
+                 WHERE blob.content_sha256 IS NULL ORDER BY projection.content_sha256",
+            )
+            .map_err(LocalReplicaError::Storage)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(LocalReplicaError::Storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(LocalReplicaError::Storage)
+    }
+
     pub(crate) fn missing_blobs(&self) -> Result<Vec<String>, LocalReplicaError> {
         let mut statement = self
             .connection
@@ -510,6 +527,10 @@ impl LocalReplicaStore {
         let json = serde_json::to_string(pack).map_err(|_| LocalReplicaError::Corrupt)?;
         if let Some(existing) = stored_pack_json(&transaction, &pack.pack_id)? {
             if existing == json {
+                transaction.commit().map_err(LocalReplicaError::Storage)?;
+                return Ok(());
+            }
+            if apply_existing_pack_update(&transaction, &existing, pack)? {
                 transaction.commit().map_err(LocalReplicaError::Storage)?;
                 return Ok(());
             }
@@ -1717,6 +1738,55 @@ fn stored_pack_json(
         .map_err(LocalReplicaError::Storage)
 }
 
+fn apply_existing_pack_update(
+    transaction: &Transaction<'_>,
+    existing: &str,
+    replacement: &ReviewPackView,
+) -> Result<bool, LocalReplicaError> {
+    let mut expected: ReviewPackView =
+        serde_json::from_str(existing).map_err(|_| LocalReplicaError::Corrupt)?;
+    expected.status = replacement.status.clone();
+    expected.current_position = replacement.current_position;
+    if expected != *replacement {
+        return Ok(false);
+    }
+    match replacement.status.as_str() {
+        "active" => Ok(true),
+        "abandoned" => update_pack_status(transaction, replacement, "abandoned").map(|()| true),
+        "completed" if local_pack_status(transaction, &replacement.pack_id)? == "completed" => {
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn local_pack_status(
+    transaction: &Transaction<'_>,
+    pack_id: &str,
+) -> Result<String, LocalReplicaError> {
+    transaction
+        .query_row(
+            "SELECT status FROM replica_review_progress WHERE pack_id = ?1",
+            [pack_id],
+            |row| row.get(0),
+        )
+        .map_err(LocalReplicaError::Storage)
+}
+
+fn update_pack_status(
+    transaction: &Transaction<'_>,
+    pack: &ReviewPackView,
+    status: &str,
+) -> Result<(), LocalReplicaError> {
+    transaction
+        .execute(
+            "UPDATE replica_review_progress SET status = ?2 WHERE pack_id = ?1",
+            params![pack.pack_id, status],
+        )
+        .map_err(LocalReplicaError::Storage)?;
+    Ok(())
+}
+
 fn insert_review_pack(
     transaction: &Transaction<'_>,
     pack: &ReviewPackView,
@@ -2872,7 +2942,8 @@ mod tests {
             "../../tests/fixtures/protocol/offline-review-v1.json"
         ))
         .unwrap();
-        let pack = decode_review_pack(fixture["pack"].clone()).unwrap();
+        let response = serde_json::from_value(fixture["pack"].clone()).unwrap();
+        let pack = decode_review_pack(response).unwrap();
         let operation: OfflineReviewOperation =
             serde_json::from_value(fixture["submission"]["operation"].clone()).unwrap();
         let pack_json = serde_json::to_string(&pack).unwrap();

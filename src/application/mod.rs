@@ -10,6 +10,10 @@ mod review;
 mod settings;
 mod sync;
 
+pub(crate) const MAX_REVIEW_PACK_ID_CHARS: usize = 128;
+pub(crate) const MAX_REVIEW_PACK_ITEMS: usize = 500;
+pub(crate) const MAX_REVIEW_PACK_MEDIA_TYPE_CHARS: usize = 255;
+
 pub(crate) use auth::{
     DevicePrincipal, DeviceRecord, DeviceScope, NewDevice, generate_device, parse_stored_scopes,
     stored_scopes, token_digest,
@@ -53,6 +57,7 @@ pub(crate) use review::{
     ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
     ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation,
     presentation_content, review_day_at, review_question, valid_operation_id,
+    validate_review_pack_projection,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};
 pub(crate) use sync::{
