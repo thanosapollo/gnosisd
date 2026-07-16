@@ -91,7 +91,9 @@ client may open the core database directly.
   resource after a client restart, and exposes only answer-concealed question
   projections to user interfaces. Periodic replica sync never creates a pack.
 - `src/protocol/client_v1.rs` owns versioned DTOs exchanged with local replica
-  clients. Raw review packs and immutable outbox payloads are persistence
+  clients. It exposes answer-concealed questions, verified pack assets, safe
+  reconciliation summaries, and machine-readable client failures. Raw review
+  packs, captured answers, and immutable outbox payloads are persistence
   records, not user-interface responses.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` routes replica synchronization, offline review-pack
@@ -99,7 +101,8 @@ client may open the core database directly.
   through `HttpClient`. Offline pack inspection and answer recording reopen the
   durable replica without network access. Online pack operations verify the
   replica binding without draining its outbox, and abandonment never depends on
-  downloading pack assets. Operator commands and remaining compatibility
+  downloading pack assets. Local asset and result queries are offline and never
+  expose captured answers. Operator commands and remaining compatibility
   methods still use the Unix socket; ordinary commands must migrate before the
   corresponding Unix methods are removed.
 

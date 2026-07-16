@@ -20,6 +20,15 @@ pub struct ReviewPackAcquisition<'a> {
     client: &'a HttpClient,
 }
 
+pub struct OfflineReviewAsset {
+    pub pack_id: String,
+    pub logical_path: String,
+    pub content_sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum ReviewPackAcquisitionError {
     #[error(transparent)]
@@ -34,6 +43,37 @@ pub enum ReviewPackAcquisitionError {
     ServerIdentity,
     #[error("there is no active offline review pack")]
     NoActivePack,
+    #[error("offline review pack asset was not found")]
+    AssetNotFound,
+    #[error("offline review pack asset bytes are missing")]
+    AssetMissing,
+}
+
+pub fn offline_asset(
+    replica: &LocalReplica,
+    pack_id: &str,
+    logical_path: &str,
+) -> Result<OfflineReviewAsset, ReviewPackAcquisitionError> {
+    let pack = replica
+        .review_pack(pack_id)?
+        .ok_or(ReviewPackAcquisitionError::AssetNotFound)?;
+    let asset = pack
+        .assets
+        .into_iter()
+        .find(|asset| asset.logical_path == logical_path)
+        .ok_or(ReviewPackAcquisitionError::AssetNotFound)?;
+    let bytes = replica
+        .blob(&asset.content_sha256)?
+        .ok_or(ReviewPackAcquisitionError::AssetMissing)?;
+    require_size(&bytes, asset.size_bytes)?;
+    Ok(OfflineReviewAsset {
+        pack_id: pack_id.to_owned(),
+        logical_path: asset.logical_path,
+        content_sha256: asset.content_sha256,
+        size_bytes: asset.size_bytes,
+        media_type: asset.media_type,
+        bytes,
+    })
 }
 
 impl<'a> ReviewPackAcquisition<'a> {

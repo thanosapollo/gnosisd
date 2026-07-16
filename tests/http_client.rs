@@ -7,6 +7,7 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
     client_replica::{
@@ -18,6 +19,7 @@ use gnosis_core::{
     protocol::{
         DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseOutcome,
         ResponseResult, ServerError,
+        client_v1::{ClientDeliveryV1, ClientFailureCodeV1, ClientFailureV1},
         http_v1::{
             ApiErrorCodeV1, DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1,
             ReviewAnswerV1, ReviewPackAssetV2, ReviewSessionRequestV1, ReviewSourceInputV1,
@@ -424,6 +426,7 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
         &proxy.base_url,
         &token_path,
         &[
+            "--json-errors",
             "review-attempt-set-accepted",
             &attempt_id,
             "--operation-id",
@@ -436,9 +439,11 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
     )
     .await;
     assert!(!uncertain.status.success());
-    let error = String::from_utf8(uncertain.stderr).unwrap();
-    assert!(error.contains("review operation cli-accept failed (unknown delivery)"));
-    assert!(error.contains("use the same operation ID"));
+    let error: ClientFailureV1 = serde_json::from_slice(&uncertain.stderr).unwrap();
+    assert_eq!(error.code, ClientFailureCodeV1::Http);
+    assert_eq!(error.delivery, ClientDeliveryV1::Unknown);
+    assert_eq!(error.operation_id.as_deref(), Some("cli-accept"));
+    assert!(error.api_error.is_none());
     assert!(proxy.task.await.unwrap().starts_with(b"HTTP/1.1 200"));
 
     let accepted = run_cli(
@@ -470,6 +475,7 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
         &daemon.base_url,
         &token_path,
         &[
+            "--json-errors",
             "review-attempt-set-suspended",
             &attempt_id,
             "--operation-id",
@@ -482,9 +488,10 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
     )
     .await;
     assert!(!output_failure.status.success());
-    let error = String::from_utf8(output_failure.stderr).unwrap();
-    assert!(error.contains("review operation cli-suspend failed (confirmed delivery)"));
-    assert!(error.contains("could not write daemon response"), "{error}");
+    let error: ClientFailureV1 = serde_json::from_slice(&output_failure.stderr).unwrap();
+    assert_eq!(error.code, ClientFailureCodeV1::Output);
+    assert_eq!(error.delivery, ClientDeliveryV1::Confirmed);
+    assert_eq!(error.operation_id.as_deref(), Some("cli-suspend"));
 
     let suspended = run_cli(
         &daemon.base_url,
@@ -513,14 +520,16 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
     let missing = run_cli(
         &daemon.base_url,
         &token_path,
-        &["review-attempt-state", "missing-attempt"],
+        &["--json-errors", "review-attempt-state", "missing-attempt"],
     )
     .await;
     assert!(!missing.status.success());
-    assert!(
-        String::from_utf8(missing.stderr)
-            .unwrap()
-            .starts_with("not_found: ")
+    let error: ClientFailureV1 = serde_json::from_slice(&missing.stderr).unwrap();
+    assert_eq!(error.code, ClientFailureCodeV1::Server);
+    assert_eq!(error.delivery, ClientDeliveryV1::Confirmed);
+    assert_eq!(
+        error.api_error.unwrap().error.code(),
+        ApiErrorCodeV1::NotFound
     );
 
     let no_token = run_cli_without_token(
@@ -541,6 +550,41 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
     let error = String::from_utf8(no_token.stderr).unwrap();
     assert!(error.contains("review operation cli-no-token failed (not-sent delivery)"));
     assert!(error.contains("--token-file is required"));
+
+    let invalid_operation = "x".repeat(129);
+    let invalid = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &[
+            "--json-errors",
+            "review-attempt-set-accepted",
+            &attempt_id,
+            "--operation-id",
+            &invalid_operation,
+            "--expected-revision",
+            "0",
+            "--accepted-success",
+            "true",
+        ],
+    )
+    .await;
+    assert!(!invalid.status.success());
+    let failure: ClientFailureV1 = serde_json::from_slice(&invalid.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Input);
+    assert_eq!(failure.delivery, ClientDeliveryV1::NotSent);
+    assert!(failure.operation_id.is_none());
+
+    let invalid_token_path = daemon._directory.path().join("invalid.token");
+    write_token(&invalid_token_path, "invalid");
+    let invalid_token = run_cli(
+        &daemon.base_url,
+        &invalid_token_path,
+        &["--json-errors", "review-attempt-state", &attempt_id],
+    )
+    .await;
+    let failure: ClientFailureV1 = serde_json::from_slice(&invalid_token.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Credentials);
+    assert_eq!(failure.delivery, ClientDeliveryV1::NotSent);
     daemon.stop().await;
 }
 
@@ -582,6 +626,18 @@ async fn cli_sync_bootstraps_and_reuses_a_durable_http_replica() {
             .is_some()
     );
     drop(replica_store);
+
+    let output_failure = run_cli_to_full(
+        &daemon.base_url,
+        &token_path,
+        &["--json-errors", "sync", "--replica", replica],
+    )
+    .await;
+    assert!(!output_failure.status.success());
+    let failure: ClientFailureV1 = serde_json::from_slice(&output_failure.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Output);
+    assert_eq!(failure.delivery, ClientDeliveryV1::Confirmed);
+    assert!(failure.operation_id.is_none());
 
     let second = run_cli(
         &daemon.base_url,
@@ -641,11 +697,29 @@ async fn cli_review_pack_answers_offline_replays_and_reconciles() {
             "target_count": null
         }
     });
-    let acquired = run_cli_with_input(
+    let lost_acquire = run_cli_with_input_to_full(
         &daemon.base_url,
         &token_path,
-        &["review-pack", "acquire", "--replica", replica],
+        &[
+            "--json-errors",
+            "review-pack",
+            "acquire",
+            "--replica",
+            replica,
+        ],
         &serde_json::to_vec(&acquire).unwrap(),
+    )
+    .await;
+    assert!(!lost_acquire.status.success());
+    let failure: ClientFailureV1 = serde_json::from_slice(&lost_acquire.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Output);
+    assert_eq!(failure.delivery, ClientDeliveryV1::Confirmed);
+    assert!(failure.operation_id.is_none());
+
+    let acquired = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["review-pack", "resume", "--replica", replica],
     )
     .await;
     assert!(
@@ -681,11 +755,24 @@ async fn cli_review_pack_answers_offline_replays_and_reconciles() {
     let first_bytes = serde_json::to_vec(&first_answer).unwrap();
     let lost = run_cli_without_token_with_input_to_full(
         offline,
-        &["review-pack", "answer", "--replica", replica],
+        &[
+            "--json-errors",
+            "review-pack",
+            "answer",
+            "--replica",
+            replica,
+        ],
         &first_bytes,
     )
     .await;
     assert!(!lost.status.success());
+    let failure: ClientFailureV1 = serde_json::from_slice(&lost.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Output);
+    assert_eq!(failure.delivery, ClientDeliveryV1::Confirmed);
+    assert_eq!(
+        failure.operation_id.as_deref(),
+        Some("cli-offline-attempt-1")
+    );
 
     let replayed = run_cli_without_token_with_input(
         offline,
@@ -745,6 +832,27 @@ async fn cli_review_pack_answers_offline_replays_and_reconciles() {
     )
     .await;
     assert!(reconciled.status.success());
+    let result_request = json!({
+        "version": 1,
+        "after": null,
+        "limit": 10,
+        "conflicts_only": false
+    });
+    let local_results = run_cli_without_token_with_input(
+        offline,
+        &["review-pack", "results", "--replica", replica],
+        &serde_json::to_vec(&result_request).unwrap(),
+    )
+    .await;
+    assert!(local_results.status.success());
+    let page: serde_json::Value = serde_json::from_slice(&local_results.stdout).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    assert!(page["items"].as_array().unwrap().iter().all(|item| {
+        item["status"] == "accepted"
+            && item.get("operation").is_none()
+            && item.get("presentation").is_none()
+            && item.get("answer").is_none()
+    }));
     let replica = LocalReplica::open(&replica_path, &device_id).unwrap();
     assert!(replica.next_device_upload().unwrap().is_none());
     let results = replica.review_results(None, 10).unwrap();
@@ -754,6 +862,109 @@ async fn cli_review_pack_answers_offline_replays_and_reconciles() {
             .items
             .iter()
             .all(|result| result.outcome == OfflineReviewOutcome::Accepted)
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_review_pack_surfaces_conflicts_without_captured_answers() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let thema_id = create_review_thema(&daemon.base_url, &raw_token).await;
+    let token_path = daemon._directory.path().join("conflict.token");
+    let replica_path = daemon._directory.path().join("conflict.sqlite");
+    write_token(&token_path, &raw_token);
+    let replica = replica_path.to_str().unwrap();
+    assert!(
+        run_cli(
+            &daemon.base_url,
+            &token_path,
+            &["sync", "--replica", replica]
+        )
+        .await
+        .status
+        .success()
+    );
+    let acquire = json!({
+        "version": 1,
+        "session": {"source": manual_source(thema_id), "target_count": null}
+    });
+    let acquired = run_cli_with_input(
+        &daemon.base_url,
+        &token_path,
+        &["review-pack", "acquire", "--replica", replica],
+        &serde_json::to_vec(&acquire).unwrap(),
+    )
+    .await;
+    assert!(acquired.status.success());
+    let current: serde_json::Value = serde_json::from_slice(&acquired.stdout).unwrap();
+    let pack_id = current["question"]["pack_id"].as_str().unwrap();
+    let answer = json!({
+        "version": 1,
+        "pack_id": pack_id,
+        "attempt_id": "cli-conflicting-attempt",
+        "session_position": 0,
+        "response": {"kind": "text", "value": "Answer"},
+        "accepted_success": null,
+        "desired_suspended": false,
+        "answered_at_us": u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap(),
+        "fuzz_sample": 0.0
+    });
+    assert!(
+        run_cli_without_token_with_input(
+            "http://127.0.0.1:1",
+            &["review-pack", "answer", "--replica", replica],
+            &serde_json::to_vec(&answer).unwrap(),
+        )
+        .await
+        .status
+        .success()
+    );
+    client.abandon_review_pack(pack_id).await.unwrap();
+    assert!(
+        run_cli(
+            &daemon.base_url,
+            &token_path,
+            &["sync", "--replica", replica]
+        )
+        .await
+        .status
+        .success()
+    );
+    let request = json!({
+        "version": 1,
+        "after": null,
+        "limit": 10,
+        "conflicts_only": true
+    });
+    let result = run_cli_without_token_with_input(
+        "http://127.0.0.1:1",
+        &["review-pack", "results", "--replica", replica],
+        &serde_json::to_vec(&request).unwrap(),
+    )
+    .await;
+
+    assert!(result.status.success());
+    let page: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(page["items"][0]["status"], "conflict");
+    assert_eq!(page["items"][0]["conflict_reason"], "lease_ended");
+    assert_eq!(page["items"][0]["attempt_id"], "cli-conflicting-attempt");
+    assert!(
+        !result
+            .stdout
+            .windows(b"presentation".len())
+            .any(|value| value == b"presentation")
+    );
+    assert!(
+        !result
+            .stdout
+            .windows(b"answer".len())
+            .any(|value| value == b"answer")
     );
     daemon.stop().await;
 }
@@ -886,9 +1097,29 @@ async fn cli_review_pack_resumes_unknown_creation_and_abandons_the_active_lease(
     let pack = replica_store.active_review_pack().unwrap().unwrap();
     assert_eq!(
         replica_store.blob(&pack.assets[0].content_sha256).unwrap(),
-        Some(asset)
+        Some(asset.clone())
     );
     drop(replica_store);
+    let asset_request = json!({
+        "version": 1,
+        "pack_id": pack.pack_id.clone(),
+        "logical_path": asset_path
+    });
+    let local_asset = run_cli_without_token_with_input(
+        "http://127.0.0.1:1",
+        &["review-pack", "asset", "--replica", replica],
+        &serde_json::to_vec(&asset_request).unwrap(),
+    )
+    .await;
+    assert!(local_asset.status.success());
+    let local_asset: serde_json::Value = serde_json::from_slice(&local_asset.stdout).unwrap();
+    assert_eq!(local_asset["content_sha256"], pack.assets[0].content_sha256);
+    assert_eq!(
+        BASE64
+            .decode(local_asset["data_base64"].as_str().unwrap())
+            .unwrap(),
+        asset
+    );
 
     let abandoned = run_cli(
         &daemon.base_url,
@@ -1000,6 +1231,7 @@ async fn cli_review_pack_rejects_oversized_input_before_opening_a_replica() {
     let result = run_cli_without_token_with_input(
         "http://127.0.0.1:1",
         &[
+            "--json-errors",
             "review-pack",
             "answer",
             "--replica",
@@ -1010,9 +1242,32 @@ async fn cli_review_pack_rejects_oversized_input_before_opening_a_replica() {
     .await;
 
     assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("client request exceeds the input limit")
-    );
+    let failure: ClientFailureV1 = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Input);
+    assert_eq!(failure.delivery, ClientDeliveryV1::NotSent);
+    assert!(failure.operation_id.is_none());
+    assert!(failure.api_error.is_none());
+
+    let invalid_cursor = json!({
+        "version": 1,
+        "after": i64::MAX as u64 + 1,
+        "limit": 10,
+        "conflicts_only": false
+    });
+    let result = run_cli_without_token_with_input(
+        "http://127.0.0.1:1",
+        &[
+            "--json-errors",
+            "review-pack",
+            "results",
+            "--replica",
+            "/definitely/missing/replica.sqlite",
+        ],
+        &serde_json::to_vec(&invalid_cursor).unwrap(),
+    )
+    .await;
+    let failure: ClientFailureV1 = serde_json::from_slice(&result.stderr).unwrap();
+    assert_eq!(failure.code, ClientFailureCodeV1::Input);
 }
 
 #[tokio::test]
@@ -2179,6 +2434,15 @@ async fn run_cli_with_input(
     input: &[u8],
 ) -> Output {
     run_cli_output(base_url, Some(token_path), args, Some(input), false).await
+}
+
+async fn run_cli_with_input_to_full(
+    base_url: &str,
+    token_path: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Output {
+    run_cli_output(base_url, Some(token_path), args, Some(input), true).await
 }
 
 async fn run_cli_without_token_with_input(base_url: &str, args: &[&str], input: &[u8]) -> Output {

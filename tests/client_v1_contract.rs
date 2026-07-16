@@ -1,6 +1,9 @@
 use gnosis_core::protocol::client_v1::{
-    OfflineReviewAnswerReceiptV1, OfflineReviewAnswerRequestV1, OfflineReviewQuestionV1,
-    ReviewPackAcquireRequestV1, ReviewPackCurrentV1, ReviewPackReceiptV1,
+    ClientDeliveryV1, ClientFailureCodeV1, ClientFailureV1, OfflineReviewAnswerReceiptV1,
+    OfflineReviewAnswerRequestV1, OfflineReviewAssetRequestV1, OfflineReviewAssetV1,
+    OfflineReviewConflictReasonV1, OfflineReviewQuestionV1, OfflineReviewResultPageRequestV1,
+    OfflineReviewResultPageV1, ReviewPackAcquireRequestV1, ReviewPackCurrentV1,
+    ReviewPackReceiptV1,
 };
 use serde_json::{Value, json};
 
@@ -76,6 +79,125 @@ fn offline_review_cli_responses_are_closed_and_versioned() {
     assert_rejects_wrong_version::<ReviewPackCurrentV1>(&current);
     assert_rejects_wrong_version::<OfflineReviewAnswerReceiptV1>(&receipt);
     assert_rejects_wrong_version::<ReviewPackReceiptV1>(&pack);
+}
+
+#[test]
+fn offline_asset_contract_is_closed_and_content_addressed() {
+    let request = json!({
+        "version": 1,
+        "pack_id": "pack",
+        "logical_path": "assets/abc/image.png"
+    });
+    let response = json!({
+        "version": 1,
+        "pack_id": "pack",
+        "logical_path": "assets/abc/image.png",
+        "content_sha256": "a".repeat(64),
+        "size_bytes": 3,
+        "media_type": "image/png",
+        "data_base64": "YWJj"
+    });
+
+    assert_round_trip::<OfflineReviewAssetRequestV1>(&request);
+    assert_round_trip::<OfflineReviewAssetV1>(&response);
+    assert_rejects_wrong_version::<OfflineReviewAssetRequestV1>(&request);
+    assert_rejects_wrong_version::<OfflineReviewAssetV1>(&response);
+    assert_rejects_unknown_field::<OfflineReviewAssetRequestV1>(&request);
+    assert_rejects_unknown_field::<OfflineReviewAssetV1>(&response);
+}
+
+#[test]
+fn review_result_pages_exclude_answer_bearing_operations() {
+    let request = json!({
+        "version": 1,
+        "after": null,
+        "limit": 50,
+        "conflicts_only": true
+    });
+    let page = json!({
+        "version": 1,
+        "items": [{
+            "status": "conflict",
+            "result_sequence": 2,
+            "server_id": "a".repeat(32),
+            "attempt_id": "attempt",
+            "device_sequence": 4,
+            "conflict_reason": "content_changed"
+        }],
+        "next_after": null
+    });
+
+    assert_round_trip::<OfflineReviewResultPageRequestV1>(&request);
+    let decoded: OfflineReviewResultPageV1 = serde_json::from_value(page.clone()).unwrap();
+    assert_eq!(
+        decoded.items[0].conflict_reason(),
+        Some(OfflineReviewConflictReasonV1::ContentChanged)
+    );
+    assert_eq!(serde_json::to_value(decoded).unwrap(), page);
+    assert!(!page.to_string().contains("presentation"));
+    assert!(!page.to_string().contains("answer"));
+    assert_rejects_unknown_field::<OfflineReviewResultPageRequestV1>(&request);
+    assert_rejects_wrong_version::<OfflineReviewResultPageV1>(&page);
+
+    let mut boundary = request.clone();
+    boundary["after"] = json!(i64::MAX as u64);
+    assert_round_trip::<OfflineReviewResultPageRequestV1>(&boundary);
+    boundary["after"] = json!(i64::MAX as u64 + 1);
+    assert!(serde_json::from_value::<OfflineReviewResultPageRequestV1>(boundary).is_err());
+    for limit in [0, 101] {
+        let mut invalid = request.clone();
+        invalid["limit"] = json!(limit);
+        assert!(serde_json::from_value::<OfflineReviewResultPageRequestV1>(invalid).is_err());
+    }
+}
+
+#[test]
+fn client_failures_are_closed_and_machine_readable() {
+    let value = json!({
+        "version": 1,
+        "code": "replica",
+        "delivery": "not_sent",
+        "operation_id": null,
+        "api_error": null
+    });
+    let decoded: ClientFailureV1 = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(decoded.code, ClientFailureCodeV1::Replica);
+    assert_eq!(decoded.delivery, ClientDeliveryV1::NotSent);
+    assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    assert_rejects_wrong_version::<ClientFailureV1>(&value);
+    assert_rejects_unknown_field::<ClientFailureV1>(&value);
+
+    let mut missing_null = value.clone();
+    missing_null.as_object_mut().unwrap().remove("api_error");
+    assert!(serde_json::from_value::<ClientFailureV1>(missing_null).is_err());
+
+    let inconsistent = json!({
+        "version": 1,
+        "code": "server",
+        "delivery": "unknown",
+        "operation_id": null,
+        "api_error": null
+    });
+    assert!(serde_json::from_value::<ClientFailureV1>(inconsistent).is_err());
+
+    let uncertain_server = json!({
+        "version": 1,
+        "code": "server",
+        "delivery": "unknown",
+        "operation_id": "operation",
+        "api_error": {"error": {
+            "code": "request_timeout",
+            "message": "request outcome is unknown",
+            "meta": null
+        }}
+    });
+    assert_round_trip::<ClientFailureV1>(&uncertain_server);
+
+    for operation_id in ["", "x/invalid", "xφ"] {
+        let mut invalid = value.clone();
+        invalid["operation_id"] = json!(operation_id);
+        assert!(serde_json::from_value::<ClientFailureV1>(invalid).is_err());
+    }
 }
 
 fn answer_request() -> Value {

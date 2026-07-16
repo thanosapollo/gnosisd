@@ -111,6 +111,28 @@ gnosis --token-file "$HOME/.config/gnosis/client.token" \
 outbox drain. Use ~review-pack abandon~ while connected to release an unused
 active pack lease.
 
+Verified pack assets and retained reconciliation outcomes are also available
+without a daemon. Both commands read a closed versioned JSON request from
+standard input. Asset output includes the logical path, digest, media type,
+size, and base64 bytes. Result pages contain only accepted or conflict
+summaries; captured presentations, correct answers, responses, and raw
+operations remain private replica records.
+
+#+begin_src sh
+gnosis review-pack asset \
+  --replica "$HOME/.local/share/gnosis/client.sqlite" \
+  < offline-asset-request.json
+
+gnosis review-pack results \
+  --replica "$HOME/.local/share/gnosis/client.sqlite" \
+  < review-result-page-request.json
+#+end_src
+
+Pass ~--json-errors~ when another program invokes ~gnosis~. Failures are then
+written to standard error as a closed versioned object with a stable category,
+delivery state, optional operation ID, and the typed HTTP error when the server
+rejected the request. Human-readable errors remain the default for terminals.
+
 The Unix message format is a four-byte big-endian length followed by UTF-8
 JSON. It is the privileged local and administrative transport for diagnostics,
 legacy inspection, device token administration, and backup commands. Online

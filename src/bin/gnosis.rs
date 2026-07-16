@@ -4,19 +4,28 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
-    client_replica::{Error as LocalReplicaError, LocalReplica, OfflineAnswer, OfflineResponse},
-    client_review::{ReviewPackAcquisition, ReviewPackAcquisitionError, active_question},
+    client_replica::{
+        Error as LocalReplicaError, LocalReplica, OfflineAnswer, OfflineResponse,
+        OfflineReviewOutcome, ReconciledOfflineReview, ReviewConflictReason,
+    },
+    client_review::{
+        ReviewPackAcquisition, ReviewPackAcquisitionError, active_question, offline_asset,
+    },
     client_sync::{ReplicaSync, ReplicaSyncError},
     protocol::{
         ClientError, ErrorCode, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
         ResponseOutcome, ResponseResult,
         client_v1::{
-            OfflineReviewAnswerReceiptV1, OfflineReviewAnswerRequestV1, ReviewPackAcquireRequestV1,
-            ReviewPackCurrentV1, ReviewPackReceiptV1,
+            ClientDeliveryV1, ClientFailureCodeV1, ClientFailureV1, OfflineReviewAnswerReceiptV1,
+            OfflineReviewAnswerRequestV1, OfflineReviewAssetRequestV1, OfflineReviewAssetV1,
+            OfflineReviewConflictReasonV1, OfflineReviewResultPageRequestV1,
+            OfflineReviewResultPageV1, OfflineReviewResultV1, ReviewPackAcquireRequestV1,
+            ReviewPackCurrentV1, ReviewPackReceiptV1, valid_client_operation_id,
         },
         http_v1::{OfflineAnswerV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1},
         request,
@@ -38,6 +47,8 @@ struct Cli {
     http_url: String,
     #[arg(long, value_name = "PATH")]
     token_file: Option<PathBuf>,
+    #[arg(long)]
+    json_errors: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -135,6 +146,14 @@ enum ReviewPackCommand {
         #[arg(long, value_name = "PATH")]
         replica: PathBuf,
     },
+    Asset {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
+    Results {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
 }
 
 impl ReviewPackCommand {
@@ -146,6 +165,8 @@ impl ReviewPackCommand {
             Self::Current { .. } => "current",
             Self::Answer { .. } => "answer",
             Self::Abandon { .. } => "abandon",
+            Self::Asset { .. } => "asset",
+            Self::Results { .. } => "results",
         }
     }
 }
@@ -192,6 +213,8 @@ enum CliError {
     ClientInputTooLarge,
     #[error("client request is not valid JSON")]
     DecodeClientInput(#[source] serde_json::Error),
+    #[error("client request values are invalid")]
+    InvalidClientInput,
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
@@ -217,7 +240,13 @@ enum CliError {
     )]
     ReviewOperation {
         operation_id: String,
-        delivery: &'static str,
+        delivery: DeliveryStatus,
+        #[source]
+        source: Box<CliError>,
+    },
+    #[error("client result failed ({delivery} delivery): {source}")]
+    ClientResult {
+        delivery: DeliveryStatus,
         #[source]
         source: Box<CliError>,
     },
@@ -243,16 +272,164 @@ impl From<ReviewPackAcquisitionError> for CliError {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match run(Cli::parse()).await {
+    let cli = Cli::parse();
+    let json_errors = cli.json_errors;
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(RunError::Protocol(error)) => {
-            eprintln!("{}: {}", error_code(error.code), error.message);
+            if json_errors {
+                write_failure(&protocol_failure());
+            } else {
+                eprintln!("{}: {}", error_code(error.code), error.message);
+            }
             ExitCode::FAILURE
         }
         Err(RunError::Client(error)) => {
-            print_client_error(&error);
+            if json_errors {
+                write_failure(&client_failure(&error));
+            } else {
+                print_client_error(&error);
+            }
             ExitCode::FAILURE
         }
+    }
+}
+
+fn write_failure(failure: &ClientFailureV1) {
+    let mut output = io::stderr().lock();
+    if serde_json::to_writer(&mut output, failure).is_ok() {
+        let _ = writeln!(output);
+    }
+}
+
+fn protocol_failure() -> ClientFailureV1 {
+    failure(
+        ClientFailureCodeV1::Protocol,
+        ClientDeliveryV1::Confirmed,
+        None,
+        None,
+    )
+}
+
+fn client_failure(error: &CliError) -> ClientFailureV1 {
+    match error {
+        CliError::Http(source) => http_failure(source, None),
+        CliError::ReviewOperation {
+            operation_id,
+            delivery,
+            source,
+        } => {
+            let mut failure = client_failure(source);
+            failure.operation_id =
+                valid_client_operation_id(operation_id).then(|| operation_id.clone());
+            failure.delivery = client_delivery(*delivery);
+            failure
+        }
+        CliError::ClientResult { delivery, source } => {
+            let mut failure = client_failure(source);
+            failure.delivery = client_delivery(*delivery);
+            failure
+        }
+        CliError::Sync(source) => sync_failure(source),
+        CliError::ReviewPack(source) => review_pack_failure(source),
+        CliError::Replica(_) => local_failure(ClientFailureCodeV1::Replica),
+        CliError::MissingTokenFile
+        | CliError::ReadToken(_)
+        | CliError::TokenPermissions
+        | CliError::TokenFile => local_failure(ClientFailureCodeV1::Credentials),
+        CliError::ReadInput(_)
+        | CliError::ReadClientInput(_)
+        | CliError::ClientInputTooLarge
+        | CliError::DecodeClientInput(_)
+        | CliError::InvalidClientInput => local_failure(ClientFailureCodeV1::Input),
+        CliError::Client(_) | CliError::MissingSocket => {
+            local_failure(ClientFailureCodeV1::Protocol)
+        }
+        CliError::Encode(_) | CliError::WriteOutput(_) => {
+            local_failure(ClientFailureCodeV1::Output)
+        }
+        CliError::Path => local_failure(ClientFailureCodeV1::Path),
+    }
+}
+
+fn sync_failure(error: &ReplicaSyncError) -> ClientFailureV1 {
+    match error {
+        ReplicaSyncError::Http(source) => http_failure(source, None),
+        ReplicaSyncError::StageAsset {
+            operation, source, ..
+        }
+        | ReplicaSyncError::Upload {
+            operation, source, ..
+        } => http_failure(source, Some(operation.operation_id.clone())),
+        ReplicaSyncError::RecordResult { operation, .. } => failure(
+            ClientFailureCodeV1::Replica,
+            ClientDeliveryV1::Confirmed,
+            Some(operation.operation_id.clone()),
+            None,
+        ),
+        ReplicaSyncError::Replica(_)
+        | ReplicaSyncError::DeviceIdentity { .. }
+        | ReplicaSyncError::MissingCursor => local_failure(ClientFailureCodeV1::Synchronization),
+    }
+}
+
+fn review_pack_failure(error: &ReviewPackAcquisitionError) -> ClientFailureV1 {
+    match error {
+        ReviewPackAcquisitionError::Http(source) => http_failure(source, None),
+        ReviewPackAcquisitionError::Replica(_) => local_failure(ClientFailureCodeV1::Replica),
+        _ => local_failure(ClientFailureCodeV1::ReviewPack),
+    }
+}
+
+fn http_failure(error: &HttpClientError, operation_id: Option<String>) -> ClientFailureV1 {
+    let code = match error {
+        HttpClientError::Server(_) => ClientFailureCodeV1::Server,
+        HttpClientError::InvalidToken => ClientFailureCodeV1::Credentials,
+        HttpClientError::InvalidBaseUrl
+        | HttpClientError::InvalidCursor
+        | HttpClientError::InvalidDigest
+        | HttpClientError::InvalidUpload
+        | HttpClientError::InvalidOperationId
+        | HttpClientError::InvalidMutation
+        | HttpClientError::InvalidReview => ClientFailureCodeV1::Input,
+        _ => ClientFailureCodeV1::Http,
+    };
+    let api_error = match error {
+        HttpClientError::Server(server) => Some(server.body().clone()),
+        _ => None,
+    };
+    failure(
+        code,
+        client_delivery(error.delivery()),
+        operation_id,
+        api_error,
+    )
+}
+
+fn local_failure(code: ClientFailureCodeV1) -> ClientFailureV1 {
+    failure(code, ClientDeliveryV1::NotSent, None, None)
+}
+
+fn failure(
+    code: ClientFailureCodeV1,
+    delivery: ClientDeliveryV1,
+    operation_id: Option<String>,
+    api_error: Option<gnosis_core::protocol::http_v1::ApiErrorResponseV1>,
+) -> ClientFailureV1 {
+    ClientFailureV1 {
+        version: 1,
+        code,
+        delivery,
+        operation_id,
+        api_error,
+    }
+}
+
+const fn client_delivery(value: DeliveryStatus) -> ClientDeliveryV1 {
+    match value {
+        DeliveryStatus::NotSent => ClientDeliveryV1::NotSent,
+        DeliveryStatus::Confirmed => ClientDeliveryV1::Confirmed,
+        DeliveryStatus::Unknown => ClientDeliveryV1::Unknown,
     }
 }
 
@@ -332,7 +509,8 @@ async fn run_http_sync(
         .synchronize(&mut replica)
         .await
         .map_err(CliError::from)?;
-    write_json(&report).map_err(Into::into)
+    write_json(&report)
+        .map_err(|source| client_result_error(DeliveryStatus::Confirmed, source).into())
 }
 
 async fn run_review_pack(
@@ -352,6 +530,8 @@ async fn run_review_pack(
         ReviewPackCommand::Abandon { replica } => {
             run_review_pack_abandon(base_url, token_file, replica).await
         }
+        ReviewPackCommand::Asset { replica } => run_review_pack_asset(replica),
+        ReviewPackCommand::Results { replica } => run_review_pack_results(replica),
     }
 }
 
@@ -366,7 +546,8 @@ async fn run_review_pack_acquire(
         .create(&mut replica, &input.session)
         .await
         .map_err(CliError::from)?;
-    write_current(&replica).map_err(Into::into)
+    write_current(&replica)
+        .map_err(|source| client_result_error(DeliveryStatus::Confirmed, source).into())
 }
 
 async fn run_review_pack_resume(
@@ -381,7 +562,8 @@ async fn run_review_pack_resume(
         .map_err(CliError::from)?
         .ok_or(ReviewPackAcquisitionError::NoActivePack)
         .map_err(CliError::from)?;
-    write_current(&replica).map_err(Into::into)
+    write_current(&replica)
+        .map_err(|source| client_result_error(DeliveryStatus::Confirmed, source).into())
 }
 
 fn run_review_pack_current(replica_path: PathBuf) -> Result<(), RunError> {
@@ -394,13 +576,21 @@ fn run_review_pack_answer(replica_path: PathBuf) -> Result<(), RunError> {
     let mut replica = LocalReplica::open_existing(replica_path).map_err(CliError::from)?;
     let (pack_id, answer) = offline_answer(input);
     let recorded = replica.answer(&pack_id, answer).map_err(CliError::from)?;
-    write_json(&OfflineReviewAnswerReceiptV1 {
+    let attempt_id = recorded.attempt_id.clone();
+    let question = active_question(&replica)
+        .map_err(CliError::from)
+        .map_err(|source| {
+            review_operation_error(attempt_id.clone(), DeliveryStatus::Confirmed, source)
+        })?;
+    let receipt = OfflineReviewAnswerReceiptV1 {
         version: 1,
         attempt_id: recorded.attempt_id,
         device_sequence: recorded.device_sequence,
-        question: active_question(&replica).map_err(CliError::from)?,
+        question,
+    };
+    write_json(&receipt).map_err(|source| {
+        review_operation_error(attempt_id, DeliveryStatus::Confirmed, source).into()
     })
-    .map_err(Into::into)
 }
 
 async fn run_review_pack_abandon(
@@ -418,7 +608,101 @@ async fn run_review_pack_abandon(
         version: 1,
         pack_id,
     })
+    .map_err(|source| client_result_error(DeliveryStatus::Confirmed, source).into())
+}
+
+fn run_review_pack_asset(replica_path: PathBuf) -> Result<(), RunError> {
+    let input: OfflineReviewAssetRequestV1 = read_client_input()?;
+    let replica = LocalReplica::open_existing(replica_path).map_err(CliError::from)?;
+    let asset =
+        offline_asset(&replica, &input.pack_id, &input.logical_path).map_err(CliError::from)?;
+    write_json(&OfflineReviewAssetV1 {
+        version: 1,
+        pack_id: asset.pack_id,
+        logical_path: asset.logical_path,
+        content_sha256: asset.content_sha256,
+        size_bytes: asset.size_bytes,
+        media_type: asset.media_type,
+        data_base64: BASE64.encode(asset.bytes),
+    })
     .map_err(Into::into)
+}
+
+fn run_review_pack_results(replica_path: PathBuf) -> Result<(), RunError> {
+    let input: OfflineReviewResultPageRequestV1 = read_client_input()?;
+    if !(1..=100).contains(&input.limit) || input.after.is_some_and(|value| value > i64::MAX as u64)
+    {
+        return Err(CliError::InvalidClientInput.into());
+    }
+    let replica = LocalReplica::open_existing(replica_path).map_err(CliError::from)?;
+    let page = if input.conflicts_only {
+        replica.conflicts(input.after, input.limit)
+    } else {
+        replica.review_results(input.after, input.limit)
+    }
+    .map_err(CliError::from)?;
+    let items = page
+        .items
+        .into_iter()
+        .map(review_result)
+        .collect::<Result<Vec<_>, _>>()?;
+    write_json(&OfflineReviewResultPageV1 {
+        version: 1,
+        items,
+        next_after: page.next_after,
+    })
+    .map_err(Into::into)
+}
+
+fn review_result(value: ReconciledOfflineReview) -> Result<OfflineReviewResultV1, CliError> {
+    let common = (
+        value.result_sequence,
+        value.server_id,
+        value.attempt_id,
+        value.device_sequence,
+    );
+    match value.outcome {
+        OfflineReviewOutcome::Accepted => accepted_review_result(common, value.event_id),
+        OfflineReviewOutcome::Conflict => conflict_review_result(common, value.conflict_reason),
+    }
+}
+
+fn accepted_review_result(
+    common: (u64, String, String, u64),
+    event_id: Option<String>,
+) -> Result<OfflineReviewResultV1, CliError> {
+    let (result_sequence, server_id, attempt_id, device_sequence) = common;
+    Ok(OfflineReviewResultV1::Accepted {
+        result_sequence,
+        server_id,
+        attempt_id,
+        device_sequence,
+        event_id: event_id.ok_or(LocalReplicaError::Response)?,
+    })
+}
+
+fn conflict_review_result(
+    common: (u64, String, String, u64),
+    reason: Option<ReviewConflictReason>,
+) -> Result<OfflineReviewResultV1, CliError> {
+    let (result_sequence, server_id, attempt_id, device_sequence) = common;
+    Ok(OfflineReviewResultV1::Conflict {
+        result_sequence,
+        server_id,
+        attempt_id,
+        device_sequence,
+        conflict_reason: conflict_reason(reason.ok_or(LocalReplicaError::Response)?),
+    })
+}
+
+const fn conflict_reason(reason: ReviewConflictReason) -> OfflineReviewConflictReasonV1 {
+    match reason {
+        ReviewConflictReason::LeaseEnded => OfflineReviewConflictReasonV1::LeaseEnded,
+        ReviewConflictReason::SessionAdvanced => OfflineReviewConflictReasonV1::SessionAdvanced,
+        ReviewConflictReason::ContentChanged => OfflineReviewConflictReasonV1::ContentChanged,
+        ReviewConflictReason::SchedulingChanged => OfflineReviewConflictReasonV1::SchedulingChanged,
+        ReviewConflictReason::CaptureMismatch => OfflineReviewConflictReasonV1::CaptureMismatch,
+    }
 }
 
 async fn bound_replica(
@@ -475,7 +759,8 @@ async fn run_http_state(
         .review_attempt_state(&attempt_id)
         .await
         .map_err(CliError::from)?;
-    write_json(&state).map_err(Into::into)
+    write_json(&state)
+        .map_err(|source| client_result_error(DeliveryStatus::Confirmed, source).into())
 }
 
 async fn run_http_accepted(
@@ -542,7 +827,8 @@ async fn run_socket(socket: Option<PathBuf>, command: Command) -> Result<(), Run
         .await
         .map_err(CliError::from)?;
     match response.outcome {
-        ResponseOutcome::Success { result } => write_result(&result).map_err(Into::into),
+        ResponseOutcome::Success { result } => write_result(&result)
+            .map_err(|source| client_result_error(DeliveryStatus::Confirmed, source).into()),
         ResponseOutcome::Failure { error } => Err(RunError::Protocol(error)),
     }
 }
@@ -587,16 +873,15 @@ fn review_operation_error(
 ) -> CliError {
     CliError::ReviewOperation {
         operation_id,
-        delivery: delivery_label(delivery),
+        delivery,
         source: Box::new(source),
     }
 }
 
-const fn delivery_label(delivery: DeliveryStatus) -> &'static str {
-    match delivery {
-        DeliveryStatus::Confirmed => "confirmed",
-        DeliveryStatus::NotSent => "not-sent",
-        DeliveryStatus::Unknown => "unknown",
+fn client_result_error(delivery: DeliveryStatus, source: CliError) -> CliError {
+    CliError::ClientResult {
+        delivery,
+        source: Box::new(source),
     }
 }
 
@@ -819,7 +1104,9 @@ mod tests {
 
     #[test]
     fn review_pack_commands_have_explicit_online_and_offline_shapes() {
-        for subcommand in ["acquire", "resume", "current", "answer", "abandon"] {
+        for subcommand in [
+            "acquire", "resume", "current", "answer", "abandon", "asset", "results",
+        ] {
             let cli = Cli::try_parse_from([
                 "gnosis",
                 "review-pack",
