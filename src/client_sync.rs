@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -16,7 +17,7 @@ pub struct ReplicaSync<'a> {
     client: &'a HttpClient,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ReplicaSyncReport {
     pub snapshot_pages: u64,
     pub snapshot_recoveries: u64,
@@ -49,14 +50,19 @@ pub enum ReplicaSyncError {
     Http(#[from] HttpClientError),
     #[error(transparent)]
     Replica(#[from] LocalReplicaError),
-    #[error("failed to stage asset for {operation}")]
+    #[error("authenticated device {authenticated} does not match replica device {replica}")]
+    DeviceIdentity {
+        authenticated: String,
+        replica: String,
+    },
+    #[error("failed to stage asset for {operation} ({delivery} delivery)")]
     StageAsset {
         operation: ReplicaSyncOperation,
         delivery: DeliveryStatus,
         #[source]
         source: HttpClientError,
     },
-    #[error("failed to upload {operation}")]
+    #[error("failed to upload {operation} ({delivery} delivery)")]
     Upload {
         operation: ReplicaSyncOperation,
         delivery: DeliveryStatus,
@@ -83,6 +89,7 @@ impl<'a> ReplicaSync<'a> {
         replica: &mut LocalReplica,
     ) -> Result<ReplicaSyncReport, ReplicaSyncError> {
         let mut report = ReplicaSyncReport::default();
+        self.verify_device(replica).await?;
         self.observe_server(replica).await?;
         self.pull_server(replica, &mut report).await?;
         self.fetch_missing_blobs(replica, &mut report).await?;
@@ -92,6 +99,19 @@ impl<'a> ReplicaSync<'a> {
             self.fetch_missing_blobs(replica, &mut report).await?;
         }
         Ok(report)
+    }
+
+    async fn verify_device(&self, replica: &LocalReplica) -> Result<(), ReplicaSyncError> {
+        let authenticated = self.client.device_identity().await?.device_id;
+        let local = replica.device_id()?;
+        if authenticated == local {
+            Ok(())
+        } else {
+            Err(ReplicaSyncError::DeviceIdentity {
+                authenticated,
+                replica: local,
+            })
+        }
     }
 
     async fn observe_server(&self, replica: &mut LocalReplica) -> Result<(), ReplicaSyncError> {

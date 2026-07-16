@@ -56,6 +56,16 @@ pub(crate) fn valid_bearer_token(value: &str) -> bool {
         })
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// The device identity bound to the authenticated bearer token.
+pub struct DeviceIdentityV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    #[schemars(length(min = 1, max = 128))]
+    pub device_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Server identity, durable cursor, and next device sequence used to bootstrap a replica.

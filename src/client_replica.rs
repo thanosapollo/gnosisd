@@ -598,6 +598,10 @@ impl LocalReplica {
         })
     }
 
+    pub fn device_id(&self) -> Result<String, Error> {
+        Ok(self.store.device_id()?)
+    }
+
     pub fn observe_state(&mut self, response: ReplicaStateV1) -> Result<(), Error> {
         let state = decode_replica_state(response)?;
         self.store
@@ -1151,10 +1155,6 @@ impl LocalReplica {
             snapshot_next: status.snapshot_next,
             next_device_sequence: status.next_device_sequence,
         })
-    }
-
-    fn device_id(&self) -> Result<String, Error> {
-        Ok(self.store.device_id()?)
     }
 
     #[cfg(test)]

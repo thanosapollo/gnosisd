@@ -31,7 +31,7 @@ use crate::{
         MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES, decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, ContentCapabilitiesV1, DocumentMutationResultV1,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, DeviceIdentityV1, DocumentMutationResultV1,
             NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
             ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
             ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1,
@@ -94,6 +94,19 @@ impl HttpClient {
 
     pub async fn replica_state(&self) -> Result<ReplicaStateV1, HttpClientError> {
         self.get_json("v1/sync/state").await
+    }
+
+    pub async fn device_identity(&self) -> Result<DeviceIdentityV1, HttpClientError> {
+        let identity: DeviceIdentityV1 = self.get_json("v1/sync/identity").await?;
+        let length = identity.device_id.chars().count();
+        if identity.version == 1
+            && (1..=128).contains(&length)
+            && !identity.device_id.contains('\0')
+        {
+            Ok(identity)
+        } else {
+            Err(invalid_response())
+        }
     }
 
     pub async fn content_capabilities(&self) -> Result<ContentCapabilitiesV1, HttpClientError> {
@@ -1060,6 +1073,16 @@ pub enum DeliveryStatus {
     Confirmed,
     NotSent,
     Unknown,
+}
+
+impl fmt::Display for DeliveryStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Confirmed => "confirmed",
+            Self::NotSent => "not-sent",
+            Self::Unknown => "unknown",
+        })
+    }
 }
 
 #[derive(Debug, Error)]

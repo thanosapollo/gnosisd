@@ -43,15 +43,15 @@ use crate::{
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
-            ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1,
-            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1,
-            OfflineAssetResultEnvelopeV1, OfflineContentOperationEnvelopeV1,
-            OfflineContentResultEnvelopeV1, OfflineReviewOperationEnvelopeV1,
-            OfflineReviewResultEnvelopeV2, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
-            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1,
-            ReviewPackEnvelopeV2, ReviewSessionRequestV1, ReviewSessionV1,
+            ContentCapabilitiesV1, ContentChangePageV1, DeviceIdentityV1, DocumentHeadV1,
+            DocumentMutationResultV1, DocumentRevisionPageV1, DocumentRevisionSummaryV1,
+            NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
+            OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
+            OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
+            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
+            ReviewCommitResponseV1, ReviewPackEnvelopeV2, ReviewSessionRequestV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
             ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
@@ -159,6 +159,7 @@ where
 fn data_router() -> Router<HttpState> {
     Router::new()
         .route("/v1/changes", get(changes))
+        .route("/v1/sync/identity", get(device_identity))
         .route("/v1/sync/state", get(replica_state))
         .route("/v1/sync/content-capabilities", get(content_capabilities))
         .route("/v1/sync/asset-capabilities", get(asset_capabilities))
@@ -319,6 +320,16 @@ async fn changes(
     Ok(Json(
         ContentChangePageV1::from_application(&items).map_err(|_| ApiError::internal())?,
     ))
+}
+
+async fn device_identity(
+    Extension(principal): Extension<DevicePrincipal>,
+) -> Result<Json<DeviceIdentityV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    Ok(Json(DeviceIdentityV1 {
+        version: 1,
+        device_id: principal.device_id,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -2673,6 +2684,7 @@ fn openapi_sync_operation(path: &str, method: &str) -> Option<Value> {
 
 fn sync_success_schema(path: &str, method: &str) -> Option<&'static str> {
     match (path, method) {
+        ("/v1/sync/identity", "get") => Some("DeviceIdentityV1"),
         ("/v1/sync/state", "get") => Some("ReplicaStateV1"),
         ("/v1/sync/content-capabilities", "get") => Some("ContentCapabilitiesV1"),
         ("/v1/sync/asset-capabilities", "get") => Some("AssetCapabilitiesV1"),
@@ -2730,6 +2742,7 @@ fn openapi_json_response(description: &str, schema: &str) -> Value {
 
 fn http_v1_schemas() -> serde_json::Map<String, Value> {
     let mut generator = openapi_schema_settings().for_serialize().into_generator();
+    generator.subschema_for::<DeviceIdentityV1>();
     generator.subschema_for::<ReplicaStateV1>();
     generator.subschema_for::<ContentCapabilitiesV1>();
     generator.subschema_for::<AssetCapabilitiesV1>();
@@ -2843,6 +2856,7 @@ fn openapi_error_response() -> Value {
 
 const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/changes", "get"),
+    ("/v1/sync/identity", "get"),
     ("/v1/sync/state", "get"),
     ("/v1/sync/content-capabilities", "get"),
     ("/v1/sync/asset-capabilities", "get"),
@@ -3154,6 +3168,25 @@ mod tests {
             ])
         );
         assert_local_refs_resolve(&api, &api);
+    }
+
+    #[test]
+    fn openapi_types_authenticated_sync_identity_exactly() {
+        let api = openapi_document();
+        let identity = &api["paths"]["/v1/sync/identity"]["get"];
+        assert_eq!(
+            response_statuses(identity),
+            set(&["200", "401", "403", "408", "500", "503"])
+        );
+        assert_eq!(identity["x-gnosis-required-scopes"], json!(["read"]));
+        assert_eq!(
+            identity["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DeviceIdentityV1"
+        );
+        let schema = &api["components"]["schemas"]["DeviceIdentityV1"];
+        assert_eq!(schema["properties"]["version"]["const"], 1);
+        assert_eq!(schema["properties"]["device_id"]["minLength"], 1);
+        assert_eq!(schema["properties"]["device_id"]["maxLength"], 128);
     }
 
     #[test]

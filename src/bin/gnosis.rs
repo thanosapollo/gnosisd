@@ -8,6 +8,8 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
+    client_replica::{Error as LocalReplicaError, LocalReplica},
+    client_sync::{ReplicaSync, ReplicaSyncError},
     protocol::{
         ClientError, ErrorCode, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
         ResponseOutcome, ResponseResult,
@@ -36,6 +38,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Sync {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
     SystemInfo,
     LegacyInfo,
     ImportOrg {
@@ -137,6 +143,10 @@ enum CliError {
     Client(#[from] ClientError),
     #[error(transparent)]
     Http(#[from] HttpClientError),
+    #[error(transparent)]
+    Replica(#[from] LocalReplicaError),
+    #[error(transparent)]
+    Sync(Box<ReplicaSyncError>),
     #[error("--socket is required for this local operator or compatibility command")]
     MissingSocket,
     #[error("--token-file is required for this HTTP command")]
@@ -162,6 +172,12 @@ enum CliError {
     WriteOutput(#[source] io::Error),
     #[error("backup path is not valid UTF-8")]
     Path,
+}
+
+impl From<ReplicaSyncError> for CliError {
+    fn from(error: ReplicaSyncError) -> Self {
+        Self::Sync(Box::new(error))
+    }
 }
 
 #[tokio::main]
@@ -199,6 +215,7 @@ fn print_client_error(error: &CliError) {
 
 async fn run(cli: Cli) -> Result<(), RunError> {
     match cli.command {
+        Command::Sync { replica } => run_http_sync(&cli.http_url, cli.token_file, replica).await,
         Command::ReviewAttemptState { attempt_id } => {
             run_http_state(&cli.http_url, cli.token_file, attempt_id).await
         }
@@ -236,6 +253,22 @@ async fn run(cli: Cli) -> Result<(), RunError> {
         }
         command => run_socket(cli.socket, command).await,
     }
+}
+
+async fn run_http_sync(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    replica_path: PathBuf,
+) -> Result<(), RunError> {
+    let client = http_client(base_url, token_file)?;
+    let identity = client.device_identity().await.map_err(CliError::from)?;
+    let mut replica =
+        LocalReplica::open(replica_path, &identity.device_id).map_err(CliError::from)?;
+    let report = ReplicaSync::new(&client)
+        .synchronize(&mut replica)
+        .await
+        .map_err(CliError::from)?;
+    write_json(&report).map_err(Into::into)
 }
 
 async fn run_http_state(
@@ -375,6 +408,7 @@ const fn delivery_label(delivery: DeliveryStatus) -> &'static str {
 
 fn command_request(command: Command) -> Result<Request, CliError> {
     match command {
+        Command::Sync { .. } => unreachable!("HTTP command reached socket"),
         Command::SystemInfo => Ok(Request::SystemInfo {}),
         Command::LegacyInfo => Ok(Request::LegacyInfo {}),
         Command::ImportOrg {

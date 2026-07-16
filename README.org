@@ -65,11 +65,17 @@ gnosis --token-file "$HOME/.config/gnosis/client.token" \
   review-attempt-set-accepted ATTEMPT_ID \
   --operation-id OPERATION_ID --expected-revision REVISION \
   --accepted-success false
+
+gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  sync --replica "$HOME/.local/share/gnosis/client.sqlite"
 #+end_src
 
-For a remote endpoint, pass ~--http-url https://...~. Mutation delivery is
-never retried automatically. If delivery is unknown, repeat the command only
-with the same operation ID and captured revision.
+For a remote endpoint, pass ~--http-url https://...~. Mutation delivery is never
+retried automatically. If delivery is unknown, repeat the command only with the
+same operation ID and captured revision. ~sync~ resumes the same local replica
+after restart and prints its snapshot, delta, blob, and outbox counts. The
+durable replica identity comes from the authenticated token and is checked again
+before synchronization changes local state.
 
 The Unix message format is a four-byte big-endian length followed by UTF-8
 JSON. It is the privileged local and administrative transport for diagnostics,
@@ -83,7 +89,8 @@ backtraces.
 The ~/v1~ API provides:
 
 - device-bound replica state, resumable snapshots, exact revision deltas, and
-  immutable blob downloads;
+  immutable blob downloads, with authenticated device identity checked before
+  local state changes;
 - optimistic thema create, search, update, archive, and unarchive;
 - revisioned Org documents, renames, tombstones, and historical retrieval;
 - content-addressed managed assets;

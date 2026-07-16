@@ -544,6 +544,163 @@ async fn cli_routes_review_recovery_and_mutations_through_http() {
 }
 
 #[tokio::test]
+async fn cli_sync_bootstraps_and_reuses_a_durable_http_replica() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let _client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let thema_id = create_review_thema(&daemon.base_url, &raw_token).await;
+    let token_path = daemon._directory.path().join("sync.token");
+    let replica_path = daemon._directory.path().join("cli-replica.sqlite");
+    fs::write(&token_path, format!("{raw_token}\n")).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let replica = replica_path.to_str().unwrap();
+
+    let first = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["sync", "--replica", replica],
+    )
+    .await;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert!(first["snapshot_pages"].as_u64().unwrap() > 0);
+    assert_eq!(first["snapshot_recoveries"], 0);
+    let replica_store = LocalReplica::open(&replica_path, &device_id).unwrap();
+    assert!(
+        replica_store
+            .projection("thema", &thema_id)
+            .unwrap()
+            .is_some()
+    );
+    drop(replica_store);
+
+    let second = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["sync", "--replica", replica],
+    )
+    .await;
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["snapshot_pages"], 0);
+    assert_eq!(second["snapshot_recoveries"], 0);
+    assert_eq!(second["downloaded_blobs"], 0);
+    assert_eq!(second["uploaded_operations"], 0);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn authenticated_sync_identity_matches_the_token_owner() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let _client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let response = raw_http_client()
+        .get(format!("{}/v1/sync/identity", daemon.base_url))
+        .bearer_auth(raw_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body, json!({"version": 1, "device_id": device_id}));
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn device_identity_client_rejects_invalid_responses() {
+    for body in [
+        json!({"version": 2, "device_id": "device"}),
+        json!({"version": 1, "device_id": ""}),
+        json!({"version": 1, "device_id": "x".repeat(129)}),
+        json!({"version": 1, "device_id": "bad\0device"}),
+    ] {
+        let raw = spawn_json_server(body).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.device_identity().await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn replica_sync_rejects_another_device_before_changing_local_state() {
+    let daemon = RunningDaemon::start().await;
+    let (first_id, first_token) = create_device(&daemon.socket).await;
+    let (second_id, second_token) = create_device(&daemon.socket).await;
+    let first_client =
+        HttpClient::new(&daemon.base_url, SecretToken::new(first_token).unwrap()).unwrap();
+    let second_client =
+        HttpClient::new(&daemon.base_url, SecretToken::new(second_token).unwrap()).unwrap();
+
+    let mut wrong = LocalReplica::open(
+        daemon._directory.path().join("wrong-device.sqlite"),
+        &second_id,
+    )
+    .unwrap();
+    let before = wrong.status().unwrap();
+    let error = ReplicaSync::new(&first_client)
+        .synchronize(&mut wrong)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!("authenticated device {first_id} does not match replica device {second_id}")
+    );
+    assert_eq!(wrong.status().unwrap(), before);
+
+    let replica_path = daemon._directory.path().join("reopened-device.sqlite");
+    let mut replica = LocalReplica::open(&replica_path, &first_id).unwrap();
+    ReplicaSync::new(&first_client)
+        .synchronize(&mut replica)
+        .await
+        .unwrap();
+    replica
+        .record_document(OfflineDocumentEdit {
+            operation_id: "preserved-device-operation".into(),
+            document_id: "preserved-device-document".into(),
+            logical_path: "preserved-device.org".into(),
+            org: "#+title: Preserved\n".into(),
+            authored_at_us: 10,
+        })
+        .unwrap();
+    drop(replica);
+
+    let mut reopened = LocalReplica::open(&replica_path, &first_id).unwrap();
+    ReplicaSync::new(&second_client)
+        .synchronize(&mut reopened)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        reopened
+            .next_device_upload()
+            .unwrap()
+            .unwrap()
+            .operation_id(),
+        "preserved-device-operation"
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn review_operations_reject_mismatched_success_identities() {
     for response in [
         review_operation_json(2, "operation", "attempt", 2),
@@ -1190,6 +1347,10 @@ async fn replica_sync_stops_on_unknown_delivery_and_replays_the_same_operation()
         .synchronize(&mut replica)
         .await
         .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "failed to upload Content operation uncertain-operation at device sequence 1 (unknown delivery)"
+    );
     let ReplicaSyncError::Upload {
         operation,
         delivery,
