@@ -267,8 +267,15 @@ fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
     }
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status":"ok"}))
+async fn health(State(state): State<HttpState>) -> Response {
+    match state.service.ready().await {
+        Ok(()) => (StatusCode::OK, Json(json!({"status":"ready"}))).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status":"unavailable"})),
+        )
+            .into_response(),
+    }
 }
 
 async fn openapi() -> Json<Value> {
@@ -2945,8 +2952,26 @@ mod tests {
             ReplicaStateV1, ReviewAttemptV1,
         },
     };
-    use crate::service::{ServiceError, ServiceRuntime};
+    use crate::service::{ServiceError, ServiceHandle, ServiceRuntime};
     use crate::store::{SqliteStore, StoreError};
+
+    #[tokio::test]
+    async fn health_fails_when_the_store_actor_is_stopped() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = ServiceHandle::stopped_for_test(directory.path().join("blobs")).unwrap();
+        let response = router(service)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body, r#"{"status":"unavailable"}"#);
+    }
 
     #[test]
     fn service_errors_have_stable_http_contracts() {

@@ -1277,7 +1277,7 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.ends_with("{\"status\":\"ok\"}"));
+        assert!(response.ends_with("{\"status\":\"ready\"}"));
         shutdown.send(()).unwrap();
         task.await.unwrap().unwrap();
     }

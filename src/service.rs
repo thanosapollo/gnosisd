@@ -49,6 +49,22 @@ pub(crate) struct ServiceHandle {
 }
 
 impl ServiceHandle {
+    pub(crate) async fn ready(&self) -> Result<(), ServiceError> {
+        request(&self.sender, |response| StoreCommand::Ready { response })
+            .await?
+            .map_err(ServiceError::Store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stopped_for_test(blob_path: PathBuf) -> Result<Self, BlobError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        Ok(Self {
+            sender,
+            blobs: Arc::new(BlobStore::open(blob_path)?),
+        })
+    }
+
     pub(crate) async fn replace(
         &self,
         prepared: PreparedServerImport,
@@ -1182,6 +1198,9 @@ enum PreparedContentOperation {
 }
 
 enum StoreCommand {
+    Ready {
+        response: oneshot::Sender<StoreResult<()>>,
+    },
     Replace {
         prepared: Box<PreparedServerImport>,
         created_at_us: i64,
@@ -1762,6 +1781,7 @@ fn stage_blob_command(
 
 fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreCommand) {
     match command {
+        StoreCommand::Ready { response } => send(response, store.settings().map(drop)),
         StoreCommand::Replace {
             prepared,
             created_at_us,
@@ -2481,6 +2501,22 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn readiness_round_trip_requires_the_store_actor() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        assert!(service.ready().await.is_ok());
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let blobs = Arc::new(BlobStore::open(directory.path().join("stopped-blobs")).unwrap());
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let stopped = ServiceHandle { sender, blobs };
+        assert!(matches!(stopped.ready().await, Err(ServiceError::Stopped)));
     }
 
     #[tokio::test]
