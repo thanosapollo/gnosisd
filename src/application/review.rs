@@ -381,7 +381,7 @@ impl ReviewAttemptOperation {
         mutation: ReviewAttemptMutation,
     ) -> Result<Self, ReviewError> {
         if format_version != 1
-            || !valid_review_operation_id(&operation_id)
+            || !valid_operation_id(&operation_id)
             || !valid_review_id(&attempt_id)
             || expected_attempt_revision > MAX_PERSISTED_REVISION
         {
@@ -397,7 +397,7 @@ impl ReviewAttemptOperation {
     }
 }
 
-pub(crate) fn valid_review_operation_id(value: &str) -> bool {
+pub(crate) fn valid_operation_id(value: &str) -> bool {
     let mut bytes = value.bytes();
     bytes
         .next()

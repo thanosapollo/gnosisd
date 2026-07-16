@@ -63,7 +63,8 @@ pub(crate) struct ContentChange {
     pub(crate) created_at_us: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DocumentHead {
     pub(crate) document_id: String,
     pub(crate) logical_path: String,

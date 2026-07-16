@@ -1,10 +1,10 @@
 use gnosis_core::protocol::http_v1::{
     ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1,
-    ContentChangePageV1, DocumentHeadV1, DocumentRevisionPageV1, NodePageV1, NoteRenameRequestV1,
-    NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
-    ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, SetAcceptedSuccessRequestV1,
-    SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1,
-    UpdateSettingsRequestV1,
+    ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+    NodePageV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
+    ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
+    ReviewAttemptStateResponseV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1,
+    StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -113,6 +113,49 @@ fn public_capability_and_error_dtos_preserve_http_shapes() {
         "meta":{"snapshot_url":"/v1/sync/snapshot"}
     }});
     assert!(serde_json::from_value::<ApiErrorResponseV1>(mismatched).is_err());
+}
+
+#[test]
+fn public_document_mutation_results_are_exclusive_and_strict() {
+    let applied = json!({
+        "status":"applied",
+        "format_version":1,
+        "operation_id":"operation",
+        "changed":true,
+        "authoritative":{
+            "document_id":"document",
+            "logical_path":"note.org",
+            "revision":2,
+            "content_sha256":"a".repeat(64),
+            "active":true
+        },
+        "cursor":"cursor"
+    });
+    let rejected = json!({
+        "status":"rejected",
+        "format_version":1,
+        "operation_id":"operation",
+        "rejection":{
+            "reason":"revision_conflict",
+            "expected_revision":1,
+            "current_revision":2
+        },
+        "cursor":"cursor"
+    });
+
+    for wire in [applied, rejected] {
+        let result: DocumentMutationResultV1 = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), wire);
+    }
+    let inconsistent = json!({
+        "status":"rejected",
+        "format_version":1,
+        "operation_id":"operation",
+        "changed":false,
+        "rejection":{"reason":"invalid_content"},
+        "cursor":"cursor"
+    });
+    assert!(serde_json::from_value::<DocumentMutationResultV1>(inconsistent).is_err());
 }
 
 #[test]

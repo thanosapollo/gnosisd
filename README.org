@@ -82,11 +82,15 @@ The ~/v1~ API provides:
 - bounded offline review packs and immutable review reconciliation;
 - sequenced offline document, lifecycle, and asset-create operations.
 
-Revisioned content and settings updates use ~If-Match~. A stale revision
+Existing revisioned content and settings updates use ~If-Match~. A stale revision
 returns ~412~ with the current revision and leaves server state unchanged.
-Sequenced offline mutations instead use immutable operation IDs and contiguous
-device sequence numbers. Review answer and commit retries use retained attempt
-state. Clients recover an attempt and its revision with
+Retry-safe document writes use ~/v1/document-mutations~, a device-scoped
+~Idempotency-Key~, and ~If-Match~ for replacement. Exact retries return the
+retained applied or rejected result and cursor. A stale base is a final typed
+rejection with HTTP ~200~; reusing a key for changed content returns ~409~.
+Sequenced offline mutations use immutable operation IDs and contiguous device
+sequence numbers. Review answer and commit retries use retained attempt state.
+Clients recover an attempt and its revision with
 ~GET /v1/review/attempts/{id}~. They set correctness or suspension through
 ~PUT /v1/review/attempts/{id}/accepted-success~ and
 ~PUT /v1/review/attempts/{id}/suspension~ using a durable operation ID and
@@ -115,14 +119,15 @@ events.
 
 * Storage
 
-Schema v11 stores native themata, tags, node associations, scheduling state,
+Schema v12 stores native themata, tags, node associations, scheduling state,
 exact review history, sessions, attempts, devices, settings, documents, and
 the node graph. It also stores replica snapshots and feed revisions, review
 packs, immutable offline operations and results, device sequence state, and
 conflict evidence. Review attempts carry a monotonic mutation revision and an
-immutable journal of accepted or conflicting desired-state operations. Public
-IDs are opaque text. Imported numeric thema IDs are retained and new resources
-use UUIDv7.
+immutable journal of accepted or conflicting desired-state operations. Direct
+device mutations retain their canonical request and applied or rejected result
+under a device-scoped operation identity. Public IDs are opaque text. Imported
+numeric thema IDs are retained and new resources use UUIDv7.
 
 Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
 tracks logical paths, heads, revisions, renames, tombstones, and the monotonic

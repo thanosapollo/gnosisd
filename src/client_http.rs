@@ -19,7 +19,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    application::MAX_OFFLINE_ASSET_BYTES,
+    application::{MAX_OFFLINE_ASSET_BYTES, valid_operation_id},
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
@@ -30,7 +30,8 @@ use crate::{
         MAX_OFFLINE_REVIEW_OPERATION_BYTES, MAX_OFFLINE_REVIEW_RESULT_BYTES,
         MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
         http_v1::{
-            ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1,
+            ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1,
+            DocumentMutationResultV1, NoteWriteRequestV1, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, StagedBlobV1, valid_bearer_token,
         },
     },
@@ -159,6 +160,43 @@ impl HttpClient {
         decode_upload_result(upload, value)
     }
 
+    pub async fn create_note(
+        &self,
+        operation_id: &str,
+        input: &NoteWriteRequestV1,
+    ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        let body = encode_document_mutation(input)?;
+        let url = self.endpoint("v1/document-mutations")?;
+        let request = self
+            .client
+            .post(url)
+            .header("Idempotency-Key", operation_id)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body);
+        execute_document_mutation(request, operation_id, None).await
+    }
+
+    pub async fn replace_note(
+        &self,
+        document_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+        input: &NoteWriteRequestV1,
+    ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        let body = encode_document_mutation(input)?;
+        let url = self.document_mutation_endpoint(document_id)?;
+        let request = self
+            .client
+            .put(url)
+            .header("Idempotency-Key", operation_id)
+            .header("If-Match", expected_revision)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body);
+        execute_document_mutation(request, operation_id, Some(document_id)).await
+    }
+
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, HttpClientError> {
         let url = self.endpoint(path)?;
         execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
@@ -168,6 +206,15 @@ impl HttpClient {
         self.base_url
             .join(path)
             .map_err(|_| HttpClientError::InvalidBaseUrl)
+    }
+
+    fn document_mutation_endpoint(&self, document_id: &str) -> Result<Url, HttpClientError> {
+        let mut url = self.endpoint("v1/document-mutations/")?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .pop_if_empty()
+            .push(document_id);
+        Ok(url)
     }
 }
 
@@ -238,6 +285,66 @@ fn require_digest(digest: &str) -> Result<(), HttpClientError> {
     is_canonical_sha256(digest)
         .then_some(())
         .ok_or(HttpClientError::InvalidDigest)
+}
+
+fn require_operation_id(operation_id: &str) -> Result<(), HttpClientError> {
+    valid_operation_id(operation_id)
+        .then_some(())
+        .ok_or(HttpClientError::InvalidOperationId)
+}
+
+fn encode_document_mutation(input: &NoteWriteRequestV1) -> Result<Vec<u8>, HttpClientError> {
+    let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
+    if body.len() > MAX_OFFLINE_CONTENT_OPERATION_BYTES {
+        return Err(HttpClientError::InvalidMutation);
+    }
+    Ok(body)
+}
+
+async fn execute_document_mutation(
+    request: RequestBuilder,
+    operation_id: &str,
+    expected_document_id: Option<&str>,
+) -> Result<DocumentMutationResultV1, HttpClientError> {
+    let result = execute_json(request, MAX_OFFLINE_CONTENT_RESULT_BYTES).await?;
+    document_mutation_matches(&result, operation_id, expected_document_id)
+        .then_some(result)
+        .ok_or_else(invalid_response)
+}
+
+fn document_mutation_matches(
+    result: &DocumentMutationResultV1,
+    expected_operation_id: &str,
+    expected_document_id: Option<&str>,
+) -> bool {
+    match result {
+        DocumentMutationResultV1::Applied {
+            format_version,
+            operation_id,
+            authoritative,
+            cursor,
+            ..
+        } => {
+            *format_version == 1
+                && operation_id == expected_operation_id
+                && expected_document_id.is_none_or(|expected| authoritative.document_id == expected)
+                && valid_result_cursor(cursor)
+        }
+        DocumentMutationResultV1::Rejected {
+            format_version,
+            operation_id,
+            cursor,
+            ..
+        } => {
+            *format_version == 1
+                && operation_id == expected_operation_id
+                && valid_result_cursor(cursor)
+        }
+    }
+}
+
+fn valid_result_cursor(cursor: &str) -> bool {
+    !cursor.is_empty() && cursor.len() <= MAX_REPLICA_CURSOR_BYTES
 }
 
 fn upload_request(
@@ -356,10 +463,19 @@ async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, H
 
 fn server_error<T>(status: StatusCode, bytes: &[u8]) -> Result<T, HttpClientError> {
     let body = serde_json::from_slice(bytes).map_err(|_| invalid_response())?;
+    let delivery = server_error_delivery(&body);
     Err(HttpClientError::Server(HttpServerError {
         status: status.as_u16(),
         body,
+        delivery,
     }))
+}
+
+fn server_error_delivery(body: &ApiErrorResponseV1) -> DeliveryStatus {
+    match body.error.code() {
+        ApiErrorCodeV1::RequestTimeout | ApiErrorCodeV1::Internal => DeliveryStatus::Unknown,
+        _ => DeliveryStatus::Confirmed,
+    }
 }
 
 fn transport_error(error: reqwest::Error) -> HttpClientError {
@@ -389,6 +505,7 @@ const fn response_too_large() -> HttpClientError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeliveryStatus {
+    Confirmed,
     NotSent,
     Unknown,
 }
@@ -398,6 +515,7 @@ pub enum DeliveryStatus {
 pub struct HttpServerError {
     status: u16,
     body: ApiErrorResponseV1,
+    delivery: DeliveryStatus,
 }
 
 impl HttpServerError {
@@ -407,6 +525,10 @@ impl HttpServerError {
 
     pub const fn body(&self) -> &ApiErrorResponseV1 {
         &self.body
+    }
+
+    pub const fn delivery(&self) -> DeliveryStatus {
+        self.delivery
     }
 }
 
@@ -422,6 +544,10 @@ pub enum HttpClientError {
     InvalidDigest,
     #[error("Gnosis pending upload is invalid")]
     InvalidUpload,
+    #[error("Gnosis operation ID is invalid")]
+    InvalidOperationId,
+    #[error("Gnosis document mutation is invalid")]
+    InvalidMutation,
     #[error("Gnosis HTTP client initialization failed")]
     ClientBuild(#[source] reqwest::Error),
     #[error("Gnosis TLS provider initialization failed")]

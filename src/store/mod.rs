@@ -9,5 +9,6 @@ pub(crate) use replica::{
     StoredReviewResultPage, canonical_json_sha256,
 };
 pub(crate) use sqlite::{
-    DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument, initialize_native_database,
+    DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
+    initialize_native_database,
 };

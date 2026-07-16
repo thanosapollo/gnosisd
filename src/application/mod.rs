@@ -1,5 +1,6 @@
 mod auth;
 mod content;
+mod device_mutation;
 mod import_document;
 mod offline_asset;
 mod offline_content;
@@ -21,6 +22,11 @@ pub(crate) use content::{
     file_link_expressions, path_key, prepare_asset, prepare_note, prepare_thema,
     retained_asset_paths_in_org, stored_thema_content, supported_asset, thema_content,
     validate_asset_path, validate_logical_path, validate_offline_thema_assets, validate_org_path,
+};
+pub(crate) use device_mutation::{
+    DeviceMutationCursor, DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
+    DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDocumentMutation,
+    prepare_device_document_mutation,
 };
 pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
 pub(crate) use import_document::{PreparedServerImport, summarize_import};
@@ -44,7 +50,7 @@ pub(crate) use review::{
     ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
     ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
     ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation, presentation_content,
-    review_day_at, valid_review_operation_id,
+    review_day_at, valid_operation_id,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};
 pub(crate) use sync::{

@@ -40,11 +40,12 @@ pub(crate) use offline_review::{
     decode_offline_result, decode_review_pack, offline_result_json, review_pack_json,
 };
 pub(crate) use replica::MAX_REPLICA_PAGE_BYTES;
+pub(crate) use replica::encode_cursor;
+#[cfg(test)]
+pub(crate) use replica::encode_snapshot_cursor;
 pub(crate) use replica::{
     DecodedReplicaItem, DecodedSnapshotPage, MAX_REPLICA_CURSOR_BYTES, ReplicaWireError,
     decode_change_page, decode_cursor, decode_replica_state, decode_snapshot_cursor,
     decode_snapshot_page, replica_change_page, replica_snapshot_page, replica_state_response,
 };
-#[cfg(test)]
-pub(crate) use replica::{encode_cursor, encode_snapshot_cursor};
 pub use server::{DaemonConfig, DaemonServer, ServerError};

@@ -33,7 +33,10 @@ use crate::{
 
 mod asset_sync;
 mod content_sync;
+mod mutation;
 mod review;
+
+pub(crate) use mutation::DeviceMutationExecution;
 
 const INITIAL_MIGRATION: &str = include_str!("migrations/0001_initial.sql");
 const SERVER_MIGRATION: &str = include_str!("migrations/0002_server.sql");
@@ -3952,10 +3955,10 @@ fn insert_document(
 }
 
 fn check_path_available(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     prepared: &PreparedNote,
 ) -> Result<(), StoreError> {
-    let owner = transaction
+    let owner = connection
         .query_row(
             "SELECT document_id FROM document WHERE path_key = ?1 AND active = 1",
             [&prepared.path_key],
@@ -3985,23 +3988,42 @@ fn replace_note_in(
     author_device_id: Option<&str>,
     allow_noop: bool,
 ) -> Result<StoredDocument, StoreError> {
-    let current = load_document(transaction, &prepared.document_id)?;
-    check_revision(expected_revision, current.as_ref())?;
-    validate_note_assets(transaction, prepared)?;
-    let current_path = document_path(transaction, &prepared.document_id)?;
-    require_unchanged_path(prepared, current_path.as_deref())?;
-    check_path_available(transaction, prepared)?;
-    if allow_noop && note_is_unchanged(transaction, prepared, current.as_ref(), &current_path)? {
-        return current.ok_or(StoreError::CorruptData { field: "document" });
+    match note_write_decision(transaction, prepared, expected_revision, allow_noop)? {
+        NoteWriteDecision::Unchanged(current) => Ok(current),
+        NoteWriteDecision::Write(current) => write_note_revision(
+            transaction,
+            prepared,
+            blob,
+            current,
+            created_at_us,
+            author_device_id,
+        ),
     }
-    write_note_revision(
-        transaction,
-        prepared,
-        blob,
-        current,
-        created_at_us,
-        author_device_id,
-    )
+}
+
+pub(super) enum NoteWriteDecision {
+    Unchanged(StoredDocument),
+    Write(Option<StoredDocument>),
+}
+
+pub(super) fn note_write_decision(
+    connection: &Connection,
+    prepared: &PreparedNote,
+    expected_revision: Option<u64>,
+    allow_noop: bool,
+) -> Result<NoteWriteDecision, StoreError> {
+    let current = load_document(connection, &prepared.document_id)?;
+    check_revision(expected_revision, current.as_ref())?;
+    validate_note_assets(connection, prepared)?;
+    let current_path = document_path(connection, &prepared.document_id)?;
+    require_unchanged_path(prepared, current_path.as_deref())?;
+    check_path_available(connection, prepared)?;
+    if allow_noop && note_is_unchanged(connection, prepared, current.as_ref(), &current_path)? {
+        return current
+            .map(NoteWriteDecision::Unchanged)
+            .ok_or(StoreError::CorruptData { field: "document" });
+    }
+    Ok(NoteWriteDecision::Write(current))
 }
 
 fn require_unchanged_path(
@@ -4016,12 +4038,12 @@ fn require_unchanged_path(
 }
 
 fn note_is_unchanged(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     prepared: &PreparedNote,
     current: Option<&StoredDocument>,
     current_path: &Option<String>,
 ) -> Result<bool, StoreError> {
-    let head = load_document_head(transaction, &prepared.document_id)?;
+    let head = load_document_head(connection, &prepared.document_id)?;
     let blob_matches = head.is_some_and(|head| {
         head.active && head.blob_sha256.as_deref() == Some(prepared.blob_sha256.as_str())
     });

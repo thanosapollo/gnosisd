@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{DocumentOperationV1, ParametersV1, TagRuleV1, ThemaKindV1};
 use crate::application::{
-    AssetHead, ContentChange, DocumentHead, DocumentRevision, NodeRecord, ParametersSnapshot,
+    AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
+    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, ParametersSnapshot,
     SettingsInput, SettingsRecord, TagRule, ThemaRecord,
 };
 use crate::domain::ThemaKind;
@@ -114,6 +115,104 @@ impl DocumentHeadV1 {
             content_sha256: value.blob_sha256.clone(),
             active: value.active,
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DocumentMutationRejectionV1 {
+    RevisionConflict {
+        #[serde(deserialize_with = "super::deserialize_required_option")]
+        #[schemars(required)]
+        expected_revision: Option<u64>,
+        #[serde(deserialize_with = "super::deserialize_required_option")]
+        #[schemars(required)]
+        current_revision: Option<u64>,
+    },
+    NotFound,
+    InvalidContent,
+    RenameRequired,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DocumentMutationResultV1 {
+    Applied {
+        #[schemars(extend("const" = 1))]
+        format_version: u32,
+        #[schemars(
+            length(min = 1, max = 128),
+            regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+        )]
+        operation_id: String,
+        changed: bool,
+        authoritative: DocumentHeadV1,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+    Rejected {
+        #[schemars(extend("const" = 1))]
+        format_version: u32,
+        #[schemars(
+            length(min = 1, max = 128),
+            regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+        )]
+        operation_id: String,
+        rejection: DocumentMutationRejectionV1,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+}
+
+impl DocumentMutationResultV1 {
+    pub(crate) fn from_application(value: &DeviceMutationResult) -> Result<Self, ContentWireError> {
+        match value {
+            DeviceMutationResult::Applied {
+                format_version,
+                operation_id,
+                changed,
+                authoritative: DeviceMutationProjection::Document(document),
+                cursor,
+            } => Ok(Self::Applied {
+                format_version: *format_version,
+                operation_id: operation_id.clone(),
+                changed: *changed,
+                authoritative: DocumentHeadV1::from_application(document),
+                cursor: mutation_cursor(cursor)?,
+            }),
+            DeviceMutationResult::Rejected {
+                format_version,
+                operation_id,
+                rejection,
+                cursor,
+            } => Ok(Self::Rejected {
+                format_version: *format_version,
+                operation_id: operation_id.clone(),
+                rejection: mutation_rejection(rejection),
+                cursor: mutation_cursor(cursor)?,
+            }),
+        }
+    }
+}
+
+fn mutation_cursor(
+    cursor: &crate::application::DeviceMutationCursor,
+) -> Result<String, ContentWireError> {
+    crate::protocol::encode_cursor(&cursor.server_id, cursor.position, &cursor.token)
+        .map_err(|_| ContentWireError)
+}
+
+fn mutation_rejection(value: &DeviceMutationRejection) -> DocumentMutationRejectionV1 {
+    match value {
+        DeviceMutationRejection::RevisionConflict { expected, actual } => {
+            DocumentMutationRejectionV1::RevisionConflict {
+                expected_revision: *expected,
+                current_revision: *actual,
+            }
+        }
+        DeviceMutationRejection::NotFound => DocumentMutationRejectionV1::NotFound,
+        DeviceMutationRejection::InvalidContent => DocumentMutationRejectionV1::InvalidContent,
+        DeviceMutationRejection::RenameRequired => DocumentMutationRejectionV1::RenameRequired,
     }
 }
 

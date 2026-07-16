@@ -11,9 +11,12 @@ use gnosis_core::{
     },
     protocol::{
         DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseOutcome,
-        ResponseResult, ServerError, http_v1::ApiErrorCodeV1, request,
+        ResponseResult, ServerError,
+        http_v1::{ApiErrorCodeV1, DocumentMutationResultV1, NoteWriteRequestV1},
+        request,
     },
 };
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -166,6 +169,263 @@ async fn client_preserves_stable_server_errors() {
     assert_eq!(server.body().error.code(), ApiErrorCodeV1::Unauthorized);
 
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn client_creates_and_replays_a_direct_document_mutation() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let note = NoteWriteRequestV1 {
+        logical_path: "note.org".into(),
+        org: "#+title: Direct\n".into(),
+    };
+
+    let first = client.create_note("direct-create", &note).await.unwrap();
+    let retry = client.create_note("direct-create", &note).await.unwrap();
+
+    assert_eq!(retry, first);
+    let DocumentMutationResultV1::Applied {
+        authoritative,
+        changed,
+        ..
+    } = first
+    else {
+        panic!("expected applied document mutation");
+    };
+    assert!(changed);
+    assert_eq!(authoritative.revision, 1);
+
+    let changed = NoteWriteRequestV1 {
+        org: "#+title: Changed\n".into(),
+        ..note
+    };
+    let error = client
+        .create_note("direct-create", &changed)
+        .await
+        .unwrap_err();
+    let HttpClientError::Server(error) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert_eq!(error.status(), 409);
+    assert_eq!(
+        error.body().error.code(),
+        ApiErrorCodeV1::IdempotencyConflict
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn client_replaces_documents_against_an_explicit_base_revision() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let original = NoteWriteRequestV1 {
+        logical_path: "note.org".into(),
+        org: "#+title: Original\n".into(),
+    };
+    let created = client
+        .create_note("create-replace", &original)
+        .await
+        .unwrap();
+    let DocumentMutationResultV1::Applied { authoritative, .. } = created else {
+        panic!("expected applied document mutation");
+    };
+    let replacement = NoteWriteRequestV1 {
+        org: "#+title: Replacement\n".into(),
+        ..original
+    };
+
+    let replaced = client
+        .replace_note(
+            &authoritative.document_id,
+            "replace-document",
+            authoritative.revision,
+            &replacement,
+        )
+        .await
+        .unwrap();
+    let retry = client
+        .replace_note(
+            &authoritative.document_id,
+            "replace-document",
+            authoritative.revision,
+            &replacement,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(retry, replaced);
+    let DocumentMutationResultV1::Applied { authoritative, .. } = replaced else {
+        panic!("expected applied document mutation");
+    };
+    assert_eq!(authoritative.revision, 2);
+
+    let stale = client
+        .replace_note(
+            &authoritative.document_id,
+            "stale-document",
+            1,
+            &replacement,
+        )
+        .await
+        .unwrap();
+    let DocumentMutationResultV1::Rejected { rejection, .. } = stale else {
+        panic!("expected retained rejection");
+    };
+    assert_eq!(
+        rejection,
+        gnosis_core::protocol::http_v1::DocumentMutationRejectionV1::RevisionConflict {
+            expected_revision: Some(1),
+            current_revision: Some(2),
+        }
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn lost_direct_document_response_replays_without_duplication() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let direct = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let before = direct.replica_state().await.unwrap().cursor;
+    let proxy = spawn_drop_response_proxy(daemon.http_addr).await;
+    let uncertain = HttpClient::new(&proxy.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let note = NoteWriteRequestV1 {
+        logical_path: "note.org".into(),
+        org: "#+title: Once\n".into(),
+    };
+
+    assert!(matches!(
+        uncertain.create_note("lost-direct", &note).await,
+        Err(HttpClientError::Transport {
+            delivery: DeliveryStatus::Unknown
+        })
+    ));
+    assert!(proxy.task.await.unwrap().starts_with(b"HTTP/1.1 200"));
+    let first_retry = direct.create_note("lost-direct", &note).await.unwrap();
+    let second_retry = direct.create_note("lost-direct", &note).await.unwrap();
+
+    assert_eq!(first_retry, second_retry);
+    assert_eq!(direct.changes(&before).await.unwrap().items.len(), 1);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn direct_document_client_rejects_invalid_operation_ids_before_transport() {
+    let client = HttpClient::new("http://127.0.0.1:9", token()).unwrap();
+    let note = NoteWriteRequestV1 {
+        logical_path: "note.org".into(),
+        org: "#+title: Note\n".into(),
+    };
+
+    assert!(matches!(
+        client.create_note("-invalid", &note).await,
+        Err(HttpClientError::InvalidOperationId)
+    ));
+}
+
+#[tokio::test]
+async fn direct_document_client_rejects_another_operation_result() {
+    let raw = spawn_json_server(json!({
+        "status": "applied",
+        "format_version": 1,
+        "operation_id": "another-operation",
+        "changed": true,
+        "authoritative": {
+            "document_id": "document",
+            "logical_path": "note.org",
+            "revision": 1,
+            "content_sha256": null,
+            "active": true
+        },
+        "cursor": "cursor"
+    }))
+    .await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    let note = NoteWriteRequestV1 {
+        logical_path: "note.org".into(),
+        org: "#+title: Note\n".into(),
+    };
+
+    assert!(matches!(
+        client.create_note("expected-operation", &note).await,
+        Err(HttpClientError::InvalidResponse {
+            delivery: DeliveryStatus::Unknown
+        })
+    ));
+    raw.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_document_client_rejects_another_result_version() {
+    let raw = spawn_json_server(document_mutation_json(2, "expected-operation", "document")).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+
+    assert!(matches!(
+        client
+            .create_note("expected-operation", &note_request())
+            .await,
+        Err(HttpClientError::InvalidResponse {
+            delivery: DeliveryStatus::Unknown
+        })
+    ));
+    raw.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_document_client_rejects_another_replacement_target() {
+    let raw = spawn_json_server(document_mutation_json(
+        1,
+        "expected-operation",
+        "another-document",
+    ))
+    .await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+
+    assert!(matches!(
+        client
+            .replace_note(
+                "expected-document",
+                "expected-operation",
+                1,
+                &note_request(),
+            )
+            .await,
+        Err(HttpClientError::InvalidResponse {
+            delivery: DeliveryStatus::Unknown
+        })
+    ));
+    raw.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn uncertain_server_failures_keep_unknown_mutation_delivery() {
+    for (status, code) in [
+        ("408 Request Timeout", "request_timeout"),
+        ("500 Internal Server Error", "internal"),
+    ] {
+        let raw = spawn_json_response(
+            status,
+            json!({"error":{"code":code,"message":"request outcome is unknown","meta":null}}),
+        )
+        .await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+
+        let error = client
+            .create_note("expected-operation", &note_request())
+            .await
+            .unwrap_err();
+        let HttpClientError::Server(error) = error else {
+            panic!("expected typed server error");
+        };
+        assert_eq!(error.delivery(), DeliveryStatus::Unknown);
+        raw.task.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -491,6 +751,58 @@ async fn spawn_raw_server(response: &'static [u8]) -> RawServer {
     RawServer {
         base_url: format!("http://{address}"),
         task,
+    }
+}
+
+async fn spawn_json_server(value: serde_json::Value) -> RawServer {
+    spawn_json_response("200 OK", value).await
+}
+
+async fn spawn_json_response(status: &'static str, value: serde_json::Value) -> RawServer {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_request_head(&mut stream).await;
+        let body = serde_json::to_vec(&value).unwrap();
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&body).await.unwrap();
+    });
+    RawServer {
+        base_url: format!("http://{address}"),
+        task,
+    }
+}
+
+fn document_mutation_json(
+    format_version: u32,
+    operation_id: &str,
+    document_id: &str,
+) -> serde_json::Value {
+    json!({
+        "status": "applied",
+        "format_version": format_version,
+        "operation_id": operation_id,
+        "changed": true,
+        "authoritative": {
+            "document_id": document_id,
+            "logical_path": "note.org",
+            "revision": 1,
+            "content_sha256": null,
+            "active": true
+        },
+        "cursor": "cursor"
+    })
+}
+
+fn note_request() -> NoteWriteRequestV1 {
+    NoteWriteRequestV1 {
+        logical_path: "note.org".into(),
+        org: "#+title: Note\n".into(),
     }
 }
 

@@ -26,10 +26,11 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 use crate::{
     application::{
         AnswerInput, ApplicationError, DevicePrincipal, DeviceScope, MAX_OFFLINE_ASSET_BYTES,
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        PreparedNote, ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
         ReviewAttemptOperationStatus, ReviewAttemptView, ReviewOperationAuthority,
         ReviewSessionView, ReviewSource, SettingsRecord, canonical_asset_path, prepare_asset,
-        prepare_note, prepare_thema, review_day_at, thema_content,
+        prepare_device_document_mutation, prepare_note, prepare_thema, review_day_at,
+        thema_content,
     },
     domain::DocumentId,
     is_canonical_sha256,
@@ -41,9 +42,10 @@ use crate::{
         http_v1::{
             ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1,
-            DocumentHeadV1, DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
+            DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+            DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
+            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
             ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
@@ -163,6 +165,11 @@ fn data_router() -> Router<HttpState> {
         .route(
             "/v1/notes/{id}",
             get(get_note).put(update_note).delete(delete_note),
+        )
+        .route("/v1/document-mutations", post(create_document_mutation))
+        .route(
+            "/v1/document-mutations/{id}",
+            axum::routing::put(replace_document_mutation),
         )
         .route("/v1/notes/{id}/rename", post(rename_note))
         .route("/v1/notes/{id}/revisions", get(note_revisions))
@@ -455,13 +462,8 @@ async fn update_note(
 ) -> Result<Json<DocumentHeadV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let revision = if_match(&headers)?;
-    let prepared = prepare_note(
-        Some(id.clone()),
-        input.logical_path,
-        input.org,
-        Some(revision),
-    )
-    .map_err(ApiError::invalid_content)?;
+    let prepared = prepare_note(Some(id), input.logical_path, input.org, Some(revision))
+        .map_err(ApiError::invalid_content)?;
     let head = state
         .service
         .replace_note(prepared, now_us_i64()?, Some(principal.device_id))
@@ -469,6 +471,61 @@ async fn update_note(
         .map_err(|error| conflict_with(error, revision))?;
     announce(&state).await;
     Ok(Json(DocumentHeadV1::from_application(&head)))
+}
+
+async fn create_document_mutation(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<NoteWriteRequestV1>,
+) -> Result<(StatusCode, Json<DocumentMutationResultV1>), ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    let operation_id = idempotency_key(&headers)?;
+    let prepared = prepare_note(None, input.logical_path, input.org, None)
+        .map_err(ApiError::invalid_content)?;
+    let result = apply_document_mutation(&state, principal, operation_id, prepared).await?;
+    Ok((StatusCode::OK, Json(result)))
+}
+
+async fn replace_document_mutation(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(input): ApiJson<NoteWriteRequestV1>,
+) -> Result<Json<DocumentMutationResultV1>, ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    let operation_id = idempotency_key(&headers)?;
+    let revision = if_match(&headers)?;
+    let prepared = prepare_note(
+        Some(id.clone()),
+        input.logical_path,
+        input.org,
+        Some(revision),
+    )
+    .map_err(ApiError::invalid_content)?;
+    let result = apply_document_mutation(&state, principal, operation_id, prepared).await?;
+    Ok(Json(result))
+}
+
+async fn apply_document_mutation(
+    state: &HttpState,
+    principal: DevicePrincipal,
+    operation_id: String,
+    prepared: PreparedNote,
+) -> Result<DocumentMutationResultV1, ApiError> {
+    let operation =
+        prepare_device_document_mutation(1, operation_id, principal.device_id, prepared)
+            .map_err(|_| ApiError::bad_request("invalid Idempotency-Key"))?;
+    let execution = state
+        .service
+        .apply_device_document_mutation(operation, now_us_i64()?)
+        .await
+        .map_err(ApiError::service)?;
+    if !execution.replayed && execution.result.changed() {
+        announce(state).await;
+    }
+    DocumentMutationResultV1::from_application(&execution.result).map_err(|_| ApiError::internal())
 }
 
 async fn get_note(
@@ -1431,6 +1488,20 @@ fn require(principal: &DevicePrincipal, scope: DeviceScope) -> Result<(), ApiErr
 fn if_match(headers: &HeaderMap) -> Result<u64, ApiError> {
     optional_if_match(headers)?.ok_or_else(|| ApiError::precondition("If-Match is required"))
 }
+
+fn idempotency_key(headers: &HeaderMap) -> Result<String, ApiError> {
+    let mut values = headers.get_all("idempotency-key").iter();
+    let value = values
+        .next()
+        .ok_or_else(|| ApiError::bad_request("Idempotency-Key is required"))?;
+    if values.next().is_some() {
+        return Err(ApiError::bad_request("invalid Idempotency-Key"));
+    }
+    value
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|_| ApiError::bad_request("invalid Idempotency-Key"))
+}
 fn optional_if_match(headers: &HeaderMap) -> Result<Option<u64>, ApiError> {
     headers
         .get(header::IF_MATCH)
@@ -1508,6 +1579,7 @@ async fn announce(state: &HttpState) {
         let _ = state.cursors.send(cursor);
     }
 }
+
 fn conflict_with(error: ServiceError, expected: u64) -> ApiError {
     match error {
         ServiceError::Store(StoreError::Conflict { actual, .. }) => {
@@ -1930,6 +2002,24 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
                 "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
             ],
         )),
+        ("/v1/document-mutations", "post") => Some(json_contract(
+            "content:write",
+            Some("NoteWriteRequestV1"),
+            "200",
+            "DocumentMutationResultV1",
+            &[
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/document-mutations/{id}", "put") => Some(json_contract(
+            "content:write",
+            Some("NoteWriteRequestV1"),
+            "200",
+            "DocumentMutationResultV1",
+            &[
+                "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
+            ],
+        )),
         ("/v1/notes/{id}", "delete") => Some(json_contract(
             "content:write",
             None,
@@ -2150,7 +2240,31 @@ fn content_parameters(path: &str, method: &str) -> Vec<Value> {
     } else if path == "/v1/assets/{digest}/{name}" && method == "put" {
         parameters.push(if_match_parameter(false));
     }
+    if content_requires_idempotency(path, method) {
+        parameters.push(idempotency_key_parameter());
+    }
     parameters
+}
+
+fn content_requires_idempotency(path: &str, method: &str) -> bool {
+    matches!(
+        (path, method),
+        ("/v1/document-mutations", "post") | ("/v1/document-mutations/{id}", "put")
+    )
+}
+
+fn idempotency_key_parameter() -> Value {
+    json!({
+        "name":"Idempotency-Key",
+        "in":"header",
+        "required":true,
+        "schema":{
+            "type":"string",
+            "minLength":1,
+            "maxLength":128,
+            "pattern":"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        }
+    })
 }
 
 fn content_query_parameters(path: &str) -> Vec<Value> {
@@ -2192,6 +2306,7 @@ fn content_requires_if_match(path: &str, method: &str) -> bool {
         (path, method),
         ("/v1/settings", "put")
             | ("/v1/notes/{id}", "put" | "delete")
+            | ("/v1/document-mutations/{id}", "put")
             | ("/v1/notes/{id}/rename", "post")
             | ("/v1/assets/{digest}/{name}", "delete")
             | ("/v1/themata/{id}", "put")
@@ -2338,6 +2453,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ReplicaSnapshotPageV1>();
     generator.subschema_for::<ContentChangePageV1>();
     generator.subschema_for::<DocumentHeadV1>();
+    generator.subschema_for::<DocumentMutationResultV1>();
     generator.subschema_for::<DocumentRevisionPageV1>();
     generator.subschema_for::<DocumentRevisionSummaryV1>();
     generator.subschema_for::<AssetHeadV1>();
@@ -2442,6 +2558,8 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/notes/{id}", "get"),
     ("/v1/notes/{id}", "put"),
     ("/v1/notes/{id}", "delete"),
+    ("/v1/document-mutations", "post"),
+    ("/v1/document-mutations/{id}", "put"),
     ("/v1/notes/{id}/rename", "post"),
     ("/v1/notes/{id}/revisions", "get"),
     ("/v1/notes/{id}/revisions/{revision}", "get"),
@@ -2861,6 +2979,28 @@ mod tests {
                 ],
             ),
             expected_json_contract(
+                "/v1/document-mutations",
+                "post",
+                "content:write",
+                Some("NoteWriteRequestV1"),
+                "200",
+                "DocumentMutationResultV1",
+                &[
+                    "200", "400", "401", "403", "408", "409", "413", "422", "500", "503",
+                ],
+            ),
+            expected_json_contract(
+                "/v1/document-mutations/{id}",
+                "put",
+                "content:write",
+                Some("NoteWriteRequestV1"),
+                "200",
+                "DocumentMutationResultV1",
+                &[
+                    "200", "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
                 "/v1/notes/{id}",
                 "delete",
                 "content:write",
@@ -3031,6 +3171,14 @@ mod tests {
         }
 
         assert_required_header(&api, "/v1/settings", "put", "If-Match");
+        assert_required_header(&api, "/v1/document-mutations", "post", "Idempotency-Key");
+        assert_required_header(
+            &api,
+            "/v1/document-mutations/{id}",
+            "put",
+            "Idempotency-Key",
+        );
+        assert_required_header(&api, "/v1/document-mutations/{id}", "put", "If-Match");
         assert_required_header(&api, "/v1/notes/{id}", "put", "If-Match");
         assert_required_header(&api, "/v1/notes/{id}", "delete", "If-Match");
         assert_required_header(&api, "/v1/notes/{id}/rename", "post", "If-Match");
@@ -3043,6 +3191,13 @@ mod tests {
             operation_parameter(&api["paths"]["/v1/settings"]["put"], "If-Match")["schema"]["pattern"],
             "^(?:[0-9]+|\"[0-9]+\")$"
         );
+        let mutation = &api["components"]["schemas"]["DocumentMutationResultV1"]["oneOf"];
+        for result in mutation.as_array().unwrap() {
+            assert_eq!(
+                result["properties"]["operation_id"]["pattern"],
+                "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+            );
+        }
 
         let changes = &api["paths"]["/v1/changes"]["get"];
         let after = operation_parameter(changes, "after");
@@ -3718,6 +3873,197 @@ mod tests {
     #[tokio::test]
     async fn missing_note_assets_are_invalid_content() {
         let directory = tempfile::tempdir().unwrap();
+        let blob_root = directory.path().join("blobs");
+        let runtime =
+            ServiceRuntime::start(directory.path().join("gnosis.sqlite"), blob_root.clone(), 8)
+                .await
+                .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("writer".into(), vec!["content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let asset = format!("assets/{}/missing.png", "a".repeat(64));
+        let org = format!("#+title: Missing\n[[file:{asset}]]\n");
+        let digest = format!("{:x}", Sha256::digest(org.as_bytes()));
+        let body = serde_json::to_vec(&json!({
+            "logical_path": "note.org",
+            "org": org
+        }))
+        .unwrap();
+
+        let response = router(service.clone())
+            .oneshot(authorized_mutation(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                "missing-asset",
+                None,
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["rejection"]["reason"],
+            "invalid_content"
+        );
+        assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        assert!(!blob_root.join(&digest[..2]).join(digest).exists());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_document_http_mutations_are_durable_and_replayable() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device =
+            generate_device("writer".into(), vec!["read".into(), "content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+        let body = note_body("note.org", "First");
+
+        let missing = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                Body::from(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+        let create = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                "create",
+                None,
+                Body::from(body.clone()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+        let created = response_json(create).await;
+        assert_eq!(created["status"], "applied");
+        assert_eq!(created["operation_id"], "create");
+        assert_eq!(created["authoritative"]["revision"], 1);
+        let document_id = created["authoritative"]["document_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            decode_cursor(created["cursor"].as_str().unwrap())
+                .unwrap()
+                .1,
+            1
+        );
+
+        let retry = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                "create",
+                None,
+                Body::from(body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(response_json(retry).await, created);
+
+        let changed = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                "create",
+                None,
+                Body::from(note_body("note.org", "Changed")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(changed).await["error"]["code"],
+            "idempotency_conflict"
+        );
+
+        let stale_path = format!("/v1/document-mutations/{document_id}");
+        let stale = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "PUT",
+                &stale_path,
+                &token,
+                "stale",
+                Some("\"0\""),
+                Body::from(note_body("note.org", "Stale")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        let stale = response_json(stale).await;
+        assert_eq!(stale["status"], "rejected");
+        assert_eq!(stale["rejection"]["reason"], "revision_conflict");
+        assert_eq!(stale["rejection"]["current_revision"], 1);
+
+        let update = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "PUT",
+                &stale_path,
+                &token,
+                "update",
+                Some("1"),
+                Body::from(note_body("note.org", "Current")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(update).await["authoritative"]["revision"], 2);
+        let stale_retry = app
+            .oneshot(authorized_mutation(
+                "PUT",
+                &stale_path,
+                &token,
+                "stale",
+                Some("0"),
+                Body::from(note_body("note.org", "Stale")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response_json(stale_retry).await, stale);
+        assert_eq!(
+            service
+                .note_revisions(DocumentId::new(document_id).unwrap(), 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_note_writes_preserve_the_frozen_v1_contract() {
+        let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
             directory.path().join("gnosis.sqlite"),
             directory.path().join("blobs"),
@@ -3729,24 +4075,54 @@ mod tests {
         let device = generate_device("writer".into(), vec!["content:write".into()]).unwrap();
         let token = device.token.clone();
         service.create_device(device, 1).await.unwrap();
-        let asset = format!("assets/{}/missing.png", "a".repeat(64));
-        let body = serde_json::to_vec(&json!({
-            "logical_path": "note.org",
-            "org": format!("#+title: Missing\n[[file:{asset}]]\n")
-        }))
-        .unwrap();
+        let app = router(service.clone());
 
-        let response = router(service.clone())
-            .oneshot(authorized("POST", "/v1/notes", &token, Body::from(body)))
+        let create = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/notes",
+                &token,
+                Body::from(note_body("note.org", "Original")),
+            ))
             .await
             .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let created = response_json(create).await;
+        assert_eq!(created["revision"], 1);
+        assert!(created.get("status").is_none());
+        let document_id = created["document_id"].as_str().unwrap();
+        let path = format!("/v1/notes/{document_id}");
 
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let update = app
+            .clone()
+            .oneshot(authorized_if_match(
+                "PUT",
+                &path,
+                &token,
+                "1",
+                Body::from(note_body("note.org", "Updated")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        assert_eq!(response_json(update).await["revision"], 2);
+
+        let stale = app
+            .oneshot(authorized_if_match(
+                "PUT",
+                &path,
+                &token,
+                "1",
+                Body::from(note_body("note.org", "Stale")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
         assert_eq!(
-            response_json(response).await["error"]["code"],
-            "invalid_content"
+            response_json(stale).await["error"]["code"],
+            "revision_conflict"
         );
-        assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -4032,15 +4408,17 @@ mod tests {
         });
         let created = app
             .clone()
-            .oneshot(authorized(
+            .oneshot(authorized_mutation(
                 "POST",
-                "/v1/notes",
+                "/v1/document-mutations",
                 &owner_token,
+                "create-note",
+                None,
                 Body::from(serde_json::to_vec(&note).unwrap()),
             ))
             .await
             .unwrap();
-        assert_eq!(created.status(), StatusCode::CREATED);
+        assert_eq!(created.status(), StatusCode::OK);
 
         let state: ReplicaStateV1 = response_typed(
             app.clone()
@@ -4222,10 +4600,12 @@ mod tests {
         let invalid = json!({"logical_path":"invalid.org","org":"not org"});
         let response = app
             .clone()
-            .oneshot(authorized(
+            .oneshot(authorized_mutation(
                 "POST",
                 "/v1/notes",
                 &owner_token,
+                "invalid-note",
+                None,
                 Body::from(serde_json::to_vec(&invalid).unwrap()),
             ))
             .await
@@ -4681,6 +5061,48 @@ mod tests {
             .header("content-type", "application/json")
             .body(body)
             .unwrap()
+    }
+
+    fn authorized_mutation(
+        method: &str,
+        uri: &str,
+        token: &str,
+        operation_id: &str,
+        if_match: Option<&str>,
+        body: Body,
+    ) -> Request<Body> {
+        let mut request = authorized(method, uri, token, body);
+        request
+            .headers_mut()
+            .insert("idempotency-key", operation_id.parse().unwrap());
+        if let Some(value) = if_match {
+            request
+                .headers_mut()
+                .insert("if-match", value.parse().unwrap());
+        }
+        request
+    }
+
+    fn authorized_if_match(
+        method: &str,
+        uri: &str,
+        token: &str,
+        if_match: &str,
+        body: Body,
+    ) -> Request<Body> {
+        let mut request = authorized(method, uri, token, body);
+        request
+            .headers_mut()
+            .insert("if-match", if_match.parse().unwrap());
+        request
+    }
+
+    fn note_body(logical_path: &str, title: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "logical_path":logical_path,
+            "org":format!("#+title: {title}\n")
+        }))
+        .unwrap()
     }
 
     fn authorized_with_type(

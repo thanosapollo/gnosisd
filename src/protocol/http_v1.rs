@@ -10,9 +10,10 @@ mod content;
 
 pub use content::{
     AssetHeadV1, ContentChangePageV1, ContentChangeV1, ContentEntityKindV1, ContentOperationV1,
-    DocumentHeadV1, DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
-    NoteRenameRequestV1, NoteWriteRequestV1, SchedulerParametersInputV1, SettingsV1, StagedBlobV1,
-    TagRuleInputV1, ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    DocumentHeadV1, DocumentMutationRejectionV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+    DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+    SchedulerParametersInputV1, SettingsV1, StagedBlobV1, TagRuleInputV1, ThemaPageV1, ThemaV1,
+    ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 
 use std::{borrow::Cow, collections::BTreeMap};

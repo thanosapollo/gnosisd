@@ -26,17 +26,20 @@ use crate::{
         DocumentHead, DocumentRevision, ImportSummary, MAX_OFFLINE_ASSET_BYTES, NewDevice,
         NodeRecord, OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
         OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedNote, PreparedServerImport, PreparedThema, QueryDueThemata,
-        QueryDueThemataPage, ReplicaChange, ReplicaState, ReviewAttemptOperation,
-        ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewError,
-        ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource,
-        SettingsError, SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
-        prepare_offline_document, retained_asset_paths_in_org, token_digest, validate_asset_path,
+        PreparedAsset, PreparedDeviceDocumentMutation, PreparedNote, PreparedServerImport,
+        PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange, ReplicaState,
+        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
+        ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackView,
+        ReviewSessionView, ReviewSource, SettingsError, SettingsInput, SettingsRecord,
+        SnapshotPage, SnapshotPosition, ThemaRecord, prepare_offline_document,
+        retained_asset_paths_in_org, token_digest, validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     is_canonical_sha256,
-    store::{DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument},
+    store::{
+        DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
+    },
 };
 
 #[derive(Clone)]
@@ -126,6 +129,21 @@ impl ServiceHandle {
             created_at_us,
             author_device_id,
             response,
+        })
+        .await?
+    }
+
+    pub(crate) async fn apply_device_document_mutation(
+        &self,
+        operation: PreparedDeviceDocumentMutation,
+        created_at_us: i64,
+    ) -> Result<DeviceMutationExecution, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ApplyDeviceDocumentMutation {
+                operation: Box::new(operation),
+                created_at_us,
+                response,
+            }
         })
         .await?
     }
@@ -1161,6 +1179,11 @@ enum StoreCommand {
         author_device_id: Option<String>,
         response: oneshot::Sender<Result<DocumentHead, ServiceError>>,
     },
+    ApplyDeviceDocumentMutation {
+        operation: Box<PreparedDeviceDocumentMutation>,
+        created_at_us: i64,
+        response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
+    },
     DocumentHead {
         document_id: DocumentId,
         response: oneshot::Sender<StoreResult<Option<DocumentHead>>>,
@@ -1634,6 +1657,23 @@ fn replace_note_command(
         .ok_or(ServiceError::Store(StoreError::NotFound))
 }
 
+fn apply_device_document_mutation_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    operation: &PreparedDeviceDocumentMutation,
+    created_at_us: i64,
+) -> Result<DeviceMutationExecution, ServiceError> {
+    let needs_blob = store
+        .device_document_mutation_needs_blob(operation)
+        .map_err(ServiceError::Store)?;
+    let blob = needs_blob
+        .then(|| blobs.put(operation.prepared.org.as_bytes(), "text/org; charset=utf-8"))
+        .transpose()?;
+    store
+        .apply_device_document_mutation(operation, blob.as_ref(), created_at_us)
+        .map_err(ServiceError::Store)
+}
+
 struct AssetWrite<'a> {
     prepared: &'a PreparedAsset,
     bytes: &'a [u8],
@@ -1713,6 +1753,14 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
                 created_at_us,
                 author_device_id.as_deref(),
             ),
+        ),
+        StoreCommand::ApplyDeviceDocumentMutation {
+            operation,
+            created_at_us,
+            response,
+        } => send(
+            response,
+            apply_device_document_mutation_command(store, blobs, &operation, created_at_us),
         ),
         StoreCommand::DocumentHead {
             document_id,
@@ -2355,12 +2403,12 @@ mod tests {
     use crate::application::{
         AssetReconciliationStatus, ImportDocument, OfflineAssetConflictReason,
         OfflineAssetOperation, ParametersSnapshot, ReplicaProjection, SettingsInput,
-        canonical_asset_path, generate_device, prepare_asset, prepare_note, prepare_thema,
-        thema_content,
+        canonical_asset_path, generate_device, prepare_asset, prepare_device_document_mutation,
+        prepare_note, prepare_thema, thema_content,
     };
     use crate::blob::BlobStore;
     use crate::protocol::canonical_asset_operation;
-    use crate::store::StoreError;
+    use crate::store::{SqliteStore, StoreError};
 
     async fn runtime(directory: &tempfile::TempDir) -> ServiceRuntime {
         ServiceRuntime::start(
@@ -2427,6 +2475,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(staged_size, bytes.len() as u64);
+        assert!(blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[test]
+    fn accepted_document_mutation_survives_dropped_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_path = directory.path().join("blobs");
+        let blobs = Arc::new(BlobStore::open(&blob_path).unwrap());
+        let device = generate_device("Device".into(), vec!["content:write".into()]).unwrap();
+        let mut store = SqliteStore::open(&database).unwrap();
+        store.create_device(&device, 1).unwrap();
+        drop(store);
+        let prepared = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Durable\n".into(),
+            None,
+        )
+        .unwrap();
+        let digest = prepared.blob_sha256.clone();
+        let operation =
+            prepare_device_document_mutation(1, "operation".into(), device.device_id, prepared)
+                .unwrap();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (response, response_receiver) = oneshot::channel();
+        sender
+            .try_send(StoreCommand::ApplyDeviceDocumentMutation {
+                operation: Box::new(operation),
+                created_at_us: 2,
+                response,
+            })
+            .unwrap();
+        drop(response_receiver);
+
+        let (ready, readiness) = mpsc::sync_channel(1);
+        let actor_blobs = blobs.clone();
+        let actor_database = database.clone();
+        let actor =
+            thread::spawn(move || store_actor(actor_database, actor_blobs, receiver, ready));
+        readiness.recv().unwrap().unwrap();
+        drop(sender);
+        actor.join().unwrap();
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let receipts: u64 = connection
+            .query_row("SELECT count(*) FROM device_mutation_receipt", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let revisions: u64 = connection
+            .query_row("SELECT count(*) FROM document_revision", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((receipts, revisions), (1, 1));
         assert!(blob_path.join(&digest[..2]).join(digest).exists());
     }
 

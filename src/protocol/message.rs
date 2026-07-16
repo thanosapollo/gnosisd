@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::application::{
     AnswerInput, ParametersSnapshot, PresentationSnapshot, ReviewAttemptOperationResult,
     ReviewAttemptState, ReviewAttemptView, ReviewSessionView, ReviewSource, ReviewSourceKind,
-    ReviewStateSnapshot, TransitionSnapshot, valid_review_operation_id,
+    ReviewStateSnapshot, TransitionSnapshot, valid_operation_id,
 };
 use crate::domain::{
     DocumentId, DocumentProjection, DueThema, LegacyDatabaseInfo, LegacyReviewState, LegacyThema,
@@ -169,7 +169,7 @@ impl Request {
             } => {
                 require_review_id(attempt_id)?;
                 if *operation_version != 1
-                    || !valid_review_operation_id(operation_id)
+                    || !valid_operation_id(operation_id)
                     || *expected_attempt_revision > i64::MAX as u64
                 {
                     return Err(MessageValidationError::InvalidReviewRequest);
