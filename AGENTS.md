@@ -71,9 +71,10 @@ client may open the core database directly.
   Unknown mutation delivery stops synchronization with the operation identity
   intact; the next explicit run replays that exact immutable operation.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
-  `src/bin/gnosis.rs` currently combines operator commands and compatibility
-  methods; ordinary commands must migrate to `HttpClient` before the Unix
-  compatibility methods are removed.
+  `src/bin/gnosis.rs` routes review attempt recovery and revisioned desired-state
+  operations through `HttpClient`. Operator commands and remaining compatibility
+  methods still use the Unix socket; ordinary commands must migrate before the
+  corresponding Unix methods are removed.
 
 Keep textual link occurrences, unique semantic node edges, and `ThemaConcept`
 learning associations separate. Node titles are local values; title paths

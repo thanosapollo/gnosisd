@@ -117,6 +117,46 @@ fn public_capability_and_error_dtos_preserve_http_shapes() {
 }
 
 #[test]
+fn public_error_code_names_match_their_wire_values() {
+    use ApiErrorCodeV1::*;
+
+    let codes = [
+        Unauthorized,
+        Forbidden,
+        NotFound,
+        InvalidRequest,
+        PreconditionRequired,
+        Internal,
+        InvalidContent,
+        RequestTooLarge,
+        InvalidBody,
+        RequestTimeout,
+        UnsupportedOfflineReviewVersion,
+        InvalidOfflineReviewOperation,
+        UnsupportedOfflineContentVersion,
+        InvalidOfflineContentOperation,
+        UnsupportedOfflineAssetVersion,
+        InvalidOfflineAssetOperation,
+        ReplicaProjectionTooLarge,
+        SnapshotRequired,
+        RevisionConflict,
+        Busy,
+        ActiveSession,
+        StaleAttempt,
+        ReviewStateConflict,
+        IdempotencyConflict,
+        DeviceSequenceGap,
+        BlobRequired,
+        BlobMetadataConflict,
+        RenameRequired,
+        InvalidBlobMetadata,
+    ];
+    for code in codes {
+        assert_eq!(serde_json::to_value(code).unwrap(), json!(code.as_str()));
+    }
+}
+
+#[test]
 fn public_document_mutation_results_are_exclusive_and_strict() {
     let applied = json!({
         "status":"applied",

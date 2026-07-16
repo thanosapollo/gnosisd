@@ -1,6 +1,9 @@
 use std::{
+    fs,
     net::SocketAddr,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
 };
 
 use gnosis_core::{
@@ -248,6 +251,159 @@ async fn client_runs_the_typed_online_review_lifecycle() {
             .event_id
             .is_empty()
     );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_routes_review_recovery_and_mutations_through_http() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let attempt_id = graded_attempt(&daemon, &client, &raw_token).await;
+    let token_path = daemon._directory.path().join("client.token");
+    fs::write(&token_path, format!("{raw_token}\n")).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let state = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["review-attempt-state", &attempt_id],
+    )
+    .await;
+    assert!(
+        state.status.success(),
+        "{}",
+        String::from_utf8_lossy(&state.stderr)
+    );
+    let state: serde_json::Value = serde_json::from_slice(&state.stdout).unwrap();
+    let revision = state["attempt_revision"].as_u64().unwrap();
+
+    let proxy = spawn_drop_response_proxy(daemon.http_addr).await;
+    let uncertain = run_cli(
+        &proxy.base_url,
+        &token_path,
+        &[
+            "review-attempt-set-accepted",
+            &attempt_id,
+            "--operation-id",
+            "cli-accept",
+            "--expected-revision",
+            &revision.to_string(),
+            "--accepted-success",
+            "false",
+        ],
+    )
+    .await;
+    assert!(!uncertain.status.success());
+    let error = String::from_utf8(uncertain.stderr).unwrap();
+    assert!(error.contains("review operation cli-accept failed (unknown delivery)"));
+    assert!(error.contains("use the same operation ID"));
+    assert!(proxy.task.await.unwrap().starts_with(b"HTTP/1.1 200"));
+
+    let accepted = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &[
+            "review-attempt-set-accepted",
+            &attempt_id,
+            "--operation-id",
+            "cli-accept",
+            "--expected-revision",
+            &revision.to_string(),
+            "--accepted-success",
+            "false",
+        ],
+    )
+    .await;
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let accepted: serde_json::Value = serde_json::from_slice(&accepted.stdout).unwrap();
+    assert_eq!(accepted["operation_id"], "cli-accept");
+    assert_eq!(accepted["attempt"]["accepted_success"], false);
+    let accepted_revision = accepted["attempt_revision"].as_u64().unwrap();
+
+    let output_failure = run_cli_to_full(
+        &daemon.base_url,
+        &token_path,
+        &[
+            "review-attempt-set-suspended",
+            &attempt_id,
+            "--operation-id",
+            "cli-suspend",
+            "--expected-revision",
+            &accepted_revision.to_string(),
+            "--desired-suspended",
+            "true",
+        ],
+    )
+    .await;
+    assert!(!output_failure.status.success());
+    let error = String::from_utf8(output_failure.stderr).unwrap();
+    assert!(error.contains("review operation cli-suspend failed (confirmed delivery)"));
+    assert!(error.contains("could not write daemon response"), "{error}");
+
+    let suspended = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &[
+            "review-attempt-set-suspended",
+            &attempt_id,
+            "--operation-id",
+            "cli-suspend",
+            "--expected-revision",
+            &accepted_revision.to_string(),
+            "--desired-suspended",
+            "true",
+        ],
+    )
+    .await;
+    assert!(
+        suspended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&suspended.stderr)
+    );
+    let suspended: serde_json::Value = serde_json::from_slice(&suspended.stdout).unwrap();
+    assert_eq!(suspended["operation_id"], "cli-suspend");
+    assert_eq!(suspended["attempt"]["desired_suspended"], true);
+
+    let missing = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["review-attempt-state", "missing-attempt"],
+    )
+    .await;
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8(missing.stderr)
+            .unwrap()
+            .starts_with("not_found: ")
+    );
+
+    let no_token = run_cli_without_token(
+        &daemon.base_url,
+        &[
+            "review-attempt-set-accepted",
+            &attempt_id,
+            "--operation-id",
+            "cli-no-token",
+            "--expected-revision",
+            "0",
+            "--accepted-success",
+            "true",
+        ],
+    )
+    .await;
+    assert!(!no_token.status.success());
+    let error = String::from_utf8(no_token.stderr).unwrap();
+    assert!(error.contains("review operation cli-no-token failed (not-sent delivery)"));
+    assert!(error.contains("--token-file is required"));
     daemon.stop().await;
 }
 
@@ -1140,6 +1296,78 @@ async fn create_device(socket: &Path) -> (String, String) {
         panic!("unexpected device response");
     };
     (created.device.device_id, created.token)
+}
+
+async fn graded_attempt(daemon: &RunningDaemon, client: &HttpClient, token: &str) -> String {
+    let thema_id = create_review_thema(&daemon.base_url, token).await;
+    let session = client
+        .create_review_session(&ReviewSessionRequestV1 {
+            source: manual_source(thema_id),
+            target_count: None,
+        })
+        .await
+        .unwrap();
+    let attempt = client
+        .begin_review_attempt(&session.session_id)
+        .await
+        .unwrap();
+    client
+        .answer_review_attempt(&attempt.attempt_id, &ReviewAnswerV1::Text("Answer".into()))
+        .await
+        .unwrap();
+    attempt.attempt_id
+}
+
+fn manual_source(thema_id: String) -> ReviewSourceInputV1 {
+    ReviewSourceInputV1 {
+        kind: ReviewSourceKindV1::Manual,
+        tags: Vec::new(),
+        exclude_tags: Vec::new(),
+        topic_node_id: None,
+        topic_forward_depth: None,
+        topic_backward_depth: None,
+        manual_ids: vec![thema_id],
+    }
+}
+
+async fn run_cli(base_url: &str, token_path: &Path, args: &[&str]) -> Output {
+    run_cli_output(base_url, Some(token_path), args, false).await
+}
+
+async fn run_cli_to_full(base_url: &str, token_path: &Path, args: &[&str]) -> Output {
+    run_cli_output(base_url, Some(token_path), args, true).await
+}
+
+async fn run_cli_without_token(base_url: &str, args: &[&str]) -> Output {
+    run_cli_output(base_url, None, args, false).await
+}
+
+async fn run_cli_output(
+    base_url: &str,
+    token_path: Option<&Path>,
+    args: &[&str],
+    fail_output: bool,
+) -> Output {
+    let base_url = base_url.to_owned();
+    let token_path = token_path.map(Path::to_owned);
+    let args: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+    tokio::task::spawn_blocking(move || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_gnosis"));
+        command.arg("--http-url").arg(base_url);
+        if let Some(path) = token_path {
+            command.arg("--token-file").arg(path);
+        }
+        if fail_output {
+            let full = fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+            command.stdout(Stdio::from(full));
+        }
+        command.args(args).output().unwrap()
+    })
+    .await
+    .unwrap()
 }
 
 fn review_thema_request() -> ThemaWriteRequestV1 {

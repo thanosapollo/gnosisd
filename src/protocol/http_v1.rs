@@ -971,6 +971,42 @@ pub enum ApiErrorCodeV1 {
     InvalidBlobMetadata,
 }
 
+impl ApiErrorCodeV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::InvalidRequest => "invalid_request",
+            Self::PreconditionRequired => "precondition_required",
+            Self::Internal => "internal",
+            Self::InvalidContent => "invalid_content",
+            Self::RequestTooLarge => "request_too_large",
+            Self::InvalidBody => "invalid_body",
+            Self::RequestTimeout => "request_timeout",
+            Self::UnsupportedOfflineReviewVersion => "unsupported_offline_review_version",
+            Self::InvalidOfflineReviewOperation => "invalid_offline_review_operation",
+            Self::UnsupportedOfflineContentVersion => "unsupported_offline_content_version",
+            Self::InvalidOfflineContentOperation => "invalid_offline_content_operation",
+            Self::UnsupportedOfflineAssetVersion => "unsupported_offline_asset_version",
+            Self::InvalidOfflineAssetOperation => "invalid_offline_asset_operation",
+            Self::ReplicaProjectionTooLarge => "replica_projection_too_large",
+            Self::SnapshotRequired => "snapshot_required",
+            Self::RevisionConflict => "revision_conflict",
+            Self::Busy => "busy",
+            Self::ActiveSession => "active_session",
+            Self::StaleAttempt => "stale_attempt",
+            Self::ReviewStateConflict => "review_state_conflict",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::DeviceSequenceGap => "device_sequence_gap",
+            Self::BlobRequired => "blob_required",
+            Self::BlobMetadataConflict => "blob_metadata_conflict",
+            Self::RenameRequired => "rename_required",
+            Self::InvalidBlobMetadata => "invalid_blob_metadata",
+        }
+    }
+}
+
 const METADATA_ERROR_CODES: [ApiErrorCodeV1; 4] = [
     ApiErrorCodeV1::SnapshotRequired,
     ApiErrorCodeV1::RevisionConflict,
