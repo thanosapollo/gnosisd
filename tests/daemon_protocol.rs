@@ -2,7 +2,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus},
     sync::Arc,
     time::Duration,
 };
@@ -29,6 +29,60 @@ struct RunningDaemon {
 struct DaemonProcess {
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), gnosis_core::protocol::ServerError>>,
+}
+
+struct ChildGuard {
+    child: Option<Child>,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().expect("child already reaped").id()
+    }
+
+    async fn wait_for_exit(mut self) -> ExitStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.try_reap() {
+                    Ok(Some(status)) => return status,
+                    Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("failed to reap daemon: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("daemon did not exit after SIGTERM")
+    }
+
+    fn try_reap(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = child.try_wait()?;
+        if status.is_some() {
+            self.child = None;
+        }
+        Ok(status)
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let _ = child.kill();
+        for _ in 0..100 {
+            match self.try_reap() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
 }
 
 impl DaemonProcess {
@@ -928,7 +982,7 @@ async fn sigterm_drains_daemon_and_removes_socket() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("process.sock");
     let database = directory.path().join("process.sqlite");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gnosisd"))
+    let child = Command::new(env!("CARGO_BIN_EXE_gnosisd"))
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -937,6 +991,7 @@ async fn sigterm_drains_daemon_and_removes_socket() {
         ])
         .spawn()
         .unwrap();
+    let child = ChildGuard::new(child);
     wait_for_daemon(&socket).await;
     assert_eq!(
         fs::metadata(&database).unwrap().permissions().mode() & 0o777,
@@ -949,9 +1004,7 @@ async fn sigterm_drains_daemon_and_removes_socket() {
             .unwrap()
             .success()
     );
-    let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
-        .await
-        .unwrap();
+    let status = child.wait_for_exit().await;
     assert!(status.success());
     assert!(!socket.exists());
 }

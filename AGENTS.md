@@ -125,14 +125,14 @@ nix develop
 Focused checks:
 
 ```sh
-cargo test domain
+cargo test --lib domain::
 cargo test --lib parser::org_tests
 cargo test --test org_parser
 cargo test --lib store::sqlite::tests
 cargo test --test sqlite_store
 cargo test --test legacy_migration
-cargo test application
-cargo test protocol
+cargo test --lib application::
+cargo test --lib protocol::
 cargo test --test daemon_protocol
 ```
 
