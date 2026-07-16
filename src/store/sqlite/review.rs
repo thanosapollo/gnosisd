@@ -18,7 +18,8 @@ use crate::{
         ReviewAttemptOperationStatus, ReviewAttemptState, ReviewAttemptView,
         ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
         ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot,
-        TransitionSnapshot, presentation_content, review_day_at, validate_offline_thema_assets,
+        TransitionSnapshot, presentation_content, review_day_at, review_question,
+        validate_offline_thema_assets,
     },
     domain::{GradeError, MATCHER_VERSION, compute_transition, fuzz_delta, grade},
 };
@@ -311,6 +312,25 @@ impl SqliteStore {
         actor_device_id: Option<&str>,
         started_at_us: u64,
     ) -> Result<ReviewAttemptView, StoreError> {
+        self.begin_review_attempt_with_contract(session_id, actor_device_id, started_at_us, false)
+    }
+
+    pub(crate) fn begin_http_review_attempt(
+        &mut self,
+        session_id: &str,
+        actor_device_id: Option<&str>,
+        started_at_us: u64,
+    ) -> Result<ReviewAttemptView, StoreError> {
+        self.begin_review_attempt_with_contract(session_id, actor_device_id, started_at_us, true)
+    }
+
+    fn begin_review_attempt_with_contract(
+        &mut self,
+        session_id: &str,
+        actor_device_id: Option<&str>,
+        started_at_us: u64,
+        require_safe_question: bool,
+    ) -> Result<ReviewAttemptView, StoreError> {
         require_session_actor(
             &self.connection,
             session_id,
@@ -318,6 +338,7 @@ impl SqliteStore {
             ReviewSessionMode::Online,
         )?;
         if let Some(attempt) = current_attempt(&self.connection, session_id)? {
+            require_safe_review_question(&attempt.presentation, require_safe_question)?;
             return Ok(attempt);
         }
         let (position, thema_id) = current_session_item(&self.connection, session_id)?;
@@ -327,6 +348,7 @@ impl SqliteStore {
         }
         let state = load_review_state(&self.connection, &thema_id)?;
         let presentation = presentation(&thema);
+        require_safe_review_question(&presentation, require_safe_question)?;
         let parameters = resolved_parameters(&self.connection, session_id, &thema.tags)?;
         let attempt_id = Uuid::now_v7().to_string();
         self.connection
@@ -1200,6 +1222,16 @@ impl PackIds {
             lease_id: Uuid::now_v7().to_string(),
         }
     }
+}
+
+fn require_safe_review_question(
+    presentation: &PresentationSnapshot,
+    required: bool,
+) -> Result<(), StoreError> {
+    if required {
+        review_question(presentation).map_err(|_| StoreError::InvalidReviewState)?;
+    }
+    Ok(())
 }
 
 fn require_review_device(connection: &Connection, device_id: &str) -> Result<(), StoreError> {
@@ -2850,7 +2882,7 @@ fn update_review_day(
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -3039,6 +3071,71 @@ mod tests {
         let id = device.device_id.clone();
         store.create_device(&device, 1).unwrap();
         id
+    }
+
+    #[test]
+    fn malformed_stored_presentations_do_not_create_attempts() {
+        for (kind, question, hypotheses) in [
+            ("basic", "", r#"[null]"#),
+            ("mcq", "Question", r#"["only"]"#),
+        ] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            add_thema(&mut store, "thema", "Question", None);
+            store
+                .connection
+                .execute(
+                    "UPDATE thema SET kind = ?1, keimenon = ?2,
+                     hypothesis_json = ?3, answer_json = '[\"only\"]'
+                     WHERE thema_id = 'thema'",
+                    params![kind, question, hypotheses],
+                )
+                .unwrap();
+            let session = store
+                .create_review_session(&manual_source("thema"), Some(1), None, 2)
+                .unwrap();
+
+            assert!(matches!(
+                store.begin_http_review_attempt(&session.session_id, None, 3),
+                Err(crate::store::StoreError::InvalidReviewState)
+            ));
+            assert_eq!(
+                store
+                    .connection
+                    .query_row("SELECT count(*) FROM review_attempt", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn local_review_begin_keeps_raw_compatibility_presentation() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "The answer is answer", None);
+        let device_id = add_device(&mut store, "reviewer");
+        let session = store
+            .create_review_session(&manual_source("thema"), Some(1), Some(&device_id), 2)
+            .unwrap();
+
+        let attempt = store
+            .begin_review_attempt(&session.session_id, None, 3)
+            .unwrap();
+
+        assert_eq!(attempt.presentation.keimenon, "The answer is answer");
+        assert_eq!(attempt.presentation.answer, vec!["answer"]);
+        assert!(matches!(
+            store.begin_http_review_attempt(&session.session_id, Some(&device_id), 4),
+            Err(crate::store::StoreError::InvalidReviewState)
+        ));
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM review_attempt", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     fn offline_answer(

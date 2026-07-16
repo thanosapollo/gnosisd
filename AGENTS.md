@@ -48,6 +48,10 @@ client may open the core database directly.
   Unix actor. Exact retries return the retained result; competing revisions
   and stale captures remain explicit. Legacy toggle methods are compatibility
   adapters and advance the same monotonic attempt revision.
+- Pending HTTP review attempts expose only a server-materialized question and
+  typed response prompt. Raw answer-bearing keimenon and captured answers stay
+  server-side until grading. Keep concealment and response cardinality in the
+  pure application projection instead of duplicating them in clients.
 - Frozen direct note routes retain their original v1 status and response shapes.
   Retry-safe direct document writes and lifecycle changes use the additive
   document-mutation routes, device-scoped immutable receipts, exact request

@@ -738,6 +738,24 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn begin_http_review_attempt(
+        &self,
+        session_id: String,
+        actor_device_id: Option<String>,
+        started_at_us: u64,
+    ) -> Result<ReviewAttemptView, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::BeginHttpReviewAttempt {
+                session_id,
+                actor_device_id,
+                started_at_us,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn grade_review_attempt(
         &self,
         attempt_id: String,
@@ -1393,6 +1411,12 @@ enum StoreCommand {
         response: oneshot::Sender<StoreResult<ReviewSessionView>>,
     },
     BeginReviewAttempt {
+        session_id: String,
+        actor_device_id: Option<String>,
+        started_at_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
+    },
+    BeginHttpReviewAttempt {
         session_id: String,
         actor_device_id: Option<String>,
         started_at_us: u64,
@@ -2078,6 +2102,15 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         } => send(
             response,
             store.begin_review_attempt(&session_id, actor_device_id.as_deref(), started_at_us),
+        ),
+        StoreCommand::BeginHttpReviewAttempt {
+            session_id,
+            actor_device_id,
+            started_at_us,
+            response,
+        } => send(
+            response,
+            store.begin_http_review_attempt(&session_id, actor_device_id.as_deref(), started_at_us),
         ),
         StoreCommand::GradeReviewAttempt {
             attempt_id,

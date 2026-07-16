@@ -3,9 +3,9 @@ use gnosis_core::protocol::http_v1::{
     ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
     NodePageV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
-    ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewSessionRequestV1,
-    ReviewSessionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-    ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewResponsePromptV1,
+    ReviewSessionRequestV1, ReviewSessionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+    SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -307,6 +307,32 @@ fn public_review_dtos_reject_unknown_attempt_discriminants() {
 }
 
 #[test]
+fn public_review_response_prompts_are_closed_and_explicit() {
+    assert_round_trip::<ReviewResponsePromptV1>(json!({
+        "kind":"text","input_script":null
+    }));
+    assert_round_trip::<ReviewResponsePromptV1>(json!({
+        "kind":"texts","input_scripts":["greek",null]
+    }));
+    assert_round_trip::<ReviewResponsePromptV1>(json!({
+        "kind":"choice","choices":["one","two"]
+    }));
+
+    assert!(
+        serde_json::from_value::<ReviewResponsePromptV1>(json!({
+            "kind":"text"
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<ReviewResponsePromptV1>(json!({
+            "kind":"choice","choices":["one","two"],"future":true
+        }))
+        .is_err()
+    );
+}
+
+#[test]
 fn public_content_dtos_preserve_existing_resource_shapes() {
     assert_round_trip::<ContentChangePageV1>(json!({
         "items":[{"cursor":1,"entity_kind":"document","entity_id":"document",
@@ -433,8 +459,8 @@ fn review_attempt_result() -> Value {
             "thema_id":"thema",
             "presentation":{
                 "kind":"basic",
-                "keimenon":"Question",
-                "hypothesis":[null],
+                "question":"Question",
+                "response":{"kind":"text","input_script":null},
                 "source_guid":null,
                 "review_image":null,
                 "tags":[]

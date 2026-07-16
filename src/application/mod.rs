@@ -50,9 +50,9 @@ pub(crate) use review::{
     PresentationSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
     ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
     ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
-    ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
-    ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation, presentation_content,
-    review_day_at, valid_operation_id,
+    ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
+    ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation,
+    presentation_content, review_day_at, review_question, valid_operation_id,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};
 pub(crate) use sync::{

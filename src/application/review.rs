@@ -1,10 +1,12 @@
 use chrono::{DateTime, Datelike, Duration, Utc};
 use chrono_tz::Tz;
+use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use unicode_script::{Script, UnicodeScript};
 
 use crate::domain::{
-    ReviewState, SchedulerParameters, StructuredResponse, ThemaContent, Transition,
+    ReviewState, SchedulerParameters, StructuredResponse, ThemaContent, ThemaKind, Transition,
     compute_transition, fuzz_delta, grade,
 };
 
@@ -151,6 +153,19 @@ pub(crate) struct PresentationSnapshot {
     pub(crate) parathema: Option<String>,
     pub(crate) review_image: Option<String>,
     pub(crate) tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewQuestion {
+    pub(crate) text: String,
+    pub(crate) response: ReviewResponsePrompt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewResponsePrompt {
+    Text { input_script: Option<String> },
+    Texts { input_scripts: Vec<Option<String>> },
+    Choice { choices: Vec<String> },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -781,6 +796,193 @@ pub(crate) fn presentation_content(
     .map_err(|_| ReviewError::Content)
 }
 
+pub(crate) fn review_question(
+    presentation: &PresentationSnapshot,
+) -> Result<ReviewQuestion, ReviewError> {
+    let content = presentation_content(presentation)?
+        .validate()
+        .map_err(|_| ReviewError::Content)?;
+    let text = question_text(&content)?;
+    ensure_question_is_safe(&content, &text)?;
+    let response = response_prompt(&content);
+    Ok(ReviewQuestion { text, response })
+}
+
+fn question_text(content: &ThemaContent) -> Result<String, ReviewError> {
+    match content.kind {
+        ThemaKind::Basic => Ok(basic_question(content)),
+        ThemaKind::Cloze => concealed_question(content, true),
+        ThemaKind::Mcq => Ok(content.keimenon.clone()),
+        ThemaKind::McCloze => concealed_question(content, false),
+    }
+}
+
+fn basic_question(content: &ThemaContent) -> String {
+    let Some(hint) = content.hypothesis.first().and_then(Option::as_deref) else {
+        return content.keimenon.clone();
+    };
+    if hint.is_empty() {
+        content.keimenon.clone()
+    } else {
+        format!("{}\n\nHint: {hint}", content.keimenon)
+    }
+}
+
+fn concealed_question(content: &ThemaContent, add_hints: bool) -> Result<String, ReviewError> {
+    let mut question = content.keimenon.clone();
+    for answer in &content.answer {
+        question = conceal_first(question, answer)?;
+    }
+    if add_hints {
+        Ok(add_cloze_hints(question, &content.hypothesis))
+    } else {
+        Ok(question)
+    }
+}
+
+fn ensure_question_is_safe(content: &ThemaContent, question: &str) -> Result<(), ReviewError> {
+    if content.kind == ThemaKind::Mcq {
+        return Ok(());
+    }
+    for answer in &content.answer {
+        let answer = trim_outer_quotes(answer).trim();
+        if answer.is_empty() || case_folded_literal(answer)?.is_match(question) {
+            return Err(ReviewError::Content);
+        }
+    }
+    Ok(())
+}
+
+fn conceal_first(question: String, captured_answer: &str) -> Result<String, ReviewError> {
+    let answer = trim_outer_quotes(captured_answer);
+    if answer.is_empty() {
+        return Err(ReviewError::Content);
+    }
+    let replacement = format!(
+        "{}(...){}",
+        leading_whitespace(answer),
+        trailing_whitespace(answer)
+    );
+    let expression = case_folded_literal(answer)?;
+    let range = match expression.find(&question) {
+        Some(found) => found.range(),
+        None => return Ok(question),
+    };
+    Ok(replace_range(question, range, &replacement))
+}
+
+fn case_folded_literal(value: &str) -> Result<regex::Regex, ReviewError> {
+    RegexBuilder::new(&regex::escape(value))
+        .case_insensitive(true)
+        .build()
+        .map_err(|_| ReviewError::Content)
+}
+
+fn replace_range(mut value: String, range: std::ops::Range<usize>, replacement: &str) -> String {
+    value.replace_range(range, replacement);
+    value
+}
+
+fn trim_outer_quotes(value: &str) -> &str {
+    let value = value.strip_suffix('"').unwrap_or(value);
+    value.strip_prefix('"').unwrap_or(value)
+}
+
+fn leading_whitespace(value: &str) -> &str {
+    let end = value
+        .find(|character: char| !character.is_whitespace())
+        .unwrap_or(value.len());
+    &value[..end]
+}
+
+fn trailing_whitespace(value: &str) -> &str {
+    let start = value
+        .char_indices()
+        .rfind(|(_, character)| !character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    &value[start..]
+}
+
+fn add_cloze_hints(mut question: String, hints: &[Option<String>]) -> String {
+    let mut cursor = 0;
+    for hint in hints {
+        let Some(relative) = question[cursor..].find("(...)") else {
+            break;
+        };
+        let start = cursor + relative;
+        cursor = replace_hint(&mut question, start, hint.as_deref());
+    }
+    question
+}
+
+fn replace_hint(question: &mut String, start: usize, hint: Option<&str>) -> usize {
+    let Some(hint) = hint.filter(|value| !matches!(*value, "" | "nil" | "\"\"")) else {
+        return start + "(...)".len();
+    };
+    let replacement = format!("({hint})");
+    question.replace_range(start..start + "(...)".len(), &replacement);
+    start + replacement.len()
+}
+
+fn response_prompt(content: &ThemaContent) -> ReviewResponsePrompt {
+    match content.kind {
+        ThemaKind::Basic => ReviewResponsePrompt::Text {
+            input_script: dominant_non_latin_script(&content.answer[0]),
+        },
+        ThemaKind::Cloze => ReviewResponsePrompt::Texts {
+            input_scripts: content
+                .answer
+                .iter()
+                .map(|answer| dominant_non_latin_script(answer))
+                .collect(),
+        },
+        ThemaKind::Mcq | ThemaKind::McCloze => ReviewResponsePrompt::Choice {
+            choices: content.hypothesis.iter().flatten().cloned().collect(),
+        },
+    }
+}
+
+fn dominant_non_latin_script(value: &str) -> Option<String> {
+    let mut counts: Vec<(Script, usize)> = Vec::new();
+    for script in value.chars().map(|character| character.script()) {
+        if matches!(
+            script,
+            Script::Latin | Script::Common | Script::Inherited | Script::Unknown
+        ) {
+            continue;
+        }
+        match counts
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == script)
+        {
+            Some((_, count)) => *count += 1,
+            None => counts.push((script, 1)),
+        }
+    }
+    let script = counts
+        .into_iter()
+        .reduce(|best, candidate| {
+            if candidate.1 > best.1 {
+                candidate
+            } else {
+                best
+            }
+        })?
+        .0;
+    Some(script_name(script))
+}
+
+fn script_name(script: Script) -> String {
+    script
+        .full_name()
+        .chars()
+        .map(|character| match character {
+            ' ' | '_' => '-',
+            value => value.to_ascii_lowercase(),
+        })
+        .collect()
+}
+
 pub(crate) fn review_day_at(
     timestamp_us: u64,
     timezone: &str,
@@ -820,9 +1022,124 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewSource, ReviewSourceKind,
-        review_day_at,
+        PresentationSnapshot, ReviewAttemptMutation, ReviewAttemptOperation, ReviewResponsePrompt,
+        ReviewSource, ReviewSourceKind, review_day_at, review_question,
     };
+
+    fn presentation(kind: &str, keimenon: &str) -> PresentationSnapshot {
+        PresentationSnapshot {
+            kind: kind.into(),
+            keimenon: keimenon.into(),
+            hypothesis: vec![],
+            answer: vec![],
+            source_guid: None,
+            parathema: None,
+            review_image: None,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn review_question_conceals_clozes_and_describes_text_inputs() {
+        let mut captured = presentation("cloze", "Question with μυστικό and тайна");
+        captured.hypothesis = vec![Some("Greek hint".into()), Some("Cyrillic hint".into())];
+        captured.answer = vec!["μυστικό".into(), "тайна".into()];
+
+        let question = review_question(&captured).unwrap();
+
+        assert_eq!(
+            question.text,
+            "Question with (Greek hint) and (Cyrillic hint)"
+        );
+        assert_eq!(
+            question.response,
+            ReviewResponsePrompt::Texts {
+                input_scripts: vec![Some("greek".into()), Some("cyrillic".into())],
+            }
+        );
+    }
+
+    #[test]
+    fn review_question_materializes_basic_hint_without_exposing_answer() {
+        let mut captured = presentation("basic", "Question");
+        captured.hypothesis = vec![Some("Remember this".into())];
+        captured.answer = vec!["ordinary Latin answer".into()];
+
+        let question = review_question(&captured).unwrap();
+
+        assert_eq!(question.text, "Question\n\nHint: Remember this");
+        assert_eq!(
+            question.response,
+            ReviewResponsePrompt::Text { input_script: None }
+        );
+    }
+
+    #[test]
+    fn review_question_conceals_mc_cloze_and_exposes_choices() {
+        let mut captured = presentation("mc-cloze", "A λόγος is concealed");
+        captured.hypothesis = vec![Some("λόγος".into()), Some("βίος".into())];
+        captured.answer = vec!["λόγος".into()];
+
+        let question = review_question(&captured).unwrap();
+
+        assert_eq!(question.text, "A (...) is concealed");
+        assert_eq!(
+            question.response,
+            ReviewResponsePrompt::Choice {
+                choices: vec!["λόγος".into(), "βίος".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn review_question_preserves_cloze_whitespace_and_skips_empty_hints() {
+        let mut captured = presentation("cloze", "Before secret after second");
+        captured.hypothesis = vec![Some("nil".into()), Some("\"\"".into())];
+        captured.answer = vec!["\" secret \"".into(), "second".into()];
+
+        let question = review_question(&captured).unwrap();
+
+        assert_eq!(question.text, "Before (...) after (...)");
+    }
+
+    #[test]
+    fn review_question_conceals_case_folded_answers_like_emacs() {
+        let mut cloze = presentation("cloze", "Alpha and ΣΟΦΌΣ");
+        cloze.answer = vec!["alpha".into(), "σοφός".into()];
+
+        let question = review_question(&cloze).unwrap();
+
+        assert_eq!(question.text, "(...) and (...)");
+    }
+
+    #[test]
+    fn review_question_uses_first_script_when_counts_are_tied() {
+        let mut captured = presentation("basic", "Question");
+        captured.answer = vec!["αб".into()];
+
+        let question = review_question(&captured).unwrap();
+
+        assert_eq!(
+            question.response,
+            ReviewResponsePrompt::Text {
+                input_script: Some("greek".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn review_question_rejects_text_that_still_contains_an_answer() {
+        let mut basic = presentation("basic", "The answer is SECRET");
+        basic.answer = vec!["secret".into()];
+        let mut repeated_cloze = presentation("cloze", "secret and secret");
+        repeated_cloze.answer = vec!["secret".into()];
+        let mut unicode_cloze = presentation("cloze", "ΣΟΦΌΣ and σοφός");
+        unicode_cloze.answer = vec!["σοφός".into()];
+
+        assert!(review_question(&basic).is_err());
+        assert!(review_question(&repeated_cloze).is_err());
+        assert!(review_question(&unicode_cloze).is_err());
+    }
 
     #[test]
     fn attempt_operations_reject_revisions_sqlite_cannot_store() {

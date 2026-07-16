@@ -1167,7 +1167,7 @@ async fn begin_attempt(
     require(&principal, DeviceScope::Review)?;
     let attempt = state
         .service
-        .begin_review_attempt(id, review_actor(&principal), now_us()?)
+        .begin_http_review_attempt(id, review_actor(&principal), now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok((
@@ -1182,6 +1182,7 @@ async fn answer_attempt(
     ApiJson(answer): ApiJson<ReviewAnswerV1>,
 ) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
+    require_safe_http_attempt(&state, &principal, &id).await?;
     let attempt = state
         .service
         .grade_review_attempt(id, review_actor(&principal), answer.into(), now_us()?)
@@ -1197,14 +1198,8 @@ async fn get_attempt_state(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewAttemptStateResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    let attempt = state
-        .service
-        .review_attempt_state(id, review_actor(&principal))
-        .await
-        .map_err(ApiError::service)?;
     Ok(Json(
-        ReviewAttemptStateResponseV1::from_application(&attempt)
-            .map_err(|_| ApiError::internal())?,
+        require_safe_http_attempt(&state, &principal, &id).await?,
     ))
 }
 async fn set_accepted_success(
@@ -1233,6 +1228,7 @@ async fn override_attempt(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
+    require_safe_http_attempt(&state, &principal, &id).await?;
     let attempt = state
         .service
         .override_review_attempt(id, review_actor(&principal))
@@ -1248,6 +1244,7 @@ async fn toggle_suspension(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
+    require_safe_http_attempt(&state, &principal, &id).await?;
     let attempt = state
         .service
         .toggle_attempt_suspension(id, review_actor(&principal))
@@ -1283,6 +1280,7 @@ async fn apply_attempt_operation(
     operation: ReviewAttemptOperation,
 ) -> Result<Json<ReviewAttemptOperationResponseV1>, ApiError> {
     require(principal, DeviceScope::Review)?;
+    require_safe_http_attempt(state, principal, &operation.attempt_id).await?;
     let result = state
         .service
         .apply_review_attempt_operation(
@@ -1328,6 +1326,7 @@ async fn commit_attempt(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewCommitResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
+    require_safe_http_attempt(&state, &principal, &id).await?;
     let event = state
         .service
         .commit_review_attempt(id, review_actor(&principal), now_us()?)
@@ -1335,6 +1334,20 @@ async fn commit_attempt(
         .map_err(ApiError::service)?;
     announce(&state).await;
     Ok(Json(ReviewCommitResponseV1 { event_id: event }))
+}
+
+async fn require_safe_http_attempt(
+    state: &HttpState,
+    principal: &DevicePrincipal,
+    attempt_id: &str,
+) -> Result<ReviewAttemptStateResponseV1, ApiError> {
+    let attempt = state
+        .service
+        .review_attempt_state(attempt_id.to_owned(), review_actor(principal))
+        .await
+        .map_err(ApiError::service)?;
+    ReviewAttemptStateResponseV1::from_application(&attempt)
+        .map_err(|_| ApiError::bad_request("review attempt presentation is invalid"))
 }
 
 async fn create_pack(
@@ -2507,7 +2520,7 @@ fn review_attempt_responses(method: &str, schema: &str) -> Value {
     let mut responses = serde_json::Map::new();
     responses.insert("200".into(), openapi_json_response("Success", schema));
     let statuses: &[&str] = if method == "get" {
-        &["401", "403", "404", "408", "500", "503"]
+        &["400", "401", "403", "404", "408", "500", "503"]
     } else {
         &[
             "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
@@ -2768,6 +2781,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode},
     };
+    use rusqlite::Connection;
     use serde_json::json;
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
@@ -3118,6 +3132,37 @@ mod tests {
             schemas["ThemaKindV1"]["enum"],
             json!(["basic", "cloze", "mcq", "mc-cloze"])
         );
+        let presentation = &schemas["ReviewPresentationV1"];
+        assert!(presentation["properties"].get("keimenon").is_none());
+        assert!(presentation["properties"].get("hypothesis").is_none());
+        assert_eq!(
+            presentation["properties"]["response"]["$ref"],
+            "#/components/schemas/ReviewResponsePromptV1"
+        );
+        assert_eq!(
+            schemas["ReviewResponsePromptV1"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        let input_script =
+            &schemas["ReviewResponsePromptV1"]["oneOf"][0]["properties"]["input_script"];
+        assert_eq!(input_script["type"], json!(["string", "null"]));
+        assert!(
+            schemas["ReviewResponsePromptV1"]["oneOf"][0]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("input_script"))
+        );
+        assert_eq!(
+            schemas["ReviewResponsePromptV1"]["oneOf"][1]["properties"]["input_scripts"]["minItems"],
+            1
+        );
+        assert_eq!(
+            schemas["ReviewResponsePromptV1"]["oneOf"][2]["properties"]["choices"]["minItems"],
+            2
+        );
         assert_local_refs_resolve(&api, &api);
     }
 
@@ -3125,6 +3170,10 @@ mod tests {
     fn openapi_online_review_response_statuses_are_exact() {
         let api = openapi_document();
         let paths = &api["paths"];
+        assert_response_statuses(
+            &paths["/v1/review/attempts/{id}"]["get"],
+            &["200", "400", "401", "403", "404", "408", "500", "503"],
+        );
         assert_response_statuses(
             &paths["/v1/review/sessions"]["post"],
             &[
@@ -4265,6 +4314,95 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn put_custom_review_thema(
+        service: &crate::service::ServiceHandle,
+        id: &str,
+        kind: &str,
+        question: &str,
+        hypothesis: Vec<Option<String>>,
+        answer: Vec<String>,
+        revision: Option<u64>,
+    ) {
+        let content =
+            thema_content(kind, question.into(), hypothesis, answer, None, None, None).unwrap();
+        let updated_at = revision.map_or(1, |value| i64::try_from(value + 1).unwrap());
+        service
+            .put_thema(
+                prepare_thema(Some(id.into()), content, vec![], vec![], vec![], revision).unwrap(),
+                20260716,
+                updated_at,
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn assert_case_folded_http_attempt(
+        app: &axum::Router,
+        token: &str,
+        thema_id: &str,
+        question: &str,
+        response_prompt: serde_json::Value,
+    ) {
+        let (session_id, uri) = start_http_review(app, token, thema_id).await;
+        let (status, first) = begin_http_review_attempt(app, token, &uri).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(first["presentation"]["question"], question);
+        assert_eq!(first["presentation"]["response"], response_prompt);
+        let (_, retry) = begin_http_review_attempt(app, token, &uri).await;
+        assert_eq!(retry, first);
+        abort_http_review(app, token, &session_id).await;
+    }
+
+    async fn start_http_review(
+        app: &axum::Router,
+        token: &str,
+        thema_id: &str,
+    ) -> (String, String) {
+        let session = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/sessions",
+                token,
+                Body::from(review_session_body(thema_id)),
+            ))
+            .await
+            .unwrap();
+        let session = response_json(session).await;
+        let session_id = session["session_id"].as_str().unwrap().to_owned();
+        let uri = format!("/v1/review/sessions/{session_id}/attempts");
+        (session_id, uri)
+    }
+
+    async fn begin_http_review_attempt(
+        app: &axum::Router,
+        token: &str,
+        uri: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .clone()
+            .oneshot(authorized("POST", uri, token, Body::empty()))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, response_json(response).await)
+    }
+
+    async fn abort_http_review(app: &axum::Router, token: &str, session_id: &str) {
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/sessions/{session_id}/abort"),
+                token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     fn review_session_body(thema_id: &str) -> Vec<u8> {
@@ -5558,6 +5696,237 @@ mod tests {
         runtime.finish().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn http_begin_attempt_conceals_case_folded_answers_and_recovers_safely() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+
+        put_custom_review_thema(
+            &service,
+            "mixed-cloze",
+            "cloze",
+            "Alpha",
+            vec![Some("hint".into())],
+            vec!["alpha".into()],
+            None,
+        )
+        .await;
+        assert_case_folded_http_attempt(
+            &app,
+            &token,
+            "mixed-cloze",
+            "(hint)",
+            json!({"kind":"texts","input_scripts":[null]}),
+        )
+        .await;
+
+        put_custom_review_thema(
+            &service,
+            "mixed-choice",
+            "mc-cloze",
+            "Alpha",
+            vec![Some("alpha".into()), Some("beta".into())],
+            vec!["alpha".into()],
+            None,
+        )
+        .await;
+        assert_case_folded_http_attempt(
+            &app,
+            &token,
+            "mixed-choice",
+            "(...)",
+            json!({"kind":"choice","choices":["alpha","beta"]}),
+        )
+        .await;
+
+        put_custom_review_thema(
+            &service,
+            "unsafe",
+            "cloze",
+            "secret and secret",
+            vec![],
+            vec!["secret".into()],
+            None,
+        )
+        .await;
+        let (_, uri) = start_http_review(&app, &token, "unsafe").await;
+        let (status, _) = begin_http_review_attempt(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        put_custom_review_thema(
+            &service,
+            "unsafe",
+            "cloze",
+            "secret once",
+            vec![],
+            vec!["secret".into()],
+            Some(1),
+        )
+        .await;
+        let (status, recovered) = begin_http_review_attempt(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(recovered["presentation"]["question"], "(...) once");
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsafe_local_attempt_rejects_http_mutations_without_state_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let runtime = ServiceRuntime::start(database.clone(), directory.path().join("blobs"), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
+        let token = device.token.clone();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        put_custom_review_thema(
+            &service,
+            "unsafe-local",
+            "basic",
+            "The answer is secret",
+            vec![],
+            vec!["secret".into()],
+            None,
+        )
+        .await;
+        let session = service
+            .create_review_session(
+                manual_source("unsafe-local"),
+                Some(1),
+                Some(device_id.clone()),
+                2,
+            )
+            .await
+            .unwrap();
+        let attempt = service
+            .begin_review_attempt(session.session_id.clone(), None, 3)
+            .await
+            .unwrap();
+        let before = service
+            .review_attempt_state(attempt.attempt_id.clone(), None)
+            .await
+            .unwrap();
+        let app = router(service.clone());
+
+        assert_unsafe_attempt_mutations_are_rejected(&app, &token, &attempt.attempt_id).await;
+
+        let after = service
+            .review_attempt_state(attempt.attempt_id, None)
+            .await
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            service
+                .active_review_session(Some(device_id))
+                .await
+                .unwrap(),
+            Some(session)
+        );
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+        assert_no_committed_review_history(&database);
+    }
+
+    fn manual_source(thema_id: &str) -> ReviewSource {
+        ReviewSource {
+            kind: ReviewSourceKind::Manual,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: vec![thema_id.into()],
+        }
+    }
+
+    async fn assert_unsafe_attempt_mutations_are_rejected(
+        app: &axum::Router,
+        token: &str,
+        attempt_id: &str,
+    ) {
+        let state = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/review/attempts/{attempt_id}"),
+                token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_invalid_review_presentation(state).await;
+        let requests = [
+            ("POST", "answer", json!({"kind":"text","value":"secret"})),
+            ("POST", "override", json!(null)),
+            ("POST", "suspension", json!(null)),
+            (
+                "PUT",
+                "suspension",
+                json!({"version":1,"operation_id":"unsafe-suspension",
+                    "expected_attempt_revision":0,"desired_suspended":true}),
+            ),
+            (
+                "PUT",
+                "accepted-success",
+                json!({"version":1,"operation_id":"unsafe-accepted",
+                    "expected_attempt_revision":0,"accepted_success":true}),
+            ),
+            ("POST", "commit", json!(null)),
+        ];
+        for (method, action, body) in requests {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    method,
+                    &format!("/v1/review/attempts/{attempt_id}/{action}"),
+                    token,
+                    Body::from(serde_json::to_vec(&body).unwrap()),
+                ))
+                .await
+                .unwrap();
+            assert_invalid_review_presentation(response).await;
+        }
+    }
+
+    async fn assert_invalid_review_presentation(response: axum::response::Response) {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(
+            body["error"]["message"],
+            "review attempt presentation is invalid"
+        );
+    }
+
+    fn assert_no_committed_review_history(database: &std::path::Path) {
+        let connection = Connection::open(database).unwrap();
+        for (table, expected) in [("review_event", 0), ("review_state_revision", 1)] {
+            let count: u64 = connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, expected, "unexpected row in {table}");
+        }
+    }
+
     #[test]
     fn pending_attempts_do_not_reveal_captured_answers() {
         let mut attempt = ReviewAttemptView {
@@ -5565,10 +5934,10 @@ mod tests {
             session_id: "session".into(),
             thema_id: "thema".into(),
             presentation: PresentationSnapshot {
-                kind: "basic".into(),
-                keimenon: "Question".into(),
-                hypothesis: vec![],
-                answer: vec!["secret".into()],
+                kind: "cloze".into(),
+                keimenon: "Question with μυστικό and тайна".into(),
+                hypothesis: vec![Some("Greek hint".into()), Some("Cyrillic hint".into())],
+                answer: vec!["μυστικό".into(), "тайна".into()],
                 source_guid: None,
                 parathema: None,
                 review_image: None,
@@ -5587,10 +5956,22 @@ mod tests {
             serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap();
         assert!(pending["revealed_answer"].is_null());
         assert!(pending["presentation"].get("answer").is_none());
+        assert!(pending["presentation"].get("keimenon").is_none());
+        assert_eq!(
+            pending["presentation"]["question"],
+            "Question with (Greek hint) and (Cyrillic hint)"
+        );
+        assert_eq!(
+            pending["presentation"]["response"],
+            json!({"kind":"texts","input_scripts":["greek","cyrillic"]})
+        );
+        let encoded = serde_json::to_string(&pending).unwrap();
+        assert!(!encoded.contains("μυστικό"));
+        assert!(!encoded.contains("тайна"));
         attempt.response = Some(AnswerInput::Text("answer".into()));
         let graded =
             serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap();
-        assert_eq!(graded["revealed_answer"], json!(["secret"]));
+        assert_eq!(graded["revealed_answer"], json!(["μυστικό", "тайна"]));
     }
 
     fn authorized(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {

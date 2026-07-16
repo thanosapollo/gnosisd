@@ -504,6 +504,50 @@ async fn online_review_session_recovers_and_has_explicit_lifecycle() {
 }
 
 #[tokio::test]
+async fn unix_review_begin_preserves_raw_compatibility_presentation() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    Connection::open(&source)
+        .unwrap()
+        .execute(
+            "UPDATE themata SET keimenon = ?1 WHERE id = 7",
+            [r#""Question Answer""#],
+        )
+        .unwrap();
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+
+    let session = successful_review_result(
+        &socket,
+        "unsafe-local-session",
+        Request::ReviewSessionCreate {
+            source: manual_review_source(),
+            target_count: None,
+        },
+    )
+    .await;
+    let ResponseResult::ReviewSession(session) = session else {
+        panic!("unexpected session response");
+    };
+    let attempt = successful_review_result(
+        &socket,
+        "unsafe-local-attempt",
+        Request::ReviewAttemptBegin {
+            session_id: session.session_id,
+        },
+    )
+    .await;
+    let attempt = review_attempt_result(attempt);
+
+    assert_eq!(attempt.presentation.keimenon, "Question Answer");
+    assert_eq!(attempt.presentation.answer, vec!["Answer"]);
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn online_review_toggle_retries_are_persistently_idempotent() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("legacy.db");

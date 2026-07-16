@@ -23,7 +23,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::application::{
     AnswerInput, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
-    ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, TransitionSnapshot,
+    ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
+    TransitionSnapshot, review_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -839,8 +840,9 @@ impl ReviewAttemptStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct ReviewPresentationV1 {
     pub kind: ThemaKindV1,
-    pub keimenon: String,
-    pub hypothesis: Vec<Option<String>>,
+    #[schemars(length(min = 1))]
+    pub question: String,
+    pub response: ReviewResponsePromptV1,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
     pub source_guid: Option<String>,
@@ -852,10 +854,12 @@ pub struct ReviewPresentationV1 {
 
 impl ReviewPresentationV1 {
     fn from_application(value: &ReviewAttemptView) -> Result<Self, ReviewAttemptWireError> {
+        let question = review_question(&value.presentation)
+            .map_err(|_| ReviewAttemptWireError::Presentation)?;
         Ok(Self {
             kind: ThemaKindV1::from_application(&value.presentation.kind)?,
-            keimenon: value.presentation.keimenon.clone(),
-            hypothesis: value.presentation.hypothesis.clone(),
+            question: question.text,
+            response: ReviewResponsePromptV1::from_application(question.response),
             source_guid: value.presentation.source_guid.clone(),
             review_image: value.presentation.review_image.clone(),
             tags: value.presentation.tags.clone(),
@@ -863,8 +867,41 @@ impl ReviewPresentationV1 {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewResponsePromptV1 {
+    Text {
+        #[serde(deserialize_with = "deserialize_required_option")]
+        #[schemars(schema_with = "nullable_string_schema", required)]
+        input_script: Option<String>,
+    },
+    Texts {
+        #[schemars(length(min = 1))]
+        input_scripts: Vec<Option<String>>,
+    },
+    Choice {
+        #[schemars(length(min = 2))]
+        choices: Vec<String>,
+    },
+}
+
+fn nullable_string_schema(generator: &mut SchemaGenerator) -> Schema {
+    Option::<String>::json_schema(generator)
+}
+
+impl ReviewResponsePromptV1 {
+    fn from_application(value: ReviewResponsePrompt) -> Self {
+        match value {
+            ReviewResponsePrompt::Text { input_script } => Self::Text { input_script },
+            ReviewResponsePrompt::Texts { input_scripts } => Self::Texts { input_scripts },
+            ReviewResponsePrompt::Choice { choices } => Self::Choice { choices },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewAttemptWireError {
+    Presentation,
     PresentationKind,
     SessionStatus,
     Status,

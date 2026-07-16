@@ -115,8 +115,14 @@ expected attempt revision. Exact retries return the retained result. The
 legacy ~POST~ override and suspension toggles remain available but must not be
 retried after an ambiguous transport failure.
 
-The first attempt response hides the answer. Grading returns the detected
-result, revealed answer, matcher version, and proposed transition.
+The first HTTP attempt response hides raw answer-bearing content. Its captured
+presentation contains a server-materialized question and a closed response
+prompt: one text input, an exact list of text inputs with optional script
+hints, or explicit choices. Cloze answers are replaced before serialization.
+Script hints use lowercase Unicode Script names with spaces or underscores
+normalized to hyphens; ~null~ means that no non-Latin input method is suggested.
+Grading returns the detected result, revealed answer, matcher version, and
+proposed transition.
 
 ~client_http::HttpClient~ is the reference native transport. It disables
 redirects, proxies, and automatic retries; bounds every response; validates
