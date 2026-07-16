@@ -50,6 +50,11 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   device-create phone --scope read --scope review
 #+end_src
 
+~GET /health~ is an operational readiness check.  It returns
+~{"status":"ready"}~ only after a round trip through the daemon-owned store
+actor.  A stopped or unavailable store returns HTTP 503 with
+~{"status":"unavailable"}~.
+
 Ordinary review recovery and desired-state commands use authenticated HTTP.
 The URL defaults to ~http://127.0.0.1:7842~. Store the one-time device token in
 a private file without placing it in shell history or argv:
@@ -375,6 +380,13 @@ cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo tree --depth 1
 nix build
+export GNOSIS_ELISP_DIR=/path/to/gnosis
+tools/check-review-parity.sh
+for fixture in basic no-file-id duplicate-links unicode compatibility; do
+  tools/check-org-parity.sh "tests/fixtures/org/$fixture.org"
+done
+nix run nixpkgs#cargo-audit -- audit
+tools/check-packaged-smoke.sh
 #+end_src
 
 The project is licensed under GPL-3.0-or-later. See [[file:LICENSE][LICENSE]].

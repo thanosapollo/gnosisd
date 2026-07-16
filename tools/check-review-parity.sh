@@ -9,7 +9,18 @@ project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/gnosis-review-parity.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
-emacs --batch -Q -L "$gnosis_dir/lisp" \
+for file in gnosis.el gnosis-algorithm.el gnosis-custom-values.el \
+    gnosis-history-schema.el; do
+    if ! test -r "$gnosis_dir/lisp/$file"; then
+        echo "review parity requires $gnosis_dir/lisp/$file" >&2
+        exit 1
+    fi
+done
+
+mkdir "$work_dir/lisp"
+cp "$gnosis_dir"/lisp/*.el "$work_dir/lisp/"
+
+emacs --batch -Q -L "$work_dir/lisp" \
     --eval '(setq native-comp-jit-compilation nil)' \
     --load "$script_dir/export-review-parity.el" \
     >"$work_dir/live.json"
