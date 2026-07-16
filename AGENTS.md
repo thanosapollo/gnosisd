@@ -94,11 +94,14 @@ client may open the core database directly.
   clients. Raw review packs and immutable outbox payloads are persistence
   records, not user-interface responses.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
-  `src/bin/gnosis.rs` routes replica synchronization, review attempt recovery,
-  and revisioned desired-state operations through `HttpClient`. Operator
-  commands and remaining compatibility methods still use the Unix socket;
-  ordinary commands must migrate before the corresponding Unix methods are
-  removed.
+  `src/bin/gnosis.rs` routes replica synchronization, offline review-pack
+  lifecycle, review attempt recovery, and revisioned desired-state operations
+  through `HttpClient`. Offline pack inspection and answer recording reopen the
+  durable replica without network access. Online pack operations verify the
+  replica binding without draining its outbox, and abandonment never depends on
+  downloading pack assets. Operator commands and remaining compatibility
+  methods still use the Unix socket; ordinary commands must migrate before the
+  corresponding Unix methods are removed.
 
 Keep textual link occurrences, unique semantic node edges, and `ThemaConcept`
 learning associations separate. Node titles are local values; title paths

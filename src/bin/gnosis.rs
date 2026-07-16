@@ -8,20 +8,26 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
-    client_replica::{Error as LocalReplicaError, LocalReplica},
+    client_replica::{Error as LocalReplicaError, LocalReplica, OfflineAnswer, OfflineResponse},
+    client_review::{ReviewPackAcquisition, ReviewPackAcquisitionError, active_question},
     client_sync::{ReplicaSync, ReplicaSyncError},
     protocol::{
         ClientError, ErrorCode, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
         ResponseOutcome, ResponseResult,
-        http_v1::{SetAcceptedSuccessRequestV1, SetSuspensionRequestV1},
+        client_v1::{
+            OfflineReviewAnswerReceiptV1, OfflineReviewAnswerRequestV1, ReviewPackAcquireRequestV1,
+            ReviewPackCurrentV1, ReviewPackReceiptV1,
+        },
+        http_v1::{OfflineAnswerV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1},
         request,
     },
 };
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use uuid::Uuid;
 
 const TOKEN_FILE_READ_LIMIT: u64 = 131;
+const CLIENT_INPUT_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "gnosis")]
@@ -41,6 +47,10 @@ enum Command {
     Sync {
         #[arg(long, value_name = "PATH")]
         replica: PathBuf,
+    },
+    ReviewPack {
+        #[command(subcommand)]
+        command: ReviewPackCommand,
     },
     SystemInfo,
     LegacyInfo,
@@ -104,6 +114,43 @@ enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+enum ReviewPackCommand {
+    Acquire {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
+    Resume {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
+    Current {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
+    Answer {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
+    Abandon {
+        #[arg(long, value_name = "PATH")]
+        replica: PathBuf,
+    },
+}
+
+impl ReviewPackCommand {
+    #[cfg(test)]
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Acquire { .. } => "acquire",
+            Self::Resume { .. } => "resume",
+            Self::Current { .. } => "current",
+            Self::Answer { .. } => "answer",
+            Self::Abandon { .. } => "abandon",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
 enum AdminCommand {
     Backup {
         #[command(subcommand)]
@@ -139,6 +186,12 @@ enum BackupCommand {
 enum CliError {
     #[error("could not read Org document from standard input")]
     ReadInput(#[source] io::Error),
+    #[error("could not read client request from standard input")]
+    ReadClientInput(#[source] io::Error),
+    #[error("client request exceeds the input limit")]
+    ClientInputTooLarge,
+    #[error("client request is not valid JSON")]
+    DecodeClientInput(#[source] serde_json::Error),
     #[error(transparent)]
     Client(#[from] ClientError),
     #[error(transparent)]
@@ -147,6 +200,8 @@ enum CliError {
     Replica(#[from] LocalReplicaError),
     #[error(transparent)]
     Sync(Box<ReplicaSyncError>),
+    #[error(transparent)]
+    ReviewPack(Box<ReviewPackAcquisitionError>),
     #[error("--socket is required for this local operator or compatibility command")]
     MissingSocket,
     #[error("--token-file is required for this HTTP command")]
@@ -177,6 +232,12 @@ enum CliError {
 impl From<ReplicaSyncError> for CliError {
     fn from(error: ReplicaSyncError) -> Self {
         Self::Sync(Box::new(error))
+    }
+}
+
+impl From<ReviewPackAcquisitionError> for CliError {
+    fn from(error: ReviewPackAcquisitionError) -> Self {
+        Self::ReviewPack(Box::new(error))
     }
 }
 
@@ -216,6 +277,9 @@ fn print_client_error(error: &CliError) {
 async fn run(cli: Cli) -> Result<(), RunError> {
     match cli.command {
         Command::Sync { replica } => run_http_sync(&cli.http_url, cli.token_file, replica).await,
+        Command::ReviewPack { command } => {
+            run_review_pack(&cli.http_url, cli.token_file, command).await
+        }
         Command::ReviewAttemptState { attempt_id } => {
             run_http_state(&cli.http_url, cli.token_file, attempt_id).await
         }
@@ -269,6 +333,136 @@ async fn run_http_sync(
         .await
         .map_err(CliError::from)?;
     write_json(&report).map_err(Into::into)
+}
+
+async fn run_review_pack(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    command: ReviewPackCommand,
+) -> Result<(), RunError> {
+    match command {
+        ReviewPackCommand::Acquire { replica } => {
+            run_review_pack_acquire(base_url, token_file, replica).await
+        }
+        ReviewPackCommand::Resume { replica } => {
+            run_review_pack_resume(base_url, token_file, replica).await
+        }
+        ReviewPackCommand::Current { replica } => run_review_pack_current(replica),
+        ReviewPackCommand::Answer { replica } => run_review_pack_answer(replica),
+        ReviewPackCommand::Abandon { replica } => {
+            run_review_pack_abandon(base_url, token_file, replica).await
+        }
+    }
+}
+
+async fn run_review_pack_acquire(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    replica_path: PathBuf,
+) -> Result<(), RunError> {
+    let input: ReviewPackAcquireRequestV1 = read_client_input()?;
+    let (client, mut replica) = bound_replica(base_url, token_file, replica_path).await?;
+    ReviewPackAcquisition::new(&client)
+        .create(&mut replica, &input.session)
+        .await
+        .map_err(CliError::from)?;
+    write_current(&replica).map_err(Into::into)
+}
+
+async fn run_review_pack_resume(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    replica_path: PathBuf,
+) -> Result<(), RunError> {
+    let (client, mut replica) = bound_replica(base_url, token_file, replica_path).await?;
+    ReviewPackAcquisition::new(&client)
+        .resume_active(&mut replica)
+        .await
+        .map_err(CliError::from)?
+        .ok_or(ReviewPackAcquisitionError::NoActivePack)
+        .map_err(CliError::from)?;
+    write_current(&replica).map_err(Into::into)
+}
+
+fn run_review_pack_current(replica_path: PathBuf) -> Result<(), RunError> {
+    let replica = LocalReplica::open_existing(replica_path).map_err(CliError::from)?;
+    write_current(&replica).map_err(Into::into)
+}
+
+fn run_review_pack_answer(replica_path: PathBuf) -> Result<(), RunError> {
+    let input: OfflineReviewAnswerRequestV1 = read_client_input()?;
+    let mut replica = LocalReplica::open_existing(replica_path).map_err(CliError::from)?;
+    let (pack_id, answer) = offline_answer(input);
+    let recorded = replica.answer(&pack_id, answer).map_err(CliError::from)?;
+    write_json(&OfflineReviewAnswerReceiptV1 {
+        version: 1,
+        attempt_id: recorded.attempt_id,
+        device_sequence: recorded.device_sequence,
+        question: active_question(&replica).map_err(CliError::from)?,
+    })
+    .map_err(Into::into)
+}
+
+async fn run_review_pack_abandon(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    replica_path: PathBuf,
+) -> Result<(), RunError> {
+    let (client, mut replica) = bound_replica(base_url, token_file, replica_path).await?;
+    let acquisition = ReviewPackAcquisition::new(&client);
+    let pack_id = acquisition
+        .abandon_active(&mut replica)
+        .await
+        .map_err(CliError::from)?;
+    write_json(&ReviewPackReceiptV1 {
+        version: 1,
+        pack_id,
+    })
+    .map_err(Into::into)
+}
+
+async fn bound_replica(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    replica_path: PathBuf,
+) -> Result<(HttpClient, LocalReplica), CliError> {
+    let client = http_client(base_url, token_file)?;
+    let identity = client.device_identity().await?;
+    let replica = LocalReplica::open(replica_path, &identity.device_id)?;
+    ReviewPackAcquisition::new(&client)
+        .verify_binding(&replica)
+        .await?;
+    Ok((client, replica))
+}
+
+fn write_current(replica: &LocalReplica) -> Result<(), CliError> {
+    write_json(&ReviewPackCurrentV1 {
+        version: 1,
+        question: active_question(replica)?,
+    })
+}
+
+fn offline_answer(input: OfflineReviewAnswerRequestV1) -> (String, OfflineAnswer) {
+    (
+        input.pack_id,
+        OfflineAnswer {
+            attempt_id: input.attempt_id,
+            session_position: input.session_position,
+            response: offline_response(input.response),
+            accepted_success: input.accepted_success,
+            desired_suspended: input.desired_suspended,
+            answered_at_us: input.answered_at_us,
+            fuzz_sample: input.fuzz_sample,
+        },
+    )
+}
+
+fn offline_response(response: OfflineAnswerV1) -> OfflineResponse {
+    match response {
+        OfflineAnswerV1::Text(value) => OfflineResponse::Text(value),
+        OfflineAnswerV1::Texts(values) => OfflineResponse::Texts(values),
+        OfflineAnswerV1::Choice(value) => OfflineResponse::Choice(value),
+    }
 }
 
 async fn run_http_state(
@@ -409,6 +603,7 @@ const fn delivery_label(delivery: DeliveryStatus) -> &'static str {
 fn command_request(command: Command) -> Result<Request, CliError> {
     match command {
         Command::Sync { .. } => unreachable!("HTTP command reached socket"),
+        Command::ReviewPack { .. } => unreachable!("HTTP command reached socket"),
         Command::SystemInfo => Ok(Request::SystemInfo {}),
         Command::LegacyInfo => Ok(Request::LegacyInfo {}),
         Command::ImportOrg {
@@ -489,6 +684,21 @@ fn read_org() -> Result<String, CliError> {
         .read_to_string(&mut input)
         .map_err(CliError::ReadInput)?;
     Ok(input)
+}
+
+fn read_client_input<T>() -> Result<T, CliError>
+where
+    T: DeserializeOwned,
+{
+    let mut input = Vec::new();
+    io::stdin()
+        .take(CLIENT_INPUT_LIMIT + 1)
+        .read_to_end(&mut input)
+        .map_err(CliError::ReadClientInput)?;
+    if input.len() > CLIENT_INPUT_LIMIT as usize {
+        return Err(CliError::ClientInputTooLarge);
+    }
+    serde_json::from_slice(&input).map_err(CliError::DecodeClientInput)
 }
 
 fn write_result(result: &ResponseResult) -> Result<(), CliError> {
@@ -605,5 +815,24 @@ mod tests {
             read_device_token(path),
             Err(CliError::TokenPermissions)
         ));
+    }
+
+    #[test]
+    fn review_pack_commands_have_explicit_online_and_offline_shapes() {
+        for subcommand in ["acquire", "resume", "current", "answer", "abandon"] {
+            let cli = Cli::try_parse_from([
+                "gnosis",
+                "review-pack",
+                subcommand,
+                "--replica",
+                "/tmp/replica.sqlite",
+            ])
+            .unwrap();
+            let Command::ReviewPack { command } = cli.command else {
+                panic!("review-pack command was not parsed");
+            };
+            assert_eq!(command.name(), subcommand);
+            assert!(cli.token_file.is_none());
+        }
     }
 }

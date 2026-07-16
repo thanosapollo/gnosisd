@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write as _,
     net::SocketAddr,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
@@ -10,7 +11,7 @@ use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
     client_replica::{
         DeviceUploadKind, LocalReplica, OfflineAnswer, OfflineAssetCreate, OfflineDocumentEdit,
-        OfflineResponse, PendingDeviceUpload,
+        OfflineResponse, OfflineReviewOutcome, PendingDeviceUpload,
     },
     client_review::{ReviewPackAcquisition, ReviewPackAcquisitionError},
     client_sync::{ReplicaSync, ReplicaSyncError},
@@ -599,6 +600,419 @@ async fn cli_sync_bootstraps_and_reuses_a_durable_http_replica() {
     assert_eq!(second["downloaded_blobs"], 0);
     assert_eq!(second["uploaded_operations"], 0);
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_review_pack_answers_offline_replays_and_reconciles() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let _client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let first_thema = create_review_thema(&daemon.base_url, &raw_token).await;
+    let second_thema = create_review_thema(&daemon.base_url, &raw_token).await;
+    let token_path = daemon._directory.path().join("review-pack.token");
+    let replica_path = daemon._directory.path().join("review-pack.sqlite");
+    fs::write(&token_path, format!("{raw_token}\n")).unwrap();
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let replica = replica_path.to_str().unwrap();
+
+    let synced = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["sync", "--replica", replica],
+    )
+    .await;
+    assert!(synced.status.success());
+    let acquire = json!({
+        "version": 1,
+        "session": {
+            "source": {
+                "kind": "manual",
+                "tags": [],
+                "exclude_tags": [],
+                "topic_node_id": null,
+                "topic_forward_depth": null,
+                "topic_backward_depth": null,
+                "manual_ids": [first_thema, second_thema]
+            },
+            "target_count": null
+        }
+    });
+    let acquired = run_cli_with_input(
+        &daemon.base_url,
+        &token_path,
+        &["review-pack", "acquire", "--replica", replica],
+        &serde_json::to_vec(&acquire).unwrap(),
+    )
+    .await;
+    assert!(
+        acquired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&acquired.stderr)
+    );
+    let current: serde_json::Value = serde_json::from_slice(&acquired.stdout).unwrap();
+    assert_eq!(current["question"]["session_position"], 0);
+    assert!(current["question"]["presentation"].get("answer").is_none());
+    let pack_id = current["question"]["pack_id"].as_str().unwrap();
+
+    let offline = "http://127.0.0.1:1";
+    let reopened =
+        run_cli_without_token(offline, &["review-pack", "current", "--replica", replica]).await;
+    assert!(reopened.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reopened.stdout).unwrap(),
+        current
+    );
+    let answered_at_us = u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap();
+    let first_answer = json!({
+        "version": 1,
+        "pack_id": pack_id,
+        "attempt_id": "cli-offline-attempt-1",
+        "session_position": 0,
+        "response": {"kind": "text", "value": "Answer"},
+        "accepted_success": null,
+        "desired_suspended": false,
+        "answered_at_us": answered_at_us,
+        "fuzz_sample": 0.0
+    });
+    let first_bytes = serde_json::to_vec(&first_answer).unwrap();
+    let lost = run_cli_without_token_with_input_to_full(
+        offline,
+        &["review-pack", "answer", "--replica", replica],
+        &first_bytes,
+    )
+    .await;
+    assert!(!lost.status.success());
+
+    let replayed = run_cli_without_token_with_input(
+        offline,
+        &["review-pack", "answer", "--replica", replica],
+        &first_bytes,
+    )
+    .await;
+    assert!(replayed.status.success());
+    let first_receipt: serde_json::Value = serde_json::from_slice(&replayed.stdout).unwrap();
+    assert_eq!(first_receipt["attempt_id"], "cli-offline-attempt-1");
+    assert_eq!(first_receipt["question"]["session_position"], 1);
+    let mut changed_answer = first_answer.clone();
+    changed_answer["response"]["value"] = json!("changed");
+    let changed = run_cli_without_token_with_input(
+        offline,
+        &["review-pack", "answer", "--replica", replica],
+        &serde_json::to_vec(&changed_answer).unwrap(),
+    )
+    .await;
+    assert!(!changed.status.success());
+    let unchanged =
+        run_cli_without_token(offline, &["review-pack", "current", "--replica", replica]).await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unchanged.stdout).unwrap()["question"]["session_position"],
+        1
+    );
+
+    let second_answer = json!({
+        "version": 1,
+        "pack_id": pack_id,
+        "attempt_id": "cli-offline-attempt-2",
+        "session_position": 1,
+        "response": {"kind": "text", "value": "Answer"},
+        "accepted_success": null,
+        "desired_suspended": false,
+        "answered_at_us": answered_at_us + 1,
+        "fuzz_sample": 0.0
+    });
+    let second = run_cli_without_token_with_input(
+        offline,
+        &["review-pack", "answer", "--replica", replica],
+        &serde_json::to_vec(&second_answer).unwrap(),
+    )
+    .await;
+    assert!(second.status.success());
+    let second_receipt: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second_receipt["device_sequence"].as_u64().unwrap(),
+        first_receipt["device_sequence"].as_u64().unwrap() + 1
+    );
+    assert!(second_receipt["question"].is_null());
+
+    let reconciled = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["sync", "--replica", replica],
+    )
+    .await;
+    assert!(reconciled.status.success());
+    let replica = LocalReplica::open(&replica_path, &device_id).unwrap();
+    assert!(replica.next_device_upload().unwrap().is_none());
+    let results = replica.review_results(None, 10).unwrap();
+    assert_eq!(results.items.len(), 2);
+    assert!(
+        results
+            .items
+            .iter()
+            .all(|result| result.outcome == OfflineReviewOutcome::Accepted)
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_review_pack_rejects_another_device_before_creating_a_lease() {
+    let daemon = RunningDaemon::start().await;
+    let (first_id, first_token) = create_device(&daemon.socket).await;
+    let (_, second_token) = create_device(&daemon.socket).await;
+    let _client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(first_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let thema_id = create_review_thema(&daemon.base_url, &first_token).await;
+    let first_path = daemon._directory.path().join("first.token");
+    let second_path = daemon._directory.path().join("second.token");
+    let replica_path = daemon._directory.path().join("identity-replica.sqlite");
+    write_token(&first_path, &first_token);
+    write_token(&second_path, &second_token);
+    let replica = replica_path.to_str().unwrap();
+    assert!(
+        run_cli(
+            &daemon.base_url,
+            &first_path,
+            &["sync", "--replica", replica]
+        )
+        .await
+        .status
+        .success()
+    );
+    let before = LocalReplica::open(&replica_path, &first_id)
+        .unwrap()
+        .status()
+        .unwrap();
+    let input = json!({
+        "version": 1,
+        "session": {"source": manual_source(thema_id), "target_count": null}
+    });
+
+    let rejected = run_cli_with_input(
+        &daemon.base_url,
+        &second_path,
+        &["review-pack", "acquire", "--replica", replica],
+        &serde_json::to_vec(&input).unwrap(),
+    )
+    .await;
+
+    assert!(!rejected.status.success());
+    assert_eq!(
+        LocalReplica::open(&replica_path, &first_id)
+            .unwrap()
+            .status()
+            .unwrap(),
+        before
+    );
+    assert_no_active_session(&daemon.socket).await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_review_pack_resumes_unknown_creation_and_abandons_the_active_lease() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let _client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let asset = b"cli review pack asset".to_vec();
+    let asset_path = put_review_asset(&daemon.base_url, &raw_token, &asset).await;
+    let thema_id = create_review_thema_with_asset(&daemon.base_url, &raw_token, &asset_path).await;
+    let token_path = daemon._directory.path().join("resume.token");
+    let replica_path = daemon._directory.path().join("resume-replica.sqlite");
+    write_token(&token_path, &raw_token);
+    let replica = replica_path.to_str().unwrap();
+    assert!(
+        run_cli(
+            &daemon.base_url,
+            &token_path,
+            &["sync", "--replica", replica]
+        )
+        .await
+        .status
+        .success()
+    );
+    let mut local = LocalReplica::open(&replica_path, &device_id).unwrap();
+    local
+        .record_document(OfflineDocumentEdit {
+            operation_id: "pack-lifecycle-pending-operation".into(),
+            document_id: "pack-lifecycle-pending-document".into(),
+            logical_path: "pack-lifecycle-pending.org".into(),
+            org: "#+title: Pending during pack lifecycle\n".into(),
+            authored_at_us: 10,
+        })
+        .unwrap();
+    drop(local);
+    let input = json!({
+        "version": 1,
+        "session": {"source": manual_source(thema_id), "target_count": null}
+    });
+    let proxy = spawn_drop_path_response_proxy(daemon.http_addr, "/v1/review/packs", 1).await;
+    let interrupted = run_cli_with_input(
+        &proxy.base_url,
+        &token_path,
+        &["review-pack", "acquire", "--replica", replica],
+        &serde_json::to_vec(&input).unwrap(),
+    )
+    .await;
+    assert!(!interrupted.status.success());
+    assert_eq!(proxy.stop().await, 1);
+    assert_eq!(
+        LocalReplica::open(&replica_path, &device_id)
+            .unwrap()
+            .next_device_upload()
+            .unwrap()
+            .unwrap()
+            .operation_id(),
+        "pack-lifecycle-pending-operation"
+    );
+
+    let resumed = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["review-pack", "resume", "--replica", replica],
+    )
+    .await;
+    assert!(resumed.status.success());
+    let replica_store = LocalReplica::open(&replica_path, &device_id).unwrap();
+    let pack = replica_store.active_review_pack().unwrap().unwrap();
+    assert_eq!(
+        replica_store.blob(&pack.assets[0].content_sha256).unwrap(),
+        Some(asset)
+    );
+    drop(replica_store);
+
+    let abandoned = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["review-pack", "abandon", "--replica", replica],
+    )
+    .await;
+    assert!(abandoned.status.success());
+    let receipt: serde_json::Value = serde_json::from_slice(&abandoned.stdout).unwrap();
+    assert_eq!(receipt["pack_id"], pack.pack_id);
+    assert!(
+        LocalReplica::open(&replica_path, &device_id)
+            .unwrap()
+            .active_review_pack()
+            .unwrap()
+            .is_none()
+    );
+    assert_no_active_session(&daemon.socket).await;
+    assert_eq!(
+        LocalReplica::open(&replica_path, &device_id)
+            .unwrap()
+            .next_device_upload()
+            .unwrap()
+            .unwrap()
+            .operation_id(),
+        "pack-lifecycle-pending-operation"
+    );
+    assert!(
+        run_cli(
+            &daemon.base_url,
+            &token_path,
+            &["sync", "--replica", replica]
+        )
+        .await
+        .status
+        .success()
+    );
+    assert!(
+        LocalReplica::open(&replica_path, &device_id)
+            .unwrap()
+            .next_device_upload()
+            .unwrap()
+            .is_none()
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_review_pack_abandon_releases_a_lease_without_fetching_assets() {
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let asset = b"unavailable during abandon".to_vec();
+    let asset_path = put_review_asset(&daemon.base_url, &raw_token, &asset).await;
+    let thema_id = create_review_thema_with_asset(&daemon.base_url, &raw_token, &asset_path).await;
+    let replica = bootstrap_replica(&daemon, &client, &device_id).await;
+    drop(replica);
+    let pack = client
+        .create_review_pack(&ReviewSessionRequestV1 {
+            source: manual_source(thema_id),
+            target_count: None,
+        })
+        .await
+        .unwrap();
+    let pack_id = pack.pack.pack_id;
+    let token_path = daemon._directory.path().join("abandon.token");
+    write_token(&token_path, &raw_token);
+    let replica_path = daemon._directory.path().join("replica.sqlite");
+    let proxy = spawn_drop_path_response_proxy(daemon.http_addr, "/assets/", 1).await;
+
+    let abandoned = run_cli(
+        &proxy.base_url,
+        &token_path,
+        &[
+            "review-pack",
+            "abandon",
+            "--replica",
+            replica_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+
+    assert!(
+        abandoned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&abandoned.stderr)
+    );
+    assert_eq!(proxy.stop().await, 0);
+    assert_eq!(
+        LocalReplica::open(&replica_path, &device_id)
+            .unwrap()
+            .review_pack(&pack_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "abandoned"
+    );
+    assert_no_active_session(&daemon.socket).await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn cli_review_pack_rejects_oversized_input_before_opening_a_replica() {
+    let input = vec![b'x'; 1024 * 1024 + 1];
+    let result = run_cli_without_token_with_input(
+        "http://127.0.0.1:1",
+        &[
+            "review-pack",
+            "answer",
+            "--replica",
+            "/definitely/missing/replica.sqlite",
+        ],
+        &input,
+    )
+    .await;
+
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("client request exceeds the input limit")
+    );
 }
 
 #[tokio::test]
@@ -1741,27 +2155,55 @@ fn manual_source(thema_id: String) -> ReviewSourceInputV1 {
     }
 }
 
+fn write_token(path: &Path, token: &str) {
+    fs::write(path, format!("{token}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 async fn run_cli(base_url: &str, token_path: &Path, args: &[&str]) -> Output {
-    run_cli_output(base_url, Some(token_path), args, false).await
+    run_cli_output(base_url, Some(token_path), args, None, false).await
 }
 
 async fn run_cli_to_full(base_url: &str, token_path: &Path, args: &[&str]) -> Output {
-    run_cli_output(base_url, Some(token_path), args, true).await
+    run_cli_output(base_url, Some(token_path), args, None, true).await
 }
 
 async fn run_cli_without_token(base_url: &str, args: &[&str]) -> Output {
-    run_cli_output(base_url, None, args, false).await
+    run_cli_output(base_url, None, args, None, false).await
+}
+
+async fn run_cli_with_input(
+    base_url: &str,
+    token_path: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> Output {
+    run_cli_output(base_url, Some(token_path), args, Some(input), false).await
+}
+
+async fn run_cli_without_token_with_input(base_url: &str, args: &[&str], input: &[u8]) -> Output {
+    run_cli_output(base_url, None, args, Some(input), false).await
+}
+
+async fn run_cli_without_token_with_input_to_full(
+    base_url: &str,
+    args: &[&str],
+    input: &[u8],
+) -> Output {
+    run_cli_output(base_url, None, args, Some(input), true).await
 }
 
 async fn run_cli_output(
     base_url: &str,
     token_path: Option<&Path>,
     args: &[&str],
+    input: Option<&[u8]>,
     fail_output: bool,
 ) -> Output {
     let base_url = base_url.to_owned();
     let token_path = token_path.map(Path::to_owned);
     let args: Vec<String> = args.iter().map(|value| (*value).to_owned()).collect();
+    let input = input.map(<[u8]>::to_vec);
     tokio::task::spawn_blocking(move || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_gnosis"));
         command.arg("--http-url").arg(base_url);
@@ -1775,7 +2217,18 @@ async fn run_cli_output(
                 .unwrap();
             command.stdout(Stdio::from(full));
         }
-        command.args(args).output().unwrap()
+        command.args(args);
+        if let Some(input) = input {
+            command.stdin(Stdio::piped()).stderr(Stdio::piped());
+            if !fail_output {
+                command.stdout(Stdio::piped());
+            }
+            let mut child = command.spawn().unwrap();
+            child.stdin.take().unwrap().write_all(&input).unwrap();
+            child.wait_with_output().unwrap()
+        } else {
+            command.output().unwrap()
+        }
     })
     .await
     .unwrap()

@@ -77,6 +77,40 @@ after restart and prints its snapshot, delta, blob, and outbox counts. The
 durable replica identity comes from the authenticated token and is checked again
 before synchronization changes local state.
 
+Offline review packs use typed JSON on standard input and output. Acquire or
+resume a pack while connected:
+
+#+begin_src sh
+gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  review-pack acquire --replica "$HOME/.local/share/gnosis/client.sqlite" \
+  < review-pack-request.json
+
+gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  review-pack resume --replica "$HOME/.local/share/gnosis/client.sqlite"
+#+end_src
+
+The current question and answer recording work without a token or daemon. The
+question projection never contains the captured answer. Answer input includes
+the immutable attempt ID, pack position, structured response, explicit nullable
+override, timestamp, and fuzz sample so the same document can be replayed after
+lost output.
+
+#+begin_src sh
+gnosis review-pack current \
+  --replica "$HOME/.local/share/gnosis/client.sqlite"
+
+gnosis review-pack answer \
+  --replica "$HOME/.local/share/gnosis/client.sqlite" \
+  < offline-answer.json
+
+gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  sync --replica "$HOME/.local/share/gnosis/client.sqlite"
+#+end_src
+
+~review-pack answer~ never contacts the network, and ~sync~ remains the only
+outbox drain. Use ~review-pack abandon~ while connected to release an unused
+active pack lease.
+
 The Unix message format is a four-byte big-endian length followed by UTF-8
 JSON. It is the privileged local and administrative transport for diagnostics,
 legacy inspection, device token administration, and backup commands. Online

@@ -28,11 +28,38 @@ pub enum ReviewPackAcquisitionError {
     Replica(#[from] LocalReplicaError),
     #[error("stored review pack asset has an inconsistent size")]
     AssetSize,
+    #[error("authenticated device does not own the local replica")]
+    DeviceIdentity,
+    #[error("local replica is not bound to the current server")]
+    ServerIdentity,
+    #[error("there is no active offline review pack")]
+    NoActivePack,
 }
 
 impl<'a> ReviewPackAcquisition<'a> {
     pub const fn new(client: &'a HttpClient) -> Self {
         Self { client }
+    }
+
+    pub async fn verify_binding(
+        &self,
+        replica: &LocalReplica,
+    ) -> Result<(), ReviewPackAcquisitionError> {
+        let identity = self.client.device_identity().await?;
+        if identity.device_id != replica.device_id()? {
+            return Err(ReviewPackAcquisitionError::DeviceIdentity);
+        }
+        let server = self.client.replica_state().await?;
+        let local = replica.status()?;
+        let current = Some(server.server_id.as_str());
+        if local.server_id.as_deref() != current
+            || local.observed_server_id.as_deref() != current
+            || local.cursor.is_none()
+            || local.snapshot_next.is_some()
+        {
+            return Err(ReviewPackAcquisitionError::ServerIdentity);
+        }
+        Ok(())
     }
 
     pub async fn create(
@@ -79,6 +106,18 @@ impl<'a> ReviewPackAcquisition<'a> {
     ) -> Result<String, ReviewPackAcquisitionError> {
         let response = self.client.abandon_review_pack(pack_id).await?;
         Ok(replica.install_review_pack(response)?)
+    }
+
+    pub async fn abandon_active(
+        &self,
+        replica: &mut LocalReplica,
+    ) -> Result<String, ReviewPackAcquisitionError> {
+        let active = self.client.active_review_pack().await?;
+        let pack_id = active
+            .pack
+            .map(|pack| pack.pack_id)
+            .ok_or(ReviewPackAcquisitionError::NoActivePack)?;
+        self.abandon(replica, &pack_id).await
     }
 
     async fn install(
