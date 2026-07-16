@@ -21,11 +21,13 @@ pub use message::{
     ReviewEventView, ReviewSourceInput, ReviewSourceKindInput, ReviewStateView, SystemInfo,
     ThemaView,
 };
+#[cfg(test)]
+pub(crate) use offline_asset::offline_asset_result_json;
 pub(crate) use offline_asset::{
     DecodedOfflineAssetResult, MAX_OFFLINE_ASSET_OPERATION_BYTES, MAX_OFFLINE_ASSET_RESULT_BYTES,
     OfflineAssetSubmission, OfflineAssetWireError, canonical_asset_operation,
     decode_offline_asset_capabilities, decode_offline_asset_result, offline_asset_capabilities,
-    offline_asset_result_json,
+    offline_asset_result_response,
 };
 #[cfg(test)]
 pub(crate) use offline_content::offline_content_result_json;

@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -18,12 +19,53 @@ use crate::{
 pub(crate) const OFFLINE_ASSET_VERSION: u32 = 1;
 pub(crate) const MAX_OFFLINE_ASSET_OPERATION_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_OFFLINE_ASSET_RESULT_BYTES: usize = 64 * 1024;
+const MAX_ASSET_NAME_CHARS: usize = 255;
+const MAX_ASSET_PATH_CHARS: usize = 327;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn deserialize_version_1<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version == OFFLINE_ASSET_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom("protocol version is unsupported"))
+    }
+}
+
+fn deserialize_true<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = bool::deserialize(deserializer)?;
+    value
+        .then_some(value)
+        .ok_or_else(|| serde::de::Error::custom("active must be true"))
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OfflineAssetSubmission {
     version: u32,
     operation: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineAssetOperationEnvelopeV1 {
+    #[serde(deserialize_with = "deserialize_version_1")]
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub operation: OfflineAssetOperationV1,
 }
 
 pub(crate) struct DecodedOfflineAsset {
@@ -60,7 +102,7 @@ impl OfflineAssetSubmission {
         if self.version != OFFLINE_ASSET_VERSION {
             return Err(OfflineAssetWireError::Version);
         }
-        let wire: AssetOperationV1 =
+        let wire: OfflineAssetOperationV1 =
             serde_json::from_value(self.operation).map_err(invalid_operation)?;
         validate_operation(&wire)?;
         let canonical_payload = encode_operation(&wire)?;
@@ -75,7 +117,7 @@ impl OfflineAssetSubmission {
 pub(crate) fn canonical_asset_operation(
     operation: &OfflineAssetOperation,
 ) -> Result<String, OfflineAssetWireError> {
-    let wire = AssetOperationV1::from(operation);
+    let wire = OfflineAssetOperationV1::from(operation);
     validate_operation(&wire)?;
     encode_operation(&wire)
 }
@@ -110,48 +152,93 @@ pub(crate) fn decode_offline_asset_capabilities(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn offline_asset_result_json(
     result: &crate::application::OfflineAssetResult,
 ) -> Result<Value, OfflineAssetWireError> {
+    serde_json::to_value(offline_asset_result_response(result)?).map_err(invalid_operation)
+}
+
+pub(crate) fn offline_asset_result_response(
+    result: &crate::application::OfflineAssetResult,
+) -> Result<OfflineAssetResultEnvelopeV1, OfflineAssetWireError> {
+    if result.format_version != OFFLINE_ASSET_VERSION {
+        return Err(OfflineAssetWireError::Version);
+    }
+    require_identity(&result.operation_id)?;
     let cursor = encode_cursor(
         &result.cursor_server_id,
         result.cursor,
         &result.cursor_token,
     )
     .map_err(invalid_operation)?;
-    bounded_value(
-        &AssetResultEnvelopeV1 {
-            version: result.format_version,
-            result: AssetResultV1 {
-                operation_id: result.operation_id.clone(),
-                status: result.status.as_str().to_owned(),
-                conflict_reason: result
-                    .conflict_reason
-                    .map(|value| value.as_str().to_owned()),
-                authoritative: result
+    let envelope = OfflineAssetResultEnvelopeV1 {
+        version: result.format_version,
+        result: asset_result_wire(result, cursor)?,
+    };
+    require_serialized_size(&envelope, MAX_OFFLINE_ASSET_RESULT_BYTES)?;
+    Ok(envelope)
+}
+
+fn asset_result_wire(
+    result: &crate::application::OfflineAssetResult,
+    cursor: String,
+) -> Result<OfflineAssetResultV1, OfflineAssetWireError> {
+    Ok(match result.status {
+        AssetReconciliationStatus::Accepted => OfflineAssetResultV1::Accepted {
+            operation_id: result.operation_id.clone(),
+            conflict_reason: require_absent(result.conflict_reason)?,
+            authoritative: asset_projection(
+                result
                     .authoritative
                     .as_ref()
-                    .map(AuthoritativeAssetV1::from),
-                cursor,
-            },
+                    .ok_or(OfflineAssetWireError::Operation)?,
+            )?,
+            cursor,
         },
-        MAX_OFFLINE_ASSET_RESULT_BYTES,
-    )
+        AssetReconciliationStatus::Conflict => OfflineAssetResultV1::Conflict {
+            operation_id: result.operation_id.clone(),
+            conflict_reason: result
+                .conflict_reason
+                .ok_or(OfflineAssetWireError::Operation)?
+                .into(),
+            authoritative: result
+                .authoritative
+                .as_ref()
+                .map(asset_projection)
+                .transpose()?,
+            cursor,
+        },
+    })
+}
+
+fn asset_projection(
+    value: &AuthoritativeAsset,
+) -> Result<OfflineAssetProjectionV1, OfflineAssetWireError> {
+    let projection = OfflineAssetProjectionV1::from(value);
+    validate_authoritative(&projection)?;
+    Ok(projection)
 }
 
 pub(crate) fn decode_offline_asset_result(
     value: Value,
 ) -> Result<DecodedOfflineAssetResult, OfflineAssetWireError> {
     require_size(&value, MAX_OFFLINE_ASSET_RESULT_BYTES)?;
-    let envelope: AssetResultEnvelopeV1 =
+    require_response_version(&value)?;
+    let envelope: OfflineAssetResultEnvelopeV1 =
         serde_json::from_value(value).map_err(invalid_operation)?;
-    if envelope.version != OFFLINE_ASSET_VERSION {
-        return Err(OfflineAssetWireError::Version);
-    }
     decode_result(envelope.result)
 }
 
-fn validate_operation(value: &AssetOperationV1) -> Result<(), OfflineAssetWireError> {
+fn require_response_version(value: &Value) -> Result<(), OfflineAssetWireError> {
+    match value.get("version").and_then(Value::as_u64) {
+        Some(version) if version == u64::from(OFFLINE_ASSET_VERSION) => Ok(()),
+        Some(_) => Err(OfflineAssetWireError::Version),
+        None => Err(OfflineAssetWireError::Operation),
+    }
+}
+
+fn validate_operation(value: &OfflineAssetOperationV1) -> Result<(), OfflineAssetWireError> {
     require_identity(&value.operation_id)?;
     require_identity(&value.device_id)?;
     if value.device_sequence == 0
@@ -166,6 +253,7 @@ fn validate_operation(value: &AssetOperationV1) -> Result<(), OfflineAssetWireEr
     validate_cursor(&value.cursor)?;
     require_digest(&value.content_sha256)?;
     require_media_type(&value.media_type)?;
+    validate_path_lengths(&value.logical_path, &value.original_name)?;
     prepare_asset(
         value.logical_path.clone(),
         value.original_name.clone(),
@@ -181,40 +269,58 @@ fn validate_operation(value: &AssetOperationV1) -> Result<(), OfflineAssetWireEr
     Ok(())
 }
 
-fn decode_result(value: AssetResultV1) -> Result<DecodedOfflineAssetResult, OfflineAssetWireError> {
-    require_identity(&value.operation_id)?;
-    validate_cursor(&value.cursor)?;
-    let status = match value.status.as_str() {
-        "accepted" => AssetReconciliationStatus::Accepted,
-        "conflict" => AssetReconciliationStatus::Conflict,
-        _ => return Err(OfflineAssetWireError::Operation),
+fn decode_result(
+    value: OfflineAssetResultV1,
+) -> Result<DecodedOfflineAssetResult, OfflineAssetWireError> {
+    let (operation_id, status, conflict_reason, authoritative, cursor) = match value {
+        OfflineAssetResultV1::Accepted {
+            operation_id,
+            authoritative,
+            cursor,
+            ..
+        } => (
+            operation_id,
+            AssetReconciliationStatus::Accepted,
+            None,
+            Some(authoritative),
+            cursor,
+        ),
+        OfflineAssetResultV1::Conflict {
+            operation_id,
+            conflict_reason,
+            authoritative,
+            cursor,
+        } => (
+            operation_id,
+            AssetReconciliationStatus::Conflict,
+            Some(conflict_reason.into()),
+            authoritative,
+            cursor,
+        ),
     };
-    let conflict_reason = value
-        .conflict_reason
-        .as_deref()
-        .map(parse_reason)
-        .transpose()?;
-    if (status == AssetReconciliationStatus::Conflict) != conflict_reason.is_some() {
-        return Err(OfflineAssetWireError::Operation);
-    }
-    if let Some(asset) = &value.authoritative {
+    require_identity(&operation_id)?;
+    validate_cursor(&cursor)?;
+    if let Some(asset) = &authoritative {
         validate_authoritative(asset)?;
     }
-    if status == AssetReconciliationStatus::Accepted && value.authoritative.is_none() {
-        return Err(OfflineAssetWireError::Operation);
-    }
     Ok(DecodedOfflineAssetResult {
-        operation_id: value.operation_id,
+        operation_id,
         status,
         conflict_reason,
-        authoritative: value.authoritative.map(AuthoritativeAsset::from),
-        cursor: value.cursor,
+        authoritative: authoritative.map(AuthoritativeAsset::from),
+        cursor,
     })
 }
 
-fn validate_authoritative(value: &AuthoritativeAssetV1) -> Result<(), OfflineAssetWireError> {
+fn validate_authoritative(value: &OfflineAssetProjectionV1) -> Result<(), OfflineAssetWireError> {
     require_digest(&value.content_sha256)?;
     require_media_type(&value.media_type)?;
+    let name = value
+        .logical_path
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .ok_or(OfflineAssetWireError::Operation)?;
+    validate_path_lengths(&value.logical_path, name)?;
     validate_asset_path(&value.logical_path).map_err(invalid_operation)?;
     if value.revision == 0 || value.revision > i64::MAX as u64 || !value.active {
         return Err(OfflineAssetWireError::Operation);
@@ -229,7 +335,7 @@ fn validate_authoritative(value: &AuthoritativeAssetV1) -> Result<(), OfflineAss
     Ok(())
 }
 
-fn encode_operation(value: &AssetOperationV1) -> Result<String, OfflineAssetWireError> {
+fn encode_operation(value: &OfflineAssetOperationV1) -> Result<String, OfflineAssetWireError> {
     let encoded = serde_json::to_string(&VersionedOperationV1 {
         version: OFFLINE_ASSET_VERSION,
         operation: value,
@@ -248,16 +354,6 @@ fn validate_cursor(value: &str) -> Result<(), OfflineAssetWireError> {
         Err(OfflineAssetWireError::Operation)
     } else {
         Ok(())
-    }
-}
-
-fn parse_reason(value: &str) -> Result<OfflineAssetConflictReason, OfflineAssetWireError> {
-    match value {
-        "cursor_changed" => Ok(OfflineAssetConflictReason::CursorChanged),
-        "base_changed" => Ok(OfflineAssetConflictReason::BaseChanged),
-        "invalid_content" => Ok(OfflineAssetConflictReason::InvalidContent),
-        "path_conflict" => Ok(OfflineAssetConflictReason::PathConflict),
-        _ => Err(OfflineAssetWireError::Operation),
     }
 }
 
@@ -291,6 +387,15 @@ fn require_media_type(value: &str) -> Result<(), OfflineAssetWireError> {
     }
 }
 
+fn validate_path_lengths(path: &str, name: &str) -> Result<(), OfflineAssetWireError> {
+    if path.chars().count() <= MAX_ASSET_PATH_CHARS && name.chars().count() <= MAX_ASSET_NAME_CHARS
+    {
+        Ok(())
+    } else {
+        Err(OfflineAssetWireError::Operation)
+    }
+}
+
 fn is_hex_identity(value: &str) -> bool {
     value.len() == 32
         && value
@@ -298,12 +403,23 @@ fn is_hex_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn bounded_value(value: &impl Serialize, maximum: usize) -> Result<Value, OfflineAssetWireError> {
+fn require_serialized_size(
+    value: &impl Serialize,
+    maximum: usize,
+) -> Result<(), OfflineAssetWireError> {
     let bytes = serde_json::to_vec(value).map_err(invalid_operation)?;
     if bytes.len() > maximum {
-        return Err(OfflineAssetWireError::Operation);
+        Err(OfflineAssetWireError::Operation)
+    } else {
+        Ok(())
     }
-    serde_json::from_slice(&bytes).map_err(invalid_operation)
+}
+
+fn require_absent<T>(value: Option<T>) -> Result<(), OfflineAssetWireError> {
+    value
+        .is_none()
+        .then_some(())
+        .ok_or(OfflineAssetWireError::Operation)
 }
 
 fn require_size(value: &Value, maximum: usize) -> Result<(), OfflineAssetWireError> {
@@ -319,37 +435,47 @@ fn invalid_operation<T>(_error: T) -> OfflineAssetWireError {
     OfflineAssetWireError::Operation
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AssetOperationV1 {
-    operation_id: String,
-    device_id: String,
-    device_sequence: u64,
-    cursor: String,
-    authored_at_us: u64,
-    kind: AssetMutationKindV1,
-    logical_path: String,
-    original_name: String,
-    content_sha256: String,
-    size_bytes: u64,
-    media_type: String,
-    base: AssetBaseV1,
+pub struct OfflineAssetOperationV1 {
+    #[schemars(length(min = 1, max = 4096))]
+    pub operation_id: String,
+    #[schemars(length(min = 1, max = 4096))]
+    pub device_id: String,
+    #[schemars(range(min = 1))]
+    pub device_sequence: u64,
+    #[schemars(length(min = 1, max = 512))]
+    pub cursor: String,
+    #[schemars(range(min = 1))]
+    pub authored_at_us: u64,
+    pub kind: OfflineAssetMutationKindV1,
+    #[schemars(length(min = 1, max = 327))]
+    pub logical_path: String,
+    #[schemars(length(min = 1, max = 255))]
+    pub original_name: String,
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+    #[schemars(range(min = 1, max = 1048576))]
+    pub size_bytes: u64,
+    #[schemars(length(min = 1, max = 255))]
+    pub media_type: String,
+    pub base: OfflineAssetBaseV1,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum AssetMutationKindV1 {
+pub enum OfflineAssetMutationKindV1 {
     PutAsset,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum AssetBaseV1 {
+pub enum OfflineAssetBaseV1 {
     Absent,
 }
 
-impl From<AssetOperationV1> for OfflineAssetOperation {
-    fn from(value: AssetOperationV1) -> Self {
+impl From<OfflineAssetOperationV1> for OfflineAssetOperation {
+    fn from(value: OfflineAssetOperationV1) -> Self {
         let (cursor_server_id, cursor, cursor_token) =
             decode_cursor(&value.cursor).expect("validated asset cursor");
         Self {
@@ -369,7 +495,7 @@ impl From<AssetOperationV1> for OfflineAssetOperation {
     }
 }
 
-impl From<&OfflineAssetOperation> for AssetOperationV1 {
+impl From<&OfflineAssetOperation> for OfflineAssetOperationV1 {
     fn from(value: &OfflineAssetOperation) -> Self {
         Self {
             operation_id: value.operation_id.clone(),
@@ -378,13 +504,13 @@ impl From<&OfflineAssetOperation> for AssetOperationV1 {
             cursor: encode_cursor(&value.cursor_server_id, value.cursor, &value.cursor_token)
                 .unwrap_or_default(),
             authored_at_us: value.authored_at_us,
-            kind: AssetMutationKindV1::PutAsset,
+            kind: OfflineAssetMutationKindV1::PutAsset,
             logical_path: value.logical_path.clone(),
             original_name: value.original_name.clone(),
             content_sha256: value.content_sha256.clone(),
             size_bytes: value.size_bytes,
             media_type: value.media_type.clone(),
-            base: AssetBaseV1::Absent,
+            base: OfflineAssetBaseV1::Absent,
         }
     }
 }
@@ -392,38 +518,91 @@ impl From<&OfflineAssetOperation> for AssetOperationV1 {
 #[derive(Serialize)]
 struct VersionedOperationV1<'a> {
     version: u32,
-    operation: &'a AssetOperationV1,
+    operation: &'a OfflineAssetOperationV1,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AssetResultEnvelopeV1 {
-    version: u32,
-    result: AssetResultV1,
+pub struct OfflineAssetResultEnvelopeV1 {
+    #[serde(deserialize_with = "deserialize_version_1")]
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub result: OfflineAssetResultV1,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OfflineAssetResultV1 {
+    Accepted {
+        #[schemars(length(min = 1, max = 4096))]
+        operation_id: String,
+        conflict_reason: (),
+        authoritative: OfflineAssetProjectionV1,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+    Conflict {
+        #[schemars(length(min = 1, max = 4096))]
+        operation_id: String,
+        conflict_reason: OfflineAssetConflictReasonV1,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        #[schemars(required)]
+        authoritative: Option<OfflineAssetProjectionV1>,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineAssetConflictReasonV1 {
+    CursorChanged,
+    BaseChanged,
+    InvalidContent,
+    PathConflict,
+}
+
+impl From<OfflineAssetConflictReason> for OfflineAssetConflictReasonV1 {
+    fn from(value: OfflineAssetConflictReason) -> Self {
+        match value {
+            OfflineAssetConflictReason::CursorChanged => Self::CursorChanged,
+            OfflineAssetConflictReason::BaseChanged => Self::BaseChanged,
+            OfflineAssetConflictReason::InvalidContent => Self::InvalidContent,
+            OfflineAssetConflictReason::PathConflict => Self::PathConflict,
+        }
+    }
+}
+
+impl From<OfflineAssetConflictReasonV1> for OfflineAssetConflictReason {
+    fn from(value: OfflineAssetConflictReasonV1) -> Self {
+        match value {
+            OfflineAssetConflictReasonV1::CursorChanged => Self::CursorChanged,
+            OfflineAssetConflictReasonV1::BaseChanged => Self::BaseChanged,
+            OfflineAssetConflictReasonV1::InvalidContent => Self::InvalidContent,
+            OfflineAssetConflictReasonV1::PathConflict => Self::PathConflict,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct AssetResultV1 {
-    operation_id: String,
-    status: String,
-    conflict_reason: Option<String>,
-    authoritative: Option<AuthoritativeAssetV1>,
-    cursor: String,
+pub struct OfflineAssetProjectionV1 {
+    #[schemars(length(min = 1, max = 327))]
+    pub logical_path: String,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+    #[schemars(range(min = 1, max = 1048576))]
+    pub size_bytes: u64,
+    #[schemars(length(min = 1, max = 255))]
+    pub media_type: String,
+    #[serde(deserialize_with = "deserialize_true")]
+    #[schemars(extend("const" = true))]
+    pub active: bool,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct AuthoritativeAssetV1 {
-    logical_path: String,
-    revision: u64,
-    content_sha256: String,
-    size_bytes: u64,
-    media_type: String,
-    active: bool,
-}
-
-impl From<&AuthoritativeAsset> for AuthoritativeAssetV1 {
+impl From<&AuthoritativeAsset> for OfflineAssetProjectionV1 {
     fn from(value: &AuthoritativeAsset) -> Self {
         Self {
             logical_path: value.logical_path.clone(),
@@ -436,8 +615,8 @@ impl From<&AuthoritativeAsset> for AuthoritativeAssetV1 {
     }
 }
 
-impl From<AuthoritativeAssetV1> for AuthoritativeAsset {
-    fn from(value: AuthoritativeAssetV1) -> Self {
+impl From<OfflineAssetProjectionV1> for AuthoritativeAsset {
+    fn from(value: OfflineAssetProjectionV1) -> Self {
         Self {
             logical_path: value.logical_path,
             revision: value.revision,
@@ -455,8 +634,9 @@ mod tests {
 
     use super::{
         OfflineAssetSubmission, decode_offline_asset_capabilities, decode_offline_asset_result,
-        offline_asset_capabilities,
+        offline_asset_capabilities, offline_asset_result_response,
     };
+    use crate::application::{AssetReconciliationStatus, AuthoritativeAsset, OfflineAssetResult};
 
     #[test]
     fn capability_is_strict_and_server_bound() {
@@ -524,6 +704,25 @@ mod tests {
     }
 
     #[test]
+    fn put_accepts_the_maximum_asset_name_length() {
+        let name = format!("{}.png", "x".repeat(super::MAX_ASSET_NAME_CHARS - 4));
+        let digest = "a".repeat(64);
+        let submission: OfflineAssetSubmission = serde_json::from_value(json!({
+            "version":1,
+            "operation":{
+                "operation_id":"operation","device_id":"device","device_sequence":1,
+                "cursor":"eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsInBvc2l0aW9uIjowLCJ0b2tlbiI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0",
+                "authored_at_us":1,"kind":"put_asset",
+                "logical_path":format!("assets/{digest}/{name}"),"original_name":name,
+                "content_sha256":digest,"size_bytes":4,"media_type":"image/png",
+                "base":{"kind":"absent"}
+            }
+        }))
+        .unwrap();
+        assert!(submission.decode().is_ok());
+    }
+
+    #[test]
     fn result_authority_rejects_unknown_fields() {
         let result = json!({
             "version": 1,
@@ -544,5 +743,46 @@ mod tests {
             }
         });
         assert!(decode_offline_asset_result(result).is_err());
+    }
+
+    #[test]
+    fn result_decoder_classifies_unknown_versions() {
+        let value = json!({"version":2,"result":{}});
+        assert!(matches!(
+            decode_offline_asset_result(value),
+            Err(super::OfflineAssetWireError::Version)
+        ));
+    }
+
+    #[test]
+    fn response_builder_rejects_incoherent_authority() {
+        let mut result = OfflineAssetResult {
+            operation_id: "operation".into(),
+            format_version: 1,
+            status: AssetReconciliationStatus::Accepted,
+            conflict_reason: None,
+            authoritative: None,
+            cursor: 0,
+            cursor_server_id: "0".repeat(32),
+            cursor_token: "1".repeat(32),
+        };
+        assert!(offline_asset_result_response(&result).is_err());
+        result.authoritative = Some(AuthoritativeAsset {
+            logical_path: format!("assets/{}/image.png", "a".repeat(64)),
+            revision: 1,
+            content_sha256: "a".repeat(64),
+            size_bytes: 4,
+            media_type: "image/png".into(),
+            active: false,
+        });
+        assert!(offline_asset_result_response(&result).is_err());
+        let name = format!("{}.png", "x".repeat(super::MAX_ASSET_NAME_CHARS - 3));
+        result.authoritative.as_mut().unwrap().active = true;
+        result.authoritative.as_mut().unwrap().logical_path =
+            format!("assets/{}/{name}", "a".repeat(64));
+        assert!(offline_asset_result_response(&result).is_err());
+        result.status = AssetReconciliationStatus::Conflict;
+        result.authoritative = None;
+        assert!(offline_asset_result_response(&result).is_err());
     }
 }

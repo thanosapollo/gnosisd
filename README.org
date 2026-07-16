@@ -139,8 +139,9 @@ media, and tombstone responses. Review-pack acquisition, pack assets, and
 offline review reconciliation expose closed v1 request and v2 response DTOs,
 exact scopes, statuses, and binary asset responses. Sequenced offline content
 reconciliation has the same closed v1 request and result contract. Sequenced
-offline asset reconciliation remains before the complete schema is
-generator-ready.
+offline asset reconciliation is also typed, including staged-blob failures and
+the exact content-addressed size bounds. The offline synchronization portion of
+the schema is generator-ready.
 CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
 network boundary.
 

@@ -59,6 +59,9 @@ client may open the core database directly.
 - Offline document reconciliation uses typed v1 operation and result envelopes.
   Mutation, base, status, and conflict variants are closed, and accepted versus
   conflict results are disjoint wire states.
+- Offline asset reconciliation uses typed v1 operation and result envelopes.
+  The only v1 mutation is a bounded content-addressed put against an absent base;
+  bytes must be staged separately before its device-sequenced commit.
 - Frozen direct note routes retain their original v1 status and response shapes.
   Retry-safe direct document writes and lifecycle changes use the additive
   document-mutation routes, device-scoped immutable receipts, exact request

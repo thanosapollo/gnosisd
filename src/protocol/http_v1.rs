@@ -8,6 +8,11 @@
 
 mod content;
 
+pub use super::offline_asset::{
+    OfflineAssetBaseV1, OfflineAssetConflictReasonV1, OfflineAssetMutationKindV1,
+    OfflineAssetOperationEnvelopeV1, OfflineAssetOperationV1, OfflineAssetProjectionV1,
+    OfflineAssetResultEnvelopeV1, OfflineAssetResultV1,
+};
 pub use super::offline_content::{
     OfflineContentBaseV1, OfflineContentConflictReasonV1, OfflineContentDocumentV1,
     OfflineContentMutationV1, OfflineContentOperationEnvelopeV1, OfflineContentOperationV1,

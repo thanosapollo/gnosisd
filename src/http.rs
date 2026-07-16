@@ -45,7 +45,8 @@ use crate::{
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
             ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1,
             DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, OfflineContentOperationEnvelopeV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1,
+            OfflineAssetResultEnvelopeV1, OfflineContentOperationEnvelopeV1,
             OfflineContentResultEnvelopeV1, OfflineReviewOperationEnvelopeV1,
             OfflineReviewResultEnvelopeV2, ReplicaChangePageV1, ReplicaSnapshotPageV1,
             ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
@@ -54,7 +55,7 @@ use crate::{
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
             ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
-        offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
+        offline_asset_capabilities, offline_asset_result_response, offline_content_capabilities,
         offline_content_result_response, offline_result_response, replica_change_page,
         replica_snapshot_page, replica_state_response, review_pack_response,
     },
@@ -1500,7 +1501,7 @@ async fn reconcile_asset(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     ApiJson(submission): ApiJson<OfflineAssetSubmission>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OfflineAssetResultEnvelopeV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let decoded = submission.decode().map_err(ApiError::offline_asset_wire)?;
     let result = state
@@ -1516,7 +1517,7 @@ async fn reconcile_asset(
         .map_err(ApiError::service)?;
     announce(&state).await;
     Ok(Json(
-        offline_asset_result_json(&result).map_err(|_| ApiError::internal())?,
+        offline_asset_result_response(&result).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -2120,6 +2121,15 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             Some("OfflineContentOperationEnvelopeV1"),
             "200",
             "OfflineContentResultEnvelopeV1",
+            &[
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/content/offline-asset-operations", "post") => Some(json_contract(
+            "content:write",
+            Some("OfflineAssetOperationEnvelopeV1"),
+            "200",
+            "OfflineAssetResultEnvelopeV1",
             &[
                 "400", "401", "403", "408", "409", "413", "422", "500", "503",
             ],
@@ -2747,6 +2757,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ActiveReviewPackEnvelopeV2>();
     generator.subschema_for::<OfflineReviewResultEnvelopeV2>();
     generator.subschema_for::<OfflineContentResultEnvelopeV1>();
+    generator.subschema_for::<OfflineAssetResultEnvelopeV1>();
     generator.subschema_for::<ApiErrorCodeV1>();
     generator.subschema_for::<ApiErrorResponseV1>();
     let mut definitions = generator.take_definitions(true);
@@ -2762,6 +2773,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<SetSuspensionRequestV1>();
     requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
     requests.subschema_for::<OfflineContentOperationEnvelopeV1>();
+    requests.subschema_for::<OfflineAssetOperationEnvelopeV1>();
     definitions.extend(requests.take_definitions(true));
     definitions
 }
@@ -3419,6 +3431,80 @@ mod tests {
             ])
         );
         assert_offline_content_result_schema(schemas);
+    }
+
+    #[test]
+    fn openapi_offline_asset_contract_is_exact() {
+        let api = openapi_document();
+        let operation = &api["paths"]["/v1/content/offline-asset-operations"]["post"];
+        assert_eq!(
+            operation["x-gnosis-required-scopes"],
+            json!(["content:write"])
+        );
+        assert_schema_ref(operation, "requestBody", "OfflineAssetOperationEnvelopeV1");
+        assert_response_schema(operation, "200", "OfflineAssetResultEnvelopeV1");
+        assert_response_statuses(
+            operation,
+            &[
+                "200", "400", "401", "403", "408", "409", "413", "422", "500", "503",
+            ],
+        );
+        let schemas = &api["components"]["schemas"];
+        assert_eq!(
+            schemas["OfflineAssetOperationEnvelopeV1"]["properties"]["version"]["const"],
+            1
+        );
+        assert_eq!(
+            schemas["OfflineAssetResultEnvelopeV1"]["properties"]["version"]["const"],
+            1
+        );
+        assert_eq!(
+            schemas["OfflineAssetMutationKindV1"]["enum"],
+            json!(["put_asset"])
+        );
+        assert_tagged_variants(&schemas["OfflineAssetBaseV1"], "kind", &["absent"]);
+        assert_eq!(
+            schemas["OfflineAssetConflictReasonV1"]["enum"],
+            json!([
+                "cursor_changed",
+                "base_changed",
+                "invalid_content",
+                "path_conflict"
+            ])
+        );
+        let size = &schemas["OfflineAssetOperationV1"]["properties"]["size_bytes"];
+        assert_eq!(size["minimum"], 1);
+        assert_eq!(size["maximum"], 1_048_576);
+        let operation = &schemas["OfflineAssetOperationV1"]["properties"];
+        assert_eq!(operation["logical_path"]["maxLength"], 327);
+        assert_eq!(operation["original_name"]["maxLength"], 255);
+        assert_eq!(
+            schemas["OfflineAssetProjectionV1"]["properties"]["active"]["const"],
+            true
+        );
+        assert_offline_asset_result_schema(schemas);
+    }
+
+    fn assert_offline_asset_result_schema(schemas: &Value) {
+        let results = schemas["OfflineAssetResultV1"]["oneOf"].as_array().unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|schema| schema["properties"]["status"]["const"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["accepted", "conflict"]
+        );
+        assert_eq!(results[0]["properties"]["conflict_reason"]["type"], "null");
+        for result in results {
+            for required in ["conflict_reason", "authoritative"] {
+                assert!(
+                    result["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(required))
+                );
+            }
+        }
     }
 
     fn assert_offline_content_result_schema(schemas: &Value) {
@@ -5264,6 +5350,86 @@ mod tests {
         runtime.finish().await.unwrap();
     }
 
+    async fn assert_asset_version_rejected(app: &axum::Router, token: &str, body: &str) {
+        let mut unsupported: Value = serde_json::from_str(body).unwrap();
+        unsupported["version"] = json!(2);
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-asset-operations",
+                token,
+                Body::from(serde_json::to_vec(&unsupported).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "unsupported_offline_asset_version"
+        );
+    }
+
+    async fn assert_asset_path_rejected_without_sequence(
+        app: &axum::Router,
+        service: &crate::service::ServiceHandle,
+        token: &str,
+        device_id: &str,
+        body: &str,
+    ) {
+        let before = service.replica_state(device_id.into()).await.unwrap();
+        let mut oversized: Value = serde_json::from_str(body).unwrap();
+        let name = format!("{}.png", "x".repeat(252));
+        let digest = oversized["operation"]["content_sha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        oversized["operation"]["original_name"] = json!(name);
+        oversized["operation"]["logical_path"] = json!(format!("assets/{digest}/{name}"));
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-asset-operations",
+                token,
+                Body::from(serde_json::to_vec(&oversized).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let after = service.replica_state(device_id.into()).await.unwrap();
+        assert_eq!(after.next_device_sequence, before.next_device_sequence);
+    }
+
+    async fn assert_blob_size_boundaries(app: &axum::Router, token: &str) {
+        let empty = Vec::new();
+        let empty_digest = format!("{:x}", Sha256::digest(&empty));
+        let empty = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{empty_digest}"),
+            token,
+            "application/octet-stream",
+            Body::from(empty),
+        );
+        assert_eq!(
+            app.clone().oneshot(empty).await.unwrap().status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let maximum = vec![7; crate::application::MAX_OFFLINE_ASSET_BYTES as usize];
+        let digest = format!("{:x}", Sha256::digest(&maximum));
+        let maximum = authorized_with_type(
+            "PUT",
+            &format!("/v1/sync/blobs/{digest}"),
+            token,
+            "application/octet-stream",
+            Body::from(maximum),
+        );
+        assert_eq!(
+            app.clone().oneshot(maximum).await.unwrap().status(),
+            StatusCode::CREATED
+        );
+    }
+
     #[tokio::test]
     async fn offline_asset_http_stages_before_sequenced_reconciliation() {
         let directory = tempfile::tempdir().unwrap();
@@ -5285,7 +5451,7 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(bytes));
         let operation = OfflineAssetOperation {
             operation_id: "asset-1".into(),
-            device_id,
+            device_id: device_id.clone(),
             device_sequence: 1,
             cursor_server_id: state.server_id,
             cursor: state.cursor,
@@ -5299,6 +5465,27 @@ mod tests {
         };
         let body = canonical_asset_operation(&operation).unwrap();
         let app = router(service.clone());
+
+        assert_asset_version_rejected(&app, &token, &body).await;
+        assert_asset_path_rejected_without_sequence(&app, &service, &token, &device_id, &body)
+            .await;
+        assert_blob_size_boundaries(&app, &token).await;
+
+        let malformed = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-asset-operations",
+                &token,
+                Body::from(r#"{"version":1,"operation":{}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(malformed).await["error"]["code"],
+            "invalid_offline_asset_operation"
+        );
 
         let missing = app
             .clone()

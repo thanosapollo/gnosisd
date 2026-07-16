@@ -2,7 +2,8 @@ use gnosis_core::protocol::http_v1::{
     ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
     AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
     DocumentMutationResultV1, DocumentRevisionPageV1, NodePageV1, NoteRenameRequestV1,
-    NoteWriteRequestV1, OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
+    NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
+    OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
@@ -389,6 +390,91 @@ fn public_offline_content_dtos_preserve_strict_v1_shapes() {
     unknown_base["operation"]["mutation"]["base"]["kind"] = json!("future");
     assert!(serde_json::from_value::<OfflineContentOperationEnvelopeV1>(unknown_base).is_err());
     assert_invalid_offline_content_results(accepted, conflict);
+}
+
+#[test]
+fn public_offline_asset_dtos_preserve_strict_v1_shapes() {
+    let operation = offline_asset_operation();
+    let accepted = offline_asset_result("accepted");
+    let conflict = offline_asset_result("conflict");
+    assert_round_trip::<OfflineAssetOperationEnvelopeV1>(operation.clone());
+    assert_round_trip::<OfflineAssetResultEnvelopeV1>(accepted.clone());
+    assert_round_trip::<OfflineAssetResultEnvelopeV1>(conflict.clone());
+
+    let mut wrong_version = operation;
+    wrong_version["version"] = json!(2);
+    assert!(serde_json::from_value::<OfflineAssetOperationEnvelopeV1>(wrong_version).is_err());
+    let mut wrong_result_version = accepted.clone();
+    wrong_result_version["version"] = json!(2);
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(wrong_result_version).is_err());
+    let mut unknown_kind = offline_asset_operation();
+    unknown_kind["operation"]["kind"] = json!("future");
+    assert!(serde_json::from_value::<OfflineAssetOperationEnvelopeV1>(unknown_kind).is_err());
+    let mut unknown_base = offline_asset_operation();
+    unknown_base["operation"]["base"]["kind"] = json!("future");
+    assert!(serde_json::from_value::<OfflineAssetOperationEnvelopeV1>(unknown_base).is_err());
+    assert_invalid_offline_asset_results(accepted, conflict);
+}
+
+fn offline_asset_operation() -> Value {
+    let digest = "a".repeat(64);
+    json!({
+        "version":1,
+        "operation":{
+            "operation_id":"operation","device_id":"device","device_sequence":1,
+            "cursor":"cursor","authored_at_us":1,"kind":"put_asset",
+            "logical_path":format!("assets/{digest}/image.png"),"original_name":"image.png",
+            "content_sha256":digest,"size_bytes":4,"media_type":"image/png",
+            "base":{"kind":"absent"}
+        }
+    })
+}
+
+fn offline_asset_result(status: &str) -> Value {
+    let accepted = status == "accepted";
+    json!({
+        "version":1,
+        "result":{
+            "operation_id":"operation","status":status,
+            "conflict_reason":(!accepted).then_some("invalid_content"),
+            "authoritative":accepted.then(|| json!({
+                "logical_path":format!("assets/{}/image.png", "a".repeat(64)),"revision":1,
+                "content_sha256":"a".repeat(64),"size_bytes":4,
+                "media_type":"image/png","active":true
+            })),
+            "cursor":"cursor"
+        }
+    })
+}
+
+fn assert_invalid_offline_asset_results(mut accepted: Value, mut conflict: Value) {
+    let mut missing = accepted.clone();
+    missing["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("conflict_reason");
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(missing).is_err());
+    let mut missing_authority = accepted.clone();
+    missing_authority["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("authoritative");
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(missing_authority).is_err());
+    accepted["result"]["conflict_reason"] = json!("base_changed");
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(accepted).is_err());
+    let mut inactive = offline_asset_result("accepted");
+    inactive["result"]["authoritative"]["active"] = json!(false);
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(inactive).is_err());
+    conflict["result"]["conflict_reason"] = Value::Null;
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(conflict.clone()).is_err());
+    conflict["result"]["conflict_reason"] = json!("future");
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(conflict.clone()).is_err());
+    conflict["result"]["conflict_reason"] = json!("invalid_content");
+    conflict["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("authoritative");
+    assert!(serde_json::from_value::<OfflineAssetResultEnvelopeV1>(conflict).is_err());
 }
 
 fn offline_content_operation() -> Value {
