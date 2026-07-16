@@ -894,29 +894,12 @@ fn internal_error() -> ProtocolError {
 fn actor_error(error: ServiceError) -> ProtocolError {
     match error {
         ServiceError::Busy => ProtocolError::new(ErrorCode::Busy, "daemon is busy"),
-        ServiceError::Application(ApplicationError::Conflict { .. }) => {
-            ProtocolError::new(ErrorCode::Conflict, "document revision conflict")
-        }
-        ServiceError::Application(ApplicationError::InvalidContent(_)) => {
-            ProtocolError::new(ErrorCode::MalformedRequest, "invalid document content")
-        }
-        ServiceError::Store(StoreError::NotFound) => {
-            ProtocolError::new(ErrorCode::NotFound, "resource not found")
-        }
-        ServiceError::Store(StoreError::InvalidReviewResponse) => {
-            ProtocolError::new(ErrorCode::MalformedRequest, "invalid review response")
-        }
         ServiceError::InvalidReviewReplay => ProtocolError::new(
             ErrorCode::MalformedRequest,
             "invalid review replay identity",
         ),
-        ServiceError::Store(
-            StoreError::ActiveReviewSession
-            | StoreError::StaleAttempt
-            | StoreError::InvalidReviewState
-            | StoreError::ReviewOwnership
-            | StoreError::IdempotencyConflict,
-        ) => ProtocolError::new(ErrorCode::Conflict, "review state conflict"),
+        ServiceError::Application(error) => actor_application_error(error),
+        ServiceError::Store(error) => actor_store_error(error),
         ServiceError::Stopped
         | ServiceError::Corrupt
         | ServiceError::AssetDigest
@@ -924,9 +907,48 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         | ServiceError::Blob(_)
         | ServiceError::Review(_)
         | ServiceError::Settings(_)
-        | ServiceError::Backup(_)
-        | ServiceError::Application(_)
-        | ServiceError::Store(_) => internal_error(),
+        | ServiceError::Backup(_) => internal_error(),
+    }
+}
+
+fn actor_application_error(error: ApplicationError) -> ProtocolError {
+    match error {
+        ApplicationError::Conflict { .. } => {
+            ProtocolError::new(ErrorCode::Conflict, "document revision conflict")
+        }
+        ApplicationError::InvalidContent(_) => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid document content")
+        }
+        ApplicationError::InvalidDocumentId(_)
+        | ApplicationError::InvalidOrg(_)
+        | ApplicationError::Storage => internal_error(),
+    }
+}
+
+fn actor_store_error(error: StoreError) -> ProtocolError {
+    match error {
+        StoreError::NotFound => ProtocolError::new(ErrorCode::NotFound, "resource not found"),
+        StoreError::InvalidReviewResponse => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid review response")
+        }
+        StoreError::ActiveReviewSession
+        | StoreError::StaleAttempt
+        | StoreError::InvalidReviewState
+        | StoreError::ReviewOwnership
+        | StoreError::IdempotencyConflict => {
+            ProtocolError::new(ErrorCode::Conflict, "review state conflict")
+        }
+        StoreError::Conflict { .. }
+        | StoreError::DeviceSequence { .. }
+        | StoreError::ReplicaCursor
+        | StoreError::ReplicaServer
+        | StoreError::BlobRequired { .. }
+        | StoreError::BlobMetadata
+        | StoreError::PathChange
+        | StoreError::InvalidProjection { .. }
+        | StoreError::CorruptData { .. }
+        | StoreError::UnsupportedSchemaVersion { .. }
+        | StoreError::Storage(_) => internal_error(),
     }
 }
 
@@ -1123,8 +1145,9 @@ mod tests {
         validate_config,
     };
     use crate::{
-        application::ServiceError,
+        application::{ApplicationError, ServiceError},
         protocol::{DueThemaView, ErrorCode, ResponseOutcome, ResponseResult},
+        store::StoreError,
     };
 
     #[test]
@@ -1132,6 +1155,36 @@ mod tests {
         let error = super::actor_error(ServiceError::Busy);
         assert_eq!(error.code, crate::protocol::ErrorCode::Busy);
         assert_eq!(error.message, "daemon is busy");
+    }
+
+    #[test]
+    fn actor_errors_separate_client_faults_from_corruption() {
+        assert_actor_error(
+            ServiceError::Store(StoreError::InvalidReviewResponse),
+            ErrorCode::MalformedRequest,
+            "invalid review response",
+        );
+        assert_actor_error(
+            ServiceError::Application(ApplicationError::Conflict {
+                expected: 1,
+                actual: Some(2),
+            }),
+            ErrorCode::Conflict,
+            "document revision conflict",
+        );
+        assert_actor_error(
+            ServiceError::Store(StoreError::CorruptData {
+                field: "private field",
+            }),
+            ErrorCode::Internal,
+            "internal daemon failure",
+        );
+    }
+
+    fn assert_actor_error(error: ServiceError, code: ErrorCode, message: &'static str) {
+        let error = super::actor_error(error);
+        assert_eq!(error.code, code);
+        assert_eq!(error.message, message);
     }
 
     #[test]

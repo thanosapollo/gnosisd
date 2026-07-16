@@ -276,7 +276,7 @@ impl ServiceHandle {
         let expected_digest = asset_path
             .split('/')
             .nth(1)
-            .ok_or(ServiceError::AssetDigest)?
+            .ok_or(ServiceError::Corrupt)?
             .to_owned();
         let head = request(&self.sender, |response| StoreCommand::AssetHead {
             asset_path,
@@ -289,7 +289,7 @@ impl ServiceHandle {
         };
         let digest = head.blob_sha256.clone().ok_or(ServiceError::Corrupt)?;
         if digest != expected_digest {
-            return Err(ServiceError::AssetDigest);
+            return Err(ServiceError::Corrupt);
         }
         let bytes = read_blob(self.blobs.clone(), digest).await?;
         Ok(Some((head, bytes)))
@@ -2605,6 +2605,43 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ServiceError::AssetDigest));
         assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stored_asset_digest_mismatch_is_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let first = b"first asset".to_vec();
+        let second = b"second asset".to_vec();
+        let first_digest = format!("{:x}", sha2::Sha256::digest(&first));
+        let second_digest = format!("{:x}", sha2::Sha256::digest(&second));
+        let first_path = canonical_asset_path(&first_digest, "first.png").unwrap();
+        let second_path = canonical_asset_path(&second_digest, "second.png").unwrap();
+        for (path, name, bytes) in [
+            (first_path.clone(), "first.png", first),
+            (second_path, "second.png", second),
+        ] {
+            let asset = prepare_asset(path, name.into(), None).unwrap();
+            service
+                .put_asset(asset, bytes, "image/png".into(), 10, None)
+                .await
+                .unwrap();
+        }
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .execute(
+                "UPDATE managed_asset SET blob_sha256 = ?1 WHERE asset_path = ?2",
+                [&second_digest, &first_path],
+            )
+            .unwrap();
+
+        let error = service.asset(first_path).await.unwrap_err();
+
+        assert!(matches!(error, ServiceError::Corrupt));
         drop(service);
         runtime.finish().await.unwrap();
     }

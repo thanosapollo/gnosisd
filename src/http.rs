@@ -25,8 +25,8 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 
 use crate::{
     application::{
-        AnswerInput, AssetHead, ContentChange, DevicePrincipal, DeviceScope, DocumentHead,
-        DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NodeRecord, ReviewAttemptMutation,
+        AnswerInput, ApplicationError, AssetHead, ContentChange, DevicePrincipal, DeviceScope,
+        DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NodeRecord, ReviewAttemptMutation,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
         ReviewAttemptView, ReviewOperationAuthority, ReviewSessionView, ReviewSource, ServiceError,
         ServiceHandle, SettingsInput, SettingsRecord, ThemaRecord, canonical_asset_path,
@@ -1747,27 +1747,49 @@ impl ApiError {
                 ApiErrorCodeV1::Busy,
                 "server is busy",
             ),
-            ServiceError::Store(StoreError::NotFound) => Self::not_found(),
-            ServiceError::Store(StoreError::Conflict { expected, actual }) => {
-                Self::conflict(expected, actual)
+            ServiceError::AssetDigest => Self::bad_request("asset digest does not match content"),
+            ServiceError::InvalidReviewReplay => {
+                Self::bad_request("review replay identity is invalid")
             }
-            ServiceError::Store(StoreError::ActiveReviewSession) => Self::new(
+            ServiceError::InvalidBlobMetadata => Self::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCodeV1::InvalidBlobMetadata,
+                "blob size or media type is invalid",
+            ),
+            ServiceError::Store(error) => Self::store(error),
+            ServiceError::Application(error) => Self::application(error),
+            ServiceError::Review(_) => Self::bad_request("review operation is invalid"),
+            ServiceError::Settings(_) => Self::invalid_content("settings"),
+            ServiceError::Stopped
+            | ServiceError::Corrupt
+            | ServiceError::Blob(_)
+            | ServiceError::Backup(_) => Self::internal(),
+        }
+    }
+
+    fn store(error: StoreError) -> Self {
+        match error {
+            StoreError::NotFound => Self::not_found(),
+            StoreError::Conflict { expected, actual } => Self::conflict(expected, actual),
+            StoreError::ActiveReviewSession => Self::new(
                 StatusCode::CONFLICT,
                 ApiErrorCodeV1::ActiveSession,
                 "a review session is already active",
             ),
-            ServiceError::Store(StoreError::StaleAttempt) => Self::new(
+            StoreError::StaleAttempt => Self::new(
                 StatusCode::PRECONDITION_FAILED,
                 ApiErrorCodeV1::StaleAttempt,
                 "thema content or review state changed",
             ),
-            ServiceError::Store(StoreError::ReviewOwnership) => Self::forbidden(),
-            ServiceError::Store(StoreError::IdempotencyConflict) => Self::new(
+            StoreError::InvalidReviewState => Self::bad_request("review operation is invalid"),
+            StoreError::InvalidReviewResponse => Self::bad_request("review response is invalid"),
+            StoreError::ReviewOwnership => Self::forbidden(),
+            StoreError::IdempotencyConflict => Self::new(
                 StatusCode::CONFLICT,
                 ApiErrorCodeV1::IdempotencyConflict,
                 "operation identity was reused with different content",
             ),
-            ServiceError::Store(StoreError::DeviceSequence { expected }) => Self {
+            StoreError::DeviceSequence { expected } => Self {
                 status: StatusCode::CONFLICT,
                 code: ApiErrorCodeV1::DeviceSequenceGap,
                 message: "device operation sequence is not contiguous",
@@ -1775,10 +1797,8 @@ impl ApiError {
                     expected_sequence: expected,
                 }),
             },
-            ServiceError::Store(StoreError::ReplicaCursor | StoreError::ReplicaServer) => {
-                Self::snapshot_required()
-            }
-            ServiceError::Store(StoreError::BlobRequired { digest }) => Self {
+            StoreError::ReplicaCursor | StoreError::ReplicaServer => Self::snapshot_required(),
+            StoreError::BlobRequired { digest } => Self {
                 status: StatusCode::CONFLICT,
                 code: ApiErrorCodeV1::BlobRequired,
                 message: "operation requires a staged blob",
@@ -1787,30 +1807,30 @@ impl ApiError {
                     content_sha256: digest,
                 }),
             },
-            ServiceError::Store(StoreError::BlobMetadata) => Self::new(
+            StoreError::BlobMetadata => Self::new(
                 StatusCode::CONFLICT,
                 ApiErrorCodeV1::BlobMetadataConflict,
                 "blob metadata does not match stored content",
             ),
-            ServiceError::Store(StoreError::InvalidReviewState) | ServiceError::Review(_) => {
-                Self::bad_request("review operation is invalid")
-            }
-            ServiceError::Store(StoreError::PathChange) => Self::new(
+            StoreError::PathChange => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ApiErrorCodeV1::RenameRequired,
                 "document path changes require the rename endpoint",
             ),
-            ServiceError::Store(StoreError::InvalidProjection { .. }) => {
-                Self::invalid_content("stored projection")
-            }
-            ServiceError::AssetDigest => Self::bad_request("asset digest does not match content"),
-            ServiceError::InvalidBlobMetadata => Self::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                ApiErrorCodeV1::InvalidBlobMetadata,
-                "blob size or media type is invalid",
-            ),
-            ServiceError::Settings(_) => Self::invalid_content("settings"),
-            _ => Self::internal(),
+            StoreError::InvalidProjection { .. } => Self::invalid_content("stored projection"),
+            StoreError::CorruptData { .. }
+            | StoreError::UnsupportedSchemaVersion { .. }
+            | StoreError::Storage(_) => Self::internal(),
+        }
+    }
+
+    fn application(error: ApplicationError) -> Self {
+        match error {
+            ApplicationError::InvalidDocumentId(error) => Self::invalid_content(error),
+            ApplicationError::InvalidOrg(error) => Self::invalid_content(error),
+            ApplicationError::InvalidContent(error) => Self::invalid_content(error),
+            ApplicationError::Conflict { expected, actual } => Self::conflict(expected, actual),
+            ApplicationError::Storage => Self::internal(),
         }
     }
 }
@@ -2131,12 +2151,12 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
 
-    use super::{OPENAPI_OPERATIONS, attempt_json, openapi_document, router};
+    use super::{ApiError, OPENAPI_OPERATIONS, attempt_json, openapi_document, router};
     use crate::application::{
-        AnswerInput, OfflineAssetOperation, OfflineReviewOperation, PresentationSnapshot,
-        ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind, ServiceRuntime,
-        SettingsInput, generate_device, prepare_asset, prepare_thema, presentation_content,
-        review_day_at, thema_content,
+        AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
+        PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
+        ServiceError, ServiceRuntime, SettingsInput, generate_device, prepare_asset, prepare_thema,
+        presentation_content, review_day_at, thema_content,
     };
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, fuzz_delta,
@@ -2145,11 +2165,104 @@ mod tests {
     use crate::protocol::{
         MAX_REPLICA_PAGE_BYTES, canonical_asset_operation, decode_cursor, encode_cursor,
         http_v1::{
-            ApiErrorCodeV1, ApiErrorResponseV1, ContentCapabilitiesV1, ReplicaStateV1,
-            ReviewAttemptV1,
+            ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1, ContentCapabilitiesV1,
+            ReplicaStateV1, ReviewAttemptV1,
         },
     };
-    use crate::store::SqliteStore;
+    use crate::store::{SqliteStore, StoreError};
+
+    #[test]
+    fn service_errors_have_stable_http_contracts() {
+        assert_api_error(
+            ServiceError::Store(StoreError::InvalidReviewResponse),
+            StatusCode::BAD_REQUEST,
+            ApiErrorCodeV1::InvalidRequest,
+            "review response is invalid",
+            None,
+        );
+        assert_api_error(
+            ServiceError::InvalidReviewReplay,
+            StatusCode::BAD_REQUEST,
+            ApiErrorCodeV1::InvalidRequest,
+            "review replay identity is invalid",
+            None,
+        );
+        assert_api_error(
+            ServiceError::Application(ApplicationError::Conflict {
+                expected: 7,
+                actual: Some(9),
+            }),
+            StatusCode::PRECONDITION_FAILED,
+            ApiErrorCodeV1::RevisionConflict,
+            "resource revision changed",
+            Some(ApiErrorMetaV1::Revision {
+                expected_revision: 7,
+                current_revision: Some(9),
+            }),
+        );
+    }
+
+    #[test]
+    fn store_recovery_errors_preserve_metadata() {
+        assert_api_error(
+            ServiceError::Store(StoreError::DeviceSequence { expected: 11 }),
+            StatusCode::CONFLICT,
+            ApiErrorCodeV1::DeviceSequenceGap,
+            "device operation sequence is not contiguous",
+            Some(ApiErrorMetaV1::DeviceSequence {
+                expected_sequence: 11,
+            }),
+        );
+        assert_api_error(
+            ServiceError::Store(StoreError::ReplicaCursor),
+            StatusCode::CONFLICT,
+            ApiErrorCodeV1::SnapshotRequired,
+            "replica cursor cannot be resumed from this server state",
+            Some(ApiErrorMetaV1::Snapshot {
+                snapshot_url: "/v1/sync/snapshot".into(),
+            }),
+        );
+        let digest = "a".repeat(64);
+        assert_api_error(
+            ServiceError::Store(StoreError::BlobRequired {
+                digest: digest.clone(),
+            }),
+            StatusCode::CONFLICT,
+            ApiErrorCodeV1::BlobRequired,
+            "operation requires a staged blob",
+            Some(ApiErrorMetaV1::Blob {
+                content_sha256: digest.clone(),
+                upload_url: format!("/v1/sync/blobs/{digest}"),
+            }),
+        );
+    }
+
+    #[test]
+    fn internal_store_errors_do_not_leak_details() {
+        assert_api_error(
+            ServiceError::Store(StoreError::CorruptData {
+                field: "private field",
+            }),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiErrorCodeV1::Internal,
+            "internal server failure",
+            None,
+        );
+    }
+
+    fn assert_api_error(
+        error: ServiceError,
+        status: StatusCode,
+        code: ApiErrorCodeV1,
+        message: &'static str,
+        meta: Option<ApiErrorMetaV1>,
+    ) {
+        let error = ApiError::service(error);
+        assert_eq!(error.status, status);
+        assert_eq!(error.code, code);
+        assert_eq!(error.message, message);
+        assert_eq!(error.meta, meta);
+    }
 
     #[test]
     fn openapi_covers_versioned_routes_and_bearer_security() {
