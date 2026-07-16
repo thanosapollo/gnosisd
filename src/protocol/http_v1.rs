@@ -40,9 +40,9 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::application::{
-    AnswerInput, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
-    ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
-    TransitionSnapshot, review_question,
+    AnswerInput, PresentationSnapshot, ReviewAttemptOperationResult, ReviewAttemptState,
+    ReviewAttemptView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
+    ReviewSourceKind, TransitionSnapshot, review_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -882,15 +882,21 @@ pub struct ReviewPresentationV1 {
 
 impl ReviewPresentationV1 {
     fn from_application(value: &ReviewAttemptView) -> Result<Self, ReviewAttemptWireError> {
-        let question = review_question(&value.presentation)
-            .map_err(|_| ReviewAttemptWireError::Presentation)?;
+        Self::from_snapshot(&value.presentation)
+    }
+
+    pub(crate) fn from_snapshot(
+        presentation: &PresentationSnapshot,
+    ) -> Result<Self, ReviewAttemptWireError> {
+        let question =
+            review_question(presentation).map_err(|_| ReviewAttemptWireError::Presentation)?;
         Ok(Self {
-            kind: ThemaKindV1::from_application(&value.presentation.kind)?,
+            kind: ThemaKindV1::from_application(&presentation.kind)?,
             question: question.text,
             response: ReviewResponsePromptV1::from_application(question.response),
-            source_guid: value.presentation.source_guid.clone(),
-            review_image: value.presentation.review_image.clone(),
-            tags: value.presentation.tags.clone(),
+            source_guid: presentation.source_guid.clone(),
+            review_image: presentation.review_image.clone(),
+            tags: presentation.tags.clone(),
         })
     }
 }

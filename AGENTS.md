@@ -87,8 +87,12 @@ client may open the core database directly.
   run replays that exact immutable operation.
 - `src/client_review.rs` owns explicit review-pack acquisition. It persists the
   typed pack before downloading its content-addressed assets, verifies every
-  asset, and resumes an incomplete download through the server's active-pack
-  resource after a client restart. Periodic replica sync never creates a pack.
+  asset, resumes an incomplete download through the server's active-pack
+  resource after a client restart, and exposes only answer-concealed question
+  projections to user interfaces. Periodic replica sync never creates a pack.
+- `src/protocol/client_v1.rs` owns versioned DTOs exchanged with local replica
+  clients. Raw review packs and immutable outbox payloads are persistence
+  records, not user-interface responses.
 - `src/bin/gnosisd.rs` is the only shipped database owner.
   `src/bin/gnosis.rs` routes replica synchronization, review attempt recovery,
   and revisioned desired-state operations through `HttpClient`. Operator

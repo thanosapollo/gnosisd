@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -206,6 +208,23 @@ impl LocalReplicaStore {
             .busy_timeout(Duration::from_secs(5))
             .map_err(LocalReplicaError::Storage)?;
         initialize(&mut connection, device_id)?;
+        Ok(Self { connection })
+    }
+
+    pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<Self, LocalReplicaError> {
+        let path = path.as_ref();
+        let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(LocalReplicaError::Storage)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(LocalReplicaError::Io)?;
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .map_err(LocalReplicaError::Storage)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(LocalReplicaError::Storage)?;
+        let device_id = existing_device_id(&connection)?;
+        initialize(&mut connection, &device_id)?;
         Ok(Self { connection })
     }
 
@@ -1229,6 +1248,16 @@ impl LocalReplicaStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(LocalReplicaError::Storage)
     }
+}
+
+fn existing_device_id(connection: &Connection) -> Result<String, LocalReplicaError> {
+    connection
+        .query_row(
+            "SELECT device_id FROM replica_identity WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(LocalReplicaError::Storage)
 }
 
 fn pending_or_accepted_asset(
@@ -2916,6 +2945,8 @@ pub(crate) fn canonical_json_sha256(value: &Value) -> Result<String, LocalReplic
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use rusqlite::{Connection, params};
     use serde_json::Value;
     use sha2::{Digest as _, Sha256};
@@ -2933,6 +2964,41 @@ mod tests {
             offline_content_result_json,
         },
     };
+
+    #[test]
+    fn existing_replica_reopens_without_an_external_device_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replica.sqlite");
+        drop(LocalReplicaStore::open(&path, "device").unwrap());
+
+        let reopened = LocalReplicaStore::open_existing(&path).unwrap();
+
+        assert_eq!(reopened.device_id().unwrap(), "device");
+    }
+
+    #[test]
+    fn existing_replica_open_never_creates_a_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.sqlite");
+
+        assert!(LocalReplicaStore::open_existing(&missing).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn existing_replica_open_rejects_an_unrelated_database_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unrelated.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute("CREATE TABLE unrelated(value TEXT)", [])
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+
+        assert!(LocalReplicaStore::open_existing(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 
     #[test]
     fn v1_upgrade_preserves_pending_review_operations_in_the_device_ledger() {

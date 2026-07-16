@@ -598,6 +598,12 @@ impl LocalReplica {
         })
     }
 
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, Error> {
+        Ok(Self {
+            store: LocalReplicaStore::open_existing(path)?,
+        })
+    }
+
     pub fn device_id(&self) -> Result<String, Error> {
         Ok(self.store.device_id()?)
     }

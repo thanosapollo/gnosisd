@@ -1,4 +1,5 @@
 mod client;
+pub mod client_v1;
 mod frame;
 pub mod http_v1;
 mod message;
