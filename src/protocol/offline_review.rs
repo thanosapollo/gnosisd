@@ -11,7 +11,7 @@ use crate::application::{
     ReviewSessionView, ReviewSource, ReviewStateSnapshot, TransitionSnapshot, presentation_content,
     review_day_at,
 };
-use crate::protocol::{is_canonical_sha256, replica::encode_cursor};
+use crate::{is_canonical_sha256, protocol::replica::encode_cursor};
 
 pub(crate) const OFFLINE_REVIEW_VERSION: u32 = 1;
 pub(crate) const MAX_OFFLINE_REVIEW_OPERATION_BYTES: usize =

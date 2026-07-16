@@ -24,6 +24,7 @@ use crate::{
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
+    is_canonical_sha256,
     protocol::{
         MAX_OFFLINE_ASSET_OPERATION_BYTES, MAX_OFFLINE_ASSET_RESULT_BYTES,
         MAX_OFFLINE_CONTENT_OPERATION_BYTES, MAX_OFFLINE_CONTENT_RESULT_BYTES,
@@ -33,7 +34,6 @@ use crate::{
             ApiErrorResponseV1, AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, valid_bearer_token,
         },
-        is_canonical_sha256,
     },
 };
 

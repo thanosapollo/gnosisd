@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     blob::{BlobError, BlobStore},
+    is_canonical_sha256,
     store::{SqliteStore, StoreError},
 };
 
@@ -303,11 +304,7 @@ fn require_regular_file(path: &Path) -> Result<(), BackupError> {
 }
 
 fn blob_relative_path(digest: &str) -> Result<PathBuf, BackupError> {
-    if digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_canonical_sha256(digest) {
         Ok(PathBuf::from(&digest[..2]).join(digest))
     } else {
         Err(BackupError::Format)

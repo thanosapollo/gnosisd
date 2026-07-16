@@ -10,9 +10,9 @@ use crate::{
         OfflineContentResult, validate_org_path,
     },
     domain::DocumentId,
+    is_canonical_sha256,
     protocol::{
         http_v1::ContentCapabilitiesV1,
-        is_canonical_sha256,
         replica::{decode_cursor, encode_cursor},
     },
 };

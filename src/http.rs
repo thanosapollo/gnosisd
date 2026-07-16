@@ -33,6 +33,7 @@ use crate::{
         prepare_asset, prepare_note, prepare_thema, review_day_at, thema_content,
     },
     domain::DocumentId,
+    is_canonical_sha256,
     protocol::{
         MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
         OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
@@ -747,11 +748,7 @@ async fn get_blob(
 }
 
 fn validate_digest(digest: &str) -> Result<(), ApiError> {
-    if digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if is_canonical_sha256(digest) {
         Ok(())
     } else {
         Err(ApiError::bad_request("invalid content digest"))

@@ -10,6 +10,7 @@ use crate::{
     domain::{
         DocumentId, DocumentProjection, NodeId, ThemaContent, ThemaContentError, ThemaId, ThemaKind,
     },
+    is_canonical_sha256,
     parser::org::{OrgParseError, parse_org},
 };
 
@@ -490,10 +491,7 @@ pub(crate) fn validate_asset_path(value: &str) -> Result<(), ContentError> {
     let parts = value.split('/').collect::<Vec<_>>();
     if parts.len() != 3
         || parts[0] != "assets"
-        || parts[1].len() != 64
-        || !parts[1]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || !is_canonical_sha256(parts[1])
         || !supported_asset(parts[2])
     {
         return Err(ContentError::UnsupportedType);

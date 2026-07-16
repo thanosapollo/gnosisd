@@ -29,6 +29,7 @@ use super::{
 use crate::{
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
+    is_canonical_sha256,
     store::{DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument},
 };
 
@@ -2280,11 +2281,11 @@ fn validate_local_review_replay(
     request_sha256: &str,
     operated_at_us: u64,
 ) -> Result<(), ServiceError> {
-    let valid_digest = request_sha256.len() == 64
-        && request_sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    if request_id.is_empty() || request_id.len() > 128 || !valid_digest || operated_at_us == 0 {
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !is_canonical_sha256(request_sha256)
+        || operated_at_us == 0
+    {
         Err(ServiceError::InvalidReviewReplay)
     } else {
         Ok(())

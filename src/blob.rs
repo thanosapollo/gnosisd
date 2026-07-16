@@ -10,6 +10,8 @@ use std::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::is_canonical_sha256;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BlobMeta {
     pub(crate) sha256: String,
@@ -184,11 +186,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), BlobError> {
 }
 
 fn validate_digest(digest: &str) -> Result<(), BlobError> {
-    if digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
+    if is_canonical_sha256(digest) {
         Ok(())
     } else {
         Err(BlobError::InvalidDigest)

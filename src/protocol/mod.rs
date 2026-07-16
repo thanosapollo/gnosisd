@@ -48,10 +48,3 @@ pub(crate) use replica::{
 #[cfg(test)]
 pub(crate) use replica::{encode_cursor, encode_snapshot_cursor};
 pub use server::{DaemonConfig, DaemonServer, ServerError};
-
-pub(crate) fn is_canonical_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}

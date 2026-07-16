@@ -209,7 +209,6 @@ impl SqliteStore {
         projection: &DocumentProjection,
         expected_revision: Option<u64>,
     ) -> Result<StoredDocument, StoreError> {
-        validate_projection(projection)?;
         self.replace(document_id, projection, expected_revision, FailPoint::None)
     }
 
@@ -220,7 +219,6 @@ impl SqliteStore {
         created_at_us: i64,
         author_device_id: Option<&str>,
     ) -> Result<StoredDocument, StoreError> {
-        validate_projection(&prepared.projection)?;
         if prepared.blob_sha256 != blob.sha256 {
             return Err(StoreError::CorruptData { field: "note blob" });
         }
@@ -3841,39 +3839,6 @@ fn to_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {
 
 fn to_u32(value: i64, field: &'static str) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|_| StoreError::CorruptData { field })
-}
-
-fn validate_projection(projection: &DocumentProjection) -> Result<(), StoreError> {
-    let node_ids: HashSet<_> = projection.nodes().iter().map(Node::id).collect();
-    if node_ids.len() != projection.nodes().len() {
-        return invalid_projection("node IDs must be unique");
-    }
-    if projection
-        .file_node_id()
-        .is_some_and(|id| !node_ids.contains(id))
-    {
-        return invalid_projection("file node must belong to the document");
-    }
-    if projection
-        .nodes()
-        .iter()
-        .filter_map(Node::parent_id)
-        .any(|id| !node_ids.contains(id))
-    {
-        return invalid_projection("node parent must belong to the document");
-    }
-    if projection
-        .link_occurrences()
-        .iter()
-        .any(|link| !node_ids.contains(link.owner()))
-    {
-        return invalid_projection("link owner must belong to the document");
-    }
-    Ok(())
-}
-
-fn invalid_projection<T>(reason: &'static str) -> Result<T, StoreError> {
-    Err(StoreError::InvalidProjection { reason })
 }
 
 fn check_revision(

@@ -8,9 +8,9 @@ use crate::{
         OfflineAssetConflictReason, OfflineAssetOperation, canonical_asset_path, prepare_asset,
         validate_asset_path,
     },
+    is_canonical_sha256,
     protocol::{
         http_v1::AssetCapabilitiesV1,
-        is_canonical_sha256,
         replica::{decode_cursor, encode_cursor},
     },
 };
