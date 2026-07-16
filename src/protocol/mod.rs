@@ -27,11 +27,13 @@ pub(crate) use offline_asset::{
     decode_offline_asset_capabilities, decode_offline_asset_result, offline_asset_capabilities,
     offline_asset_result_json,
 };
+#[cfg(test)]
+pub(crate) use offline_content::offline_content_result_json;
 pub(crate) use offline_content::{
     DecodedOfflineContentResult, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
     MAX_OFFLINE_CONTENT_RESULT_BYTES, OfflineContentSubmission, OfflineContentWireError,
     canonical_content_operation, decode_offline_content_capabilities,
-    decode_offline_content_result, offline_content_capabilities, offline_content_result_json,
+    decode_offline_content_result, offline_content_capabilities, offline_content_result_response,
 };
 pub(crate) use offline_review::canonical_offline_operation;
 pub(crate) use offline_review::{

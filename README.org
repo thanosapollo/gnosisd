@@ -138,8 +138,9 @@ response fields and describe scopes, conditional headers, pagination, raw
 media, and tombstone responses. Review-pack acquisition, pack assets, and
 offline review reconciliation expose closed v1 request and v2 response DTOs,
 exact scopes, statuses, and binary asset responses. Sequenced offline content
-and asset reconciliation still require the same treatment before the complete
-schema is generator-ready.
+reconciliation has the same closed v1 request and result contract. Sequenced
+offline asset reconciliation remains before the complete schema is
+generator-ready.
 CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
 network boundary.
 

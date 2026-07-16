@@ -8,6 +8,11 @@
 
 mod content;
 
+pub use super::offline_content::{
+    OfflineContentBaseV1, OfflineContentConflictReasonV1, OfflineContentDocumentV1,
+    OfflineContentMutationV1, OfflineContentOperationEnvelopeV1, OfflineContentOperationV1,
+    OfflineContentResultEnvelopeV1, OfflineContentResultV1,
+};
 pub use super::offline_review::{
     ActiveReviewPackEnvelopeV2, OfflineAnswerV1, OfflineParametersV1, OfflinePresentationV1,
     OfflineReviewConflictReasonV2, OfflineReviewOperationEnvelopeV1, OfflineReviewOperationV1,

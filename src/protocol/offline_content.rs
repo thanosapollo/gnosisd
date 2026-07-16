@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -22,11 +23,40 @@ const OFFLINE_CONTENT_CAPABILITIES_VERSION: u32 = 1;
 pub(crate) const MAX_OFFLINE_CONTENT_OPERATION_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_OFFLINE_CONTENT_RESULT_BYTES: usize = 128 * 1024;
 
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn deserialize_version_1<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version == OFFLINE_CONTENT_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom("protocol version is unsupported"))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OfflineContentSubmission {
     version: u32,
     operation: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineContentOperationEnvelopeV1 {
+    #[serde(deserialize_with = "deserialize_version_1")]
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub operation: OfflineContentOperationV1,
 }
 
 pub(crate) struct DecodedOfflineContent {
@@ -109,22 +139,30 @@ pub(crate) fn decode_offline_content_capabilities(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn offline_content_result_json(
     result: &OfflineContentResult,
 ) -> Result<Value, OfflineContentWireError> {
+    serde_json::to_value(offline_content_result_response(result)?).map_err(invalid_operation)
+}
+
+pub(crate) fn offline_content_result_response(
+    result: &OfflineContentResult,
+) -> Result<OfflineContentResultEnvelopeV1, OfflineContentWireError> {
     let cursor = encode_cursor(
         &result.cursor_server_id,
         result.cursor,
         &result.cursor_token,
     )
     .map_err(|_| OfflineContentWireError::Operation)?;
-    let envelope = content_result_envelope(result, cursor.clone(), result.authoritative.clone());
-    match bounded_value(&envelope, MAX_OFFLINE_CONTENT_RESULT_BYTES) {
-        Ok(value) => Ok(value),
-        Err(_) if result.status == ContentReconciliationStatus::Conflict => bounded_value(
-            &content_result_envelope(result, cursor, None),
-            MAX_OFFLINE_CONTENT_RESULT_BYTES,
-        ),
+    let envelope = content_result_envelope(result, cursor.clone(), result.authoritative.as_ref())?;
+    match require_serialized_size(&envelope, MAX_OFFLINE_CONTENT_RESULT_BYTES) {
+        Ok(()) => Ok(envelope),
+        Err(_) if result.status == ContentReconciliationStatus::Conflict => {
+            let envelope = content_result_envelope(result, cursor, None)?;
+            require_serialized_size(&envelope, MAX_OFFLINE_CONTENT_RESULT_BYTES)?;
+            Ok(envelope)
+        }
         Err(error) => Err(error),
     }
 }
@@ -132,30 +170,49 @@ pub(crate) fn offline_content_result_json(
 fn content_result_envelope(
     result: &OfflineContentResult,
     cursor: String,
-    authoritative: Option<AuthoritativeDocument>,
-) -> ContentResultEnvelopeV1 {
-    ContentResultEnvelopeV1 {
-        version: OFFLINE_CONTENT_VERSION,
-        result: ContentResultV1 {
+    authoritative: Option<&AuthoritativeDocument>,
+) -> Result<OfflineContentResultEnvelopeV1, OfflineContentWireError> {
+    let wire = match result.status {
+        ContentReconciliationStatus::Accepted => OfflineContentResultV1::Accepted {
             operation_id: result.operation_id.clone(),
-            status: result.status.as_str().into(),
-            conflict_reason: result.conflict_reason.map(|reason| reason.as_str().into()),
-            authoritative,
+            conflict_reason: require_absent(result.conflict_reason)?,
+            authoritative: OfflineContentDocumentV1::from(
+                authoritative.ok_or(OfflineContentWireError::Operation)?,
+            ),
             cursor,
         },
-    }
+        ContentReconciliationStatus::Conflict => OfflineContentResultV1::Conflict {
+            operation_id: result.operation_id.clone(),
+            conflict_reason: result
+                .conflict_reason
+                .ok_or(OfflineContentWireError::Operation)?
+                .into(),
+            authoritative: authoritative.map(OfflineContentDocumentV1::from),
+            cursor,
+        },
+    };
+    Ok(OfflineContentResultEnvelopeV1 {
+        version: OFFLINE_CONTENT_VERSION,
+        result: wire,
+    })
 }
 
 pub(crate) fn decode_offline_content_result(
     value: Value,
 ) -> Result<DecodedOfflineContentResult, OfflineContentWireError> {
     require_size(&value, MAX_OFFLINE_CONTENT_RESULT_BYTES)?;
-    let envelope: ContentResultEnvelopeV1 =
+    require_response_version(&value)?;
+    let envelope: OfflineContentResultEnvelopeV1 =
         serde_json::from_value(value).map_err(invalid_operation)?;
-    if envelope.version != OFFLINE_CONTENT_VERSION {
-        return Err(OfflineContentWireError::Version);
-    }
     decode_result(envelope.result)
+}
+
+fn require_response_version(value: &Value) -> Result<(), OfflineContentWireError> {
+    match value.get("version").and_then(Value::as_u64) {
+        Some(version) if version == u64::from(OFFLINE_CONTENT_VERSION) => Ok(()),
+        Some(_) => Err(OfflineContentWireError::Version),
+        None => Err(OfflineContentWireError::Operation),
+    }
 }
 
 fn encode_operation(
@@ -184,19 +241,19 @@ fn validate_operation(value: &OfflineContentOperationV1) -> Result<(), OfflineCo
     }
     validate_cursor(&value.cursor)?;
     match &value.mutation {
-        ContentMutationV1::Put {
+        OfflineContentMutationV1::Put {
             document_id,
             logical_path,
             content_sha256,
             org,
             base,
         } => validate_document_put(document_id, logical_path, content_sha256, org, base),
-        ContentMutationV1::Rename {
+        OfflineContentMutationV1::Rename {
             document_id,
             logical_path,
             base,
         } => validate_document_rename(document_id, logical_path, base),
-        ContentMutationV1::Tombstone { document_id, base } => {
+        OfflineContentMutationV1::Tombstone { document_id, base } => {
             validate_document_tombstone(document_id, base)
         }
     }
@@ -207,7 +264,7 @@ fn validate_document_put(
     logical_path: &str,
     content_sha256: &str,
     org: &str,
-    base: &ContentBaseV1,
+    base: &OfflineContentBaseV1,
 ) -> Result<(), OfflineContentWireError> {
     DocumentId::new(document_id.to_owned()).map_err(invalid_operation)?;
     if logical_path.len() > 4096 {
@@ -225,7 +282,7 @@ fn validate_document_put(
 fn validate_document_rename(
     document_id: &str,
     logical_path: &str,
-    base: &ContentBaseV1,
+    base: &OfflineContentBaseV1,
 ) -> Result<(), OfflineContentWireError> {
     validate_document_identity(document_id)?;
     if logical_path.len() > 4096 {
@@ -237,7 +294,7 @@ fn validate_document_rename(
 
 fn validate_document_tombstone(
     document_id: &str,
-    base: &ContentBaseV1,
+    base: &OfflineContentBaseV1,
 ) -> Result<(), OfflineContentWireError> {
     validate_document_identity(document_id)?;
     require_revision_base(base)
@@ -249,18 +306,18 @@ fn validate_document_identity(document_id: &str) -> Result<(), OfflineContentWir
         .map_err(invalid_operation)
 }
 
-fn require_revision_base(base: &ContentBaseV1) -> Result<(), OfflineContentWireError> {
-    if matches!(base, ContentBaseV1::Revision { .. }) && valid_content_base(base) {
+fn require_revision_base(base: &OfflineContentBaseV1) -> Result<(), OfflineContentWireError> {
+    if matches!(base, OfflineContentBaseV1::Revision { .. }) && valid_content_base(base) {
         Ok(())
     } else {
         Err(OfflineContentWireError::Operation)
     }
 }
 
-fn valid_content_base(base: &ContentBaseV1) -> bool {
+fn valid_content_base(base: &OfflineContentBaseV1) -> bool {
     match base {
-        ContentBaseV1::Absent => true,
-        ContentBaseV1::Revision {
+        OfflineContentBaseV1::Absent => true,
+        OfflineContentBaseV1::Revision {
             revision,
             content_sha256,
             predecessor_operation_id,
@@ -282,32 +339,45 @@ fn valid_content_base(base: &ContentBaseV1) -> bool {
 }
 
 fn decode_result(
-    value: ContentResultV1,
+    value: OfflineContentResultV1,
 ) -> Result<DecodedOfflineContentResult, OfflineContentWireError> {
-    require_identity(&value.operation_id)?;
-    validate_cursor(&value.cursor)?;
-    let status = parse_status(&value.status)?;
-    let conflict_reason = value
-        .conflict_reason
-        .as_deref()
-        .map(parse_reason)
-        .transpose()?;
-    if (status == ContentReconciliationStatus::Conflict) != conflict_reason.is_some() {
-        return Err(OfflineContentWireError::Operation);
-    }
-    let authoritative = value.authoritative;
+    let (operation_id, status, conflict_reason, authoritative, cursor) = match value {
+        OfflineContentResultV1::Accepted {
+            operation_id,
+            authoritative,
+            cursor,
+            ..
+        } => (
+            operation_id,
+            ContentReconciliationStatus::Accepted,
+            None,
+            Some(authoritative.into()),
+            cursor,
+        ),
+        OfflineContentResultV1::Conflict {
+            operation_id,
+            conflict_reason,
+            authoritative,
+            cursor,
+        } => (
+            operation_id,
+            ContentReconciliationStatus::Conflict,
+            Some(conflict_reason.into()),
+            authoritative.map(AuthoritativeDocument::from),
+            cursor,
+        ),
+    };
+    require_identity(&operation_id)?;
+    validate_cursor(&cursor)?;
     if let Some(document) = &authoritative {
         validate_authoritative(document)?;
     }
-    if status == ContentReconciliationStatus::Accepted && authoritative.is_none() {
-        return Err(OfflineContentWireError::Operation);
-    }
     Ok(DecodedOfflineContentResult {
-        operation_id: value.operation_id,
+        operation_id,
         status,
         conflict_reason,
         authoritative,
-        cursor: value.cursor,
+        cursor,
     })
 }
 
@@ -326,12 +396,16 @@ fn validate_authoritative(document: &AuthoritativeDocument) -> Result<(), Offlin
     Ok(())
 }
 
-fn bounded_value(value: &impl Serialize, maximum: usize) -> Result<Value, OfflineContentWireError> {
+fn require_serialized_size(
+    value: &impl Serialize,
+    maximum: usize,
+) -> Result<(), OfflineContentWireError> {
     let bytes = serde_json::to_vec(value).map_err(invalid_operation)?;
     if bytes.len() > maximum {
-        return Err(OfflineContentWireError::Operation);
+        Err(OfflineContentWireError::Operation)
+    } else {
+        Ok(())
     }
-    serde_json::from_slice(&bytes).map_err(invalid_operation)
 }
 
 fn require_size(value: &Value, maximum: usize) -> Result<(), OfflineContentWireError> {
@@ -343,22 +417,11 @@ fn require_size(value: &Value, maximum: usize) -> Result<(), OfflineContentWireE
     }
 }
 
-fn parse_status(value: &str) -> Result<ContentReconciliationStatus, OfflineContentWireError> {
-    match value {
-        "accepted" => Ok(ContentReconciliationStatus::Accepted),
-        "conflict" => Ok(ContentReconciliationStatus::Conflict),
-        _ => Err(OfflineContentWireError::Operation),
-    }
-}
-
-fn parse_reason(value: &str) -> Result<OfflineContentConflictReason, OfflineContentWireError> {
-    match value {
-        "cursor_changed" => Ok(OfflineContentConflictReason::CursorChanged),
-        "base_changed" => Ok(OfflineContentConflictReason::BaseChanged),
-        "invalid_content" => Ok(OfflineContentConflictReason::InvalidContent),
-        "path_conflict" => Ok(OfflineContentConflictReason::PathConflict),
-        _ => Err(OfflineContentWireError::Operation),
-    }
+fn require_absent<T>(value: Option<T>) -> Result<(), OfflineContentWireError> {
+    value
+        .is_none()
+        .then_some(())
+        .ok_or(OfflineContentWireError::Operation)
 }
 
 fn require_identity(value: &str) -> Result<(), OfflineContentWireError> {
@@ -403,44 +466,49 @@ struct VersionedOperationV1<'a> {
     operation: &'a OfflineContentOperationV1,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OfflineContentOperationV1 {
-    operation_id: String,
-    device_id: String,
-    device_sequence: u64,
-    cursor: String,
-    authored_at_us: u64,
-    mutation: ContentMutationV1,
+pub struct OfflineContentOperationV1 {
+    #[schemars(length(min = 1, max = 4096))]
+    pub operation_id: String,
+    #[schemars(length(min = 1, max = 4096))]
+    pub device_id: String,
+    #[schemars(range(min = 1))]
+    pub device_sequence: u64,
+    #[schemars(length(min = 1, max = 512))]
+    pub cursor: String,
+    #[schemars(range(min = 1))]
+    pub authored_at_us: u64,
+    pub mutation: OfflineContentMutationV1,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ContentMutationV1 {
+pub enum OfflineContentMutationV1 {
     #[serde(rename = "put_document")]
     Put {
         document_id: String,
         logical_path: String,
         content_sha256: String,
         org: String,
-        base: ContentBaseV1,
+        base: OfflineContentBaseV1,
     },
     #[serde(rename = "rename_document")]
     Rename {
         document_id: String,
         logical_path: String,
-        base: ContentBaseV1,
+        base: OfflineContentBaseV1,
     },
     #[serde(rename = "tombstone_document")]
     Tombstone {
         document_id: String,
-        base: ContentBaseV1,
+        base: OfflineContentBaseV1,
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ContentBaseV1 {
+pub enum OfflineContentBaseV1 {
     Absent,
     Revision {
         revision: u64,
@@ -480,10 +548,10 @@ impl From<&OfflineContentOperation> for OfflineContentOperationV1 {
     }
 }
 
-impl From<ContentMutationV1> for OfflineContentMutation {
-    fn from(value: ContentMutationV1) -> Self {
+impl From<OfflineContentMutationV1> for OfflineContentMutation {
+    fn from(value: OfflineContentMutationV1) -> Self {
         match value {
-            ContentMutationV1::Put {
+            OfflineContentMutationV1::Put {
                 document_id,
                 logical_path,
                 content_sha256,
@@ -496,7 +564,7 @@ impl From<ContentMutationV1> for OfflineContentMutation {
                 org,
                 base: base.into(),
             },
-            ContentMutationV1::Rename {
+            OfflineContentMutationV1::Rename {
                 document_id,
                 logical_path,
                 base,
@@ -505,7 +573,7 @@ impl From<ContentMutationV1> for OfflineContentMutation {
                 logical_path,
                 base: base.into(),
             },
-            ContentMutationV1::Tombstone { document_id, base } => Self::Tombstone {
+            OfflineContentMutationV1::Tombstone { document_id, base } => Self::Tombstone {
                 document_id,
                 base: base.into(),
             },
@@ -513,7 +581,7 @@ impl From<ContentMutationV1> for OfflineContentMutation {
     }
 }
 
-impl From<&OfflineContentMutation> for ContentMutationV1 {
+impl From<&OfflineContentMutation> for OfflineContentMutationV1 {
     fn from(value: &OfflineContentMutation) -> Self {
         match value {
             OfflineContentMutation::Put {
@@ -546,11 +614,11 @@ impl From<&OfflineContentMutation> for ContentMutationV1 {
     }
 }
 
-impl From<ContentBaseV1> for ContentBase {
-    fn from(value: ContentBaseV1) -> Self {
+impl From<OfflineContentBaseV1> for ContentBase {
+    fn from(value: OfflineContentBaseV1) -> Self {
         match value {
-            ContentBaseV1::Absent => Self::Absent,
-            ContentBaseV1::Revision {
+            OfflineContentBaseV1::Absent => Self::Absent,
+            OfflineContentBaseV1::Revision {
                 revision,
                 content_sha256,
                 predecessor_operation_id,
@@ -563,7 +631,7 @@ impl From<ContentBaseV1> for ContentBase {
     }
 }
 
-impl From<ContentBase> for ContentBaseV1 {
+impl From<ContentBase> for OfflineContentBaseV1 {
     fn from(value: ContentBase) -> Self {
         match value {
             ContentBase::Absent => Self::Absent,
@@ -580,21 +648,106 @@ impl From<ContentBase> for ContentBaseV1 {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ContentResultEnvelopeV1 {
-    version: u32,
-    result: ContentResultV1,
+pub struct OfflineContentResultEnvelopeV1 {
+    #[serde(deserialize_with = "deserialize_version_1")]
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub result: OfflineContentResultV1,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OfflineContentResultV1 {
+    Accepted {
+        #[schemars(length(min = 1, max = 4096))]
+        operation_id: String,
+        conflict_reason: (),
+        authoritative: OfflineContentDocumentV1,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+    Conflict {
+        #[schemars(length(min = 1, max = 4096))]
+        operation_id: String,
+        conflict_reason: OfflineContentConflictReasonV1,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        #[schemars(required)]
+        authoritative: Option<OfflineContentDocumentV1>,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineContentConflictReasonV1 {
+    CursorChanged,
+    BaseChanged,
+    InvalidContent,
+    PathConflict,
+}
+
+impl From<OfflineContentConflictReason> for OfflineContentConflictReasonV1 {
+    fn from(value: OfflineContentConflictReason) -> Self {
+        match value {
+            OfflineContentConflictReason::CursorChanged => Self::CursorChanged,
+            OfflineContentConflictReason::BaseChanged => Self::BaseChanged,
+            OfflineContentConflictReason::InvalidContent => Self::InvalidContent,
+            OfflineContentConflictReason::PathConflict => Self::PathConflict,
+        }
+    }
+}
+
+impl From<OfflineContentConflictReasonV1> for OfflineContentConflictReason {
+    fn from(value: OfflineContentConflictReasonV1) -> Self {
+        match value {
+            OfflineContentConflictReasonV1::CursorChanged => Self::CursorChanged,
+            OfflineContentConflictReasonV1::BaseChanged => Self::BaseChanged,
+            OfflineContentConflictReasonV1::InvalidContent => Self::InvalidContent,
+            OfflineContentConflictReasonV1::PathConflict => Self::PathConflict,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ContentResultV1 {
-    operation_id: String,
-    status: String,
-    conflict_reason: Option<String>,
-    authoritative: Option<AuthoritativeDocument>,
-    cursor: String,
+pub struct OfflineContentDocumentV1 {
+    #[schemars(length(min = 1, max = 4096))]
+    pub document_id: String,
+    #[schemars(length(min = 1, max = 4096))]
+    pub logical_path: String,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub content_sha256: Option<String>,
+    pub active: bool,
+}
+
+impl From<&AuthoritativeDocument> for OfflineContentDocumentV1 {
+    fn from(value: &AuthoritativeDocument) -> Self {
+        Self {
+            document_id: value.document_id.clone(),
+            logical_path: value.logical_path.clone(),
+            revision: value.revision,
+            content_sha256: value.content_sha256.clone(),
+            active: value.active,
+        }
+    }
+}
+
+impl From<OfflineContentDocumentV1> for AuthoritativeDocument {
+    fn from(value: OfflineContentDocumentV1) -> Self {
+        Self {
+            document_id: value.document_id,
+            logical_path: value.logical_path,
+            revision: value.revision,
+            content_sha256: value.content_sha256,
+            active: value.active,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -604,7 +757,7 @@ mod tests {
 
     use super::{
         OfflineContentSubmission, OfflineContentWireError, decode_offline_content_capabilities,
-        offline_content_capabilities, offline_content_result_json,
+        decode_offline_content_result, offline_content_capabilities, offline_content_result_json,
     };
     use crate::application::{
         AuthoritativeDocument, ContentReconciliationStatus, OfflineContentConflictReason,
@@ -635,6 +788,15 @@ mod tests {
         }))
         .unwrap();
         assert!(submission.decode().is_ok());
+    }
+
+    #[test]
+    fn result_decoder_classifies_unknown_versions() {
+        let value = json!({"version":2,"result":{}});
+        assert!(matches!(
+            decode_offline_content_result(value),
+            Err(OfflineContentWireError::Version)
+        ));
     }
 
     #[test]

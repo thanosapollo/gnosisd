@@ -45,7 +45,8 @@ use crate::{
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
             ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1,
             DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, OfflineReviewOperationEnvelopeV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, OfflineContentOperationEnvelopeV1,
+            OfflineContentResultEnvelopeV1, OfflineReviewOperationEnvelopeV1,
             OfflineReviewResultEnvelopeV2, ReplicaChangePageV1, ReplicaSnapshotPageV1,
             ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
             ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1,
@@ -54,7 +55,7 @@ use crate::{
             ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
-        offline_content_result_json, offline_result_response, replica_change_page,
+        offline_content_result_response, offline_result_response, replica_change_page,
         replica_snapshot_page, replica_state_response, review_pack_response,
     },
     service::{ServiceError, ServiceHandle},
@@ -1473,7 +1474,7 @@ async fn reconcile_content(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     ApiJson(submission): ApiJson<OfflineContentSubmission>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OfflineContentResultEnvelopeV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let decoded = submission
         .decode()
@@ -1491,7 +1492,7 @@ async fn reconcile_content(
         .map_err(ApiError::service)?;
     announce(&state).await;
     Ok(Json(
-        offline_content_result_json(&result).map_err(|_| ApiError::internal())?,
+        offline_content_result_response(&result).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -2114,6 +2115,15 @@ fn json_contract(
 
 fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract> {
     match (path, method) {
+        ("/v1/content/offline-operations", "post") => Some(json_contract(
+            "content:write",
+            Some("OfflineContentOperationEnvelopeV1"),
+            "200",
+            "OfflineContentResultEnvelopeV1",
+            &[
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
         ("/v1/changes", "get") => Some(json_contract(
             "read",
             None,
@@ -2736,6 +2746,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ReviewPackEnvelopeV2>();
     generator.subschema_for::<ActiveReviewPackEnvelopeV2>();
     generator.subschema_for::<OfflineReviewResultEnvelopeV2>();
+    generator.subschema_for::<OfflineContentResultEnvelopeV1>();
     generator.subschema_for::<ApiErrorCodeV1>();
     generator.subschema_for::<ApiErrorResponseV1>();
     let mut definitions = generator.take_definitions(true);
@@ -2750,6 +2761,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
     requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
+    requests.subschema_for::<OfflineContentOperationEnvelopeV1>();
     definitions.extend(requests.take_definitions(true));
     definitions
 }
@@ -3356,6 +3368,99 @@ mod tests {
         assert_offline_review_operation_contract(paths);
         assert_offline_review_asset_contract(paths);
         assert_offline_review_schemas(&api["components"]["schemas"]);
+    }
+
+    #[test]
+    fn openapi_offline_content_contract_is_exact() {
+        let api = openapi_document();
+        let operation = &api["paths"]["/v1/content/offline-operations"]["post"];
+        assert_eq!(
+            operation["x-gnosis-required-scopes"],
+            json!(["content:write"])
+        );
+        assert_schema_ref(
+            operation,
+            "requestBody",
+            "OfflineContentOperationEnvelopeV1",
+        );
+        assert_response_schema(operation, "200", "OfflineContentResultEnvelopeV1");
+        assert_response_statuses(
+            operation,
+            &[
+                "200", "400", "401", "403", "408", "409", "413", "422", "500", "503",
+            ],
+        );
+        let schemas = &api["components"]["schemas"];
+        assert_eq!(
+            schemas["OfflineContentOperationEnvelopeV1"]["properties"]["version"]["const"],
+            1
+        );
+        assert_eq!(
+            schemas["OfflineContentResultEnvelopeV1"]["properties"]["version"]["const"],
+            1
+        );
+        assert_tagged_variants(
+            &schemas["OfflineContentMutationV1"],
+            "kind",
+            &["put_document", "rename_document", "tombstone_document"],
+        );
+        assert_tagged_variants(
+            &schemas["OfflineContentBaseV1"],
+            "kind",
+            &["absent", "revision"],
+        );
+        assert_eq!(
+            schemas["OfflineContentConflictReasonV1"]["enum"],
+            json!([
+                "cursor_changed",
+                "base_changed",
+                "invalid_content",
+                "path_conflict"
+            ])
+        );
+        assert_offline_content_result_schema(schemas);
+    }
+
+    fn assert_offline_content_result_schema(schemas: &Value) {
+        let results = schemas["OfflineContentResultV1"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|schema| schema["properties"]["status"]["const"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["accepted", "conflict"]
+        );
+        assert_eq!(results[0]["properties"]["conflict_reason"]["type"], "null");
+        assert!(
+            results[0]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("conflict_reason"))
+        );
+        assert!(
+            results[1]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("authoritative"))
+        );
+        assert!(
+            schemas["OfflineContentDocumentV1"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("content_sha256"))
+        );
+    }
+
+    fn assert_tagged_variants(schema: &Value, tag: &str, expected: &[&str]) {
+        let actual = schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| variant["properties"][tag]["const"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 
     fn assert_offline_review_operation_contract(paths: &Value) {
@@ -5063,6 +5168,21 @@ mod tests {
         let token = device.token.clone();
         service.create_device(device, 1).await.unwrap();
         let app = router(service.clone());
+        let malformed = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-operations",
+                &token,
+                Body::from(r#"{"version":1,"operation":{}}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(malformed).await["error"]["code"],
+            "invalid_offline_content_operation"
+        );
         let state: ReplicaStateV1 = response_typed(
             app.clone()
                 .oneshot(authorized("GET", "/v1/sync/state", &token, Body::empty()))

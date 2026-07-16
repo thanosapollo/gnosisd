@@ -56,6 +56,9 @@ client may open the core database directly.
   reconciliation responses. Pack, session, source, status, and conflict
   discriminants are closed enums. Keep the runtime response types and OpenAPI
   schemas identical instead of returning generic JSON values.
+- Offline document reconciliation uses typed v1 operation and result envelopes.
+  Mutation, base, status, and conflict variants are closed, and accepted versus
+  conflict results are disjoint wire states.
 - Frozen direct note routes retain their original v1 status and response shapes.
   Retry-safe direct document writes and lifecycle changes use the additive
   document-mutation routes, device-scoped immutable receipts, exact request

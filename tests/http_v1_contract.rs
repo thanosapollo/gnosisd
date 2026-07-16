@@ -2,8 +2,9 @@ use gnosis_core::protocol::http_v1::{
     ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
     AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
     DocumentMutationResultV1, DocumentRevisionPageV1, NodePageV1, NoteRenameRequestV1,
-    NoteWriteRequestV1, OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2,
-    ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
+    NoteWriteRequestV1, OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
+    OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
+    ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
     ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
     SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1,
@@ -362,6 +363,97 @@ fn public_offline_review_dtos_preserve_v1_requests_and_v2_responses() {
     assert_offline_thema_kind_is_closed(&fixture["pack"]);
     assert_zero_byte_pack_asset_round_trips(&fixture["pack"]);
     assert_invalid_offline_result_pairings(&fixture["result"]);
+}
+
+#[test]
+fn public_offline_content_dtos_preserve_strict_v1_shapes() {
+    let operation = offline_content_operation();
+    let accepted = offline_content_result("accepted");
+    let conflict = offline_content_result("conflict");
+    assert_round_trip::<OfflineContentOperationEnvelopeV1>(operation.clone());
+    assert_round_trip::<OfflineContentResultEnvelopeV1>(accepted.clone());
+    assert_round_trip::<OfflineContentResultEnvelopeV1>(conflict.clone());
+
+    let mut wrong_version = operation;
+    wrong_version["version"] = json!(2);
+    assert!(serde_json::from_value::<OfflineContentOperationEnvelopeV1>(wrong_version).is_err());
+    let mut wrong_result_version = accepted.clone();
+    wrong_result_version["version"] = json!(2);
+    assert!(
+        serde_json::from_value::<OfflineContentResultEnvelopeV1>(wrong_result_version).is_err()
+    );
+    let mut unknown_kind = offline_content_operation();
+    unknown_kind["operation"]["mutation"]["kind"] = json!("future");
+    assert!(serde_json::from_value::<OfflineContentOperationEnvelopeV1>(unknown_kind).is_err());
+    let mut unknown_base = offline_content_operation();
+    unknown_base["operation"]["mutation"]["base"]["kind"] = json!("future");
+    assert!(serde_json::from_value::<OfflineContentOperationEnvelopeV1>(unknown_base).is_err());
+    assert_invalid_offline_content_results(accepted, conflict);
+}
+
+fn offline_content_operation() -> Value {
+    json!({
+        "version":1,
+        "operation":{
+            "operation_id":"operation","device_id":"device","device_sequence":1,
+            "cursor":"cursor","authored_at_us":1,
+            "mutation":{"kind":"put_document","document_id":"document",
+                "logical_path":"note.org","content_sha256":"a".repeat(64),
+                "org":"#+title: Note\n","base":{"kind":"absent"}}
+        }
+    })
+}
+
+fn offline_content_result(status: &str) -> Value {
+    let accepted = status == "accepted";
+    json!({
+        "version":1,
+        "result":{
+            "operation_id":"operation","status":status,
+            "conflict_reason":(!accepted).then_some("invalid_content"),
+            "authoritative":accepted.then(|| json!({
+                "document_id":"document","logical_path":"note.org","revision":1,
+                "content_sha256":"a".repeat(64),"active":true
+            })),
+            "cursor":"cursor"
+        }
+    })
+}
+
+fn assert_invalid_offline_content_results(mut accepted: Value, mut conflict: Value) {
+    let mut missing_conflict_reason = accepted.clone();
+    missing_conflict_reason["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("conflict_reason");
+    assert!(
+        serde_json::from_value::<OfflineContentResultEnvelopeV1>(missing_conflict_reason).is_err()
+    );
+
+    let mut tombstone = accepted.clone();
+    tombstone["result"]["authoritative"]["content_sha256"] = Value::Null;
+    tombstone["result"]["authoritative"]["active"] = json!(false);
+    assert_round_trip::<OfflineContentResultEnvelopeV1>(tombstone.clone());
+    tombstone["result"]["authoritative"]
+        .as_object_mut()
+        .unwrap()
+        .remove("content_sha256");
+    assert!(serde_json::from_value::<OfflineContentResultEnvelopeV1>(tombstone).is_err());
+
+    accepted["result"]["conflict_reason"] = json!("base_changed");
+    assert!(serde_json::from_value::<OfflineContentResultEnvelopeV1>(accepted).is_err());
+    conflict["result"]["conflict_reason"] = Value::Null;
+    assert!(serde_json::from_value::<OfflineContentResultEnvelopeV1>(conflict.clone()).is_err());
+    conflict["result"]["conflict_reason"] = json!("future");
+    assert!(serde_json::from_value::<OfflineContentResultEnvelopeV1>(conflict.clone()).is_err());
+    conflict["result"]["conflict_reason"] = json!("invalid_content");
+    conflict["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("authoritative");
+    assert!(serde_json::from_value::<OfflineContentResultEnvelopeV1>(conflict.clone()).is_err());
+    conflict["result"]["status"] = json!("accepted");
+    assert!(serde_json::from_value::<OfflineContentResultEnvelopeV1>(conflict).is_err());
 }
 
 fn assert_offline_versions_are_exact(fixture: &Value) {
