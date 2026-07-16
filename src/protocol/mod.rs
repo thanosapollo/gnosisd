@@ -36,9 +36,11 @@ pub(crate) use offline_content::{
 pub(crate) use offline_review::canonical_offline_operation;
 pub(crate) use offline_review::{
     MAX_OFFLINE_REVIEW_OPERATION_BYTES, MAX_OFFLINE_REVIEW_RESULT_BYTES, OFFLINE_REVIEW_VERSION,
-    OfflineReviewSubmission, OfflineReviewWireError, active_review_pack_json,
-    decode_offline_result, decode_review_pack, offline_result_json, review_pack_json,
+    OfflineReviewSubmission, OfflineReviewWireError, active_review_pack_response,
+    decode_offline_result, decode_review_pack, offline_result_response, review_pack_response,
 };
+#[cfg(test)]
+pub(crate) use offline_review::{offline_result_json, review_pack_json};
 pub(crate) use replica::MAX_REPLICA_PAGE_BYTES;
 pub(crate) use replica::encode_cursor;
 #[cfg(test)]

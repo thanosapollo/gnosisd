@@ -38,22 +38,24 @@ use crate::{
     protocol::{
         MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
         OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
-        OfflineReviewWireError, ReplicaWireError, active_review_pack_json, decode_cursor,
+        OfflineReviewWireError, ReplicaWireError, active_review_pack_response, decode_cursor,
         decode_snapshot_cursor,
         http_v1::{
-            ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1,
-            ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1,
-            ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
-            DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
-            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
-            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
-            ReviewCommitResponseV1, ReviewSessionRequestV1, ReviewSessionV1,
+            ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
+            ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
+            ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1,
+            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, OfflineReviewOperationEnvelopeV1,
+            OfflineReviewResultEnvelopeV2, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
+            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1,
+            ReviewPackEnvelopeV2, ReviewSessionRequestV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
             ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
-        offline_content_result_json, offline_result_json, replica_change_page,
-        replica_snapshot_page, replica_state_response, review_pack_json,
+        offline_content_result_json, offline_result_response, replica_change_page,
+        replica_snapshot_page, replica_state_response, review_pack_response,
     },
     service::{ServiceError, ServiceHandle},
     store::StoreError,
@@ -1354,7 +1356,7 @@ async fn create_pack(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     ApiJson(input): ApiJson<ReviewSessionRequestV1>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<ReviewPackEnvelopeV2>), ApiError> {
     require(&principal, DeviceScope::Review)?;
     let (source, target_count) = input.into_application();
     let pack = state
@@ -1370,7 +1372,7 @@ async fn create_pack(
         .map_err(ApiError::service)?;
     Ok((
         StatusCode::CREATED,
-        Json(review_pack_json(&pack).map_err(|_| ApiError::internal())?),
+        Json(review_pack_response(&pack).map_err(|_| ApiError::internal())?),
     ))
 }
 
@@ -1378,7 +1380,7 @@ async fn get_pack(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewPackEnvelopeV2>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     let pack = state
         .service
@@ -1387,27 +1389,22 @@ async fn get_pack(
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(
-        review_pack_json(&pack).map_err(|_| ApiError::internal())?,
+        review_pack_response(&pack).map_err(|_| ApiError::internal())?,
     ))
 }
 
 async fn active_pack(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ActiveReviewPackEnvelopeV2>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     let pack = state
         .service
         .active_review_pack(review_actor(&principal))
         .await
         .map_err(ApiError::service)?;
-    let version = pack
-        .as_ref()
-        .map_or(crate::protocol::OFFLINE_REVIEW_VERSION, |pack| {
-            pack.format_version
-        });
     Ok(Json(
-        active_review_pack_json(version, pack.as_ref()).map_err(|_| ApiError::internal())?,
+        active_review_pack_response(pack.as_ref()).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -1436,7 +1433,7 @@ async fn abandon_pack(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ReviewPackEnvelopeV2>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     let pack = state
         .service
@@ -1444,7 +1441,7 @@ async fn abandon_pack(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
-        review_pack_json(&pack).map_err(|_| ApiError::internal())?,
+        review_pack_response(&pack).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -1452,7 +1449,7 @@ async fn reconcile_offline(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     ApiJson(submission): ApiJson<OfflineReviewSubmission>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<OfflineReviewResultEnvelopeV2>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     let decoded = submission.decode().map_err(ApiError::offline_review_wire)?;
     let result = state
@@ -1468,7 +1465,7 @@ async fn reconcile_offline(
         .map_err(ApiError::service)?;
     announce(&state).await;
     Ok(Json(
-        offline_result_json(&result).map_err(|_| ApiError::internal())?,
+        offline_result_response(&result).map_err(|_| ApiError::internal())?,
     ))
 }
 
@@ -1940,6 +1937,9 @@ fn openapi_operation(path: &str, method: &str) -> Value {
     if let Some(operation) = openapi_content_operation(path, method) {
         return operation;
     }
+    if let Some(operation) = openapi_offline_review_operation(path, method) {
+        return operation;
+    }
     if let Some(operation) = openapi_online_review_operation(path, method) {
         return operation;
     }
@@ -1956,6 +1956,105 @@ fn openapi_operation(path: &str, method: &str) -> Value {
         operation["requestBody"] = body;
     }
     operation
+}
+
+fn openapi_offline_review_operation(path: &str, method: &str) -> Option<Value> {
+    if path == "/v1/review/packs/{id}/assets/{digest}/{name}" && method == "get" {
+        return Some(offline_review_binary_operation(path, method));
+    }
+    let contract = offline_review_contract(path, method)?;
+    let mut operation = json!({
+        "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
+        "security":[{"bearerAuth":[]}],
+        "x-gnosis-required-scopes":["review"],
+        "parameters":openapi_path_parameters(path),
+        "responses":content_json_responses(
+            contract.success_status,
+            contract.response,
+            contract.error_statuses,
+        )
+    });
+    if let Some(request) = contract.request {
+        operation["requestBody"] = openapi_json_request(request);
+    }
+    Some(operation)
+}
+
+fn offline_review_contract(path: &str, method: &str) -> Option<ContentJsonContract> {
+    match (path, method) {
+        ("/v1/review/packs", "post") => Some(json_contract(
+            "review",
+            Some("ReviewSessionRequestV1"),
+            "201",
+            "ReviewPackEnvelopeV2",
+            &[
+                "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/review/packs/active", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ActiveReviewPackEnvelopeV2",
+            &["401", "403", "408", "500", "503"],
+        )),
+        ("/v1/review/packs/{id}", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewPackEnvelopeV2",
+            &["401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/review/packs/{id}/abandon", "post") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewPackEnvelopeV2",
+            &["400", "401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/review/offline-operations", "post") => Some(json_contract(
+            "review",
+            Some("OfflineReviewOperationEnvelopeV1"),
+            "200",
+            "OfflineReviewResultEnvelopeV2",
+            &[
+                "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
+        _ => None,
+    }
+}
+
+fn offline_review_binary_operation(path: &str, method: &str) -> Value {
+    json!({
+        "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
+        "security":[{"bearerAuth":[]}],
+        "x-gnosis-required-scopes":["review"],
+        "parameters":offline_review_asset_parameters(path),
+        "responses":{
+            "200":{"description":"Pack asset bytes","content":{"*/*":{
+                "schema":{"type":"string","format":"binary"}
+            }}},
+            "401":openapi_error_response(),
+            "403":openapi_error_response(),
+            "404":openapi_error_response(),
+            "408":openapi_error_response(),
+            "422":openapi_error_response(),
+            "500":openapi_error_response(),
+            "503":openapi_error_response()
+        }
+    })
+}
+
+fn offline_review_asset_parameters(path: &str) -> Vec<Value> {
+    let mut parameters = openapi_path_parameters(path);
+    if let Some(digest) = parameters
+        .iter_mut()
+        .find(|value| value["name"] == "digest")
+    {
+        digest["schema"] = json!({"type":"string","pattern":"^[0-9a-f]{64}$"});
+    }
+    parameters
 }
 
 fn openapi_content_operation(path: &str, method: &str) -> Option<Value> {
@@ -2634,6 +2733,9 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ReviewCommitResponseV1>();
     generator.subschema_for::<ReviewAttemptStateResponseV1>();
     generator.subschema_for::<ReviewAttemptOperationResponseV1>();
+    generator.subschema_for::<ReviewPackEnvelopeV2>();
+    generator.subschema_for::<ActiveReviewPackEnvelopeV2>();
+    generator.subschema_for::<OfflineReviewResultEnvelopeV2>();
     generator.subschema_for::<ApiErrorCodeV1>();
     generator.subschema_for::<ApiErrorResponseV1>();
     let mut definitions = generator.take_definitions(true);
@@ -2647,6 +2749,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<ReviewAnswerV1>();
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
+    requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
     definitions.extend(requests.take_definitions(true));
     definitions
 }
@@ -2782,7 +2885,7 @@ mod tests {
         http::{HeaderMap, Request, StatusCode},
     };
     use rusqlite::Connection;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
 
@@ -3221,6 +3324,136 @@ mod tests {
             &[
                 "200", "400", "401", "403", "404", "408", "412", "500", "503",
             ],
+        );
+    }
+
+    #[test]
+    fn openapi_offline_review_contracts_are_exact() {
+        let api = openapi_document();
+        let paths = &api["paths"];
+        let create = &paths["/v1/review/packs"]["post"];
+        assert_eq!(create["x-gnosis-required-scopes"], json!(["review"]));
+        assert_schema_ref(create, "requestBody", "ReviewSessionRequestV1");
+        assert_response_schema(create, "201", "ReviewPackEnvelopeV2");
+        assert_response_statuses(
+            create,
+            &[
+                "201", "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        );
+        let active = &paths["/v1/review/packs/active"]["get"];
+        assert_response_schema(active, "200", "ActiveReviewPackEnvelopeV2");
+        assert_response_statuses(active, &["200", "401", "403", "408", "500", "503"]);
+        let get = &paths["/v1/review/packs/{id}"]["get"];
+        assert_response_schema(get, "200", "ReviewPackEnvelopeV2");
+        assert_response_statuses(get, &["200", "401", "403", "404", "408", "500", "503"]);
+        let abandon = &paths["/v1/review/packs/{id}/abandon"]["post"];
+        assert_response_schema(abandon, "200", "ReviewPackEnvelopeV2");
+        assert_response_statuses(
+            abandon,
+            &["200", "400", "401", "403", "404", "408", "500", "503"],
+        );
+        assert_offline_review_operation_contract(paths);
+        assert_offline_review_asset_contract(paths);
+        assert_offline_review_schemas(&api["components"]["schemas"]);
+    }
+
+    fn assert_offline_review_operation_contract(paths: &Value) {
+        let operation = &paths["/v1/review/offline-operations"]["post"];
+        assert_schema_ref(operation, "requestBody", "OfflineReviewOperationEnvelopeV1");
+        assert_response_schema(operation, "200", "OfflineReviewResultEnvelopeV2");
+        assert_response_statuses(
+            operation,
+            &[
+                "200", "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        );
+    }
+
+    fn assert_offline_review_asset_contract(paths: &Value) {
+        let asset = &paths["/v1/review/packs/{id}/assets/{digest}/{name}"]["get"];
+        assert_eq!(asset["x-gnosis-required-scopes"], json!(["review"]));
+        assert_eq!(
+            asset["responses"]["200"]["content"]["*/*"]["schema"],
+            json!({"type":"string","format":"binary"})
+        );
+        let digest = asset["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "digest")
+            .unwrap();
+        assert_eq!(digest["schema"]["pattern"], "^[0-9a-f]{64}$");
+        assert_response_statuses(
+            asset,
+            &["200", "401", "403", "404", "408", "422", "500", "503"],
+        );
+    }
+
+    fn assert_offline_review_schemas(schemas: &Value) {
+        assert_eq!(
+            schemas["OfflineReviewOperationEnvelopeV1"]["properties"]["version"]["const"],
+            1
+        );
+        assert_eq!(
+            schemas["ReviewPackEnvelopeV2"]["properties"]["version"]["const"],
+            2
+        );
+        assert_eq!(
+            schemas["ActiveReviewPackEnvelopeV2"]["properties"]["version"]["const"],
+            2
+        );
+        assert_eq!(
+            schemas["OfflineReviewResultEnvelopeV2"]["properties"]["version"]["const"],
+            2
+        );
+        assert_eq!(
+            schemas["ReviewPackStatusV2"]["enum"],
+            json!(["active", "completed", "abandoned"])
+        );
+        assert_eq!(
+            schemas["OfflineThemaKindV1"]["enum"],
+            json!(["basic", "cloze", "mcq", "mc-cloze"])
+        );
+        assert_eq!(
+            schemas["ReviewPackV2"]["properties"]["items"]["minItems"],
+            1
+        );
+        let size = &schemas["ReviewPackAssetV2"]["properties"]["size_bytes"];
+        assert_eq!(size["minimum"], 0);
+        assert!(size.get("maximum").is_none());
+        let results = schemas["OfflineReviewResultV2"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for (schema, status, null_field) in [
+            (&results[0], "accepted", "conflict_reason"),
+            (&results[1], "conflict", "event_id"),
+        ] {
+            assert_eq!(schema["properties"]["status"]["const"], status);
+            assert_eq!(schema["properties"][null_field]["type"], "null");
+            for required in ["conflict_reason", "event_id"] {
+                assert!(
+                    schema["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(required))
+                );
+            }
+        }
+    }
+
+    fn assert_schema_ref(operation: &Value, location: &str, schema: &str) {
+        assert_eq!(
+            operation[location]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{schema}")
+        );
+    }
+
+    fn assert_response_schema(operation: &Value, status: &str, schema: &str) {
+        assert_eq!(
+            operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
+            format!("#/components/schemas/{schema}")
         );
     }
 
@@ -5368,7 +5601,7 @@ mod tests {
         service.create_device(owner, 1).await.unwrap();
         service.create_device(other, 2).await.unwrap();
         service.create_device(admin, 3).await.unwrap();
-        let image = b"offline image".to_vec();
+        let image = Vec::new();
         let digest = format!("{:x}", Sha256::digest(&image));
         let asset_path = super::canonical_asset_path(&digest, "image.png").unwrap();
         let asset_head = service
@@ -5435,6 +5668,7 @@ mod tests {
         let created = response_json(created).await;
         assert_eq!(created["version"], 2);
         assert!(created["pack"]["cursor"].is_string());
+        assert_eq!(created["pack"]["assets"][0]["size_bytes"], 0);
         let pack = service
             .review_pack(
                 created["pack"]["pack_id"].as_str().unwrap().to_owned(),

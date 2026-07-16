@@ -1,11 +1,13 @@
 use gnosis_core::protocol::http_v1::{
-    ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1,
-    ContentChangePageV1, DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
-    NodePageV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
-    ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
-    ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewResponsePromptV1,
-    ReviewSessionRequestV1, ReviewSessionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
-    SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
+    AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
+    DocumentMutationResultV1, DocumentRevisionPageV1, NodePageV1, NoteRenameRequestV1,
+    NoteWriteRequestV1, OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2,
+    ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
+    ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
+    ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
+    SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1,
+    UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -330,6 +332,94 @@ fn public_review_response_prompts_are_closed_and_explicit() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn public_offline_review_dtos_preserve_v1_requests_and_v2_responses() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
+
+    assert_round_trip::<OfflineReviewOperationEnvelopeV1>(fixture["submission"].clone());
+    assert_round_trip::<ReviewPackEnvelopeV2>(fixture["pack"].clone());
+    assert_round_trip::<OfflineReviewResultEnvelopeV2>(fixture["result"].clone());
+    assert_round_trip::<ActiveReviewPackEnvelopeV2>(json!({"version":2,"pack":null}));
+
+    let mut unknown = fixture["pack"].clone();
+    unknown["future"] = json!(true);
+    assert!(serde_json::from_value::<ReviewPackEnvelopeV2>(unknown).is_err());
+    assert!(serde_json::from_value::<ActiveReviewPackEnvelopeV2>(json!({"version":2})).is_err());
+    let mut missing_nullable = fixture["result"].clone();
+    missing_nullable["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("conflict_reason");
+    assert!(serde_json::from_value::<OfflineReviewResultEnvelopeV2>(missing_nullable).is_err());
+    let mut unknown_status = fixture["pack"].clone();
+    unknown_status["pack"]["status"] = json!("future");
+    assert!(serde_json::from_value::<ReviewPackEnvelopeV2>(unknown_status).is_err());
+
+    assert_offline_versions_are_exact(&fixture);
+    assert_offline_thema_kind_is_closed(&fixture["pack"]);
+    assert_zero_byte_pack_asset_round_trips(&fixture["pack"]);
+    assert_invalid_offline_result_pairings(&fixture["result"]);
+}
+
+fn assert_offline_versions_are_exact(fixture: &Value) {
+    let mut submission = fixture["submission"].clone();
+    submission["version"] = json!(2);
+    assert!(serde_json::from_value::<OfflineReviewOperationEnvelopeV1>(submission).is_err());
+
+    let mut pack = fixture["pack"].clone();
+    pack["version"] = json!(1);
+    assert!(serde_json::from_value::<ReviewPackEnvelopeV2>(pack).is_err());
+
+    let mut result = fixture["result"].clone();
+    result["version"] = json!(1);
+    assert!(serde_json::from_value::<OfflineReviewResultEnvelopeV2>(result).is_err());
+
+    let active = json!({"version":1,"pack":null});
+    assert!(serde_json::from_value::<ActiveReviewPackEnvelopeV2>(active).is_err());
+}
+
+fn assert_offline_thema_kind_is_closed(pack: &Value) {
+    let mut unknown = pack.clone();
+    unknown["pack"]["items"][0]["presentation"]["kind"] = json!("future");
+    assert!(serde_json::from_value::<ReviewPackEnvelopeV2>(unknown).is_err());
+}
+
+fn assert_zero_byte_pack_asset_round_trips(pack: &Value) {
+    let mut zero_byte_asset = pack.clone();
+    let digest = "a".repeat(64);
+    zero_byte_asset["pack"]["assets"] = json!([{
+        "logical_path":format!("assets/{digest}/empty.bin"),
+        "content_sha256":digest,
+        "size_bytes":0,
+        "media_type":"application/octet-stream"
+    }]);
+    assert_round_trip::<ReviewPackEnvelopeV2>(zero_byte_asset);
+}
+
+fn assert_invalid_offline_result_pairings(result: &Value) {
+    let mut accepted_without_event = result.clone();
+    accepted_without_event["result"]["event_id"] = Value::Null;
+    assert!(
+        serde_json::from_value::<OfflineReviewResultEnvelopeV2>(accepted_without_event).is_err()
+    );
+
+    let mut accepted_with_conflict = result.clone();
+    accepted_with_conflict["result"]["conflict_reason"] = json!("content_changed");
+    assert!(
+        serde_json::from_value::<OfflineReviewResultEnvelopeV2>(accepted_with_conflict).is_err()
+    );
+
+    let mut conflict = result.clone();
+    conflict["result"]["status"] = json!("conflict");
+    conflict["result"]["conflict_reason"] = json!("content_changed");
+    assert!(serde_json::from_value::<OfflineReviewResultEnvelopeV2>(conflict.clone()).is_err());
+    conflict["result"]["event_id"] = Value::Null;
+    assert_round_trip::<OfflineReviewResultEnvelopeV2>(conflict.clone());
+    conflict["result"]["conflict_reason"] = Value::Null;
+    assert!(serde_json::from_value::<OfflineReviewResultEnvelopeV2>(conflict).is_err());
 }
 
 #[test]

@@ -135,9 +135,11 @@ direct content resources, online review sessions and attempts, desired-state
 operations, and stable errors are generated from the public Rust DTOs in
 ~protocol::http_v1~. Content schemas distinguish request defaults from required
 response fields and describe scopes, conditional headers, pagination, raw
-media, and tombstone responses. Review packs and offline reconciliation
-envelopes remain a route-level catalogue and are not yet a complete
-client-generation contract.
+media, and tombstone responses. Review-pack acquisition, pack assets, and
+offline review reconciliation expose closed v1 request and v2 response DTOs,
+exact scopes, statuses, and binary asset responses. Sequenced offline content
+and asset reconciliation still require the same treatment before the complete
+schema is generator-ready.
 CORS is disabled. Keep ~gnosisd~ on loopback and terminate HTTPS at a trusted
 network boundary.
 

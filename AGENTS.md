@@ -52,6 +52,10 @@ client may open the core database directly.
   typed response prompt. Raw answer-bearing keimenon and captured answers stay
   server-side until grading. Keep concealment and response cardinality in the
   pure application projection instead of duplicating them in clients.
+- Offline review HTTP uses a typed v1 operation envelope and typed v2 pack and
+  reconciliation responses. Pack, session, source, status, and conflict
+  discriminants are closed enums. Keep the runtime response types and OpenAPI
+  schemas identical instead of returning generic JSON values.
 - Frozen direct note routes retain their original v1 status and response shapes.
   Retry-safe direct document writes and lifecycle changes use the additive
   document-mutation routes, device-scoped immutable receipts, exact request

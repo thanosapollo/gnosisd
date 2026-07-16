@@ -1,6 +1,7 @@
 use std::{collections::BTreeSet, io};
 
-use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -18,6 +19,40 @@ pub(crate) const MAX_OFFLINE_REVIEW_OPERATION_BYTES: usize =
     MAX_REVIEW_PACK_BYTES + 2 * MAX_OFFLINE_ASSET_BYTES as usize;
 pub(crate) const MAX_OFFLINE_REVIEW_RESULT_BYTES: usize = MAX_REVIEW_PACK_BYTES + 64 * 1024;
 const OFFLINE_REVIEW_RESPONSE_VERSION: u32 = 2;
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn deserialize_version_1<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_version::<D, 1>(deserializer)
+}
+
+fn deserialize_version_2<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_version::<D, 2>(deserializer)
+}
+
+fn deserialize_version<'de, D, const VERSION: u32>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version == VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom("protocol version is unsupported"))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +98,7 @@ pub(crate) fn canonical_offline_operation(
     if version != OFFLINE_REVIEW_VERSION {
         return Err(OfflineReviewWireError::Version);
     }
-    encode_v1_operation(&OfflineReviewOperationV1::from(operation))
+    encode_v1_operation(&OfflineReviewOperationV1::try_from(operation)?)
 }
 
 fn encode_v1_operation(
@@ -76,39 +111,50 @@ fn encode_v1_operation(
     .map_err(|_| OfflineReviewWireError::Operation)
 }
 
+#[cfg(test)]
 pub(crate) fn review_pack_json(pack: &ReviewPackView) -> Result<Value, serde_json::Error> {
-    serde_json::to_value(ReviewPackEnvelopeV1 {
+    serde_json::to_value(review_pack_response(pack)?)
+}
+
+pub(crate) fn review_pack_response(
+    pack: &ReviewPackView,
+) -> Result<ReviewPackEnvelopeV2, serde_json::Error> {
+    Ok(ReviewPackEnvelopeV2 {
         version: OFFLINE_REVIEW_RESPONSE_VERSION,
-        pack: ReviewPackV1::try_from(pack)?,
+        pack: ReviewPackV2::try_from(pack)?,
     })
 }
 
-pub(crate) fn active_review_pack_json(
-    _version: u32,
+pub(crate) fn active_review_pack_response(
     pack: Option<&ReviewPackView>,
-) -> Result<Value, serde_json::Error> {
-    serde_json::to_value(ActiveReviewPackEnvelopeV1 {
+) -> Result<ActiveReviewPackEnvelopeV2, serde_json::Error> {
+    Ok(ActiveReviewPackEnvelopeV2 {
         version: OFFLINE_REVIEW_RESPONSE_VERSION,
-        pack: pack.map(ReviewPackV1::try_from).transpose()?,
+        pack: pack.map(ReviewPackV2::try_from).transpose()?,
     })
 }
 
+#[cfg(test)]
 pub(crate) fn offline_result_json(
     result: &OfflineReviewResult,
 ) -> Result<Value, serde_json::Error> {
-    serde_json::to_value(OfflineResultEnvelopeV1 {
+    serde_json::to_value(offline_result_response(result)?)
+}
+
+pub(crate) fn offline_result_response(
+    result: &OfflineReviewResult,
+) -> Result<OfflineReviewResultEnvelopeV2, serde_json::Error> {
+    Ok(OfflineReviewResultEnvelopeV2 {
         version: OFFLINE_REVIEW_RESPONSE_VERSION,
-        result: OfflineResultV1::try_from(result)?,
+        result: OfflineReviewResultV2::try_from(result)?,
     })
 }
 
 pub(crate) fn decode_review_pack(value: Value) -> Result<ReviewPackView, OfflineReviewWireError> {
     require_response_size(&value)?;
-    let envelope: ReviewPackEnvelopeV1 =
+    require_response_version(&value)?;
+    let envelope: ReviewPackEnvelopeV2 =
         serde_json::from_value(value).map_err(|_| OfflineReviewWireError::Operation)?;
-    if envelope.version != OFFLINE_REVIEW_RESPONSE_VERSION {
-        return Err(OfflineReviewWireError::Version);
-    }
     ReviewPackView::try_from(envelope.pack)
 }
 
@@ -116,12 +162,22 @@ pub(crate) fn decode_offline_result(
     value: Value,
 ) -> Result<OfflineReviewResult, OfflineReviewWireError> {
     require_response_size(&value)?;
-    let envelope: OfflineResultEnvelopeV1 =
+    require_response_version(&value)?;
+    let envelope: OfflineReviewResultEnvelopeV2 =
         serde_json::from_value(value).map_err(|_| OfflineReviewWireError::Operation)?;
-    if envelope.version != OFFLINE_REVIEW_RESPONSE_VERSION {
-        return Err(OfflineReviewWireError::Version);
-    }
     OfflineReviewResult::try_from(envelope.result)
+}
+
+fn require_response_version(value: &Value) -> Result<(), OfflineReviewWireError> {
+    let version = value
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or(OfflineReviewWireError::Operation)?;
+    if version == u64::from(OFFLINE_REVIEW_RESPONSE_VERSION) {
+        Ok(())
+    } else {
+        Err(OfflineReviewWireError::Version)
+    }
 }
 
 fn require_response_size(value: &Value) -> Result<(), OfflineReviewWireError> {
@@ -139,31 +195,49 @@ struct VersionedOperationV1<'a> {
     operation: &'a OfflineReviewOperationV1,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OfflineReviewOperationV1 {
-    attempt_id: String,
-    pack_id: String,
-    session_id: String,
-    lease_id: String,
-    device_id: String,
-    device_sequence: u64,
-    session_position: u32,
-    thema_id: String,
-    thema_revision: u64,
-    base_state_revision: u64,
-    content_sha256: String,
-    presentation: PresentationV1,
-    parameters: ParametersV1,
-    matcher_version: u32,
-    response: AnswerV1,
-    detected_success: bool,
-    accepted_success: bool,
-    override_count: u32,
-    proposed_transition: TransitionV1,
-    desired_suspended: bool,
-    answered_at_us: u64,
-    fuzz_sample: f64,
+pub struct OfflineReviewOperationEnvelopeV1 {
+    #[serde(deserialize_with = "deserialize_version_1")]
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub operation: OfflineReviewOperationV1,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineReviewOperationV1 {
+    #[schemars(length(min = 1, max = 128))]
+    pub attempt_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub pack_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub session_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub lease_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub device_id: String,
+    #[schemars(range(min = 1))]
+    pub device_sequence: u64,
+    pub session_position: u32,
+    #[schemars(length(min = 1, max = 128))]
+    pub thema_id: String,
+    pub thema_revision: u64,
+    pub base_state_revision: u64,
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+    pub presentation: OfflinePresentationV1,
+    pub parameters: OfflineParametersV1,
+    pub matcher_version: u32,
+    pub response: OfflineAnswerV1,
+    pub detected_success: bool,
+    pub accepted_success: bool,
+    pub override_count: u32,
+    pub proposed_transition: OfflineTransitionV1,
+    pub desired_suspended: bool,
+    #[schemars(range(min = 1))]
+    pub answered_at_us: u64,
+    pub fuzz_sample: f64,
 }
 
 impl From<OfflineReviewOperationV1> for OfflineReviewOperation {
@@ -195,9 +269,11 @@ impl From<OfflineReviewOperationV1> for OfflineReviewOperation {
     }
 }
 
-impl From<&OfflineReviewOperation> for OfflineReviewOperationV1 {
-    fn from(value: &OfflineReviewOperation) -> Self {
-        Self {
+impl TryFrom<&OfflineReviewOperation> for OfflineReviewOperationV1 {
+    type Error = OfflineReviewWireError;
+
+    fn try_from(value: &OfflineReviewOperation) -> Result<Self, Self::Error> {
+        Ok(Self {
             attempt_id: value.attempt_id.clone(),
             pack_id: value.pack_id.clone(),
             session_id: value.session_id.clone(),
@@ -209,7 +285,8 @@ impl From<&OfflineReviewOperation> for OfflineReviewOperationV1 {
             thema_revision: value.thema_revision,
             base_state_revision: value.base_state_revision,
             content_sha256: value.content_sha256.clone(),
-            presentation: (&value.presentation).into(),
+            presentation: OfflinePresentationV1::try_from(&value.presentation)
+                .map_err(|_| OfflineReviewWireError::Operation)?,
             parameters: (&value.parameters).into(),
             matcher_version: value.matcher_version,
             response: (&value.response).into(),
@@ -220,27 +297,63 @@ impl From<&OfflineReviewOperation> for OfflineReviewOperationV1 {
             desired_suspended: value.desired_suspended,
             answered_at_us: value.answered_at_us,
             fuzz_sample: value.fuzz_sample,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflinePresentationV1 {
+    pub kind: OfflineThemaKindV1,
+    pub keimenon: String,
+    pub hypothesis: Vec<Option<String>>,
+    pub answer: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub source_guid: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub parathema: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub review_image: Option<String>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OfflineThemaKindV1 {
+    Basic,
+    Cloze,
+    Mcq,
+    McCloze,
+}
+
+impl OfflineThemaKindV1 {
+    fn parse(value: &str) -> Result<Self, serde_json::Error> {
+        match value {
+            "basic" => Ok(Self::Basic),
+            "cloze" => Ok(Self::Cloze),
+            "mcq" => Ok(Self::Mcq),
+            "mc-cloze" => Ok(Self::McCloze),
+            _ => Err(invalid_response("offline thema kind is invalid")),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Cloze => "cloze",
+            Self::Mcq => "mcq",
+            Self::McCloze => "mc-cloze",
         }
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PresentationV1 {
-    kind: String,
-    keimenon: String,
-    hypothesis: Vec<Option<String>>,
-    answer: Vec<String>,
-    source_guid: Option<String>,
-    parathema: Option<String>,
-    review_image: Option<String>,
-    tags: Vec<String>,
-}
-
-impl From<PresentationV1> for PresentationSnapshot {
-    fn from(value: PresentationV1) -> Self {
+impl From<OfflinePresentationV1> for PresentationSnapshot {
+    fn from(value: OfflinePresentationV1) -> Self {
         Self {
-            kind: value.kind,
+            kind: value.kind.as_str().into(),
             keimenon: value.keimenon,
             hypothesis: value.hypothesis,
             answer: value.answer,
@@ -252,10 +365,12 @@ impl From<PresentationV1> for PresentationSnapshot {
     }
 }
 
-impl From<&PresentationSnapshot> for PresentationV1 {
-    fn from(value: &PresentationSnapshot) -> Self {
-        Self {
-            kind: value.kind.clone(),
+impl TryFrom<&PresentationSnapshot> for OfflinePresentationV1 {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &PresentationSnapshot) -> Result<Self, Self::Error> {
+        Ok(Self {
+            kind: OfflineThemaKindV1::parse(&value.kind)?,
             keimenon: value.keimenon.clone(),
             hypothesis: value.hypothesis.clone(),
             answer: value.answer.clone(),
@@ -263,33 +378,39 @@ impl From<&PresentationSnapshot> for PresentationV1 {
             parathema: value.parathema.clone(),
             review_image: value.review_image.clone(),
             tags: value.tags.clone(),
-        }
+        })
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewStateV1 {
-    state_revision: u64,
-    review_count: u64,
-    legacy_review_count: u64,
-    legacy_unclassified_count: u64,
-    last_reviewed_at_us: Option<u64>,
-    last_review_day: Option<u32>,
-    next_review_day: u32,
-    interval_days: Option<u32>,
-    consecutive_successes: u64,
-    total_successes: u64,
-    consecutive_failures: u64,
-    total_failures: u64,
-    suspended: bool,
-    gnosis_plus: f64,
-    gnosis_minus: f64,
-    gnosis_synolon: f64,
+pub struct OfflineReviewStateV1 {
+    pub state_revision: u64,
+    pub review_count: u64,
+    pub legacy_review_count: u64,
+    pub legacy_unclassified_count: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub last_reviewed_at_us: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub last_review_day: Option<u32>,
+    pub next_review_day: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub interval_days: Option<u32>,
+    pub consecutive_successes: u64,
+    pub total_successes: u64,
+    pub consecutive_failures: u64,
+    pub total_failures: u64,
+    pub suspended: bool,
+    pub gnosis_plus: f64,
+    pub gnosis_minus: f64,
+    pub gnosis_synolon: f64,
 }
 
-impl From<ReviewStateV1> for ReviewStateSnapshot {
-    fn from(value: ReviewStateV1) -> Self {
+impl From<OfflineReviewStateV1> for ReviewStateSnapshot {
+    fn from(value: OfflineReviewStateV1) -> Self {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
@@ -311,7 +432,7 @@ impl From<ReviewStateV1> for ReviewStateSnapshot {
     }
 }
 
-impl From<&ReviewStateSnapshot> for ReviewStateV1 {
+impl From<&ReviewStateSnapshot> for OfflineReviewStateV1 {
     fn from(value: &ReviewStateSnapshot) -> Self {
         Self {
             state_revision: value.state_revision,
@@ -334,22 +455,22 @@ impl From<&ReviewStateSnapshot> for ReviewStateV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ParametersV1 {
-    scheduler_version: u32,
-    amnesia: f64,
-    epignosis: f64,
-    agnoia: f64,
-    anagnosis: u64,
-    lethe: u64,
-    synolon_max: f64,
-    interval_fuzz: f64,
-    proto: Vec<u32>,
+pub struct OfflineParametersV1 {
+    pub scheduler_version: u32,
+    pub amnesia: f64,
+    pub epignosis: f64,
+    pub agnoia: f64,
+    pub anagnosis: u64,
+    pub lethe: u64,
+    pub synolon_max: f64,
+    pub interval_fuzz: f64,
+    pub proto: Vec<u32>,
 }
 
-impl From<ParametersV1> for ParametersSnapshot {
-    fn from(value: ParametersV1) -> Self {
+impl From<OfflineParametersV1> for ParametersSnapshot {
+    fn from(value: OfflineParametersV1) -> Self {
         Self {
             scheduler_version: value.scheduler_version,
             amnesia: value.amnesia,
@@ -364,7 +485,7 @@ impl From<ParametersV1> for ParametersSnapshot {
     }
 }
 
-impl From<&ParametersSnapshot> for ParametersV1 {
+impl From<&ParametersSnapshot> for OfflineParametersV1 {
     fn from(value: &ParametersSnapshot) -> Self {
         Self {
             scheduler_version: value.scheduler_version,
@@ -380,30 +501,30 @@ impl From<&ParametersSnapshot> for ParametersV1 {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
     content = "value",
     rename_all = "snake_case",
     deny_unknown_fields
 )]
-enum AnswerV1 {
+pub enum OfflineAnswerV1 {
     Text(String),
     Texts(Vec<String>),
     Choice(String),
 }
 
-impl From<AnswerV1> for AnswerInput {
-    fn from(value: AnswerV1) -> Self {
+impl From<OfflineAnswerV1> for AnswerInput {
+    fn from(value: OfflineAnswerV1) -> Self {
         match value {
-            AnswerV1::Text(value) => Self::Text(value),
-            AnswerV1::Texts(value) => Self::Texts(value),
-            AnswerV1::Choice(value) => Self::Choice(value),
+            OfflineAnswerV1::Text(value) => Self::Text(value),
+            OfflineAnswerV1::Texts(value) => Self::Texts(value),
+            OfflineAnswerV1::Choice(value) => Self::Choice(value),
         }
     }
 }
 
-impl From<&AnswerInput> for AnswerV1 {
+impl From<&AnswerInput> for OfflineAnswerV1 {
     fn from(value: &AnswerInput) -> Self {
         match value {
             AnswerInput::Text(value) => Self::Text(value.clone()),
@@ -413,24 +534,24 @@ impl From<&AnswerInput> for AnswerV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct TransitionV1 {
-    before: ReviewStateV1,
-    after: ReviewStateV1,
-    parameters: ParametersV1,
-    reviewed_at_us: u64,
-    review_day: u32,
-    success: bool,
-    first_review: bool,
-    elapsed_days: u32,
-    algorithm_interval_days: f64,
-    computed_interval_days: u32,
-    fuzz_delta: f64,
+pub struct OfflineTransitionV1 {
+    pub before: OfflineReviewStateV1,
+    pub after: OfflineReviewStateV1,
+    pub parameters: OfflineParametersV1,
+    pub reviewed_at_us: u64,
+    pub review_day: u32,
+    pub success: bool,
+    pub first_review: bool,
+    pub elapsed_days: u32,
+    pub algorithm_interval_days: f64,
+    pub computed_interval_days: u32,
+    pub fuzz_delta: f64,
 }
 
-impl From<TransitionV1> for TransitionSnapshot {
-    fn from(value: TransitionV1) -> Self {
+impl From<OfflineTransitionV1> for TransitionSnapshot {
+    fn from(value: OfflineTransitionV1) -> Self {
         Self {
             before: value.before.into(),
             after: value.after.into(),
@@ -447,7 +568,7 @@ impl From<TransitionV1> for TransitionSnapshot {
     }
 }
 
-impl From<&TransitionSnapshot> for TransitionV1 {
+impl From<&TransitionSnapshot> for OfflineTransitionV1 {
     fn from(value: &TransitionSnapshot) -> Self {
         Self {
             before: (&value.before).into(),
@@ -465,38 +586,79 @@ impl From<&TransitionSnapshot> for TransitionV1 {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewPackEnvelopeV1 {
-    version: u32,
-    pack: ReviewPackV1,
+pub struct ReviewPackEnvelopeV2 {
+    #[serde(deserialize_with = "deserialize_version_2")]
+    #[schemars(extend("const" = 2))]
+    pub version: u32,
+    pub pack: ReviewPackV2,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ActiveReviewPackEnvelopeV1 {
-    version: u32,
-    pack: Option<ReviewPackV1>,
+pub struct ActiveReviewPackEnvelopeV2 {
+    #[serde(deserialize_with = "deserialize_version_2")]
+    #[schemars(extend("const" = 2))]
+    pub version: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub pack: Option<ReviewPackV2>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewPackV1 {
-    pack_id: String,
-    session_id: String,
-    device_id: String,
-    lease_id: String,
-    status: String,
-    cursor: String,
-    issued_at_us: u64,
-    current_position: u32,
-    timezone: String,
-    day_boundary_hour: u8,
-    items: Vec<ReviewPackItemV1>,
-    assets: Vec<ReviewPackAssetV1>,
+pub struct ReviewPackV2 {
+    #[schemars(length(min = 1, max = 128))]
+    pub pack_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub session_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub device_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub lease_id: String,
+    pub status: ReviewPackStatusV2,
+    #[schemars(length(min = 1, max = 512))]
+    pub cursor: String,
+    #[schemars(range(min = 1))]
+    pub issued_at_us: u64,
+    pub current_position: u32,
+    pub timezone: String,
+    #[schemars(range(max = 23))]
+    pub day_boundary_hour: u8,
+    #[schemars(length(min = 1, max = 500))]
+    pub items: Vec<ReviewPackItemV2>,
+    pub assets: Vec<ReviewPackAssetV2>,
 }
 
-impl TryFrom<&ReviewPackView> for ReviewPackV1 {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewPackStatusV2 {
+    Active,
+    Completed,
+    Abandoned,
+}
+
+impl ReviewPackStatusV2 {
+    fn parse(value: &str) -> Result<Self, serde_json::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "abandoned" => Ok(Self::Abandoned),
+            _ => Err(invalid_response("review pack status is invalid")),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+impl TryFrom<&ReviewPackView> for ReviewPackV2 {
     type Error = serde_json::Error;
 
     fn try_from(value: &ReviewPackView) -> Result<Self, Self::Error> {
@@ -505,29 +667,32 @@ impl TryFrom<&ReviewPackView> for ReviewPackV1 {
             session_id: value.session_id.clone(),
             device_id: value.device_id.clone(),
             lease_id: value.lease_id.clone(),
-            status: value.status.clone(),
+            status: ReviewPackStatusV2::parse(&value.status)?,
             cursor: durable_cursor(&value.cursor_server_id, value.cursor, &value.cursor_token)?,
             issued_at_us: value.issued_at_us,
             current_position: value.current_position,
             timezone: value.timezone.clone(),
             day_boundary_hour: value.day_boundary_hour,
-            items: value.items.iter().map(ReviewPackItemV1::from).collect(),
-            assets: value.assets.iter().map(ReviewPackAssetV1::from).collect(),
+            items: value
+                .items
+                .iter()
+                .map(ReviewPackItemV2::try_from)
+                .collect::<Result<_, _>>()?,
+            assets: value.assets.iter().map(ReviewPackAssetV2::from).collect(),
         })
     }
 }
 
-impl TryFrom<ReviewPackV1> for ReviewPackView {
+impl TryFrom<ReviewPackV2> for ReviewPackView {
     type Error = OfflineReviewWireError;
 
-    fn try_from(value: ReviewPackV1) -> Result<Self, Self::Error> {
+    fn try_from(value: ReviewPackV2) -> Result<Self, Self::Error> {
         validate_review_pack(&value)?;
         let (server_id, cursor, token) = decode_durable_cursor(&value.cursor)?;
         if value.pack_id.is_empty()
             || value.session_id.is_empty()
             || value.device_id.is_empty()
             || value.lease_id.is_empty()
-            || value.status.is_empty()
             || value.issued_at_us == 0
             || value.day_boundary_hour > 23
         {
@@ -539,7 +704,7 @@ impl TryFrom<ReviewPackV1> for ReviewPackView {
             session_id: value.session_id,
             device_id: value.device_id,
             lease_id: value.lease_id,
-            status: value.status,
+            status: value.status.as_str().into(),
             cursor,
             cursor_server_id: server_id,
             cursor_token: token,
@@ -559,12 +724,11 @@ impl TryFrom<ReviewPackV1> for ReviewPackView {
     }
 }
 
-fn validate_review_pack(value: &ReviewPackV1) -> Result<(), OfflineReviewWireError> {
-    let coherent_status = match value.status.as_str() {
-        "active" => (value.current_position as usize) < value.items.len(),
-        "completed" => value.current_position as usize == value.items.len(),
-        "abandoned" => value.current_position as usize <= value.items.len(),
-        _ => false,
+fn validate_review_pack(value: &ReviewPackV2) -> Result<(), OfflineReviewWireError> {
+    let coherent_status = match value.status {
+        ReviewPackStatusV2::Active => (value.current_position as usize) < value.items.len(),
+        ReviewPackStatusV2::Completed => value.current_position as usize == value.items.len(),
+        ReviewPackStatusV2::Abandoned => value.current_position as usize <= value.items.len(),
     };
     if value.items.is_empty() || !coherent_status {
         return Err(OfflineReviewWireError::Operation);
@@ -626,38 +790,42 @@ fn validate_decoded_pack(pack: &ReviewPackView) -> Result<(), OfflineReviewWireE
     Ok(())
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewPackItemV1 {
-    position: u32,
-    thema_id: String,
-    thema_revision: u64,
-    content_sha256: String,
-    presentation: PresentationV1,
-    review_state: ReviewStateV1,
-    parameters: ParametersV1,
-    matcher_version: u32,
-    asset_paths: Vec<String>,
+pub struct ReviewPackItemV2 {
+    pub position: u32,
+    #[schemars(length(min = 1, max = 128))]
+    pub thema_id: String,
+    pub thema_revision: u64,
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+    pub presentation: OfflinePresentationV1,
+    pub review_state: OfflineReviewStateV1,
+    pub parameters: OfflineParametersV1,
+    pub matcher_version: u32,
+    pub asset_paths: Vec<String>,
 }
 
-impl From<&ReviewPackItem> for ReviewPackItemV1 {
-    fn from(value: &ReviewPackItem) -> Self {
-        Self {
+impl TryFrom<&ReviewPackItem> for ReviewPackItemV2 {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &ReviewPackItem) -> Result<Self, Self::Error> {
+        Ok(Self {
             position: value.position,
             thema_id: value.thema_id.clone(),
             thema_revision: value.thema_revision,
             content_sha256: value.content_sha256.clone(),
-            presentation: (&value.presentation).into(),
+            presentation: OfflinePresentationV1::try_from(&value.presentation)?,
             review_state: (&value.review_state).into(),
             parameters: (&value.parameters).into(),
             matcher_version: value.matcher_version,
             asset_paths: value.asset_paths.clone(),
-        }
+        })
     }
 }
 
-impl From<ReviewPackItemV1> for ReviewPackItem {
-    fn from(value: ReviewPackItemV1) -> Self {
+impl From<ReviewPackItemV2> for ReviewPackItem {
+    fn from(value: ReviewPackItemV2) -> Self {
         Self {
             position: value.position,
             thema_id: value.thema_id,
@@ -672,16 +840,19 @@ impl From<ReviewPackItemV1> for ReviewPackItem {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewPackAssetV1 {
-    logical_path: String,
-    content_sha256: String,
-    size_bytes: u64,
-    media_type: String,
+pub struct ReviewPackAssetV2 {
+    #[schemars(length(min = 1))]
+    pub logical_path: String,
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+    pub size_bytes: u64,
+    #[schemars(length(min = 1, max = 255))]
+    pub media_type: String,
 }
 
-impl From<&ReviewPackAsset> for ReviewPackAssetV1 {
+impl From<&ReviewPackAsset> for ReviewPackAssetV2 {
     fn from(value: &ReviewPackAsset) -> Self {
         Self {
             logical_path: value.logical_path.clone(),
@@ -692,8 +863,8 @@ impl From<&ReviewPackAsset> for ReviewPackAssetV1 {
     }
 }
 
-impl From<ReviewPackAssetV1> for ReviewPackAsset {
-    fn from(value: ReviewPackAssetV1) -> Self {
+impl From<ReviewPackAssetV2> for ReviewPackAsset {
+    fn from(value: ReviewPackAssetV2) -> Self {
         Self {
             logical_path: value.logical_path,
             content_sha256: value.content_sha256,
@@ -703,63 +874,150 @@ impl From<ReviewPackAssetV1> for ReviewPackAsset {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OfflineResultEnvelopeV1 {
-    version: u32,
-    result: OfflineResultV1,
+pub struct OfflineReviewResultEnvelopeV2 {
+    #[serde(deserialize_with = "deserialize_version_2")]
+    #[schemars(extend("const" = 2))]
+    pub version: u32,
+    pub result: OfflineReviewResultV2,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct OfflineResultV1 {
-    attempt_id: String,
-    status: String,
-    conflict_reason: Option<String>,
-    event_id: Option<String>,
-    authoritative_state: ReviewStateV1,
-    session: ReviewSessionV1,
-    cursor: String,
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OfflineReviewResultV2 {
+    Accepted {
+        #[schemars(length(min = 1, max = 128))]
+        attempt_id: String,
+        conflict_reason: (),
+        #[schemars(length(min = 1, max = 128))]
+        event_id: String,
+        authoritative_state: OfflineReviewStateV1,
+        session: OfflineReviewSessionV2,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+    Conflict {
+        #[schemars(length(min = 1, max = 128))]
+        attempt_id: String,
+        conflict_reason: OfflineReviewConflictReasonV2,
+        event_id: (),
+        authoritative_state: OfflineReviewStateV1,
+        session: OfflineReviewSessionV2,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
 }
 
-impl TryFrom<&OfflineReviewResult> for OfflineResultV1 {
-    type Error = serde_json::Error;
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineReviewConflictReasonV2 {
+    LeaseEnded,
+    SessionAdvanced,
+    ContentChanged,
+    SchedulingChanged,
+    CaptureMismatch,
+}
 
-    fn try_from(value: &OfflineReviewResult) -> Result<Self, Self::Error> {
-        Ok(Self {
-            attempt_id: value.attempt_id.clone(),
-            status: value.status.as_str().into(),
-            conflict_reason: value.conflict_reason.map(|reason| reason.as_str().into()),
-            event_id: value.event_id.clone(),
-            authoritative_state: (&value.authoritative_state).into(),
-            session: (&value.session).into(),
-            cursor: durable_cursor(&value.cursor_server_id, value.cursor, &value.cursor_token)?,
-        })
+impl From<OfflineConflictReason> for OfflineReviewConflictReasonV2 {
+    fn from(value: OfflineConflictReason) -> Self {
+        match value {
+            OfflineConflictReason::LeaseEnded => Self::LeaseEnded,
+            OfflineConflictReason::SessionAdvanced => Self::SessionAdvanced,
+            OfflineConflictReason::ContentChanged => Self::ContentChanged,
+            OfflineConflictReason::SchedulingChanged => Self::SchedulingChanged,
+            OfflineConflictReason::CaptureMismatch => Self::CaptureMismatch,
+        }
     }
 }
 
-impl TryFrom<OfflineResultV1> for OfflineReviewResult {
+impl From<OfflineReviewConflictReasonV2> for OfflineConflictReason {
+    fn from(value: OfflineReviewConflictReasonV2) -> Self {
+        match value {
+            OfflineReviewConflictReasonV2::LeaseEnded => Self::LeaseEnded,
+            OfflineReviewConflictReasonV2::SessionAdvanced => Self::SessionAdvanced,
+            OfflineReviewConflictReasonV2::ContentChanged => Self::ContentChanged,
+            OfflineReviewConflictReasonV2::SchedulingChanged => Self::SchedulingChanged,
+            OfflineReviewConflictReasonV2::CaptureMismatch => Self::CaptureMismatch,
+        }
+    }
+}
+
+impl TryFrom<&OfflineReviewResult> for OfflineReviewResultV2 {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &OfflineReviewResult) -> Result<Self, Self::Error> {
+        let authoritative_state = (&value.authoritative_state).into();
+        let session = OfflineReviewSessionV2::try_from(&value.session)?;
+        let cursor = durable_cursor(&value.cursor_server_id, value.cursor, &value.cursor_token)?;
+        match value.status {
+            ReconciliationStatus::Accepted => Ok(Self::Accepted {
+                attempt_id: value.attempt_id.clone(),
+                conflict_reason: require_absent(value.conflict_reason, "accepted conflict")?,
+                event_id: require_nonempty(value.event_id.clone(), "accepted event")?,
+                authoritative_state,
+                session,
+                cursor,
+            }),
+            ReconciliationStatus::Conflict => Ok(Self::Conflict {
+                attempt_id: value.attempt_id.clone(),
+                conflict_reason: require_present(value.conflict_reason, "conflict reason")?.into(),
+                event_id: require_absent(value.event_id.as_ref(), "conflict event")?,
+                authoritative_state,
+                session,
+                cursor,
+            }),
+        }
+    }
+}
+
+impl TryFrom<OfflineReviewResultV2> for OfflineReviewResult {
     type Error = OfflineReviewWireError;
 
-    fn try_from(value: OfflineResultV1) -> Result<Self, Self::Error> {
-        let (server_id, cursor, token) = decode_durable_cursor(&value.cursor)?;
-        let status = parse_reconciliation_status(&value.status)?;
-        let conflict_reason = value
-            .conflict_reason
-            .as_deref()
-            .map(parse_conflict_reason)
-            .transpose()?;
-        if value.attempt_id.is_empty()
-            || (status == ReconciliationStatus::Accepted) != value.event_id.is_some()
-            || (status == ReconciliationStatus::Conflict) != conflict_reason.is_some()
-            || value.event_id.as_ref().is_some_and(String::is_empty)
-        {
+    fn try_from(value: OfflineReviewResultV2) -> Result<Self, Self::Error> {
+        let (attempt_id, status, conflict_reason, event_id, state, session, encoded_cursor) =
+            match value {
+                OfflineReviewResultV2::Accepted {
+                    attempt_id,
+                    event_id,
+                    authoritative_state,
+                    session,
+                    cursor,
+                    ..
+                } => (
+                    attempt_id,
+                    ReconciliationStatus::Accepted,
+                    None,
+                    Some(event_id),
+                    authoritative_state,
+                    session,
+                    cursor,
+                ),
+                OfflineReviewResultV2::Conflict {
+                    attempt_id,
+                    conflict_reason,
+                    authoritative_state,
+                    session,
+                    cursor,
+                    ..
+                } => (
+                    attempt_id,
+                    ReconciliationStatus::Conflict,
+                    Some(conflict_reason.into()),
+                    None,
+                    authoritative_state,
+                    session,
+                    cursor,
+                ),
+            };
+        let (server_id, cursor, token) = decode_durable_cursor(&encoded_cursor)?;
+        if attempt_id.is_empty() || event_id.as_ref().is_some_and(String::is_empty) {
             return Err(OfflineReviewWireError::Operation);
         }
-        let authoritative_state: ReviewStateSnapshot = value.authoritative_state.into();
+        let authoritative_state: ReviewStateSnapshot = state.into();
         crate::domain::validate_state(&authoritative_state.clone().into())
             .map_err(|_| OfflineReviewWireError::Operation)?;
-        let session = ReviewSessionView::try_from(value.session)?;
+        let session = ReviewSessionView::try_from(session)?;
         if session.mode != ReviewSessionMode::Offline
             || session
                 .owner_device_id
@@ -770,10 +1028,10 @@ impl TryFrom<OfflineResultV1> for OfflineReviewResult {
         }
         Ok(Self {
             format_version: OFFLINE_REVIEW_VERSION,
-            attempt_id: value.attempt_id,
+            attempt_id,
             status,
             conflict_reason,
-            event_id: value.event_id,
+            event_id,
             authoritative_state,
             session,
             cursor,
@@ -787,27 +1045,6 @@ fn decode_durable_cursor(value: &str) -> Result<(String, u64, String), OfflineRe
     crate::protocol::replica::decode_cursor(value).map_err(|_| OfflineReviewWireError::Operation)
 }
 
-fn parse_reconciliation_status(
-    value: &str,
-) -> Result<ReconciliationStatus, OfflineReviewWireError> {
-    match value {
-        "accepted" => Ok(ReconciliationStatus::Accepted),
-        "conflict" => Ok(ReconciliationStatus::Conflict),
-        _ => Err(OfflineReviewWireError::Operation),
-    }
-}
-
-fn parse_conflict_reason(value: &str) -> Result<OfflineConflictReason, OfflineReviewWireError> {
-    match value {
-        "lease_ended" => Ok(OfflineConflictReason::LeaseEnded),
-        "session_advanced" => Ok(OfflineConflictReason::SessionAdvanced),
-        "content_changed" => Ok(OfflineConflictReason::ContentChanged),
-        "scheduling_changed" => Ok(OfflineConflictReason::SchedulingChanged),
-        "capture_mismatch" => Ok(OfflineConflictReason::CaptureMismatch),
-        _ => Err(OfflineReviewWireError::Operation),
-    }
-}
-
 fn durable_cursor(
     server_id: &str,
     position: u64,
@@ -817,54 +1054,136 @@ fn durable_cursor(
         .map_err(|error| serde_json::Error::io(io::Error::other(error)))
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewSessionV1 {
-    session_id: String,
-    owner_device_id: Option<String>,
-    mode: String,
-    source: ReviewSourceV1,
-    target_count: Option<u32>,
-    status: String,
-    current_position: u32,
-    queue_length: u32,
-    started_at_us: u64,
+fn invalid_response(message: &'static str) -> serde_json::Error {
+    serde_json::Error::io(io::Error::new(io::ErrorKind::InvalidData, message))
 }
 
-impl From<&ReviewSessionView> for ReviewSessionV1 {
-    fn from(value: &ReviewSessionView) -> Self {
-        Self {
-            session_id: value.session_id.clone(),
-            owner_device_id: value.owner_device_id.clone(),
-            mode: match value.mode {
-                ReviewSessionMode::Online => "online",
-                ReviewSessionMode::Offline => "offline",
-            }
-            .into(),
-            source: (&value.source).into(),
-            target_count: value.target_count,
-            status: value.status.clone(),
-            current_position: value.current_position,
-            queue_length: value.queue_length,
-            started_at_us: value.started_at_us,
+fn require_present<T>(value: Option<T>, message: &'static str) -> Result<T, serde_json::Error> {
+    value.ok_or_else(|| invalid_response(message))
+}
+
+fn require_nonempty(
+    value: Option<String>,
+    message: &'static str,
+) -> Result<String, serde_json::Error> {
+    require_present(value, message).and_then(|value| {
+        (!value.is_empty())
+            .then_some(value)
+            .ok_or_else(|| invalid_response(message))
+    })
+}
+
+fn require_absent<T>(value: Option<T>, message: &'static str) -> Result<(), serde_json::Error> {
+    if value.is_none() {
+        Ok(())
+    } else {
+        Err(invalid_response(message))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineReviewSessionV2 {
+    #[schemars(length(min = 1, max = 128))]
+    pub session_id: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub owner_device_id: Option<String>,
+    pub mode: OfflineReviewSessionModeV2,
+    pub source: OfflineReviewSourceV2,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub target_count: Option<u32>,
+    pub status: OfflineReviewSessionStatusV2,
+    pub current_position: u32,
+    pub queue_length: u32,
+    #[schemars(range(min = 1))]
+    pub started_at_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineReviewSessionModeV2 {
+    Online,
+    Offline,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineReviewSessionStatusV2 {
+    Active,
+    Completed,
+    Quit,
+    Aborted,
+}
+
+impl OfflineReviewSessionStatusV2 {
+    fn parse(value: &str) -> Result<Self, serde_json::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "completed" => Ok(Self::Completed),
+            "quit" => Ok(Self::Quit),
+            "aborted" => Ok(Self::Aborted),
+            _ => Err(invalid_response("review session status is invalid")),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Quit => "quit",
+            Self::Aborted => "aborted",
         }
     }
 }
 
-impl TryFrom<ReviewSessionV1> for ReviewSessionView {
+impl From<ReviewSessionMode> for OfflineReviewSessionModeV2 {
+    fn from(value: ReviewSessionMode) -> Self {
+        match value {
+            ReviewSessionMode::Online => Self::Online,
+            ReviewSessionMode::Offline => Self::Offline,
+        }
+    }
+}
+
+impl From<OfflineReviewSessionModeV2> for ReviewSessionMode {
+    fn from(value: OfflineReviewSessionModeV2) -> Self {
+        match value {
+            OfflineReviewSessionModeV2::Online => Self::Online,
+            OfflineReviewSessionModeV2::Offline => Self::Offline,
+        }
+    }
+}
+
+impl TryFrom<&ReviewSessionView> for OfflineReviewSessionV2 {
+    type Error = serde_json::Error;
+
+    fn try_from(value: &ReviewSessionView) -> Result<Self, Self::Error> {
+        Ok(Self {
+            session_id: value.session_id.clone(),
+            owner_device_id: value.owner_device_id.clone(),
+            mode: value.mode.into(),
+            source: (&value.source).into(),
+            target_count: value.target_count,
+            status: OfflineReviewSessionStatusV2::parse(&value.status)?,
+            current_position: value.current_position,
+            queue_length: value.queue_length,
+            started_at_us: value.started_at_us,
+        })
+    }
+}
+
+impl TryFrom<OfflineReviewSessionV2> for ReviewSessionView {
     type Error = OfflineReviewWireError;
 
-    fn try_from(value: ReviewSessionV1) -> Result<Self, Self::Error> {
-        let mode = match value.mode.as_str() {
-            "online" => ReviewSessionMode::Online,
-            "offline" => ReviewSessionMode::Offline,
-            _ => return Err(OfflineReviewWireError::Operation),
-        };
-        let coherent_position = match value.status.as_str() {
-            "active" => value.current_position < value.queue_length,
-            "completed" => value.current_position == value.queue_length,
-            "aborted" | "quit" => value.current_position <= value.queue_length,
-            _ => false,
+    fn try_from(value: OfflineReviewSessionV2) -> Result<Self, Self::Error> {
+        let coherent_position = match value.status {
+            OfflineReviewSessionStatusV2::Active => value.current_position < value.queue_length,
+            OfflineReviewSessionStatusV2::Completed => value.current_position == value.queue_length,
+            OfflineReviewSessionStatusV2::Aborted | OfflineReviewSessionStatusV2::Quit => {
+                value.current_position <= value.queue_length
+            }
         };
         if value.session_id.is_empty()
             || !coherent_position
@@ -876,10 +1195,10 @@ impl TryFrom<ReviewSessionV1> for ReviewSessionView {
         Ok(Self {
             session_id: value.session_id,
             owner_device_id: value.owner_device_id,
-            mode,
+            mode: value.mode.into(),
             source: ReviewSource::try_from(value.source)?,
             target_count: value.target_count,
-            status: value.status,
+            status: value.status.as_str().into(),
             current_position: value.current_position,
             queue_length: value.queue_length,
             started_at_us: value.started_at_us,
@@ -887,22 +1206,70 @@ impl TryFrom<ReviewSessionV1> for ReviewSessionView {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ReviewSourceV1 {
-    kind: String,
-    tags: Vec<String>,
-    exclude_tags: Vec<String>,
-    topic_node_id: Option<String>,
-    topic_forward_depth: Option<u32>,
-    topic_backward_depth: Option<u32>,
-    manual_ids: Vec<String>,
+pub struct OfflineReviewSourceV2 {
+    pub kind: OfflineReviewSourceKindV2,
+    pub tags: Vec<String>,
+    pub exclude_tags: Vec<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub topic_node_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub topic_forward_depth: Option<u32>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
+    pub topic_backward_depth: Option<u32>,
+    pub manual_ids: Vec<String>,
 }
 
-impl From<&ReviewSource> for ReviewSourceV1 {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineReviewSourceKindV2 {
+    Due,
+    Overdue,
+    DueWithoutOverdue,
+    Tag,
+    DueTag,
+    Topic,
+    Manual,
+}
+
+impl From<&crate::application::ReviewSourceKind> for OfflineReviewSourceKindV2 {
+    fn from(value: &crate::application::ReviewSourceKind) -> Self {
+        use crate::application::ReviewSourceKind;
+        match value {
+            ReviewSourceKind::Due => Self::Due,
+            ReviewSourceKind::Overdue => Self::Overdue,
+            ReviewSourceKind::DueWithoutOverdue => Self::DueWithoutOverdue,
+            ReviewSourceKind::Tag => Self::Tag,
+            ReviewSourceKind::DueTag => Self::DueTag,
+            ReviewSourceKind::Topic => Self::Topic,
+            ReviewSourceKind::Manual => Self::Manual,
+        }
+    }
+}
+
+impl From<OfflineReviewSourceKindV2> for crate::application::ReviewSourceKind {
+    fn from(value: OfflineReviewSourceKindV2) -> Self {
+        use crate::application::ReviewSourceKind;
+        match value {
+            OfflineReviewSourceKindV2::Due => ReviewSourceKind::Due,
+            OfflineReviewSourceKindV2::Overdue => ReviewSourceKind::Overdue,
+            OfflineReviewSourceKindV2::DueWithoutOverdue => ReviewSourceKind::DueWithoutOverdue,
+            OfflineReviewSourceKindV2::Tag => ReviewSourceKind::Tag,
+            OfflineReviewSourceKindV2::DueTag => ReviewSourceKind::DueTag,
+            OfflineReviewSourceKindV2::Topic => ReviewSourceKind::Topic,
+            OfflineReviewSourceKindV2::Manual => ReviewSourceKind::Manual,
+        }
+    }
+}
+
+impl From<&ReviewSource> for OfflineReviewSourceV2 {
     fn from(value: &ReviewSource) -> Self {
         Self {
-            kind: value.kind.as_str().into(),
+            kind: (&value.kind).into(),
             tags: value.tags.clone(),
             exclude_tags: value.exclude_tags.clone(),
             topic_node_id: value.topic_node_id.clone(),
@@ -913,22 +1280,12 @@ impl From<&ReviewSource> for ReviewSourceV1 {
     }
 }
 
-impl TryFrom<ReviewSourceV1> for ReviewSource {
+impl TryFrom<OfflineReviewSourceV2> for ReviewSource {
     type Error = OfflineReviewWireError;
 
-    fn try_from(value: ReviewSourceV1) -> Result<Self, Self::Error> {
-        let kind = match value.kind.as_str() {
-            "due" => crate::application::ReviewSourceKind::Due,
-            "overdue" => crate::application::ReviewSourceKind::Overdue,
-            "due_without_overdue" => crate::application::ReviewSourceKind::DueWithoutOverdue,
-            "tag" => crate::application::ReviewSourceKind::Tag,
-            "due_tag" => crate::application::ReviewSourceKind::DueTag,
-            "topic" => crate::application::ReviewSourceKind::Topic,
-            "manual" => crate::application::ReviewSourceKind::Manual,
-            _ => return Err(OfflineReviewWireError::Operation),
-        };
+    fn try_from(value: OfflineReviewSourceV2) -> Result<Self, Self::Error> {
         ReviewSource {
-            kind,
+            kind: value.kind.into(),
             tags: value.tags,
             exclude_tags: value.exclude_tags,
             topic_node_id: value.topic_node_id,
@@ -947,7 +1304,8 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        OfflineReviewSubmission, OfflineReviewWireError, offline_result_json, review_pack_json,
+        OfflineReviewSubmission, OfflineReviewWireError, decode_offline_result, decode_review_pack,
+        offline_result_json, review_pack_json,
     };
     use crate::application::{OfflineReviewResult, ReviewPackView};
 
@@ -975,6 +1333,26 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn response_decoders_classify_unknown_versions() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/protocol/offline-review-v1.json"
+        ))
+        .unwrap();
+        let mut pack = fixture["pack"].clone();
+        pack["version"] = json!(1);
+        assert!(matches!(
+            decode_review_pack(pack),
+            Err(OfflineReviewWireError::Version)
+        ));
+        let mut result = fixture["result"].clone();
+        result["version"] = json!(1);
+        assert!(matches!(
+            decode_offline_result(result),
+            Err(OfflineReviewWireError::Version)
+        ));
     }
 
     #[test]

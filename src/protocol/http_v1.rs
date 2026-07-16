@@ -1,6 +1,6 @@
 //! Public JSON contracts for authenticated HTTP `/v1` clients.
 //!
-//! These response DTOs preserve the frozen v1 JSON shape. In particular,
+//! These DTOs preserve their exact versioned JSON shapes. In particular,
 //! [`ReplicaStateV1::next_device_sequence`] is serialized with the legacy
 //! `next_review_sequence` field name. Deserialization enforces wire shape;
 //! `LocalReplica` performs cursor, identity, projection, and ordering validation
@@ -8,6 +8,14 @@
 
 mod content;
 
+pub use super::offline_review::{
+    ActiveReviewPackEnvelopeV2, OfflineAnswerV1, OfflineParametersV1, OfflinePresentationV1,
+    OfflineReviewConflictReasonV2, OfflineReviewOperationEnvelopeV1, OfflineReviewOperationV1,
+    OfflineReviewResultEnvelopeV2, OfflineReviewResultV2, OfflineReviewSessionModeV2,
+    OfflineReviewSessionStatusV2, OfflineReviewSessionV2, OfflineReviewSourceKindV2,
+    OfflineReviewSourceV2, OfflineReviewStateV1, OfflineThemaKindV1, OfflineTransitionV1,
+    ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackItemV2, ReviewPackStatusV2, ReviewPackV2,
+};
 pub use content::{
     AssetHeadV1, ContentChangePageV1, ContentChangeV1, ContentEntityKindV1, ContentOperationV1,
     DocumentHeadV1, DocumentMutationRejectionV1, DocumentMutationResultV1, DocumentRevisionPageV1,
