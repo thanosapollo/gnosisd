@@ -5,14 +5,18 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::application::{
-    AnswerInput, OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult,
-    ParametersSnapshot, PresentationSnapshot, ReconciliationStatus, ReviewPackAsset,
-    ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource,
-    ReviewStateSnapshot, TransitionSnapshot, presentation_content, review_day_at,
+    AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, OfflineConflictReason,
+    OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot, PresentationSnapshot,
+    ReconciliationStatus, ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode,
+    ReviewSessionView, ReviewSource, ReviewStateSnapshot, TransitionSnapshot, presentation_content,
+    review_day_at,
 };
-use crate::protocol::replica::encode_cursor;
+use crate::protocol::{is_canonical_sha256, replica::encode_cursor};
 
 pub(crate) const OFFLINE_REVIEW_VERSION: u32 = 1;
+pub(crate) const MAX_OFFLINE_REVIEW_OPERATION_BYTES: usize =
+    MAX_REVIEW_PACK_BYTES + 2 * MAX_OFFLINE_ASSET_BYTES as usize;
+pub(crate) const MAX_OFFLINE_REVIEW_RESULT_BYTES: usize = MAX_REVIEW_PACK_BYTES + 64 * 1024;
 const OFFLINE_REVIEW_RESPONSE_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize)]
@@ -122,7 +126,7 @@ pub(crate) fn decode_offline_result(
 
 fn require_response_size(value: &Value) -> Result<(), OfflineReviewWireError> {
     let bytes = serde_json::to_vec(value).map_err(|_| OfflineReviewWireError::Operation)?;
-    if bytes.len() <= crate::application::MAX_REVIEW_PACK_BYTES + 64 * 1024 {
+    if bytes.len() <= MAX_OFFLINE_REVIEW_RESULT_BYTES {
         Ok(())
     } else {
         Err(OfflineReviewWireError::Operation)
@@ -572,7 +576,7 @@ fn validate_review_pack(value: &ReviewPackV1) -> Result<(), OfflineReviewWireErr
         .collect::<BTreeSet<_>>();
     if assets.len() != value.assets.len()
         || value.assets.iter().any(|asset| {
-            !valid_sha256(&asset.content_sha256)
+            !is_canonical_sha256(&asset.content_sha256)
                 || asset.media_type.is_empty()
                 || crate::application::validate_asset_path(&asset.logical_path).is_err()
                 || asset.logical_path.split('/').nth(1) != Some(asset.content_sha256.as_str())
@@ -583,7 +587,7 @@ fn validate_review_pack(value: &ReviewPackV1) -> Result<(), OfflineReviewWireErr
     for (position, item) in value.items.iter().enumerate() {
         if item.position as usize != position
             || item.thema_id.is_empty()
-            || !valid_sha256(&item.content_sha256)
+            || !is_canonical_sha256(&item.content_sha256)
             || item.asset_paths.iter().collect::<BTreeSet<_>>().len() != item.asset_paths.len()
             || item
                 .asset_paths
@@ -620,13 +624,6 @@ fn validate_decoded_pack(pack: &ReviewPackView) -> Result<(), OfflineReviewWireE
         }
     }
     Ok(())
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Deserialize, Serialize)]

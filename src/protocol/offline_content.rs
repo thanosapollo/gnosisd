@@ -12,14 +12,15 @@ use crate::{
     domain::DocumentId,
     protocol::{
         http_v1::ContentCapabilitiesV1,
+        is_canonical_sha256,
         replica::{decode_cursor, encode_cursor},
     },
 };
 
 pub(crate) const OFFLINE_CONTENT_VERSION: u32 = 1;
 const OFFLINE_CONTENT_CAPABILITIES_VERSION: u32 = 1;
-const MAX_OFFLINE_CONTENT_OPERATION_BYTES: usize = 1024 * 1024;
-const MAX_OFFLINE_CONTENT_RESULT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_OFFLINE_CONTENT_OPERATION_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_OFFLINE_CONTENT_RESULT_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -369,11 +370,7 @@ fn require_identity(value: &str) -> Result<(), OfflineContentWireError> {
 }
 
 fn require_digest(value: &str) -> Result<(), OfflineContentWireError> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_canonical_sha256(value) {
         Ok(())
     } else {
         Err(OfflineContentWireError::Operation)

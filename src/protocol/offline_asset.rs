@@ -10,13 +10,14 @@ use crate::{
     },
     protocol::{
         http_v1::AssetCapabilitiesV1,
+        is_canonical_sha256,
         replica::{decode_cursor, encode_cursor},
     },
 };
 
 pub(crate) const OFFLINE_ASSET_VERSION: u32 = 1;
-const MAX_OPERATION_BYTES: usize = 64 * 1024;
-const MAX_RESULT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_OFFLINE_ASSET_OPERATION_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_OFFLINE_ASSET_RESULT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,14 +135,14 @@ pub(crate) fn offline_asset_result_json(
                 cursor,
             },
         },
-        MAX_RESULT_BYTES,
+        MAX_OFFLINE_ASSET_RESULT_BYTES,
     )
 }
 
 pub(crate) fn decode_offline_asset_result(
     value: Value,
 ) -> Result<DecodedOfflineAssetResult, OfflineAssetWireError> {
-    require_size(&value, MAX_RESULT_BYTES)?;
+    require_size(&value, MAX_OFFLINE_ASSET_RESULT_BYTES)?;
     let envelope: AssetResultEnvelopeV1 =
         serde_json::from_value(value).map_err(invalid_operation)?;
     if envelope.version != OFFLINE_ASSET_VERSION {
@@ -234,7 +235,7 @@ fn encode_operation(value: &AssetOperationV1) -> Result<String, OfflineAssetWire
         operation: value,
     })
     .map_err(invalid_operation)?;
-    if encoded.len() > MAX_OPERATION_BYTES {
+    if encoded.len() > MAX_OFFLINE_ASSET_OPERATION_BYTES {
         Err(OfflineAssetWireError::Operation)
     } else {
         Ok(encoded)
@@ -269,11 +270,7 @@ fn require_identity(value: &str) -> Result<(), OfflineAssetWireError> {
 }
 
 fn require_digest(value: &str) -> Result<(), OfflineAssetWireError> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_canonical_sha256(value) {
         Ok(())
     } else {
         Err(OfflineAssetWireError::Operation)

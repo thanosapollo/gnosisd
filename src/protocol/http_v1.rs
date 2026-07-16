@@ -16,6 +16,17 @@ use crate::application::{
     TransitionSnapshot,
 };
 
+const MIN_BEARER_TOKEN_BYTES: usize = 40;
+const MAX_BEARER_TOKEN_BYTES: usize = 128;
+
+pub(crate) fn valid_bearer_token(value: &str) -> bool {
+    (MIN_BEARER_TOKEN_BYTES..=MAX_BEARER_TOKEN_BYTES).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Server identity, durable cursor, and next device sequence used to bootstrap a replica.

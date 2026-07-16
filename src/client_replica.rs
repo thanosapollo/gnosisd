@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fmt, path::Path};
 
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -9,17 +9,17 @@ use crate::{
         AnswerInput, AssetReconciliationStatus, AuthoritativeAsset, AuthoritativeDocument,
         ContentBase, ContentReconciliationStatus, OfflineAnswerInput, OfflineAssetConflictReason,
         OfflineAssetOperation, OfflineConflictReason, OfflineContentConflictReason,
-        OfflineContentMutation, OfflineContentOperation, OfflineReviewOperation,
-        ReconciliationStatus, asset_paths_in_org, canonical_asset_path, validate_asset_path,
+        OfflineContentMutation, OfflineContentOperation, OfflineReviewResult, ReconciliationStatus,
+        asset_paths_in_org, canonical_asset_path, validate_asset_path,
     },
     protocol::{
-        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
-        OfflineContentWireError, OfflineReviewWireError, ReplicaWireError,
-        canonical_asset_operation, canonical_content_operation, canonical_offline_operation,
-        decode_change_page, decode_cursor, decode_offline_asset_capabilities,
-        decode_offline_asset_result, decode_offline_content_capabilities,
-        decode_offline_content_result, decode_offline_result, decode_replica_state,
-        decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
+        DecodedOfflineAssetResult, DecodedOfflineContentResult, OfflineAssetSubmission,
+        OfflineAssetWireError, OfflineContentSubmission, OfflineContentWireError,
+        OfflineReviewWireError, ReplicaWireError, canonical_asset_operation,
+        canonical_content_operation, canonical_offline_operation, decode_change_page,
+        decode_cursor, decode_offline_asset_capabilities, decode_offline_asset_result,
+        decode_offline_content_capabilities, decode_offline_content_result, decode_offline_result,
+        decode_replica_state, decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
         http_v1::{
             AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
             ReplicaStateV1,
@@ -40,20 +40,57 @@ pub struct LocalReplica {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingUpload {
-    pub attempt_id: String,
-    pub device_sequence: u64,
-    pub canonical_payload: String,
-    pub submission: Value,
-    operation: OfflineReviewOperation,
+    attempt_id: String,
+    device_sequence: u64,
+    canonical_payload: String,
+}
+
+impl PendingUpload {
+    pub fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    pub const fn device_sequence(&self) -> u64 {
+        self.device_sequence
+    }
+
+    pub fn canonical_payload(&self) -> &str {
+        &self.canonical_payload
+    }
+
+    pub fn submission(&self) -> Result<Value, Error> {
+        submission_value(&self.canonical_payload)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingContentUpload {
-    pub operation_id: String,
-    pub device_sequence: u64,
-    pub document_id: String,
-    pub canonical_payload: String,
-    pub submission: Value,
+    operation_id: String,
+    device_sequence: u64,
+    document_id: String,
+    canonical_payload: String,
+}
+
+impl PendingContentUpload {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub const fn device_sequence(&self) -> u64 {
+        self.device_sequence
+    }
+
+    pub fn document_id(&self) -> &str {
+        &self.document_id
+    }
+
+    pub fn canonical_payload(&self) -> &str {
+        &self.canonical_payload
+    }
+
+    pub fn submission(&self) -> Result<Value, Error> {
+        submission_value(&self.canonical_payload)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,16 +100,174 @@ pub enum PendingDeviceUpload {
     Asset(PendingAssetUpload),
 }
 
+impl PendingDeviceUpload {
+    pub const fn kind(&self) -> DeviceUploadKind {
+        match self {
+            Self::Review(_) => DeviceUploadKind::Review,
+            Self::Content(_) => DeviceUploadKind::Content,
+            Self::Asset(_) => DeviceUploadKind::Asset,
+        }
+    }
+
+    pub fn operation_id(&self) -> &str {
+        match self {
+            Self::Review(upload) => &upload.attempt_id,
+            Self::Content(upload) => &upload.operation_id,
+            Self::Asset(upload) => &upload.operation_id,
+        }
+    }
+
+    pub const fn device_sequence(&self) -> u64 {
+        match self {
+            Self::Review(upload) => upload.device_sequence,
+            Self::Content(upload) => upload.device_sequence,
+            Self::Asset(upload) => upload.device_sequence,
+        }
+    }
+
+    pub(crate) fn canonical_payload(&self) -> &str {
+        match self {
+            Self::Review(upload) => &upload.canonical_payload,
+            Self::Content(upload) => &upload.canonical_payload,
+            Self::Asset(upload) => &upload.canonical_payload,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceUploadKind {
+    Review,
+    Content,
+    Asset,
+}
+
+pub struct DeviceUploadResult {
+    result_json: String,
+    result: DecodedDeviceUploadResult,
+}
+
+impl DeviceUploadResult {
+    pub(crate) fn decode(kind: DeviceUploadKind, value: Value) -> Result<Self, Error> {
+        let result_json = serde_json::to_string(&value).map_err(|_| Error::Response)?;
+        let result = match kind {
+            DeviceUploadKind::Review => DecodedDeviceUploadResult::Review {
+                cursor: string_field(&value, &["result", "cursor"])?,
+                result: Box::new(decode_offline_result(value)?),
+            },
+            DeviceUploadKind::Content => {
+                DecodedDeviceUploadResult::Content(decode_offline_content_result(value)?)
+            }
+            DeviceUploadKind::Asset => {
+                DecodedDeviceUploadResult::Asset(decode_offline_asset_result(value)?)
+            }
+        };
+        Ok(Self {
+            result_json,
+            result,
+        })
+    }
+
+    pub const fn kind(&self) -> DeviceUploadKind {
+        self.result.kind()
+    }
+
+    pub fn operation_id(&self) -> &str {
+        self.result.operation_id()
+    }
+
+    fn into_parts(self) -> (String, DecodedDeviceUploadResult) {
+        (self.result_json, self.result)
+    }
+}
+
+enum DecodedDeviceUploadResult {
+    Review {
+        cursor: String,
+        result: Box<OfflineReviewResult>,
+    },
+    Content(DecodedOfflineContentResult),
+    Asset(DecodedOfflineAssetResult),
+}
+
+impl DecodedDeviceUploadResult {
+    const fn kind(&self) -> DeviceUploadKind {
+        match self {
+            Self::Review { .. } => DeviceUploadKind::Review,
+            Self::Content(_) => DeviceUploadKind::Content,
+            Self::Asset(_) => DeviceUploadKind::Asset,
+        }
+    }
+
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::Review { result, .. } => &result.attempt_id,
+            Self::Content(result) => &result.operation_id,
+            Self::Asset(result) => &result.operation_id,
+        }
+    }
+}
+
+impl fmt::Debug for DeviceUploadResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceUploadResult")
+            .field("kind", &self.kind())
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingAssetUpload {
-    pub operation_id: String,
-    pub device_sequence: u64,
-    pub logical_path: String,
-    pub content_sha256: String,
-    pub media_type: String,
-    pub bytes: Vec<u8>,
-    pub canonical_payload: String,
-    pub submission: Value,
+    operation_id: String,
+    device_sequence: u64,
+    logical_path: String,
+    content_sha256: String,
+    size_bytes: u64,
+    media_type: String,
+    bytes: Vec<u8>,
+    canonical_payload: String,
+}
+
+impl PendingAssetUpload {
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub const fn device_sequence(&self) -> u64 {
+        self.device_sequence
+    }
+
+    pub fn logical_path(&self) -> &str {
+        &self.logical_path
+    }
+
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    pub fn media_type(&self) -> &str {
+        &self.media_type
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn canonical_payload(&self) -> &str {
+        &self.canonical_payload
+    }
+
+    pub fn submission(&self) -> Result<Value, Error> {
+        submission_value(&self.canonical_payload)
+    }
+}
+
+fn submission_value(payload: &str) -> Result<Value, Error> {
+    serde_json::from_str(payload).map_err(|_| Error::Response)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -580,13 +775,10 @@ impl LocalReplica {
         let operation = pending.operation;
         let canonical_payload =
             canonical_offline_operation(crate::protocol::OFFLINE_REVIEW_VERSION, &operation)?;
-        let submission = serde_json::from_str(&canonical_payload).map_err(|_| Error::Response)?;
         Ok(Some(PendingUpload {
             attempt_id: operation.attempt_id.clone(),
             device_sequence: operation.device_sequence,
-            operation,
             canonical_payload,
-            submission,
         }))
     }
 
@@ -737,18 +929,19 @@ impl LocalReplica {
         let Some(pending) = self.store.next_pending_content_operation()? else {
             return Ok(None);
         };
-        let submission: Value =
+        let submission: OfflineContentSubmission =
             serde_json::from_str(&pending.canonical_payload).map_err(|_| Error::Response)?;
-        let decoded: OfflineContentSubmission =
-            serde_json::from_value(submission.clone()).map_err(|_| Error::Response)?;
-        let operation = decoded.decode()?.operation;
+        let decoded = submission.decode()?;
+        if decoded.canonical_payload != pending.canonical_payload {
+            return Err(Error::Response);
+        }
+        let operation = decoded.operation;
         let document_id = operation.document_id().to_owned();
         Ok(Some(PendingContentUpload {
-            operation_id: operation.operation_id,
+            operation_id: operation.operation_id.clone(),
             device_sequence: operation.device_sequence,
             document_id,
             canonical_payload: pending.canonical_payload,
-            submission,
         }))
     }
 
@@ -756,23 +949,26 @@ impl LocalReplica {
         let Some(pending) = self.store.next_pending_asset_operation()? else {
             return Ok(None);
         };
-        let submission: Value =
+        let submission: OfflineAssetSubmission =
             serde_json::from_str(&pending.canonical_payload).map_err(|_| Error::Response)?;
-        let decoded: OfflineAssetSubmission =
-            serde_json::from_value(submission.clone()).map_err(|_| Error::Response)?;
-        let operation = decoded.decode()?.operation;
-        if format!("{:x}", Sha256::digest(&pending.bytes)) != operation.content_sha256 {
+        let decoded = submission.decode()?;
+        let operation = decoded.operation;
+        let size_bytes = u64::try_from(pending.bytes.len()).map_err(|_| Error::Response)?;
+        if decoded.canonical_payload != pending.canonical_payload
+            || format!("{:x}", Sha256::digest(&pending.bytes)) != operation.content_sha256
+            || size_bytes != operation.size_bytes
+        {
             return Err(Error::Response);
         }
         Ok(Some(PendingAssetUpload {
-            operation_id: operation.operation_id,
+            operation_id: operation.operation_id.clone(),
             device_sequence: operation.device_sequence,
-            logical_path: operation.logical_path,
-            content_sha256: operation.content_sha256,
-            media_type: operation.media_type,
+            logical_path: operation.logical_path.clone(),
+            content_sha256: operation.content_sha256.clone(),
+            size_bytes,
+            media_type: operation.media_type.clone(),
             bytes: pending.bytes,
             canonical_payload: pending.canonical_payload,
-            submission,
         }))
     }
 
@@ -786,9 +982,33 @@ impl LocalReplica {
         Ok(self.next_asset_upload()?.map(PendingDeviceUpload::Asset))
     }
 
+    pub fn record_device_result(&mut self, result: DeviceUploadResult) -> Result<(), Error> {
+        let (result_json, result) = result.into_parts();
+        match result {
+            DecodedDeviceUploadResult::Review { cursor, result } => {
+                self.store.record_result(&result, &cursor, &result_json)?;
+                Ok(())
+            }
+            DecodedDeviceUploadResult::Content(result) => {
+                self.record_decoded_content_result(result, result_json)
+            }
+            DecodedDeviceUploadResult::Asset(result) => {
+                self.record_decoded_asset_result(result, result_json)
+            }
+        }
+    }
+
     pub fn record_content_result(&mut self, value: Value) -> Result<(), Error> {
         let result_json = serde_json::to_string(&value).map_err(|_| Error::Response)?;
         let decoded = decode_offline_content_result(value)?;
+        self.record_decoded_content_result(decoded, result_json)
+    }
+
+    fn record_decoded_content_result(
+        &mut self,
+        decoded: DecodedOfflineContentResult,
+        result_json: String,
+    ) -> Result<(), Error> {
         let operation_json = self
             .store
             .existing_content_operation(&decoded.operation_id)?
@@ -805,6 +1025,14 @@ impl LocalReplica {
     pub fn record_asset_result(&mut self, value: Value) -> Result<(), Error> {
         let result_json = serde_json::to_string(&value).map_err(|_| Error::Response)?;
         let decoded = decode_offline_asset_result(value)?;
+        self.record_decoded_asset_result(decoded, result_json)
+    }
+
+    fn record_decoded_asset_result(
+        &mut self,
+        decoded: DecodedOfflineAssetResult,
+        result_json: String,
+    ) -> Result<(), Error> {
         let operation_json = self
             .store
             .existing_asset_operation(&decoded.operation_id)?
@@ -1664,10 +1892,10 @@ mod tests {
         },
         protocol::{
             OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineContentSubmission,
-            decode_cursor, decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
-            offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
-            offline_content_result_json, offline_result_json, replica_change_page,
-            replica_snapshot_page, replica_state_response, review_pack_json,
+            OfflineReviewSubmission, decode_cursor, decode_snapshot_cursor, encode_cursor,
+            encode_snapshot_cursor, offline_asset_capabilities, offline_asset_result_json,
+            offline_content_capabilities, offline_content_result_json, offline_result_json,
+            replica_change_page, replica_snapshot_page, replica_state_response, review_pack_json,
         },
     };
 
@@ -2606,7 +2834,7 @@ mod tests {
             .unwrap();
         let upload = replica.next_content_upload().unwrap().unwrap();
         assert_eq!(
-            upload.submission["operation"]["mutation"]["base"]["kind"],
+            upload.submission().unwrap()["operation"]["mutation"]["base"]["kind"],
             "absent"
         );
         let result = reconcile_content_upload(&service, &upload, &device_id, 8).await;
@@ -3302,7 +3530,7 @@ mod tests {
         received_at_us: u64,
     ) -> Value {
         let submission: OfflineContentSubmission =
-            serde_json::from_value(upload.submission.clone()).unwrap();
+            serde_json::from_value(upload.submission().unwrap()).unwrap();
         let decoded = submission.decode().unwrap();
         let result = service
             .reconcile_content_operation(
@@ -3324,7 +3552,7 @@ mod tests {
         received_at_us: u64,
     ) -> Result<Value, crate::application::ServiceError> {
         let submission: OfflineAssetSubmission =
-            serde_json::from_value(upload.submission.clone()).unwrap();
+            serde_json::from_value(upload.submission().unwrap()).unwrap();
         let decoded = submission.decode().unwrap();
         let result = service
             .reconcile_asset_operation(
@@ -3479,11 +3707,14 @@ mod tests {
         device_id: &str,
         received_at_us: u64,
     ) -> Value {
+        let submission: OfflineReviewSubmission =
+            serde_json::from_value(upload.submission().unwrap()).unwrap();
+        let decoded = submission.decode().unwrap();
         let result = service
             .reconcile_offline_operation(
-                OFFLINE_REVIEW_VERSION,
-                upload.operation.clone(),
-                upload.canonical_payload.clone(),
+                decoded.version,
+                decoded.operation,
+                decoded.canonical_payload,
                 Some(device_id.into()),
                 received_at_us,
             )

@@ -26,23 +26,23 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 use crate::{
     application::{
         AnswerInput, AssetHead, ContentChange, DevicePrincipal, DeviceScope, DocumentHead,
-        DocumentRevision, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, NodeRecord,
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptOperationStatus, ReviewAttemptView, ReviewOperationAuthority,
-        ReviewSessionView, ReviewSource, ServiceError, ServiceHandle, SettingsInput,
-        SettingsRecord, ThemaRecord, canonical_asset_path, prepare_asset, prepare_note,
-        prepare_thema, review_day_at, thema_content,
+        DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NodeRecord, ReviewAttemptMutation,
+        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
+        ReviewAttemptView, ReviewOperationAuthority, ReviewSessionView, ReviewSource, ServiceError,
+        ServiceHandle, SettingsInput, SettingsRecord, ThemaRecord, canonical_asset_path,
+        prepare_asset, prepare_note, prepare_thema, review_day_at, thema_content,
     },
     domain::DocumentId,
     protocol::{
-        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
-        OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
-        active_review_pack_json, decode_cursor, decode_snapshot_cursor,
+        MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
+        OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
+        OfflineReviewWireError, ReplicaWireError, active_review_pack_json, decode_cursor,
+        decode_snapshot_cursor,
         http_v1::{
             ApiErrorBodyV1, ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
             ReplicaStateV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
         offline_content_result_json, offline_result_json, replica_change_page,
@@ -52,7 +52,6 @@ use crate::{
 };
 
 const MAX_BODY: usize = MAX_OFFLINE_ASSET_BYTES as usize;
-const MAX_OFFLINE_OPERATION_BODY: usize = MAX_REVIEW_PACK_BYTES + 2 * MAX_BODY;
 const MAX_PAGE: u16 = 500;
 const MAX_REPLICA_PAGE: u16 = 32;
 
@@ -198,7 +197,8 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/review/packs/{id}/abandon", post(abandon_pack))
         .route(
             "/v1/review/offline-operations",
-            post(reconcile_offline).layer(DefaultBodyLimit::max(MAX_OFFLINE_OPERATION_BODY)),
+            post(reconcile_offline)
+                .layer(DefaultBodyLimit::max(MAX_OFFLINE_REVIEW_OPERATION_BYTES)),
         )
         .route("/v1/review/attempts/{id}/answer", post(answer_attempt))
         .route("/v1/review/attempts/{id}", get(get_attempt_state))
@@ -238,7 +238,7 @@ fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
     let token = value
         .strip_prefix("Bearer ")
         .ok_or_else(ApiError::unauthorized)?;
-    if token.len() < 40 || token.len() > 128 {
+    if !valid_bearer_token(token) {
         Err(ApiError::unauthorized())
     } else {
         Ok(token.to_owned())

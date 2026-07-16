@@ -2,6 +2,7 @@
 
 mod application;
 mod blob;
+pub mod client_http;
 pub mod client_replica;
 mod domain;
 mod http;

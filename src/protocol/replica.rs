@@ -9,12 +9,15 @@ use crate::application::{
     validate_asset_path, validate_org_path,
 };
 
-use super::http_v1::{
-    AssetOperationV1, AssetRevisionV1, DocumentOperationV1, DocumentProjectionV1,
-    DocumentRevisionV1, ParametersV1, ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1,
-    ReplicaChangePageV1, ReplicaChangeV1, ReplicaProjectionV1, ReplicaSnapshotPageV1,
-    ReplicaStateV1, ReviewStateRevisionV1, ReviewStateV1, SettingsOperationV1, SettingsRevisionV1,
-    TagRuleV1, ThemaKindV1, ThemaOperationV1, ThemaRevisionV1,
+use super::{
+    http_v1::{
+        AssetOperationV1, AssetRevisionV1, DocumentOperationV1, DocumentProjectionV1,
+        DocumentRevisionV1, ParametersV1, ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1,
+        ReplicaChangePageV1, ReplicaChangeV1, ReplicaProjectionV1, ReplicaSnapshotPageV1,
+        ReplicaStateV1, ReviewStateRevisionV1, ReviewStateV1, SettingsOperationV1,
+        SettingsRevisionV1, TagRuleV1, ThemaKindV1, ThemaOperationV1, ThemaRevisionV1,
+    },
+    is_canonical_sha256,
 };
 
 pub(crate) const REPLICA_VERSION: u32 = 1;
@@ -681,11 +684,7 @@ fn require_identity(value: &str) -> Result<(), ReplicaWireError> {
 }
 
 fn require_digest(value: &str) -> Result<(), ReplicaWireError> {
-    if value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if is_canonical_sha256(value) {
         Ok(())
     } else {
         Err(ReplicaWireError::Response)

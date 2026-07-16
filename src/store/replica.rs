@@ -3089,7 +3089,11 @@ mod tests {
 
         let replica = LocalReplica::open(&path, "device").unwrap();
         assert_eq!(
-            replica.next_content_upload().unwrap().unwrap().operation_id,
+            replica
+                .next_content_upload()
+                .unwrap()
+                .unwrap()
+                .operation_id(),
             "pending"
         );
         let results = replica.content_results(None, 10).unwrap();
