@@ -1,4 +1,5 @@
 mod auth;
+mod client_views;
 mod content;
 mod device_mutation;
 mod import_document;
@@ -17,6 +18,11 @@ pub(crate) const MAX_REVIEW_PACK_MEDIA_TYPE_CHARS: usize = 255;
 pub(crate) use auth::{
     DevicePrincipal, DeviceRecord, DeviceScope, NewDevice, generate_device, parse_stored_scopes,
     stored_scopes, token_digest,
+};
+pub(crate) use client_views::{
+    ContentCounts, DashboardSummary, ReviewHistoryEvent, ReviewHistoryQuery, ReviewQueueCounts,
+    ReviewQueueSummary, ReviewSessionQuery, ReviewSessionSummary, ReviewTotals, ReviewWindow,
+    ThemaReviewState,
 };
 pub(crate) use content::{
     AssetHead, AssetRevision, ContentChange, ContentError, DocumentHead,

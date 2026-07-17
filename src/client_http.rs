@@ -9,6 +9,7 @@
 
 use std::{fmt, net::IpAddr, time::Duration};
 
+use chrono::NaiveDate;
 use reqwest::{
     RequestBuilder, Response, StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
@@ -31,13 +32,17 @@ use crate::{
         MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES, decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, ContentCapabilitiesV1, DeviceIdentityV1, DocumentMutationResultV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
-            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1,
-            ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2, ReviewSessionModeV1,
-            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, valid_bearer_token,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1, DeviceIdentityV1,
+            DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
+            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
+            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
+            ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
+            ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
+            ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
+            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaReviewStateV1,
+            valid_bearer_token,
         },
     },
 };
@@ -324,6 +329,91 @@ impl HttpClient {
         checked_online_session(session, None)
     }
 
+    pub async fn dashboard(&self, days: Option<u16>) -> Result<DashboardV1, HttpClientError> {
+        let mut url = self.endpoint("v1/dashboard")?;
+        if let Some(days) = days {
+            if !(1..=365).contains(&days) {
+                return Err(HttpClientError::InvalidReview);
+            }
+            url.query_pairs_mut().append_pair("days", &days.to_string());
+        }
+        execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
+    }
+
+    pub async fn review_sessions(
+        &self,
+        query: &ReviewSessionListRequestV1,
+    ) -> Result<ReviewSessionPageV1, HttpClientError> {
+        validate_review_page(query.after.as_deref(), query.limit)?;
+        let mut url = self.endpoint("v1/review/sessions")?;
+        append_review_page(&mut url, query.after.as_deref(), query.limit);
+        if let Some(status) = query.status {
+            url.query_pairs_mut().append_pair("status", status.as_str());
+        }
+        if let Some(mode) = query.mode {
+            url.query_pairs_mut().append_pair("mode", mode.as_str());
+        }
+        execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
+    }
+
+    pub async fn review_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ReviewSessionSummaryV1, HttpClientError> {
+        require_review_id(session_id)?;
+        let url = self.review_resource_endpoint("sessions", session_id, None)?;
+        execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
+    }
+
+    pub async fn review_history(
+        &self,
+        query: &ReviewHistoryRequestV1,
+    ) -> Result<ReviewHistoryPageV1, HttpClientError> {
+        validate_review_history_query(query)?;
+        let mut url = self.endpoint("v1/review/history")?;
+        append_review_page(&mut url, query.after.as_deref(), query.limit);
+        let mut pairs = url.query_pairs_mut();
+        if let Some(value) = query.thema_id.as_deref() {
+            pairs.append_pair("thema_id", value);
+        }
+        if let Some(value) = query.session_id.as_deref() {
+            pairs.append_pair("session_id", value);
+        }
+        if let Some(value) = query.from_day {
+            pairs.append_pair("from_day", &value.to_string());
+        }
+        if let Some(value) = query.through_day {
+            pairs.append_pair("through_day", &value.to_string());
+        }
+        if let Some(value) = query.accepted_success {
+            pairs.append_pair("accepted_success", if value { "true" } else { "false" });
+        }
+        drop(pairs);
+        execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
+    }
+
+    pub async fn review_queue_summary(
+        &self,
+        input: &ReviewQueueSummaryRequestV1,
+    ) -> Result<ReviewQueueSummaryV1, HttpClientError> {
+        let request = self.post_review_json("v1/review/queue/summary", input)?;
+        execute_json(request, MAX_REPLICA_PAGE_BYTES).await
+    }
+
+    pub async fn thema_review_state(
+        &self,
+        thema_id: &str,
+    ) -> Result<ThemaReviewStateV1, HttpClientError> {
+        require_review_id(thema_id)?;
+        let mut url = self.endpoint("v1/themata/")?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .pop_if_empty()
+            .push(thema_id)
+            .push("review-state");
+        execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
+    }
+
     pub async fn active_review_session(&self) -> Result<ActiveReviewSessionV1, HttpClientError> {
         let active: ActiveReviewSessionV1 = self.get_json("v1/review/sessions/active").await?;
         if active.session.as_ref().is_none_or(valid_online_session) {
@@ -375,6 +465,20 @@ impl HttpClient {
         let request = json_request(self.client.post(url), body);
         let attempt = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
         checked_attempt(attempt, Some(attempt_id), None)
+    }
+
+    pub async fn check_review_clozes(
+        &self,
+        attempt_id: &str,
+        input: &ReviewClozeCheckRequestV1,
+    ) -> Result<ReviewClozeCheckV1, HttpClientError> {
+        require_review_id(attempt_id)?;
+        if input.inputs.is_empty() || input.inputs.len() > 500 {
+            return Err(HttpClientError::InvalidReview);
+        }
+        let url = self.review_resource_endpoint("attempts", attempt_id, Some("cloze-check"))?;
+        let request = json_request(self.client.post(url), encode_review_body(input)?);
+        execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await
     }
 
     pub async fn review_attempt_state(
@@ -604,6 +708,51 @@ fn append_cursor(url: &mut Url, cursor: &str) -> Result<(), HttpClientError> {
     }
     url.query_pairs_mut().append_pair("cursor", cursor);
     Ok(())
+}
+
+fn validate_review_page(after: Option<&str>, limit: Option<u16>) -> Result<(), HttpClientError> {
+    if let Some(after) = after {
+        require_review_id(after)?;
+    }
+    if limit.is_some_and(|limit| !(1..=500).contains(&limit)) {
+        return Err(HttpClientError::InvalidReview);
+    }
+    Ok(())
+}
+
+fn append_review_page(url: &mut Url, after: Option<&str>, limit: Option<u16>) {
+    let mut pairs = url.query_pairs_mut();
+    if let Some(after) = after {
+        pairs.append_pair("after", after);
+    }
+    if let Some(limit) = limit {
+        pairs.append_pair("limit", &limit.to_string());
+    }
+}
+
+fn validate_review_history_query(query: &ReviewHistoryRequestV1) -> Result<(), HttpClientError> {
+    validate_review_page(query.after.as_deref(), query.limit)?;
+    if let Some(value) = query.thema_id.as_deref() {
+        require_review_id(value)?;
+    }
+    if let Some(value) = query.session_id.as_deref() {
+        require_review_id(value)?;
+    }
+    if query.from_day.is_some_and(|day| !valid_review_day(day))
+        || query.through_day.is_some_and(|day| !valid_review_day(day))
+        || query
+            .from_day
+            .zip(query.through_day)
+            .is_some_and(|(from, through)| from > through)
+    {
+        return Err(HttpClientError::InvalidReview);
+    }
+    Ok(())
+}
+
+fn valid_review_day(value: u32) -> bool {
+    i32::try_from(value / 10_000)
+        .is_ok_and(|year| NaiveDate::from_ymd_opt(year, value / 100 % 100, value % 100).is_some())
 }
 
 fn require_digest(digest: &str) -> Result<(), HttpClientError> {
@@ -1168,8 +1317,10 @@ mod tests {
         },
         client_replica::{LocalReplica, OfflineAnswer, OfflineResponse},
         protocol::{
-            DaemonConfig, DaemonServer, offline_asset_capabilities, offline_content_capabilities,
-            replica_snapshot_page, replica_state_response, review_pack_response,
+            DaemonConfig, DaemonServer,
+            http_v1::{ReviewSourceInputV1, ReviewSourceKindV1},
+            offline_asset_capabilities, offline_content_capabilities, replica_snapshot_page,
+            replica_state_response, review_pack_response,
         },
         service::ServiceRuntime,
     };
@@ -1247,6 +1398,73 @@ mod tests {
         daemon.stop().await;
     }
 
+    #[tokio::test]
+    async fn client_review_views_use_typed_contracts() {
+        let fixture = prepare_review_fixture().await;
+        let daemon = TestDaemon::start(&fixture).await;
+        let token = SecretToken::new(fixture.token.clone()).unwrap();
+        let client = HttpClient::new(&daemon.base_url, token).unwrap();
+
+        let dashboard = client.dashboard(Some(7)).await.unwrap();
+        assert_eq!(dashboard.window.days, 7);
+        assert_eq!(dashboard.content.active_themata, 1);
+        let sessions = client
+            .review_sessions(&ReviewSessionListRequestV1 {
+                mode: Some(ReviewSessionModeV1::Offline),
+                ..ReviewSessionListRequestV1::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(sessions.items.len(), 1);
+        let session_id = &sessions.items[0].session.session_id;
+        assert_eq!(
+            client
+                .review_session(session_id)
+                .await
+                .unwrap()
+                .review_count,
+            0
+        );
+        assert!(
+            client
+                .review_history(&ReviewHistoryRequestV1::default())
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let queue = client
+            .review_queue_summary(&ReviewQueueSummaryRequestV1 {
+                source: ReviewSourceInputV1 {
+                    kind: ReviewSourceKindV1::Manual,
+                    tags: vec![],
+                    exclude_tags: vec![],
+                    topic_node_id: None,
+                    topic_forward_depth: None,
+                    topic_backward_depth: None,
+                    manual_ids: vec!["thema".into()],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(queue.matched_count, 1);
+        assert_eq!(
+            client
+                .thema_review_state("thema")
+                .await
+                .unwrap()
+                .state
+                .review_count,
+            0
+        );
+        assert!(matches!(
+            client.dashboard(Some(0)).await,
+            Err(HttpClientError::InvalidReview)
+        ));
+
+        daemon.stop().await;
+    }
+
     struct ReviewFixture {
         _directory: TempDir,
         database: PathBuf,
@@ -1267,7 +1485,8 @@ mod tests {
             .await
             .unwrap();
         let service = runtime.handle();
-        let device = generate_device("review-client".into(), vec!["review".into()]).unwrap();
+        let device =
+            generate_device("review-client".into(), vec!["read".into(), "review".into()]).unwrap();
         let device_id = device.device_id.clone();
         let token = device.token.clone();
         service.create_device(device, 1).await.unwrap();

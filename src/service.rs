@@ -22,20 +22,23 @@ use import::persist_server_import;
 
 use crate::{
     application::{
-        AnswerInput, ApplicationError, AssetHead, ContentChange, DevicePrincipal, DeviceRecord,
-        DocumentHead, DocumentRevision, ImportSummary, MAX_OFFLINE_ASSET_BYTES, NewDevice,
-        NodeRecord, OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
-        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
-        PreparedNote, PreparedServerImport, PreparedThema, QueryDueThemata, QueryDueThemataPage,
-        ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewOperationAuthority,
-        ReviewPackAsset, ReviewPackView, ReviewSessionView, ReviewSource, SettingsError,
+        AnswerInput, ApplicationError, AssetHead, ContentChange, DashboardSummary, DevicePrincipal,
+        DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, MAX_OFFLINE_ASSET_BYTES,
+        NewDevice, NodeRecord, OfflineAssetOperation, OfflineAssetResult,
+        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
+        PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation, PreparedNote,
+        PreparedServerImport, PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange,
+        ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
+        ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
+        ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
+        ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
         SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
-        prepare_offline_document, retained_asset_paths_in_org, token_digest, validate_asset_path,
+        ThemaReviewState, prepare_offline_document, retained_asset_paths_in_org, token_digest,
+        validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
-    domain::{DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
+    domain::{ClozeCheck, DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
     is_canonical_sha256,
     store::{
         DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
@@ -615,6 +618,101 @@ impl ServiceHandle {
             inbound,
             limit,
             after,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn dashboard(
+        &self,
+        days: u16,
+        now_us: u64,
+    ) -> Result<DashboardSummary, ServiceError> {
+        request(&self.sender, |response| StoreCommand::Dashboard {
+            days,
+            now_us,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn review_sessions(
+        &self,
+        query: ReviewSessionQuery,
+    ) -> Result<Vec<ReviewSessionSummary>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ReviewSessions {
+            query,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn review_session_summary(
+        &self,
+        session_id: String,
+    ) -> Result<Option<ReviewSessionSummary>, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ReviewSessionSummary {
+                session_id,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn review_history(
+        &self,
+        query: ReviewHistoryQuery,
+    ) -> Result<Vec<ReviewHistoryEvent>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ReviewHistory {
+            query,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn review_queue_summary(
+        &self,
+        source: ReviewSource,
+        now_us: u64,
+    ) -> Result<ReviewQueueSummary, ServiceError> {
+        let source = source.validate().map_err(ServiceError::Review)?;
+        request(&self.sender, |response| StoreCommand::ReviewQueueSummary {
+            source,
+            now_us,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn check_cloze_attempt(
+        &self,
+        attempt_id: String,
+        actor_device_id: Option<String>,
+        inputs: Vec<String>,
+    ) -> Result<ClozeCheck, ServiceError> {
+        request(&self.sender, |response| StoreCommand::CheckClozeAttempt {
+            attempt_id,
+            actor_device_id,
+            inputs,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn thema_review_state(
+        &self,
+        thema_id: String,
+    ) -> Result<ThemaReviewState, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ThemaReviewState {
+            thema_id,
             response,
         })
         .await?
@@ -1388,6 +1486,38 @@ enum StoreCommand {
         after: Option<String>,
         response: oneshot::Sender<StoreResult<Vec<NodeRecord>>>,
     },
+    Dashboard {
+        days: u16,
+        now_us: u64,
+        response: oneshot::Sender<StoreResult<DashboardSummary>>,
+    },
+    ReviewSessions {
+        query: ReviewSessionQuery,
+        response: oneshot::Sender<StoreResult<Vec<ReviewSessionSummary>>>,
+    },
+    ReviewSessionSummary {
+        session_id: String,
+        response: oneshot::Sender<StoreResult<Option<ReviewSessionSummary>>>,
+    },
+    ReviewHistory {
+        query: ReviewHistoryQuery,
+        response: oneshot::Sender<StoreResult<Vec<ReviewHistoryEvent>>>,
+    },
+    ReviewQueueSummary {
+        source: ReviewSource,
+        now_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewQueueSummary>>,
+    },
+    ThemaReviewState {
+        thema_id: String,
+        response: oneshot::Sender<StoreResult<ThemaReviewState>>,
+    },
+    CheckClozeAttempt {
+        attempt_id: String,
+        actor_device_id: Option<String>,
+        inputs: Vec<String>,
+        response: oneshot::Sender<StoreResult<ClozeCheck>>,
+    },
     CreateDevice {
         device: NewDevice,
         created_at_us: i64,
@@ -2057,6 +2187,38 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         } => send(
             response,
             store.graph_nodes(&node_id, inbound, limit, after.as_deref()),
+        ),
+        StoreCommand::Dashboard {
+            days,
+            now_us,
+            response,
+        } => send(response, store.dashboard(days, now_us)),
+        StoreCommand::ReviewSessions { query, response } => {
+            send(response, store.review_sessions(&query))
+        }
+        StoreCommand::ReviewSessionSummary {
+            session_id,
+            response,
+        } => send(response, store.review_session_summary(&session_id)),
+        StoreCommand::ReviewHistory { query, response } => {
+            send(response, store.review_history(&query))
+        }
+        StoreCommand::ReviewQueueSummary {
+            source,
+            now_us,
+            response,
+        } => send(response, store.review_queue_summary(&source, now_us)),
+        StoreCommand::ThemaReviewState { thema_id, response } => {
+            send(response, store.thema_review_state(&thema_id))
+        }
+        StoreCommand::CheckClozeAttempt {
+            attempt_id,
+            actor_device_id,
+            inputs,
+            response,
+        } => send(
+            response,
+            store.check_cloze_attempt(&attempt_id, actor_device_id.as_deref(), &inputs),
         ),
         StoreCommand::CreateDevice {
             device,

@@ -6,6 +6,7 @@
 //! `LocalReplica` performs cursor, identity, projection, and ordering validation
 //! before persistence.
 
+mod client_views;
 mod content;
 
 pub use super::offline_asset::{
@@ -25,6 +26,13 @@ pub use super::offline_review::{
     OfflineReviewSessionStatusV2, OfflineReviewSessionV2, OfflineReviewSourceKindV2,
     OfflineReviewSourceV2, OfflineReviewStateV1, OfflineThemaKindV1, OfflineTransitionV1,
     ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackItemV2, ReviewPackStatusV2, ReviewPackV2,
+};
+pub use client_views::{
+    ContentCountsV1, DashboardV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1,
+    ReviewHistoryEventV1, ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewQueueCountsV1,
+    ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
+    ReviewSessionPageV1, ReviewSessionSummaryV1, ReviewTotalsV1, ReviewWindowV1,
+    ThemaReviewStateV1,
 };
 pub use content::{
     AssetHeadV1, ContentChangePageV1, ContentChangeV1, ContentEntityKindV1, ContentOperationV1,
@@ -625,6 +633,15 @@ pub enum ReviewSessionModeV1 {
     Offline,
 }
 
+impl ReviewSessionModeV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Online => "online",
+            Self::Offline => "offline",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewSessionStatusV1 {
@@ -632,6 +649,17 @@ pub enum ReviewSessionStatusV1 {
     Completed,
     Quit,
     Aborted,
+}
+
+impl ReviewSessionStatusV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Quit => "quit",
+            Self::Aborted => "aborted",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

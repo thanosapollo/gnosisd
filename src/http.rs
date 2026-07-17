@@ -16,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use chrono::NaiveDate;
 use schemars::generate::SchemaSettings;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -28,10 +29,10 @@ use crate::{
         ApplicationError, DevicePrincipal, DeviceScope, MAX_OFFLINE_ASSET_BYTES,
         PreparedDeviceDocumentLifecycleMutation, PreparedNote, ReviewAttemptMutation,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-        ReviewOperationAuthority, SettingsRecord, canonical_asset_path, prepare_asset,
-        prepare_device_document_mutation, prepare_device_document_rename,
-        prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
-        thema_content, validate_org_path,
+        ReviewHistoryQuery, ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord,
+        canonical_asset_path, prepare_asset, prepare_device_document_mutation,
+        prepare_device_document_rename, prepare_device_document_tombstone, prepare_note,
+        prepare_thema, review_day_at, thema_content, validate_org_path,
     },
     domain::DocumentId,
     is_canonical_sha256,
@@ -43,17 +44,21 @@ use crate::{
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
-            ContentCapabilitiesV1, ContentChangePageV1, DeviceIdentityV1, DocumentHeadV1,
-            DocumentMutationResultV1, DocumentRevisionPageV1, DocumentRevisionSummaryV1,
-            NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DeviceIdentityV1,
+            DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+            DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
             OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
             OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
             ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
-            ReviewCommitResponseV1, ReviewPackEnvelopeV2, ReviewSessionRequestV1, ReviewSessionV1,
+            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
+            ReviewHistoryPageV1, ReviewPackEnvelopeV2, ReviewQueueSummaryRequestV1,
+            ReviewQueueSummaryV1, ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
+            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-            ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
+            ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+            valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_response, offline_content_capabilities,
         offline_content_result_response, offline_result_response, replica_change_page,
@@ -158,6 +163,7 @@ where
 
 fn data_router() -> Router<HttpState> {
     Router::new()
+        .route("/v1/dashboard", get(dashboard))
         .route("/v1/changes", get(changes))
         .route("/v1/sync/identity", get(device_identity))
         .route("/v1/sync/state", get(replica_state))
@@ -197,18 +203,25 @@ fn data_router() -> Router<HttpState> {
         )
         .route("/v1/themata", post(create_thema).get(search_themata))
         .route("/v1/themata/{id}", get(get_thema).put(update_thema))
+        .route("/v1/themata/{id}/review-state", get(get_thema_review_state))
         .route("/v1/themata/{id}/archive", post(archive_thema))
         .route("/v1/themata/{id}/unarchive", post(unarchive_thema))
         .route("/v1/nodes", get(search_nodes))
         .route("/v1/nodes/{id}", get(get_node))
         .route("/v1/nodes/{id}/inbound", get(inbound_nodes))
         .route("/v1/nodes/{id}/outbound", get(outbound_nodes))
-        .route("/v1/review/sessions", post(create_session))
+        .route(
+            "/v1/review/sessions",
+            get(review_sessions).post(create_session),
+        )
         .route("/v1/review/sessions/active", get(active_session))
+        .route("/v1/review/sessions/{id}", get(review_session))
         .route("/v1/review/sessions/{id}/resume", post(resume_session))
         .route("/v1/review/sessions/{id}/quit", post(quit_session))
         .route("/v1/review/sessions/{id}/abort", post(abort_session))
         .route("/v1/review/sessions/{id}/attempts", post(begin_attempt))
+        .route("/v1/review/history", get(review_history))
+        .route("/v1/review/queue/summary", post(review_queue_summary))
         .route("/v1/review/packs", post(create_pack))
         .route("/v1/review/packs/active", get(active_pack))
         .route("/v1/review/packs/{id}", get(get_pack))
@@ -223,6 +236,10 @@ fn data_router() -> Router<HttpState> {
                 .layer(DefaultBodyLimit::max(MAX_OFFLINE_REVIEW_OPERATION_BYTES)),
         )
         .route("/v1/review/attempts/{id}/answer", post(answer_attempt))
+        .route(
+            "/v1/review/attempts/{id}/cloze-check",
+            post(check_cloze_attempt),
+        )
         .route("/v1/review/attempts/{id}", get(get_attempt_state))
         .route(
             "/v1/review/attempts/{id}/accepted-success",
@@ -305,6 +322,37 @@ fn replica_page_limit(value: Option<u16>) -> Result<u16, ApiError> {
     } else {
         Err(ApiError::bad_request("invalid replica page limit"))
     }
+}
+
+#[derive(Deserialize)]
+struct DashboardQuery {
+    days: Option<u16>,
+}
+
+fn dashboard_days(value: Option<u16>) -> Result<u16, ApiError> {
+    let value = value.unwrap_or(30);
+    if (1..=365).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("invalid dashboard window"))
+    }
+}
+
+async fn dashboard(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<DashboardQuery>,
+) -> Result<Json<DashboardV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    require(&principal, DeviceScope::Review)?;
+    let summary = state
+        .service
+        .dashboard(dashboard_days(query.days)?, now_us()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        DashboardV1::from_application(&summary).map_err(|_| ApiError::internal())?,
+    ))
 }
 
 async fn changes(
@@ -1016,6 +1064,21 @@ async fn unarchive_thema(
 ) -> Result<Json<ThemaV1>, ApiError> {
     set_archive(state, principal, path, headers, false).await
 }
+
+async fn get_thema_review_state(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+) -> Result<Json<ThemaReviewStateV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let state = state
+        .service
+        .thema_review_state(id)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(ThemaReviewStateV1::from(&state)))
+}
+
 async fn set_archive(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -1102,6 +1165,119 @@ async fn graph(
     Ok(Json(NodePageV1::from_application(&items)))
 }
 
+#[derive(Deserialize)]
+struct ReviewSessionsQuery {
+    after: Option<String>,
+    limit: Option<u16>,
+    status: Option<ReviewSessionStatusV1>,
+    mode: Option<ReviewSessionModeV1>,
+}
+
+async fn review_sessions(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<ReviewSessionsQuery>,
+) -> Result<Json<ReviewSessionPageV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let sessions = state
+        .service
+        .review_sessions(ReviewSessionQuery {
+            after: query.after,
+            limit: page_limit(query.limit)?,
+            status: query.status.map(|status| status.as_str().to_owned()),
+            mode: query.mode.map(|mode| mode.as_str().to_owned()),
+        })
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(
+        ReviewSessionPageV1::from_application(&sessions).map_err(|_| ApiError::internal())?,
+    ))
+}
+
+async fn review_session(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+) -> Result<Json<ReviewSessionSummaryV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let session = state
+        .service
+        .review_session_summary(id)
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(
+        ReviewSessionSummaryV1::from_application(&session).map_err(|_| ApiError::internal())?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct ReviewHistoryHttpQuery {
+    after: Option<String>,
+    limit: Option<u16>,
+    thema_id: Option<String>,
+    session_id: Option<String>,
+    from_day: Option<u32>,
+    through_day: Option<u32>,
+    accepted_success: Option<bool>,
+}
+
+impl ReviewHistoryHttpQuery {
+    fn into_application(self) -> Result<ReviewHistoryQuery, ApiError> {
+        if self.from_day.is_some_and(|day| !valid_review_day(day))
+            || self.through_day.is_some_and(|day| !valid_review_day(day))
+            || self
+                .from_day
+                .zip(self.through_day)
+                .is_some_and(|(from, through)| from > through)
+        {
+            return Err(ApiError::bad_request("invalid review history window"));
+        }
+        Ok(ReviewHistoryQuery {
+            after: self.after,
+            limit: page_limit(self.limit)?,
+            thema_id: self.thema_id,
+            session_id: self.session_id,
+            from_day: self.from_day,
+            through_day: self.through_day,
+            accepted_success: self.accepted_success,
+        })
+    }
+}
+
+fn valid_review_day(value: u32) -> bool {
+    i32::try_from(value / 10_000)
+        .is_ok_and(|year| NaiveDate::from_ymd_opt(year, value / 100 % 100, value % 100).is_some())
+}
+
+async fn review_history(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<ReviewHistoryHttpQuery>,
+) -> Result<Json<ReviewHistoryPageV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let events = state
+        .service
+        .review_history(query.into_application()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(ReviewHistoryPageV1::from_application(&events)))
+}
+
+async fn review_queue_summary(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(request): ApiJson<ReviewQueueSummaryRequestV1>,
+) -> Result<Json<ReviewQueueSummaryV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let summary = state
+        .service
+        .review_queue_summary(request.into_application(), now_us()?)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(ReviewQueueSummaryV1::from(&summary)))
+}
+
 async fn create_session(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -1126,7 +1302,7 @@ async fn active_session(
     require(&principal, DeviceScope::Review)?;
     let session = state
         .service
-        .active_review_session(review_actor(&principal))
+        .active_review_session(online_review_actor())
         .await
         .map_err(ApiError::service)?;
     let session = session
@@ -1144,7 +1320,7 @@ async fn resume_session(
     require(&principal, DeviceScope::Review)?;
     let session = state
         .service
-        .resume_review_session(id, review_actor(&principal))
+        .resume_review_session(id, online_review_actor())
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
@@ -1174,7 +1350,7 @@ async fn stop_session(
     require(&principal, DeviceScope::Review)?;
     let session = state
         .service
-        .stop_review_session(id, review_actor(&principal), abort, now_us()?)
+        .stop_review_session(id, online_review_actor(), abort, now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
@@ -1189,7 +1365,7 @@ async fn begin_attempt(
     require(&principal, DeviceScope::Review)?;
     let attempt = state
         .service
-        .begin_http_review_attempt(id, review_actor(&principal), now_us()?)
+        .begin_http_review_attempt(id, online_review_actor(), now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok((
@@ -1204,15 +1380,31 @@ async fn answer_attempt(
     ApiJson(answer): ApiJson<ReviewAnswerV1>,
 ) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    require_safe_http_attempt(&state, &principal, &id).await?;
+    require_safe_http_attempt(&state, &id).await?;
     let attempt = state
         .service
-        .grade_review_attempt(id, review_actor(&principal), answer.into(), now_us()?)
+        .grade_review_attempt(id, online_review_actor(), answer.into(), now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
         ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?,
     ))
+}
+
+async fn check_cloze_attempt(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<ReviewClozeCheckRequestV1>,
+) -> Result<Json<ReviewClozeCheckV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    require_safe_http_attempt(&state, &id).await?;
+    let check = state
+        .service
+        .check_cloze_attempt(id, online_review_actor(), request.inputs)
+        .await
+        .map_err(ApiError::service)?;
+    Ok(Json(ReviewClozeCheckV1::from(check)))
 }
 async fn get_attempt_state(
     State(state): State<HttpState>,
@@ -1220,9 +1412,7 @@ async fn get_attempt_state(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewAttemptStateResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    Ok(Json(
-        require_safe_http_attempt(&state, &principal, &id).await?,
-    ))
+    Ok(Json(require_safe_http_attempt(&state, &id).await?))
 }
 async fn set_accepted_success(
     State(state): State<HttpState>,
@@ -1250,10 +1440,10 @@ async fn override_attempt(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    require_safe_http_attempt(&state, &principal, &id).await?;
+    require_safe_http_attempt(&state, &id).await?;
     let attempt = state
         .service
-        .override_review_attempt(id, review_actor(&principal))
+        .override_review_attempt(id, online_review_actor())
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
@@ -1266,10 +1456,10 @@ async fn toggle_suspension(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewAttemptV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    require_safe_http_attempt(&state, &principal, &id).await?;
+    require_safe_http_attempt(&state, &id).await?;
     let attempt = state
         .service
-        .toggle_attempt_suspension(id, review_actor(&principal))
+        .toggle_attempt_suspension(id, online_review_actor())
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
@@ -1302,7 +1492,7 @@ async fn apply_attempt_operation(
     operation: ReviewAttemptOperation,
 ) -> Result<Json<ReviewAttemptOperationResponseV1>, ApiError> {
     require(principal, DeviceScope::Review)?;
-    require_safe_http_attempt(state, principal, &operation.attempt_id).await?;
+    require_safe_http_attempt(state, &operation.attempt_id).await?;
     let result = state
         .service
         .apply_review_attempt_operation(
@@ -1348,10 +1538,10 @@ async fn commit_attempt(
     Path(id): Path<String>,
 ) -> Result<Json<ReviewCommitResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
-    require_safe_http_attempt(&state, &principal, &id).await?;
+    require_safe_http_attempt(&state, &id).await?;
     let event = state
         .service
-        .commit_review_attempt(id, review_actor(&principal), now_us()?)
+        .commit_review_attempt(id, online_review_actor(), now_us()?)
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
@@ -1360,12 +1550,11 @@ async fn commit_attempt(
 
 async fn require_safe_http_attempt(
     state: &HttpState,
-    principal: &DevicePrincipal,
     attempt_id: &str,
 ) -> Result<ReviewAttemptStateResponseV1, ApiError> {
     let attempt = state
         .service
-        .review_attempt_state(attempt_id.to_owned(), review_actor(principal))
+        .review_attempt_state(attempt_id.to_owned(), online_review_actor())
         .await
         .map_err(ApiError::service)?;
     ReviewAttemptStateResponseV1::from_application(&attempt)
@@ -1404,7 +1593,7 @@ async fn get_pack(
     require(&principal, DeviceScope::Review)?;
     let pack = state
         .service
-        .review_pack(id, review_actor(&principal))
+        .review_pack(id, device_review_actor(&principal))
         .await
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
@@ -1420,7 +1609,7 @@ async fn active_pack(
     require(&principal, DeviceScope::Review)?;
     let pack = state
         .service
-        .active_review_pack(review_actor(&principal))
+        .active_review_pack(device_review_actor(&principal))
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
@@ -1437,7 +1626,7 @@ async fn get_pack_asset(
     let path = canonical_asset_path(&digest, &name).map_err(ApiError::invalid_content)?;
     let (asset, bytes) = state
         .service
-        .review_pack_asset(id, review_actor(&principal), &path, &digest)
+        .review_pack_asset(id, device_review_actor(&principal), &path, &digest)
         .await
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
@@ -1457,7 +1646,7 @@ async fn abandon_pack(
     require(&principal, DeviceScope::Review)?;
     let pack = state
         .service
-        .abandon_review_pack(id, review_actor(&principal), now_us()?)
+        .abandon_review_pack(id, device_review_actor(&principal), now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok(Json(
@@ -1478,7 +1667,7 @@ async fn reconcile_offline(
             decoded.version,
             decoded.operation,
             decoded.canonical_payload,
-            review_actor(&principal),
+            device_review_actor(&principal),
             now_us()?,
         )
         .await
@@ -1539,7 +1728,11 @@ async fn reconcile_asset(
     ))
 }
 
-fn review_actor(principal: &DevicePrincipal) -> Option<String> {
+fn online_review_actor() -> Option<String> {
+    None
+}
+
+fn device_review_actor(principal: &DevicePrincipal) -> Option<String> {
     (!principal.scopes.contains(&DeviceScope::Admin)).then(|| principal.device_id.clone())
 }
 
@@ -2530,11 +2723,16 @@ fn if_match_parameter(required: bool) -> Value {
 
 fn openapi_online_review_operation(path: &str, method: &str) -> Option<Value> {
     let contract = online_review_contract(path, method)?;
+    let scopes = if path == "/v1/dashboard" {
+        json!(["read", "review"])
+    } else {
+        json!(["review"])
+    };
     let mut operation = json!({
         "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
         "security":[{"bearerAuth":[]}],
-        "x-gnosis-required-scopes":["review"],
-        "parameters":openapi_path_parameters(path),
+        "x-gnosis-required-scopes":scopes,
+        "parameters":online_review_parameters(path),
         "responses":content_json_responses(
             contract.success_status,
             contract.response,
@@ -2549,6 +2747,27 @@ fn openapi_online_review_operation(path: &str, method: &str) -> Option<Value> {
 
 fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContract> {
     match (path, method) {
+        ("/v1/dashboard", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "DashboardV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/themata/{id}/review-state", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ThemaReviewStateV1",
+            &["401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/review/sessions", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewSessionPageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
         ("/v1/review/sessions", "post") => Some(json_contract(
             "review",
             Some("ReviewSessionRequestV1"),
@@ -2564,6 +2783,13 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
             "200",
             "ActiveReviewSessionV1",
             &["401", "403", "408", "500", "503"],
+        )),
+        ("/v1/review/sessions/{id}", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewSessionSummaryV1",
+            &["401", "403", "404", "408", "500", "503"],
         )),
         ("/v1/review/sessions/{id}/resume", "post") => Some(json_contract(
             "review",
@@ -2588,6 +2814,20 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
             "ReviewAttemptV1",
             &["400", "401", "403", "404", "408", "500", "503"],
         )),
+        ("/v1/review/history", "get") => Some(json_contract(
+            "review",
+            None,
+            "200",
+            "ReviewHistoryPageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/review/queue/summary", "post") => Some(json_contract(
+            "review",
+            Some("ReviewQueueSummaryRequestV1"),
+            "200",
+            "ReviewQueueSummaryV1",
+            &["400", "401", "403", "408", "413", "422", "500", "503"],
+        )),
         ("/v1/review/attempts/{id}/answer", "post") => Some(json_contract(
             "review",
             Some("ReviewAnswerV1"),
@@ -2595,6 +2835,15 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
             "ReviewAttemptV1",
             &[
                 "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/review/attempts/{id}/cloze-check", "post") => Some(json_contract(
+            "review",
+            Some("ReviewClozeCheckRequestV1"),
+            "200",
+            "ReviewClozeCheckV1",
+            &[
+                "400", "401", "403", "404", "408", "412", "413", "422", "500", "503",
             ],
         )),
         ("/v1/review/attempts/{id}/override", "post") => Some(json_contract(
@@ -2620,6 +2869,37 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
         )),
         _ => None,
     }
+}
+
+fn online_review_parameters(path: &str) -> Vec<Value> {
+    let mut parameters = openapi_path_parameters(path);
+    match path {
+        "/v1/dashboard" => parameters.push(json!({
+            "name":"days", "in":"query", "required":false,
+            "schema":{"type":"integer","minimum":1,"maximum":365,"default":30}
+        })),
+        "/v1/review/sessions" => {
+            parameters.extend([
+                json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
+                json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
+                json!({"name":"status","in":"query","required":false,"schema":{"$ref":"#/components/schemas/ReviewSessionStatusV1"}}),
+                json!({"name":"mode","in":"query","required":false,"schema":{"$ref":"#/components/schemas/ReviewSessionModeV1"}}),
+            ]);
+        }
+        "/v1/review/history" => {
+            parameters.extend([
+                json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
+                json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
+                json!({"name":"thema_id","in":"query","required":false,"schema":{"type":"string"}}),
+                json!({"name":"session_id","in":"query","required":false,"schema":{"type":"string"}}),
+                json!({"name":"from_day","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":99991231}}),
+                json!({"name":"through_day","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":99991231}}),
+                json!({"name":"accepted_success","in":"query","required":false,"schema":{"type":"boolean"}}),
+            ]);
+        }
+        _ => {}
+    }
+    parameters
 }
 
 fn openapi_review_attempt_operation(path: &str, method: &str) -> Option<Value> {
@@ -2768,6 +3048,13 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<NodePageV1>();
     generator.subschema_for::<NodeV1>();
     generator.subschema_for::<SettingsV1>();
+    generator.subschema_for::<DashboardV1>();
+    generator.subschema_for::<ReviewSessionPageV1>();
+    generator.subschema_for::<ReviewSessionSummaryV1>();
+    generator.subschema_for::<ReviewHistoryPageV1>();
+    generator.subschema_for::<ReviewClozeCheckV1>();
+    generator.subschema_for::<ReviewQueueSummaryV1>();
+    generator.subschema_for::<ThemaReviewStateV1>();
     generator.subschema_for::<ActiveReviewSessionV1>();
     generator.subschema_for::<ReviewSessionV1>();
     generator.subschema_for::<ReviewAttemptV1>();
@@ -2789,6 +3076,8 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<ThemaWriteRequestV1>();
     requests.subschema_for::<UpdateSettingsRequestV1>();
     requests.subschema_for::<ReviewSessionRequestV1>();
+    requests.subschema_for::<ReviewQueueSummaryRequestV1>();
+    requests.subschema_for::<ReviewClozeCheckRequestV1>();
     requests.subschema_for::<ReviewAnswerV1>();
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
@@ -2863,6 +3152,7 @@ fn openapi_error_response() -> Value {
 }
 
 const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
+    ("/v1/dashboard", "get"),
     ("/v1/changes", "get"),
     ("/v1/sync/identity", "get"),
     ("/v1/sync/state", "get"),
@@ -2895,18 +3185,23 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/themata", "post"),
     ("/v1/themata/{id}", "get"),
     ("/v1/themata/{id}", "put"),
+    ("/v1/themata/{id}/review-state", "get"),
     ("/v1/themata/{id}/archive", "post"),
     ("/v1/themata/{id}/unarchive", "post"),
     ("/v1/nodes", "get"),
     ("/v1/nodes/{id}", "get"),
     ("/v1/nodes/{id}/inbound", "get"),
     ("/v1/nodes/{id}/outbound", "get"),
+    ("/v1/review/sessions", "get"),
     ("/v1/review/sessions", "post"),
     ("/v1/review/sessions/active", "get"),
+    ("/v1/review/sessions/{id}", "get"),
     ("/v1/review/sessions/{id}/resume", "post"),
     ("/v1/review/sessions/{id}/quit", "post"),
     ("/v1/review/sessions/{id}/abort", "post"),
     ("/v1/review/sessions/{id}/attempts", "post"),
+    ("/v1/review/history", "get"),
+    ("/v1/review/queue/summary", "post"),
     ("/v1/review/packs", "post"),
     ("/v1/review/packs/active", "get"),
     ("/v1/review/packs/{id}", "get"),
@@ -2915,6 +3210,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/review/offline-operations", "post"),
     ("/v1/review/attempts/{id}", "get"),
     ("/v1/review/attempts/{id}/answer", "post"),
+    ("/v1/review/attempts/{id}/cloze-check", "post"),
     ("/v1/review/attempts/{id}/accepted-success", "put"),
     ("/v1/review/attempts/{id}/override", "post"),
     ("/v1/review/attempts/{id}/suspension", "post"),
@@ -3349,6 +3645,67 @@ mod tests {
             schemas["ReviewResponsePromptV1"]["oneOf"][2]["properties"]["choices"]["minItems"],
             2
         );
+        assert_local_refs_resolve(&api, &api);
+    }
+
+    #[test]
+    fn openapi_types_client_read_views_exactly() {
+        let api = openapi_document();
+        let paths = &api["paths"];
+        let dashboard = &paths["/v1/dashboard"]["get"];
+        assert_eq!(
+            dashboard["x-gnosis-required-scopes"],
+            json!(["read", "review"])
+        );
+        assert_eq!(
+            operation_parameter(dashboard, "days")["schema"]["maximum"],
+            365
+        );
+        assert_response_schema(dashboard, "200", "DashboardV1");
+        let sessions = &paths["/v1/review/sessions"]["get"];
+        assert_response_schema(sessions, "200", "ReviewSessionPageV1");
+        assert_eq!(
+            operation_parameter(sessions, "status")["schema"]["$ref"],
+            "#/components/schemas/ReviewSessionStatusV1"
+        );
+        assert_response_schema(
+            &paths["/v1/review/sessions/{id}"]["get"],
+            "200",
+            "ReviewSessionSummaryV1",
+        );
+        let history = &paths["/v1/review/history"]["get"];
+        assert_response_schema(history, "200", "ReviewHistoryPageV1");
+        assert_eq!(
+            operation_parameter(history, "accepted_success")["schema"]["type"],
+            "boolean"
+        );
+        let queue = &paths["/v1/review/queue/summary"]["post"];
+        assert_eq!(
+            queue["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewQueueSummaryRequestV1"
+        );
+        assert_response_schema(queue, "200", "ReviewQueueSummaryV1");
+        assert_response_schema(
+            &paths["/v1/themata/{id}/review-state"]["get"],
+            "200",
+            "ThemaReviewStateV1",
+        );
+        let cloze = &paths["/v1/review/attempts/{id}/cloze-check"]["post"];
+        assert_eq!(
+            cloze["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ReviewClozeCheckRequestV1"
+        );
+        assert_response_schema(cloze, "200", "ReviewClozeCheckV1");
+        assert_eq!(
+            api["components"]["schemas"]["ReviewClozeCheckRequestV1"]["properties"]["inputs"]["maxItems"],
+            500
+        );
+        assert_eq!(
+            api["components"]["schemas"]["ReviewClozeCheckRequestV1"]["properties"]["inputs"]["minItems"],
+            1
+        );
+        let event = &api["components"]["schemas"]["ReviewHistoryEventV1"];
+        assert!(event["properties"].get("response").is_none());
         assert_local_refs_resolve(&api, &api);
     }
 
@@ -4578,7 +4935,7 @@ mod tests {
         let other = generate_device("other".into(), vec!["review".into()]).unwrap();
         let other_token = other.token.clone();
         service.create_device(other, 4).await.unwrap();
-        let wrong_owner_state = app
+        let cross_device_state = app
             .clone()
             .oneshot(authorized(
                 "GET",
@@ -4588,7 +4945,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(wrong_owner_state.status(), StatusCode::FORBIDDEN);
+        assert_eq!(cross_device_state.status(), StatusCode::OK);
         let reused = app
             .clone()
             .oneshot(authorized(
@@ -4599,7 +4956,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(reused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(reused.status(), StatusCode::PRECONDITION_FAILED);
 
         let admin = generate_device("admin".into(), vec!["admin".into()]).unwrap();
         let admin_token = admin.token.clone();
@@ -4713,6 +5070,247 @@ mod tests {
         assert_eq!(stale_override.status(), StatusCode::PRECONDITION_FAILED);
         drop(service);
         runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_read_views_and_online_sessions_work_across_devices() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let first = generate_device("first".into(), vec!["read".into(), "review".into()]).unwrap();
+        let first_token = first.token.clone();
+        let first_id = first.device_id.clone();
+        service.create_device(first, 1).await.unwrap();
+        let second =
+            generate_device("second".into(), vec!["read".into(), "review".into()]).unwrap();
+        let second_token = second.token.clone();
+        service.create_device(second, 2).await.unwrap();
+        put_review_thema(&service, "Question", None, 3).await;
+        let app = router(service.clone());
+
+        let queue = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/queue/summary",
+                &second_token,
+                Body::from(review_queue_body("thema")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(queue.status(), StatusCode::OK);
+        assert_eq!(response_json(queue).await["matched_count"], 1);
+
+        let session = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/sessions",
+                &first_token,
+                Body::from(review_session_body("thema")),
+            ))
+            .await
+            .unwrap();
+        let session = response_json(session).await;
+        let session_id = session["session_id"].as_str().unwrap();
+        assert_eq!(session["owner_device_id"], first_id);
+
+        let active = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/review/sessions/active",
+                &second_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response_json(active).await["session"]["session_id"],
+            session_id
+        );
+        for action in ["quit", "resume"] {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    "POST",
+                    &format!("/v1/review/sessions/{session_id}/{action}"),
+                    &second_token,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let attempt = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/sessions/{session_id}/attempts"),
+                &second_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let attempt = response_json(attempt).await;
+        let attempt_id = attempt["attempt_id"].as_str().unwrap();
+        let answer = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{attempt_id}/answer"),
+                &second_token,
+                Body::from(r#"{"kind":"text","value":"answer"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(answer.status(), StatusCode::OK);
+        let commit = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{attempt_id}/commit"),
+                &second_token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(commit.status(), StatusCode::OK);
+
+        assert_client_read_views(&app, &second_token, session_id).await;
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    async fn assert_client_read_views(app: &axum::Router, token: &str, session_id: &str) {
+        let dashboard = authenticated_json(app, token, "/v1/dashboard?days=30").await;
+        assert_eq!(dashboard["today"]["review_count"], 1);
+        assert_eq!(dashboard["active_session"], Value::Null);
+        let sessions = authenticated_json(
+            app,
+            token,
+            "/v1/review/sessions?status=completed&mode=online",
+        )
+        .await;
+        assert_eq!(sessions["next"], session_id);
+        let history =
+            authenticated_json(app, token, "/v1/review/history?accepted_success=true").await;
+        assert_eq!(history["items"].as_array().unwrap().len(), 1);
+        assert_eq!(history["items"][0]["session_id"], session_id);
+        let state = authenticated_json(app, token, "/v1/themata/thema/review-state").await;
+        assert_eq!(state["state"]["review_count"], 1);
+        let detail =
+            authenticated_json(app, token, &format!("/v1/review/sessions/{session_id}")).await;
+        assert_eq!(detail["review_count"], 1);
+    }
+
+    async fn authenticated_json(app: &axum::Router, token: &str, uri: &str) -> Value {
+        let response = app
+            .clone()
+            .oneshot(authorized("GET", uri, token, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        response_json(response).await
+    }
+
+    fn review_queue_body(thema_id: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "source": {
+                "kind": "manual",
+                "tags": [],
+                "exclude_tags": [],
+                "topic_node_id": null,
+                "topic_forward_depth": null,
+                "topic_backward_depth": null,
+                "manual_ids": [thema_id]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_cloze_checks_are_partial_order_independent_and_non_mutating() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        put_custom_review_thema(
+            &service,
+            "multi-cloze",
+            "cloze",
+            "cat and cut",
+            vec![None, None],
+            vec!["cat".into(), "cut".into()],
+            None,
+        )
+        .await;
+        let app = router(service.clone());
+        let (_, attempts_uri) = start_http_review(&app, &token, "multi-cloze").await;
+        let (_, attempt) = begin_http_review_attempt(&app, &token, &attempts_uri).await;
+        let attempt_id = attempt["attempt_id"].as_str().unwrap();
+
+        let empty = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{attempt_id}/cloze-check"),
+                &token,
+                Body::from(r#"{"inputs":[]}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        let partial = check_cloze_inputs(&app, &token, attempt_id, &["cut"]).await;
+        assert_eq!(partial["matches"], json!([true]));
+        assert_eq!(partial["all_entered_correct"], true);
+        assert_eq!(partial["complete"], false);
+        let complete = check_cloze_inputs(&app, &token, attempt_id, &["cot", "bat"]).await;
+        assert_eq!(complete["matches"], json!([true, true]));
+        assert_eq!(complete["complete"], true);
+        let state =
+            authenticated_json(&app, &token, &format!("/v1/review/attempts/{attempt_id}")).await;
+        assert_eq!(state["attempt"]["status"], "pending");
+        assert_eq!(state["attempt"]["response"], Value::Null);
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    async fn check_cloze_inputs(
+        app: &axum::Router,
+        token: &str,
+        attempt_id: &str,
+        inputs: &[&str],
+    ) -> Value {
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/attempts/{attempt_id}/cloze-check"),
+                token,
+                Body::from(serde_json::to_vec(&json!({"inputs": inputs})).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
     }
 
     async fn online_attempt(service: &crate::service::ServiceHandle) -> (String, String, String) {
@@ -6474,6 +7072,7 @@ mod tests {
         assert_invalid_review_presentation(state).await;
         let requests = [
             ("POST", "answer", json!({"kind":"text","value":"secret"})),
+            ("POST", "cloze-check", json!({"inputs":["secret"]})),
             ("POST", "override", json!(null)),
             ("POST", "suspension", json!(null)),
             (

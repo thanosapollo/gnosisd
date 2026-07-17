@@ -21,7 +21,10 @@ use crate::{
         ReviewStateSnapshot, TransitionSnapshot, presentation_content, review_day_at,
         review_question, validate_offline_thema_assets, validate_review_pack_projection,
     },
-    domain::{GradeError, MATCHER_VERSION, compute_transition, fuzz_delta, grade},
+    domain::{
+        ClozeCheck, GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition,
+        fuzz_delta, grade,
+    },
 };
 
 struct LocalReviewReplay<'a> {
@@ -236,6 +239,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT session_id FROM review_session
                  WHERE status = 'active'
+                   AND review_mode = 'online'
                    AND (?1 IS NULL OR owner_device_id = ?1)",
                 [actor_device_id],
                 |row| row.get::<_, String>(0),
@@ -442,6 +446,34 @@ impl SqliteStore {
             )
             .map_err(StoreError::storage)?;
         load_attempt(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub(crate) fn check_cloze_attempt(
+        &self,
+        attempt_id: &str,
+        actor_device_id: Option<&str>,
+        inputs: &[String],
+    ) -> Result<ClozeCheck, StoreError> {
+        let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
+        require_session_actor(
+            &self.connection,
+            &row.session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
+        if row.status != "pending" {
+            return Err(StoreError::InvalidReviewState);
+        }
+        verify_live_attempt(&self.connection, &row)?;
+        let content = presentation_content(&row.presentation).map_err(StoreError::storage)?;
+        if content.kind != ThemaKind::Cloze
+            || inputs.is_empty()
+            || inputs.len() > 500
+            || inputs.len() > content.answer.len()
+        {
+            return Err(StoreError::InvalidReviewResponse);
+        }
+        Ok(check_clozes(&content.answer, inputs))
     }
 
     pub(crate) fn override_review_attempt(
@@ -1475,7 +1507,7 @@ fn require_no_active_other(connection: &Connection, session_id: &str) -> Result<
     }
 }
 
-fn select_queue(
+pub(super) fn select_queue(
     connection: &Connection,
     source: &ReviewSource,
     review_day: u32,
@@ -2326,8 +2358,7 @@ fn reconcile_attempt_operation(
     if let Some(result) = replayed_attempt_operation(connection, operation, authority, digest)? {
         return Ok(result);
     }
-    let result =
-        apply_new_attempt_operation(connection, operation, authority.session_actor_device_id())?;
+    let result = apply_new_attempt_operation(connection, operation, None)?;
     insert_attempt_operation(
         connection,
         operation,

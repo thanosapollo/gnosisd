@@ -32,6 +32,7 @@ use crate::{
 };
 
 mod asset_sync;
+mod client_views;
 mod content_sync;
 mod mutation;
 mod review;

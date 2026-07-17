@@ -18,6 +18,13 @@ pub(crate) struct Grade {
     pub(crate) revealed_answer: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClozeCheck {
+    pub(crate) matches: Vec<bool>,
+    pub(crate) all_entered_correct: bool,
+    pub(crate) complete: bool,
+}
+
 pub(crate) fn grade(
     matcher_version: u32,
     content: &ThemaContent,
@@ -46,20 +53,54 @@ pub(crate) fn grade(
 }
 
 fn grade_clozes(answers: &[String], inputs: &[String]) -> bool {
-    if answers.len() != inputs.len() {
-        return false;
+    check_clozes(answers, inputs).complete
+}
+
+pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck {
+    let mut answer_owners = vec![None; answers.len()];
+    for input_index in 0..inputs.len() {
+        let mut visited = vec![false; answers.len()];
+        assign_cloze(
+            input_index,
+            answers,
+            inputs,
+            &mut answer_owners,
+            &mut visited,
+        );
     }
-    let mut remaining = answers.iter().collect::<Vec<_>>();
-    for input in inputs {
-        let Some(position) = remaining
-            .iter()
-            .position(|answer| equivalent(answer, input))
-        else {
-            return false;
-        };
-        remaining.remove(position);
+    let mut matches = vec![false; inputs.len()];
+    for input_index in answer_owners.into_iter().flatten() {
+        matches[input_index] = true;
     }
-    remaining.is_empty()
+    let all_entered_correct = matches.iter().all(|matched| *matched);
+    ClozeCheck {
+        complete: inputs.len() == answers.len() && all_entered_correct,
+        matches,
+        all_entered_correct,
+    }
+}
+
+fn assign_cloze(
+    input_index: usize,
+    answers: &[String],
+    inputs: &[String],
+    answer_owners: &mut [Option<usize>],
+    visited: &mut [bool],
+) -> bool {
+    for answer_index in 0..answers.len() {
+        if visited[answer_index] || !equivalent(&answers[answer_index], &inputs[input_index]) {
+            continue;
+        }
+        visited[answer_index] = true;
+        // Reassign earlier fuzzy matches so input order cannot change the result.
+        let available = answer_owners[answer_index]
+            .is_none_or(|owner| assign_cloze(owner, answers, inputs, answer_owners, visited));
+        if available {
+            answer_owners[answer_index] = Some(input_index);
+            return true;
+        }
+    }
+    false
 }
 
 fn grade_choice(content: &ThemaContent, choice: &str) -> Result<bool, GradeError> {
@@ -129,7 +170,7 @@ pub(crate) enum GradeError {
 mod tests {
     use serde::Deserialize;
 
-    use super::{GradeError, StructuredResponse, grade};
+    use super::{GradeError, StructuredResponse, check_clozes, grade};
     use crate::application::thema_content;
 
     #[test]
@@ -172,6 +213,41 @@ mod tests {
         .unwrap();
         let response = StructuredResponse::Texts(vec!["BETA".into(), "alpha".into()]);
         assert!(grade(1, &content, &response).unwrap().success);
+    }
+
+    #[test]
+    fn cloze_matching_finds_a_valid_order_independent_assignment() {
+        let content = thema_content(
+            "cloze",
+            "Question".into(),
+            vec![None, None],
+            vec!["cat".into(), "cut".into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let response = StructuredResponse::Texts(vec!["cot".into(), "bat".into()]);
+
+        assert!(grade(1, &content, &response).unwrap().success);
+    }
+
+    #[test]
+    fn partial_cloze_checks_consume_each_correct_answer_once() {
+        let answers = vec!["alpha".into(), "beta".into()];
+
+        assert_eq!(
+            check_clozes(&answers, &["BETA".into()]),
+            super::ClozeCheck {
+                matches: vec![true],
+                all_entered_correct: true,
+                complete: false,
+            }
+        );
+        assert_eq!(
+            check_clozes(&answers, &["alpha".into(), "alpha".into()]).matches,
+            vec![true, false]
+        );
     }
 
     #[test]

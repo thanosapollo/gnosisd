@@ -462,13 +462,6 @@ impl ReviewOperationAuthority {
             Self::DeviceOwner(device_id) | Self::DeviceAdministrator(device_id) => Some(device_id),
         }
     }
-
-    pub(crate) fn session_actor_device_id(&self) -> Option<&str> {
-        match self {
-            Self::DeviceOwner(device_id) => Some(device_id),
-            Self::Local | Self::DeviceAdministrator(_) => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
