@@ -139,7 +139,7 @@ impl From<serde_json::Error> for LegacyMigrationError {
     }
 }
 
-/// Import schema-v9 data into a new normalized schema-v1 database.
+/// Import schema-v9 data into a new canonical server schema-v2 database.
 ///
 /// The source is opened read-only and is never modified. The target must not
 /// exist. Only a fully imported and checked staging database is published.
