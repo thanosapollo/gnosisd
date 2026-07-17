@@ -4424,11 +4424,22 @@ mod tests {
             "string"
         );
         let schemas = &api["components"]["schemas"];
+        let mut obsolete_scheduler_schemas = schemas
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|name| name.contains("Scheduler") || name.contains("TagRule"))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        obsolete_scheduler_schemas.sort_unstable();
+        assert!(
+            obsolete_scheduler_schemas.is_empty(),
+            "{obsolete_scheduler_schemas:?}"
+        );
         assert_eq!(
             schemas["ThemaWriteRequestV1"]["properties"]["kind"]["pattern"],
             "^(basic|cloze|mcq|mc-cloze)$"
         );
-        assert!(schemas.get("SchedulerParametersInputV1").is_none());
         assert!(
             schemas["UpdateSettingsRequestV1"]["required"]
                 .as_array()
@@ -4453,11 +4464,6 @@ mod tests {
         ] {
             assert!(!thema_required.contains(&json!(optional)), "{optional}");
         }
-        assert!(
-            schemas["TagRuleInputV1"]
-                .get("required")
-                .is_none_or(|required| required.as_array().is_some_and(Vec::is_empty))
-        );
         assert_raw_content_response_statuses(&api);
         assert_local_refs_resolve(&api, &api);
     }

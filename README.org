@@ -236,19 +236,22 @@ immutable. Normal replica synchronization never creates a review pack.
 
 * Storage
 
-Schema v1 stores native themata, tags, node associations, scheduling state,
-exact review history, sessions, attempts, devices, settings, documents, and
-the node graph. It also stores replica snapshots and feed revisions, review
-packs, immutable offline operations and results, device sequence state, and
-conflict evidence. Review attempts carry a monotonic mutation revision and an
-immutable journal of accepted or conflicting desired-state operations. Direct
-device mutations retain their canonical request and applied or rejected result
-under a device-scoped operation identity. Public IDs are opaque text. Imported
-numeric thema IDs are retained and new resources use UUIDv7.
+The server's canonical schema v2 stores native themata, tags, node associations,
+scheduling state, exact review history, sessions, attempts, devices, settings,
+documents, and the node graph. It also stores replica snapshots and feed
+revisions, review packs, immutable offline operations and results, device
+sequence state, and conflict evidence. Review attempts carry a monotonic
+mutation revision and an immutable journal of accepted or conflicting
+desired-state operations. Direct device mutations retain their canonical
+request and applied or rejected result under a device-scoped operation identity.
+Public IDs are opaque text. Imported numeric thema IDs are retained and new
+resources use UUIDv7.
 
-Server and replica databases each have one canonical schema at version 1 and
-use distinct SQLite application IDs. Startup creates that schema only for an
-empty database and rejects every other version or database identity.
+The replica database retains its distinct canonical schema v1. Server and
+replica databases use distinct SQLite application IDs. Startup creates the
+applicable schema only for an empty database and rejects every other version or
+database identity; historical server data must enter through the explicit
+migration path.
 
 Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
 tracks logical paths, heads, revisions, renames, tombstones, and the monotonic
