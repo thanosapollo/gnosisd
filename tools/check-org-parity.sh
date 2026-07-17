@@ -8,8 +8,7 @@ if [ "$#" -ne 1 ]; then
 fi
 
 fixture=$1
-: "${GNOSIS_ELISP_DIR:?set GNOSIS_ELISP_DIR to the gnosis Emacs checkout}"
-gnosis_dir=$GNOSIS_ELISP_DIR
+gnosis_dir=${GNOSIS_ELISP_DIR:-/home/thanos/Projects/emacs-lisp/gnosis}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/gnosis-org-parity.XXXXXX")

@@ -5023,7 +5023,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(snapshot_settings.settings.revision, 1);
-        assert_eq!(snapshot_settings.settings.timezone, "UTC");
+        assert_eq!(snapshot_settings.settings.timezone, "Europe/Athens");
 
         let (changes, latest, _) = store
             .replica_changes(

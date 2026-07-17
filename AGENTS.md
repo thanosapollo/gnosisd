@@ -4,15 +4,16 @@ Keep this file current as the project develops.
 
 Gnosis Core is the source of truth for Gnosis storage and shared domain
 behavior. It serves the `gnosis` Emacs frontend, command-line, and future web
-clients. The separate `gnosis` package is the Emacs frontend, not a separate
-product named emacs-gnosis. Its established UI and behavior are the
-compatibility contract for the migration. Coordinated frontend changes are
+clients. The package in `~/Projects/emacs-lisp/gnosis/` is the Emacs frontend,
+not a separate product named emacs-gnosis. Its established UI and behavior are
+the compatibility contract for the migration. Coordinated frontend changes are
 expected when a core operation lands.
 
-The deployed daemon exclusively owns the configured SQLite database. Ordinary
-clients use authenticated HTTP `/v1`; the Unix socket is the privileged local
-trust, administration, recovery, and temporary compatibility boundary. No
-client may open the core database directly.
+The deployed daemon exclusively owns
+`~/.local/share/gnosis/gnosis.sqlite`. Ordinary clients use authenticated HTTP
+`/v1`; the Unix socket is the privileged local trust, administration, recovery,
+and temporary compatibility boundary. No client may open the core database
+directly.
 
 ## Architecture
 
@@ -120,8 +121,25 @@ Socket startup uses an atomic `.startup-lock` directory to serialize stale
 cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
 SIGTERM both enter graceful shutdown.
 
-Online reviews and device-bound offline review packs reconcile through
-immutable operations. The daemon remains authoritative, conflicts stay
+The Emacs review dogfood path is explicitly opt-in. `gnosis-review-backend`
+defaults to `legacy`; `core` still uses the Unix compatibility protocol until
+the frontend moves to authenticated HTTP. That migration must use the typed
+online review DTOs, desired-state operations, and raw digest-addressed asset
+downloads while preserving the private verified cache. Review-loop edit and
+delete remain disabled until typed daemon operations can fail or commit before
+any local mutation.
+
+This milestone does not migrate the full Emacs frontend. Dashboard, history,
+content authoring, edit, archive and delete, capture, import, note indexing,
+link maintenance, and some topic or tag prompt reads remain compatibility
+operations. Core review events are not mirrored into the legacy database.
+Rollback means selecting the legacy review backend and preserving both
+databases for inspection. Never overwrite core with the old database,
+reverse-migrate events, or merge divergence by timestamps.
+
+Emacs integration, authenticated remote transport, and replica synchronization
+are active work. Online reviews and device-bound offline review packs reconcile
+through immutable operations. The daemon remains authoritative, conflicts stay
 explicit, and review or content state must never use last-write-wins.
 Offline review v1 submissions remain accepted; v2 pack and result envelopes
 return durable replica cursors.
@@ -197,7 +215,6 @@ cargo tree --depth 1
 Org parity checks run the live Elisp code read-only:
 
 ```sh
-export GNOSIS_ELISP_DIR=/path/to/gnosis
 tools/check-org-parity.sh tests/fixtures/org/basic.org
 tools/check-org-parity.sh tests/fixtures/org/no-file-id.org
 tools/check-org-parity.sh tests/fixtures/org/duplicate-links.org
@@ -205,8 +222,8 @@ tools/check-org-parity.sh tests/fixtures/org/unicode.org
 tools/check-org-parity.sh tests/fixtures/org/compatibility.org
 ```
 
-Parity checks must not run build targets or write compiled files into the Emacs
-frontend checkout.
+Never run a Gnosis Emacs build target for parity because it may write compiled
+files into the live checkout.
 
 ## Git
 

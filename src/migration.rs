@@ -668,7 +668,7 @@ fn import_review_sessions(
              session_id, source_kind, source_json, target_count, timezone,
              day_boundary_hour, scheduler_json, status, started_at_us,
              ended_at_us, current_position
-         ) VALUES (?1, ?2, ?3, ?4, 'UTC', ?5, ?6, ?7, ?8, ?9, ?10)",
+         ) VALUES (?1, ?2, ?3, ?4, 'Europe/Athens', ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     while let Some(row) = rows.next()? {
         let payload = row_json(row, &columns)?;

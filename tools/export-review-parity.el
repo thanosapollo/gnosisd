@@ -78,14 +78,14 @@
     state))
 
 (defconst gnosis-core-parity--tag-values
-  '((:tag "tag-a" (:proto (1 3) :anagnosis 3 :amnesia 0.45
+  '((:tag "Amboss" (:proto (1 3) :anagnosis 3 :amnesia 0.45
                             :epignosis 0.5 :agnoia 0.4 :lethe 2))
-    (:tag "tag-b" (:amnesia 0.55 :proto (0 1 3) :lethe 2))
-    (:tag "tag-c" (:proto (1 3) :amnesia 0.45))
-    (:tag "tag-d" (:amnesia 0.65 :proto (0 1 3)))))
+    (:tag "Bulgarian" (:amnesia 0.55 :proto (0 1 3) :lethe 2))
+    (:tag "Unking" (:proto (1 3) :amnesia 0.45))
+    (:tag "vocabulary" (:amnesia 0.65 :proto (0 1 3)))))
 
 (defun gnosis-core-parity--tag-rules ()
-  (let ((tags '("tag-a" "tag-c")))
+  (let ((tags '("Amboss" "Unking")))
     `((tags . ,(vconcat tags))
       (amnesia . ,(gnosis-get-thema-amnesia
                    nil tags gnosis-core-parity--tag-values))

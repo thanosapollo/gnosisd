@@ -6408,7 +6408,7 @@ mod tests {
         let snapshot_settings = snapshot_settings.unwrap();
         let snapshot_cursor = snapshot_cursor.unwrap();
         assert_eq!(snapshot_settings["revision"], 1);
-        assert_eq!(snapshot_settings["timezone"], "UTC");
+        assert_eq!(snapshot_settings["timezone"], "Europe/Athens");
 
         let delta = response_json(
             app.clone()

@@ -702,7 +702,7 @@ fn thema_wire() -> Value {
 
 fn settings_wire(include_output_fields: bool) -> Value {
     let mut value = json!({
-        "timezone":"UTC","day_boundary_hour":0,
+        "timezone":"Europe/Athens","day_boundary_hour":0,
         "scheduler":{"amnesia":0.5,"epignosis":0.1,"agnoia":0.2,"anagnosis":3,
             "lethe":2,"synolon_max":3.0,"interval_fuzz":0.1,"proto":[0,1,2]}
     });

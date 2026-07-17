@@ -1274,7 +1274,7 @@ mod tests {
                 _ => panic!("unknown logical-day parity case {}", case.name),
             };
             assert_eq!(
-                review_day_at(timestamp, "Europe/Berlin", boundary).unwrap(),
+                review_day_at(timestamp, "Europe/Athens", boundary).unwrap(),
                 case.review_day,
                 "{}",
                 case.name

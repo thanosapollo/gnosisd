@@ -96,7 +96,7 @@ mod tests {
 
     fn settings() -> SettingsInput {
         SettingsInput {
-            timezone: "UTC".into(),
+            timezone: "Europe/Athens".into(),
             day_boundary_hour: 0,
             scheduler: ParametersSnapshot {
                 scheduler_version: 1,
@@ -110,7 +110,7 @@ mod tests {
                 proto: vec![0, 1, 2],
             },
             tag_rules: BTreeMap::from([(
-                "tag-d".into(),
+                "vocabulary".into(),
                 TagRule {
                     amnesia: Some(0.65),
                     ..TagRule::default()
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn rejects_invalid_rule_after_global_merge() {
         let mut invalid = settings();
-        invalid.tag_rules.get_mut("tag-d").unwrap().amnesia = Some(1.5);
+        invalid.tag_rules.get_mut("vocabulary").unwrap().amnesia = Some(1.5);
         assert_eq!(invalid.validate().unwrap_err(), SettingsError::Rule);
     }
 }

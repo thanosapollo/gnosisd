@@ -3796,21 +3796,6 @@ mod tests {
     #[test]
     fn tag_rules_replace_globals_and_aggregate_like_elisp() {
         let mut store = SqliteStore::open_in_memory().unwrap();
-        for (tag, parameters) in [
-            (
-                "tag-a",
-                r#"{"agnoia":0.4,"amnesia":0.45,"anagnosis":3,"epignosis":0.5,"lethe":2,"proto":[1,3]}"#,
-            ),
-            ("tag-c", r#"{"amnesia":0.45,"proto":[1,3]}"#),
-        ] {
-            store
-                .connection
-                .execute(
-                    "INSERT INTO tag_rule(tag, parameters_json) VALUES (?1, ?2)",
-                    params![tag, parameters],
-                )
-                .unwrap();
-        }
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/review/parity-v1.json"
         ))

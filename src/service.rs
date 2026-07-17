@@ -3395,8 +3395,8 @@ mod tests {
         let runtime = runtime(&directory).await;
         let service = runtime.handle();
         let initial = service.settings().await.unwrap();
-        assert_eq!(initial.timezone, "UTC");
-        assert!(initial.tag_rules.is_empty());
+        assert_eq!(initial.timezone, "Europe/Athens");
+        assert!(initial.tag_rules.contains_key("Amboss"));
         let input = SettingsInput {
             timezone: "Europe/Sofia".into(),
             day_boundary_hour: 4,
