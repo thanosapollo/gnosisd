@@ -38,23 +38,9 @@ mod review;
 
 pub(crate) use mutation::DeviceMutationExecution;
 
-const INITIAL_MIGRATION: &str = include_str!("migrations/0001_initial.sql");
-const SERVER_MIGRATION: &str = include_str!("migrations/0002_server.sql");
-const REMOTE_REVIEW_MIGRATION: &str = include_str!("migrations/0003_remote_review.sql");
-const OFFLINE_REVIEW_MIGRATION: &str = include_str!("migrations/0004_offline_review.sql");
-const REPLICA_SYNC_MIGRATION: &str = include_str!("migrations/0005_replica_sync.sql");
-const OFFLINE_CONTENT_MIGRATION: &str = include_str!("migrations/0006_offline_content.sql");
-const OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION: &str =
-    include_str!("migrations/0007_offline_document_lifecycle.sql");
-const DOCUMENT_ASSET_INTEGRITY_MIGRATION: &str =
-    include_str!("migrations/0008_document_asset_integrity.sql");
-const OFFLINE_ASSET_PUT_MIGRATION: &str = include_str!("migrations/0009_offline_asset_put.sql");
-const LOCAL_REVIEW_REPLAY_MIGRATION: &str = include_str!("migrations/0010_local_review_replay.sql");
-const REVIEW_ATTEMPT_OPERATION_MIGRATION: &str =
-    include_str!("migrations/0011_review_attempt_operations.sql");
-const DEVICE_MUTATION_RECEIPT_MIGRATION: &str =
-    include_str!("migrations/0012_device_mutation_receipts.sql");
-const SCHEMA_VERSION: u32 = 12;
+const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
+const APPLICATION_ID: u32 = 0x474e4f53;
+const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -92,8 +78,10 @@ pub(crate) enum StoreError {
     InvalidProjection { reason: &'static str },
     #[error("stored document contains invalid {field}")]
     CorruptData { field: &'static str },
-    #[error("database schema version {found} is newer than supported version {supported}")]
+    #[error("database schema version {found} is unsupported; expected version {supported}")]
     UnsupportedSchemaVersion { found: u32, supported: u32 },
+    #[error("database application ID {found} is unsupported; expected {expected}")]
+    UnsupportedApplicationId { found: u32, expected: u32 },
     #[error("storage operation failed")]
     Storage(#[source] Box<dyn Error + Send + Sync>),
 }
@@ -164,7 +152,7 @@ impl SqliteStore {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(StoreError::storage)?;
-        migrate(&connection)?;
+        initialize_schema(&connection)?;
         backfill_current_replica_history(&connection)?;
         Ok(Self { connection })
     }
@@ -934,6 +922,7 @@ impl SqliteStore {
                 supported: SCHEMA_VERSION,
             });
         }
+        require_application_id(&connection)?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(StoreError::storage)?;
@@ -3207,75 +3196,43 @@ enum FailPoint {
     AfterDocument,
 }
 
-fn migrate(connection: &Connection) -> Result<(), StoreError> {
+fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
     let found = schema_version(connection)?;
-    if found > SCHEMA_VERSION {
-        return Err(StoreError::UnsupportedSchemaVersion {
+    match found {
+        SCHEMA_VERSION => require_application_id(connection),
+        0 if user_schema_is_empty(connection)? => connection
+            .execute_batch(CURRENT_SCHEMA)
+            .map_err(StoreError::storage),
+        _ => Err(StoreError::UnsupportedSchemaVersion {
             found,
             supported: SCHEMA_VERSION,
-        });
+        }),
     }
-    if found == 0 {
-        connection
-            .execute_batch(INITIAL_MIGRATION)
-            .map_err(StoreError::storage)?;
+}
+
+fn require_application_id(connection: &Connection) -> Result<(), StoreError> {
+    let found = application_id(connection)?;
+    if found == APPLICATION_ID {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedApplicationId {
+            found,
+            expected: APPLICATION_ID,
+        })
     }
-    if found < 2 {
-        connection
-            .execute_batch(SERVER_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 3 {
-        connection
-            .execute_batch(REMOTE_REVIEW_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 4 {
-        connection
-            .execute_batch(OFFLINE_REVIEW_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 5 {
-        connection
-            .execute_batch(REPLICA_SYNC_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 6 {
-        connection
-            .execute_batch(OFFLINE_CONTENT_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 7 {
-        connection
-            .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 8 {
-        connection
-            .execute_batch(DOCUMENT_ASSET_INTEGRITY_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 9 {
-        connection
-            .execute_batch(OFFLINE_ASSET_PUT_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 10 {
-        connection
-            .execute_batch(LOCAL_REVIEW_REPLAY_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 11 {
-        connection
-            .execute_batch(REVIEW_ATTEMPT_OPERATION_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    if found < 12 {
-        connection
-            .execute_batch(DEVICE_MUTATION_RECEIPT_MIGRATION)
-            .map_err(StoreError::storage)?;
-    }
-    Ok(())
+}
+
+fn user_schema_is_empty(connection: &Connection) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE name NOT LIKE 'sqlite_%'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)
 }
 
 fn backfill_current_replica_history(connection: &Connection) -> Result<(), StoreError> {
@@ -3489,7 +3446,7 @@ pub(crate) fn initialize_native_database(connection: &Connection) -> Result<(), 
     connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(StoreError::storage)?;
-    migrate(connection)
+    initialize_schema(connection)
 }
 
 fn schema_version(connection: &Connection) -> Result<u32, StoreError> {
@@ -3499,6 +3456,12 @@ fn schema_version(connection: &Connection) -> Result<u32, StoreError> {
     u32::try_from(version).map_err(|_| StoreError::CorruptData {
         field: "schema version",
     })
+}
+
+fn application_id(connection: &Connection) -> Result<u32, StoreError> {
+    connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(StoreError::storage)
 }
 
 fn load_legacy_database_info(
@@ -4652,23 +4615,18 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DOCUMENT_ASSET_INTEGRITY_MIGRATION, FailPoint, INITIAL_MIGRATION,
-        LOCAL_REVIEW_REPLAY_MIGRATION, OFFLINE_ASSET_PUT_MIGRATION, OFFLINE_CONTENT_MIGRATION,
-        OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION,
-        REPLICA_SYNC_MIGRATION, REVIEW_ATTEMPT_OPERATION_MIGRATION, SCHEMA_VERSION,
-        SERVER_MIGRATION, SqliteStore, StoreError, migrate, schema_version,
+        APPLICATION_ID, FailPoint, SCHEMA_VERSION, SqliteStore, StoreError, application_id,
+        initialize_schema, schema_version,
     };
     use crate::application::{
-        AuthoritativeDocument, ContentBase, ContentReconciliationStatus, OfflineContentMutation,
-        OfflineContentOperation, OfflineReviewOperation, ReconciliationStatus, ReplicaProjection,
-        SettingsInput, generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
+        ReplicaProjection, SettingsInput, generate_device, prepare_asset, prepare_note,
+        prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
         SourceSpan, TitlePath,
     };
-    use crate::protocol::canonical_content_operation;
 
     fn projection(title: &str, digest: &str) -> DocumentProjection {
         let root = NodeId::new("root").unwrap();
@@ -4822,7 +4780,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_and_reopens_database() {
+    fn initializes_and_reopens_database() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("gnosis.db");
         assert_eq!(
@@ -4840,428 +4798,95 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_an_existing_schema_v2_database() {
+    fn rejects_noncurrent_schema_without_changes() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection.execute_batch(INITIAL_MIGRATION).unwrap();
-        connection.execute_batch(SERVER_MIGRATION).unwrap();
-        assert_eq!(schema_version(&connection).unwrap(), 2);
-
-        migrate(&connection).unwrap();
-
-        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
-        for (table, column) in [
-            ("retired_node_edge", "source_id"),
-            ("review_attempt", "thema_revision"),
-            ("review_attempt", "parameters_json"),
-            ("review_attempt", "fuzz_sample"),
-            ("review_session", "owner_device_id"),
-            ("review_session", "review_mode"),
-            ("device", "last_device_sequence"),
-            ("server_identity", "server_id"),
-            ("replica_snapshot_item", "entity_kind"),
-            ("thema_revision", "content_sha256"),
-            ("settings_revision", "tag_rules_json"),
-            ("review_state_revision", "state_json"),
-        ] {
-            let present: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                    [table, column],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(present, "missing {table}.{column}");
-        }
-    }
-
-    #[test]
-    fn upgrades_schema_v10_for_review_attempt_operations() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        for migration in [
-            INITIAL_MIGRATION,
-            SERVER_MIGRATION,
-            REMOTE_REVIEW_MIGRATION,
-            OFFLINE_REVIEW_MIGRATION,
-            REPLICA_SYNC_MIGRATION,
-            OFFLINE_CONTENT_MIGRATION,
-            OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION,
-            DOCUMENT_ASSET_INTEGRITY_MIGRATION,
-            OFFLINE_ASSET_PUT_MIGRATION,
-            LOCAL_REVIEW_REPLAY_MIGRATION,
-        ] {
-            connection.execute_batch(migration).unwrap();
-        }
-        assert_eq!(schema_version(&connection).unwrap(), 10);
-        insert_v10_review_replay(&connection);
-
-        migrate(&connection).unwrap();
-
-        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
-        assert!(schema_column_exists(
-            &connection,
-            "review_attempt",
-            "mutation_revision"
-        ));
-        assert!(schema_table_exists(&connection, "review_attempt_operation"));
-        let revision: u64 = connection
-            .query_row(
-                "SELECT mutation_revision FROM review_attempt WHERE attempt_id = 'attempt'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(revision, 0);
-        let replay: String = connection
-            .query_row(
-                "SELECT result_json FROM local_review_replay WHERE request_id = 'legacy-request'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&replay).unwrap()["attempt_id"],
-            "attempt"
-        );
-        assert_review_operation_is_immutable(&connection);
-        let mut store = SqliteStore { connection };
-        let replayed = store
-            .override_local_review_attempt("attempt", None, "legacy-request", &"b".repeat(64), 3)
-            .unwrap();
-        assert_eq!(replayed.attempt_id, "attempt");
-    }
-
-    #[test]
-    fn upgrades_schema_v11_for_device_mutation_receipts() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("schema-v11.sqlite");
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        for migration in [
-            INITIAL_MIGRATION,
-            SERVER_MIGRATION,
-            REMOTE_REVIEW_MIGRATION,
-            OFFLINE_REVIEW_MIGRATION,
-            REPLICA_SYNC_MIGRATION,
-            OFFLINE_CONTENT_MIGRATION,
-            OFFLINE_DOCUMENT_LIFECYCLE_MIGRATION,
-            DOCUMENT_ASSET_INTEGRITY_MIGRATION,
-            OFFLINE_ASSET_PUT_MIGRATION,
-            LOCAL_REVIEW_REPLAY_MIGRATION,
-            REVIEW_ATTEMPT_OPERATION_MIGRATION,
-        ] {
-            connection.execute_batch(migration).unwrap();
-        }
-        assert_eq!(schema_version(&connection).unwrap(), 11);
-        insert_receipt_devices(&connection);
-
-        migrate(&connection).unwrap();
-
-        assert_eq!(schema_version(&connection).unwrap(), 12);
-        assert!(schema_table_exists(&connection, "device_mutation_receipt"));
-        assert_device_mutation_receipt_contract(&connection);
-        drop(connection);
-
-        let reopened = rusqlite::Connection::open(path).unwrap();
-        reopened.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        migrate(&reopened).unwrap();
-        assert_eq!(schema_version(&reopened).unwrap(), 12);
-        let receipt_count: u64 = reopened
-            .query_row("SELECT count(*) FROM device_mutation_receipt", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(receipt_count, 3);
-        let foreign_key_errors: u64 = reopened
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(foreign_key_errors, 0);
-        let migration_count: u64 = reopened
-            .query_row(
-                "SELECT count(*) FROM schema_migration WHERE version = 12",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(migration_count, 1);
-    }
-
-    fn insert_v10_review_replay(connection: &rusqlite::Connection) {
         connection
             .execute_batch(
-                "INSERT INTO thema(thema_id) VALUES ('thema');
-                 INSERT INTO review_session(
-                     session_id, source_kind, source_json, timezone, day_boundary_hour,
-                     scheduler_json, status, started_at_us
-                 ) VALUES ('session', 'manual', '{}', 'UTC', 0, '{}', 'active', 1);
-                 INSERT INTO review_session_item(session_id, position, thema_id)
-                 VALUES ('session', 0, 'thema');
-                 INSERT INTO review_attempt(
-                     attempt_id, session_id, session_position, thema_id, state_revision,
-                     content_sha256, presentation_json, matcher_version, desired_suspended,
-                     status, started_at_us
-                 ) VALUES (
-                     'attempt', 'session', 0, 'thema', 0,
-                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-                     '{}', 1, 0, 'pending', 1
-                 );
-                 ",
+                "CREATE TABLE marker(value TEXT);
+                 INSERT INTO marker VALUES ('preserved');
+                 PRAGMA user_version = 2;",
             )
             .unwrap();
-        let result = serde_json::json!({
-            "attempt_id":"attempt",
-            "session_id":"session",
-            "thema_id":"thema",
-            "presentation":{
-                "kind":"basic", "keimenon":"Question", "hypothesis":[], "answer":[],
-                "source_guid":null, "parathema":null, "review_image":null, "tags":[]
-            },
-            "matcher_version":1,
-            "response":null,
-            "detected_success":null,
-            "accepted_success":null,
-            "override_count":0,
-            "proposed_transition":null,
-            "desired_suspended":false,
-            "status":"pending"
-        })
-        .to_string();
-        connection
-            .execute(
-                "INSERT INTO local_review_replay(
-                     request_id, request_sha256, attempt_id, action, result_json, created_at_us
-                 ) VALUES ('legacy-request', ?1, 'attempt', 'override', ?2, 1)",
-                rusqlite::params!["b".repeat(64), result],
-            )
-            .unwrap();
+
+        let error = initialize_schema(&connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::UnsupportedSchemaVersion {
+                found: 2,
+                supported: SCHEMA_VERSION
+            }
+        ));
+        assert_eq!(schema_version(&connection).unwrap(), 2);
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM marker", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
     }
 
-    fn assert_review_operation_is_immutable(connection: &rusqlite::Connection) {
+    #[test]
+    fn rejects_unversioned_nonempty_database_without_changes() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
-            .execute(
-                "INSERT INTO review_attempt_operation(
-                     operation_id, format_version, actor_kind, attempt_id, operation_kind,
-                     expected_revision, desired_value, payload_sha256, payload_json,
-                     result_kind, result_json, created_at_us
-                 ) VALUES ('operation', 1, 'local', 'attempt', 'suspension_set', 0, 1,
-                     ?1, '{}', 'accepted', '{}', 2)",
-                ["c".repeat(64)],
-            )
+            .execute("CREATE TABLE marker(value TEXT)", [])
             .unwrap();
-        assert!(
-            connection
-                .execute(
-                    "UPDATE review_attempt_operation SET result_json = 'changed'",
-                    [],
-                )
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute("DELETE FROM review_attempt_operation", [])
-                .is_err()
-        );
-        for operation_id in ["\0", "a\0x", "π", "-leading", "contains space"] {
-            assert!(
-                connection
-                    .execute(
-                        "INSERT INTO review_attempt_operation(
-                         operation_id, format_version, actor_kind, attempt_id, operation_kind,
-                         expected_revision, desired_value, payload_sha256, payload_json,
-                         result_kind, result_json, created_at_us
-                         ) VALUES (?1, 1, 'local', 'attempt', 'suspension_set', 0, 1,
-                         ?2, '{}', 'accepted', '{}', 3)",
-                        rusqlite::params![operation_id, "d".repeat(64)],
-                    )
-                    .is_err(),
-                "accepted {operation_id:?}"
-            );
-        }
+
+        let error = initialize_schema(&connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::UnsupportedSchemaVersion {
+                found: 0,
+                supported: SCHEMA_VERSION
+            }
+        ));
+        assert!(schema_table_exists(&connection, "marker"));
+        assert!(!schema_table_exists(&connection, "document"));
     }
 
-    fn insert_receipt_devices(connection: &rusqlite::Connection) {
+    #[test]
+    fn rejects_historical_v1_without_the_current_identity() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
-            .execute(
-                "INSERT INTO device(
-                     device_id, name, token_digest, scopes_json, created_at_us
-                 ) VALUES
-                     ('device-a', 'Device A', ?1, '[\"write\"]', 1),
-                     ('device-b', 'Device B', ?2, '[\"write\"]', 1)",
-                rusqlite::params!["a".repeat(64), "b".repeat(64)],
+            .execute_batch(
+                "CREATE TABLE document(document_id TEXT PRIMARY KEY);
+                 PRAGMA user_version = 1;",
             )
             .unwrap();
+
+        let error = initialize_schema(&connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::UnsupportedApplicationId {
+                found: 0,
+                expected: APPLICATION_ID
+            }
+        ));
     }
 
-    fn assert_device_mutation_receipt_contract(connection: &rusqlite::Connection) {
-        insert_device_mutation_receipt(connection, "device-a", "operation", "c");
-        insert_device_mutation_receipt(connection, "device-b", "operation", "d");
-        let boundary_id = format!("{}._:-", "x".repeat(124));
-        connection
-            .execute(
-                "INSERT INTO device_mutation_receipt(
-                     device_id, operation_id, format_version, mutation_kind,
-                     request_sha256, request_json, result_kind, result_json, created_at_us
-                 ) VALUES (
-                     'device-a', ?1, 1, 'settings_replace', ?2, '{}',
-                     'rejected', '{\"reason\":\"revision_conflict\"}', 2
-                 )",
-                rusqlite::params![boundary_id, "e".repeat(64)],
-            )
-            .unwrap();
-        let replay: (String, String) = connection
-            .query_row(
-                "SELECT result_kind, result_json FROM device_mutation_receipt
-                 WHERE device_id = 'device-a' AND operation_id = 'operation'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(replay, ("applied".into(), "{}".into()));
-        assert!(
-            connection
-                .execute(
-                    "INSERT INTO device_mutation_receipt
-                     SELECT * FROM device_mutation_receipt
-                     WHERE device_id = 'device-a' AND operation_id = 'operation'",
-                    [],
-                )
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute(
-                    "UPDATE device_mutation_receipt SET result_json = 'changed'",
-                    [],
-                )
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute("DELETE FROM device_mutation_receipt", [])
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute("DELETE FROM device WHERE device_id = 'device-a'", [],)
-                .is_err()
-        );
-        assert_receipt_rejects_invalid_rows(connection);
-    }
+    #[test]
+    fn current_schema_is_v1_without_migration_history() {
+        let store = SqliteStore::open_in_memory().unwrap();
 
-    fn insert_device_mutation_receipt(
-        connection: &rusqlite::Connection,
-        device_id: &str,
-        operation_id: &str,
-        digest_character: &str,
-    ) {
-        connection
-            .execute(
-                "INSERT INTO device_mutation_receipt(
-                     device_id, operation_id, format_version, mutation_kind,
-                     request_sha256, request_json, result_kind, result_json, created_at_us
-                 ) VALUES (?1, ?2, 1, 'document_replace', ?3, '{}', 'applied', '{}', 2)",
-                rusqlite::params![device_id, operation_id, digest_character.repeat(64)],
-            )
-            .unwrap();
-    }
-
-    fn assert_receipt_rejects_invalid_rows(connection: &rusqlite::Connection) {
-        for operation_id in [
-            "",
-            "\0",
-            "a\0x",
-            "π",
-            "-leading",
-            "contains space",
-            &"x".repeat(129),
+        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(application_id(&store.connection).unwrap(), APPLICATION_ID);
+        assert!(!schema_table_exists(&store.connection, "schema_migration"));
+        for table in [
+            "document",
+            "review_attempt_operation",
+            "device_mutation_receipt",
+            "offline_asset_operation",
+            "replica_snapshot",
         ] {
             assert!(
-                connection
-                    .execute(
-                        "INSERT INTO device_mutation_receipt(
-                             device_id, operation_id, format_version, mutation_kind,
-                             request_sha256, request_json, result_kind, result_json,
-                             created_at_us
-                         ) VALUES (
-                             'device-a', ?1, 1, 'document_replace', ?2, '{}',
-                             'rejected', '{}', 3
-                         )",
-                        rusqlite::params![operation_id, "e".repeat(64)],
-                    )
-                    .is_err(),
-                "accepted {operation_id:?}"
+                schema_table_exists(&store.connection, table),
+                "missing {table}"
             );
         }
-        for statement in [
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'missing', 'orphan', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'bad-kind', 1, 'unknown',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'bad-digest', 1, 'document_replace', 'ABC',
-                 '{}', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'uppercase-digest', 1, 'document_replace',
-                 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-                 '{}', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'nonhex-digest', 1, 'document_replace',
-                 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg',
-                 '{}', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'bad-result', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'unknown', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'bad-version', 2, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'empty-request', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'empty-result', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'applied', '', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'malformed-request', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{', 'applied', '{}', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'malformed-result', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'applied', ']', 3)",
-            "INSERT INTO device_mutation_receipt VALUES (
-                 'device-a', 'bad-time', 1, 'document_replace',
-                 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
-                 '{}', 'applied', '{}', 0)",
-        ] {
-            assert!(
-                connection.execute(statement, []).is_err(),
-                "accepted {statement}"
-            );
-        }
-    }
-
-    fn schema_column_exists(connection: &rusqlite::Connection, table: &str, column: &str) -> bool {
-        connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                [table, column],
-                |row| row.get(0),
-            )
-            .unwrap()
     }
 
     fn schema_table_exists(connection: &rusqlite::Connection, table: &str) -> bool {
@@ -5273,499 +4898,6 @@ mod tests {
             )
             .unwrap()
     }
-
-    #[test]
-    fn upgrades_projection_only_unix_documents_into_snapshot_history() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("projection-only.sqlite");
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        connection.execute_batch(INITIAL_MIGRATION).unwrap();
-        connection.execute_batch(SERVER_MIGRATION).unwrap();
-        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
-        connection.execute_batch(OFFLINE_REVIEW_MIGRATION).unwrap();
-        let mut old_store = SqliteStore { connection };
-        let document_id = DocumentId::new("../legacy/socket").unwrap();
-        old_store
-            .replace_document(&document_id, &projection("Legacy", "digest"), None)
-            .unwrap();
-        drop(old_store);
-
-        let mut store = SqliteStore::open(&path).unwrap();
-        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
-        let device_id = device.device_id.clone();
-        store.create_device(&device, 1).unwrap();
-        let snapshot = store.create_replica_snapshot(&device_id, 2, 10).unwrap();
-        let document = snapshot
-            .items
-            .iter()
-            .find_map(|projection| match projection {
-                ReplicaProjection::Document(document) => Some(document),
-                _ => None,
-            })
-            .unwrap();
-
-        assert_eq!(document.revision.operation, "snapshot");
-        assert!(document.revision.blob_sha256.is_none());
-        assert!(document.revision.logical_path.starts_with("legacy/"));
-        assert_eq!(document.projection.as_ref().unwrap().title, "Legacy");
-    }
-
-    #[test]
-    fn upgrades_populated_schema_v3_without_losing_rows_or_cursor_sequence() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        connection.execute_batch(INITIAL_MIGRATION).unwrap();
-        connection.execute_batch(SERVER_MIGRATION).unwrap();
-        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
-        connection
-            .execute(
-                "INSERT INTO device(
-                     device_id, name, token_digest, scopes_json, created_at_us
-                 ) VALUES ('device', 'Device', ?1, '[\"review\"]', 1)",
-                ["a".repeat(64)],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_session(
-                     session_id, source_kind, source_json, timezone, day_boundary_hour,
-                     scheduler_json, status, started_at_us
-                 ) VALUES (
-                     'session', 'manual', '{\"kind\":\"manual\",\"manual_ids\":[\"thema\"]}',
-                     'UTC', 0, '{}', 'active', 1
-                 )",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO content_change(
-                     entity_kind, entity_id, revision, operation, created_at_us
-                 ) VALUES ('settings', 'settings', 1, 'update', 1)",
-                [],
-            )
-            .unwrap();
-        let old_cursor: i64 = connection
-            .query_row("SELECT max(cursor) FROM content_change", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-
-        migrate(&connection).unwrap();
-
-        let device: (i64, i64) = connection
-            .query_row(
-                "SELECT count(*), last_device_sequence FROM device WHERE device_id = 'device'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(device, (1, 0));
-        let session: (Option<String>, String) = connection
-            .query_row(
-                "SELECT owner_device_id, review_mode FROM review_session
-                 WHERE session_id = 'session'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(session, (None, "online".into()));
-        connection
-            .execute(
-                "INSERT INTO content_change(
-                     entity_kind, entity_id, revision, operation, created_at_us
-                 ) VALUES ('review', 'thema', 1, 'commit', 2)",
-                [],
-            )
-            .unwrap();
-        let new_cursor: i64 = connection
-            .query_row("SELECT max(cursor) FROM content_change", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(new_cursor, old_cursor + 1);
-        let violations: i64 = connection
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(violations, 0);
-    }
-
-    #[test]
-    fn upgrades_populated_schema_v4_with_replica_history_and_floor() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        connection.execute_batch(INITIAL_MIGRATION).unwrap();
-        connection.execute_batch(SERVER_MIGRATION).unwrap();
-        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
-        connection.execute_batch(OFFLINE_REVIEW_MIGRATION).unwrap();
-        connection
-            .execute(
-                "INSERT INTO thema(
-                     thema_id, revision, kind, keimenon, hypothesis_json,
-                     answer_json, content_sha256, created_at_us, updated_at_us
-                 ) VALUES (?1, 1, 'basic', 'Question', '[null]', '[\"answer\"]', ?2, 1, 1)",
-                ("thema", "a".repeat(64)),
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_state VALUES (
-                     'thema', 0, 0, 0, 0, NULL, NULL, 20260715, NULL,
-                     0, 0, 0, 0, 0, 0.35, 0.30, 1.3
-                 )",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO content_change(
-                     entity_kind, entity_id, revision, operation, created_at_us
-                 ) VALUES ('thema', 'thema', 1, 'create', 1)",
-                [],
-            )
-            .unwrap();
-        let old_cursor: i64 = connection
-            .query_row("SELECT max(cursor) FROM content_change", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-
-        migrate(&connection).unwrap();
-
-        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
-        let floor: i64 = connection
-            .query_row(
-                "SELECT retained_after_cursor FROM sync_feed_state",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(floor, old_cursor);
-        for table in [
-            "thema_revision",
-            "settings_revision",
-            "review_state_revision",
-        ] {
-            let count: i64 = connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, 1, "missing {table} backfill");
-        }
-        let server_id: String = connection
-            .query_row("SELECT server_id FROM server_identity", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        migrate(&connection).unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT server_id FROM server_identity", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap(),
-            server_id
-        );
-    }
-
-    #[test]
-    fn upgrades_schema_v5_review_journal_into_the_shared_device_ledger() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/protocol/offline-review-v1.json"
-        ))
-        .unwrap();
-        let operation: OfflineReviewOperation =
-            serde_json::from_value(fixture["submission"]["operation"].clone()).unwrap();
-        let canonical_payload = serde_json::to_string(&fixture["submission"]).unwrap();
-        let payload_sha256 = format!("{:x}", sha2::Sha256::digest(canonical_payload.as_bytes()));
-        let state_json =
-            serde_json::to_string(&fixture["result"]["result"]["authoritative_state"]).unwrap();
-        let session_json = serde_json::to_string(&fixture["result"]["result"]["session"]).unwrap();
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        for migration in [
-            INITIAL_MIGRATION,
-            SERVER_MIGRATION,
-            REMOTE_REVIEW_MIGRATION,
-            OFFLINE_REVIEW_MIGRATION,
-            REPLICA_SYNC_MIGRATION,
-        ] {
-            connection.execute_batch(migration).unwrap();
-        }
-        connection
-            .execute(
-                "INSERT INTO device(
-                     device_id, name, token_digest, scopes_json, created_at_us
-                 ) VALUES ('device', 'Device', ?1, '[\"review\"]', 1)",
-                ["a".repeat(64)],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_session(
-                     session_id, source_kind, source_json, timezone, day_boundary_hour,
-                     scheduler_json, status, started_at_us, owner_device_id, review_mode
-                 ) VALUES (
-                     'session', 'manual', '{}', 'UTC', 0, '{}', 'active', 1,
-                     'device', 'offline'
-                 )",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_pack(
-                     pack_id, format_version, session_id, device_id, lease_id,
-                     status, cursor, issued_at_us, cursor_server_id, cursor_token
-                 ) SELECT 'pack', 1, 'session', 'device', 'lease', 'active', 0, 1,
-                          server_identity.server_id, sync_feed_state.retained_after_token
-                   FROM server_identity JOIN sync_feed_state ON sync_feed_state.id = 1",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO offline_review_operation(
-                     attempt_id, pack_id, device_id, device_sequence, format_version,
-                     payload_sha256, payload_json, received_at_us
-                 ) VALUES ('attempt', 'pack', 'device', 1, 1, ?1, ?2, 2)",
-                rusqlite::params![payload_sha256, canonical_payload],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO offline_review_result(
-                     attempt_id, format_version, status, conflict_reason, event_id,
-                     authoritative_state_json, session_json, cursor, reconciled_at_us,
-                     cursor_server_id, cursor_token
-                 ) SELECT 'attempt', 1, 'conflict', 'scheduling_changed', NULL,
-                          ?1, ?2, 0, 3, server_identity.server_id,
-                          sync_feed_state.retained_after_token
-                   FROM server_identity JOIN sync_feed_state ON sync_feed_state.id = 1",
-                rusqlite::params![state_json, session_json],
-            )
-            .unwrap();
-
-        migrate(&connection).unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT last_device_sequence FROM device WHERE device_id = 'device'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        let mut store = SqliteStore { connection };
-        let replay = store
-            .reconcile_offline_operation(1, &operation, &canonical_payload, Some("device"), 4)
-            .unwrap();
-        assert_eq!(replay.status, ReconciliationStatus::Conflict);
-        assert_eq!(replay.attempt_id, "attempt");
-    }
-
-    #[test]
-    fn upgrades_populated_schema_v6_content_ledger_without_changing_replay() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        for migration in [
-            INITIAL_MIGRATION,
-            SERVER_MIGRATION,
-            REMOTE_REVIEW_MIGRATION,
-            OFFLINE_REVIEW_MIGRATION,
-            REPLICA_SYNC_MIGRATION,
-            OFFLINE_CONTENT_MIGRATION,
-        ] {
-            connection.execute_batch(migration).unwrap();
-        }
-        let mut store = SqliteStore { connection };
-        let device = generate_device("Offline".into(), vec!["content:write".into()]).unwrap();
-        let device_id = device.device_id.clone();
-        store.create_device(&device, 1).unwrap();
-        let state = store.replica_state(&device_id).unwrap();
-        let org = "#+title: Preserved\n";
-        let content_sha256 = format!("{:x}", sha2::Sha256::digest(org.as_bytes()));
-        let operation = OfflineContentOperation {
-            operation_id: "operation".into(),
-            device_id: device_id.clone(),
-            device_sequence: 1,
-            cursor_server_id: state.server_id.clone(),
-            cursor: state.cursor,
-            cursor_token: state.cursor_token.clone(),
-            authored_at_us: 2,
-            mutation: OfflineContentMutation::Put {
-                document_id: "document".into(),
-                logical_path: "note.org".into(),
-                content_sha256: content_sha256.clone(),
-                org: org.into(),
-                base: ContentBase::Absent,
-            },
-        };
-        let payload = canonical_content_operation(&operation).unwrap();
-        let payload_sha256 = format!("{:x}", sha2::Sha256::digest(payload.as_bytes()));
-        let authoritative = serde_json::to_string(&AuthoritativeDocument {
-            document_id: "document".into(),
-            logical_path: "note.org".into(),
-            revision: 1,
-            content_sha256: Some(content_sha256.clone()),
-            active: true,
-        })
-        .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO device_operation VALUES (?1, ?2, 1, 'content', 1, ?3, ?4, 3)",
-                rusqlite::params![operation.operation_id, device_id, payload_sha256, payload],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO offline_content_operation VALUES (
-                     ?1, 'document', ?2, 'put_document', 'absent', NULL, NULL, NULL,
-                     ?3, ?4, ?5, 2
-                 )",
-                rusqlite::params![
-                    operation.operation_id,
-                    content_sha256,
-                    state.server_id,
-                    i64::try_from(state.cursor).unwrap(),
-                    state.cursor_token,
-                ],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO offline_content_result VALUES (
-                     ?1, 1, 'accepted', NULL, ?2, ?3, ?4, ?5, 4
-                 )",
-                rusqlite::params![
-                    operation.operation_id,
-                    authoritative,
-                    i64::try_from(state.cursor).unwrap(),
-                    state.server_id,
-                    state.cursor_token,
-                ],
-            )
-            .unwrap();
-        let chained_org = "#+title: Chained\n";
-        let chained_digest = format!("{:x}", sha2::Sha256::digest(chained_org.as_bytes()));
-        let chained = OfflineContentOperation {
-            operation_id: "chained".into(),
-            device_id: device_id.clone(),
-            device_sequence: 2,
-            cursor_server_id: state.server_id.clone(),
-            cursor: state.cursor,
-            cursor_token: state.cursor_token.clone(),
-            authored_at_us: 3,
-            mutation: OfflineContentMutation::Put {
-                document_id: "document".into(),
-                logical_path: "note.org".into(),
-                content_sha256: chained_digest.clone(),
-                org: chained_org.into(),
-                base: ContentBase::Revision {
-                    revision: 1,
-                    content_sha256: Some(content_sha256),
-                    predecessor_operation_id: Some(operation.operation_id.clone()),
-                },
-            },
-        };
-        let chained_payload = canonical_content_operation(&chained).unwrap();
-        let chained_payload_sha256 =
-            format!("{:x}", sha2::Sha256::digest(chained_payload.as_bytes()));
-        store
-            .connection
-            .execute(
-                "INSERT INTO device_operation VALUES (?1, ?2, 2, 'content', 1, ?3, ?4, 4)",
-                rusqlite::params![
-                    chained.operation_id,
-                    device_id,
-                    chained_payload_sha256,
-                    chained_payload,
-                ],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO offline_content_operation VALUES (
-                     ?1, 'document', ?2, 'put_document', 'revision', 1, ?3, ?4,
-                     ?5, ?6, ?7, 3
-                 )",
-                rusqlite::params![
-                    chained.operation_id,
-                    chained_digest,
-                    chained.base().content_sha256(),
-                    operation.operation_id,
-                    state.server_id,
-                    i64::try_from(state.cursor).unwrap(),
-                    state.cursor_token,
-                ],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO offline_content_result VALUES (
-                     ?1, 1, 'conflict', 'base_changed', ?2, ?3, ?4, ?5, 5
-                 )",
-                rusqlite::params![
-                    chained.operation_id,
-                    authoritative,
-                    i64::try_from(state.cursor).unwrap(),
-                    state.server_id,
-                    state.cursor_token,
-                ],
-            )
-            .unwrap();
-
-        migrate(&store.connection).unwrap();
-        assert_eq!(schema_version(&store.connection).unwrap(), SCHEMA_VERSION);
-        let violations: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(violations, 0);
-        let replay = store
-            .reconcile_content_operation(
-                1,
-                &operation,
-                &canonical_content_operation(&operation).unwrap(),
-                Some(&device_id),
-                5,
-                Ok((None, None)),
-            )
-            .unwrap();
-        assert_eq!(replay.status, ContentReconciliationStatus::Accepted);
-        assert_eq!(replay.authoritative.unwrap().revision, 1);
-        let replay = store
-            .reconcile_content_operation(
-                1,
-                &chained,
-                &canonical_content_operation(&chained).unwrap(),
-                Some(&device_id),
-                6,
-                Ok((None, None)),
-            )
-            .unwrap();
-        assert_eq!(replay.status, ContentReconciliationStatus::Conflict);
-    }
-
     #[test]
     fn replica_cursors_reject_other_servers_rollback_and_expiration() {
         let mut store = SqliteStore::open_in_memory().unwrap();

@@ -232,7 +232,7 @@ immutable. Normal replica synchronization never creates a review pack.
 
 * Storage
 
-Schema v12 stores native themata, tags, node associations, scheduling state,
+Schema v1 stores native themata, tags, node associations, scheduling state,
 exact review history, sessions, attempts, devices, settings, documents, and
 the node graph. It also stores replica snapshots and feed revisions, review
 packs, immutable offline operations and results, device sequence state, and
@@ -241,6 +241,10 @@ immutable journal of accepted or conflicting desired-state operations. Direct
 device mutations retain their canonical request and applied or rejected result
 under a device-scoped operation identity. Public IDs are opaque text. Imported
 numeric thema IDs are retained and new resources use UUIDv7.
+
+Server and replica databases each have one canonical schema at version 1 and
+use distinct SQLite application IDs. Startup creates that schema only for an
+empty database and rejects every other version or database identity.
 
 Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
 tracks logical paths, heads, revisions, renames, tombstones, and the monotonic

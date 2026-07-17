@@ -2882,14 +2882,10 @@ fn update_review_day(
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::{Connection, params};
-    use serde_json::json;
+    use rusqlite::params;
     use tempfile::tempdir;
 
-    use super::{
-        ATTEMPT_OPERATION_REPLAY_SQL, MAX_REVIEW_PACK_ITEMS, SqliteStore, load_offline_result,
-        load_review_pack,
-    };
+    use super::{ATTEMPT_OPERATION_REPLAY_SQL, MAX_REVIEW_PACK_ITEMS, SqliteStore};
     use crate::application::{
         AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_ID_CHARS, OfflineConflictReason,
         OfflineReviewOperation, ReconciliationStatus, ReviewAttemptMutation,
@@ -2898,10 +2894,6 @@ mod tests {
         prepare_thema, presentation_content, review_day_at, thema_content,
     };
     use crate::blob::BlobMeta;
-    use crate::store::sqlite::{
-        INITIAL_MIGRATION, OFFLINE_REVIEW_MIGRATION, REMOTE_REVIEW_MIGRATION, SERVER_MIGRATION,
-        migrate,
-    };
 
     fn add_thema_with_tags(
         store: &mut SqliteStore,
@@ -2923,133 +2915,6 @@ mod tests {
         let prepared =
             prepare_thema(Some(id.into()), content, tags, vec![], vec![], revision).unwrap();
         store.put_thema(&prepared, 20260715, 1, None).unwrap();
-    }
-
-    #[test]
-    fn v4_cursor_zero_review_records_upgrade_to_expired_durable_cursors() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON;")
-            .unwrap();
-        connection.execute_batch(INITIAL_MIGRATION).unwrap();
-        connection.execute_batch(SERVER_MIGRATION).unwrap();
-        connection.execute_batch(REMOTE_REVIEW_MIGRATION).unwrap();
-        connection.execute_batch(OFFLINE_REVIEW_MIGRATION).unwrap();
-        connection
-            .execute(
-                "INSERT INTO device(
-                     device_id, name, token_digest, scopes_json, created_at_us
-                 ) VALUES ('device', 'Device', ?1, '[\"review\"]', 1)",
-                ["a".repeat(64)],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_session(
-                     session_id, source_kind, source_json, target_count, timezone,
-                     day_boundary_hour, scheduler_json, status, started_at_us,
-                     owner_device_id, review_mode
-                 ) VALUES (
-                     'session', 'manual', ?1, 1, 'UTC', 0, '{}', 'completed', 1,
-                     'device', 'offline'
-                 )",
-                [json!({
-                    "kind":"manual", "tags":[], "exclude_tags":[],
-                    "topic_node_id":null, "topic_forward_depth":null,
-                    "topic_backward_depth":null, "manual_ids":["thema"]
-                })
-                .to_string()],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO review_pack(
-                     pack_id, format_version, session_id, device_id, lease_id,
-                     status, cursor, issued_at_us
-                 ) VALUES ('pack', 1, 'session', 'device', 'lease', 'completed', 0, 1)",
-                [],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO offline_review_operation(
-                     attempt_id, pack_id, device_id, device_sequence, format_version,
-                     payload_sha256, payload_json, received_at_us
-                 ) VALUES ('attempt', 'pack', 'device', 1, 1, ?1, '{}', 1)",
-                ["b".repeat(64)],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO offline_review_result(
-                     attempt_id, format_version, status, conflict_reason, event_id,
-                     authoritative_state_json, session_json, cursor, reconciled_at_us
-                 ) VALUES ('attempt', 1, 'conflict', 'lease_ended', NULL, ?1, ?2, 0, 1)",
-                [review_state_json(), review_session_json()],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO content_change(
-                     entity_kind, entity_id, revision, operation, created_at_us
-                 ) VALUES ('settings', 'canonical', 1, 'update', 2)",
-                [],
-            )
-            .unwrap();
-
-        migrate(&connection).unwrap();
-
-        let pack = load_review_pack(&connection, "pack").unwrap().unwrap();
-        let result = load_offline_result(&connection, "attempt")
-            .unwrap()
-            .unwrap();
-        assert_eq!(pack.cursor, 0);
-        assert_eq!(result.cursor, 0);
-        assert_eq!(pack.cursor_server_id, result.cursor_server_id);
-        assert_eq!(pack.cursor_token, result.cursor_token);
-        assert_eq!(pack.cursor_token.len(), 32);
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT last_device_sequence FROM device WHERE device_id = 'device'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
-        assert!(
-            connection
-                .execute(
-                    "UPDATE review_pack SET cursor_token = NULL WHERE pack_id = 'pack'",
-                    [],
-                )
-                .is_err()
-        );
-    }
-
-    fn review_state_json() -> String {
-        json!({
-            "state_revision":0, "review_count":0, "legacy_review_count":0,
-            "legacy_unclassified_count":0, "last_reviewed_at_us":null,
-            "last_review_day":null, "next_review_day":20260715,
-            "interval_days":null, "consecutive_successes":0, "total_successes":0,
-            "consecutive_failures":0, "total_failures":0, "suspended":false,
-            "gnosis_plus":0.35, "gnosis_minus":0.3, "gnosis_synolon":1.3
-        })
-        .to_string()
-    }
-
-    fn review_session_json() -> String {
-        json!({
-            "session_id":"session", "owner_device_id":"device", "mode":"offline",
-            "source":{"kind":"manual", "tags":[], "exclude_tags":[],
-                "topic_node_id":null, "topic_forward_depth":null,
-                "topic_backward_depth":null, "manual_ids":["thema"]},
-            "target_count":1, "status":"completed", "current_position":0,
-            "queue_length":0, "started_at_us":1
-        })
-        .to_string()
     }
 
     fn add_thema(store: &mut SqliteStore, id: &str, question: &str, revision: Option<u64>) {

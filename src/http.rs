@@ -1906,6 +1906,7 @@ impl ApiError {
             StoreError::InvalidProjection { .. } => Self::invalid_content("stored projection"),
             StoreError::CorruptData { .. }
             | StoreError::UnsupportedSchemaVersion { .. }
+            | StoreError::UnsupportedApplicationId { .. }
             | StoreError::Storage(_) => Self::internal(),
         }
     }

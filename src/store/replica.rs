@@ -15,11 +15,9 @@ use crate::application::{
     ReviewSessionMode, path_key, prepare_offline_operation, validate_org_path,
 };
 
-const INITIAL_SCHEMA: &str = include_str!("replica/0001_initial.sql");
-const OFFLINE_CONTENT_SCHEMA: &str = include_str!("replica/0002_offline_content.sql");
-const OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA: &str =
-    include_str!("replica/0003_offline_document_lifecycle.sql");
-const OFFLINE_ASSET_PUT_SCHEMA: &str = include_str!("replica/0004_offline_asset_put.sql");
+const CURRENT_SCHEMA: &str = include_str!("schema/replica_v1.sql");
+const APPLICATION_ID: u32 = 0x474e4f52;
+const SCHEMA_VERSION: u32 = 1;
 const FIRST_REQUEST: &str = "";
 
 pub(crate) struct LocalReplicaStore {
@@ -1301,44 +1299,14 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
     let version = transaction
         .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
         .map_err(LocalReplicaError::Storage)?;
-    match version {
-        0 => {
-            transaction
-                .execute_batch(INITIAL_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-            transaction
-                .execute_batch(OFFLINE_CONTENT_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-            transaction
-                .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-            transaction
-                .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-        }
-        1 => {
-            transaction
-                .execute_batch(OFFLINE_CONTENT_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-            transaction
-                .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-            transaction
-                .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-        }
-        2 => {
-            transaction
-                .execute_batch(OFFLINE_DOCUMENT_LIFECYCLE_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-            transaction
-                .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
-                .map_err(LocalReplicaError::Storage)?;
-        }
-        3 => transaction
-            .execute_batch(OFFLINE_ASSET_PUT_SCHEMA)
+    let application_id = transaction
+        .pragma_query_value(None, "application_id", |row| row.get::<_, u32>(0))
+        .map_err(LocalReplicaError::Storage)?;
+    match (version, application_id) {
+        (SCHEMA_VERSION, APPLICATION_ID) => {}
+        (0, 0) if user_schema_is_empty(&transaction)? => transaction
+            .execute_batch(CURRENT_SCHEMA)
             .map_err(LocalReplicaError::Storage)?,
-        4 => {}
         _ => return Err(LocalReplicaError::Schema),
     }
     let stored = transaction
@@ -1371,6 +1339,19 @@ fn initialize(connection: &mut Connection, device_id: &str) -> Result<(), LocalR
     };
     result?;
     transaction.commit().map_err(LocalReplicaError::Storage)
+}
+
+fn user_schema_is_empty(connection: &Connection) -> Result<bool, LocalReplicaError> {
+    connection
+        .query_row(
+            "SELECT NOT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE name NOT LIKE 'sqlite_%'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(LocalReplicaError::Storage)
 }
 
 fn sync_singleton_exists(transaction: &Transaction<'_>) -> Result<bool, LocalReplicaError> {
@@ -2947,23 +2928,9 @@ pub(crate) fn canonical_json_sha256(value: &Value) -> Result<String, LocalReplic
 mod tests {
     use std::fs;
 
-    use rusqlite::{Connection, params};
-    use serde_json::Value;
-    use sha2::{Digest as _, Sha256};
+    use rusqlite::Connection;
 
-    use super::{INITIAL_SCHEMA, LocalReplicaStore, OFFLINE_CONTENT_SCHEMA};
-    use crate::{
-        application::{
-            AuthoritativeDocument, ContentBase, ContentReconciliationStatus,
-            OfflineContentMutation, OfflineContentOperation, OfflineContentResult,
-            OfflineReviewOperation,
-        },
-        client_replica::LocalReplica,
-        protocol::{
-            canonical_content_operation, decode_review_pack, encode_cursor,
-            offline_content_result_json,
-        },
-    };
+    use super::{APPLICATION_ID, LocalReplicaStore, SCHEMA_VERSION};
 
     #[test]
     fn existing_replica_reopens_without_an_external_device_identity() {
@@ -3001,280 +2968,87 @@ mod tests {
     }
 
     #[test]
-    fn v1_upgrade_preserves_pending_review_operations_in_the_device_ledger() {
+    fn rejects_noncurrent_replica_schema_without_changes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("replica.sqlite");
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/protocol/offline-review-v1.json"
-        ))
-        .unwrap();
-        let response = serde_json::from_value(fixture["pack"].clone()).unwrap();
-        let pack = decode_review_pack(response).unwrap();
-        let operation: OfflineReviewOperation =
-            serde_json::from_value(fixture["submission"]["operation"].clone()).unwrap();
-        let pack_json = serde_json::to_string(&pack).unwrap();
-        let operation_json = serde_json::to_string(&operation).unwrap();
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(INITIAL_SCHEMA).unwrap();
         connection
-            .execute(
-                "INSERT INTO replica_identity(
-                     id, device_id, server_id, observed_server_id
-                 ) VALUES (1, 'device', ?1, ?1)",
-                [&pack.cursor_server_id],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_sync(id, cursor, next_review_sequence)
-                 VALUES (1, ?1, 2)",
-                [fixture["pack"]["pack"]["cursor"].as_str().unwrap()],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_review_pack(
-                     pack_id, session_id, device_id, server_id, cursor, pack_json
-                 ) VALUES ('pack', 'session', 'device', ?1, ?2, ?3)",
-                params![
-                    &pack.cursor_server_id,
-                    fixture["pack"]["pack"]["cursor"].as_str().unwrap(),
-                    pack_json,
-                ],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_review_operation(
-                     attempt_id, server_id, device_sequence, pack_id,
-                     session_position, operation_json
-                 ) VALUES ('attempt', ?1, 1, 'pack', 0, ?2)",
-                params![&pack.cursor_server_id, operation_json],
+            .execute_batch(
+                "CREATE TABLE marker(value TEXT);
+                 INSERT INTO marker VALUES ('preserved');
+                 PRAGMA user_version = 2;",
             )
             .unwrap();
         drop(connection);
 
-        let store = LocalReplicaStore::open(&path, "device").unwrap();
-        let pending = store.next_pending_operation().unwrap().unwrap();
-        assert_eq!(pending.operation, operation);
-        assert_eq!(store.status().unwrap().next_device_sequence, 2);
+        assert!(matches!(
+            LocalReplicaStore::open(&path, "device"),
+            Err(super::LocalReplicaError::Schema)
+        ));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM marker", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
     }
 
     #[test]
-    fn v2_upgrade_preserves_content_results_and_autoincrement_order() {
+    fn rejects_historical_replica_v1_without_the_current_identity() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("replica.sqlite");
-        let server_id = "0".repeat(32);
-        let token = "1".repeat(32);
-        let cursor = encode_cursor(&server_id, 0, &token).unwrap();
-        let first_org = "#+title: First\n";
-        let first_digest = format!("{:x}", Sha256::digest(first_org.as_bytes()));
-        let first = OfflineContentOperation {
-            operation_id: "operation".into(),
-            device_id: "device".into(),
-            device_sequence: 1,
-            cursor_server_id: server_id.clone(),
-            cursor: 0,
-            cursor_token: token.clone(),
-            authored_at_us: 1,
-            mutation: OfflineContentMutation::Put {
-                document_id: "document".into(),
-                logical_path: "note.org".into(),
-                content_sha256: first_digest.clone(),
-                org: first_org.into(),
-                base: ContentBase::Absent,
-            },
-        };
-        let first_json = canonical_content_operation(&first).unwrap();
-        let result_json = serde_json::to_string(
-            &offline_content_result_json(&OfflineContentResult {
-                operation_id: first.operation_id.clone(),
-                format_version: 1,
-                status: ContentReconciliationStatus::Accepted,
-                conflict_reason: None,
-                authoritative: Some(AuthoritativeDocument {
-                    document_id: "document".into(),
-                    logical_path: "note.org".into(),
-                    revision: 1,
-                    content_sha256: Some(first_digest.clone()),
-                    active: true,
-                }),
-                cursor: 0,
-                cursor_server_id: server_id.clone(),
-                cursor_token: token.clone(),
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let pending_org = "#+title: Pending\n";
-        let pending_digest = format!("{:x}", Sha256::digest(pending_org.as_bytes()));
-        let pending = OfflineContentOperation {
-            operation_id: "pending".into(),
-            device_id: "device".into(),
-            device_sequence: 2,
-            cursor_server_id: server_id.clone(),
-            cursor: 0,
-            cursor_token: token.clone(),
-            authored_at_us: 2,
-            mutation: OfflineContentMutation::Put {
-                document_id: "document".into(),
-                logical_path: "note.org".into(),
-                content_sha256: pending_digest.clone(),
-                org: pending_org.into(),
-                base: ContentBase::Revision {
-                    revision: 1,
-                    content_sha256: Some(first_digest.clone()),
-                    predecessor_operation_id: Some(first.operation_id.clone()),
-                },
-            },
-        };
-        let pending_json = canonical_content_operation(&pending).unwrap();
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(INITIAL_SCHEMA).unwrap();
-        connection.execute_batch(OFFLINE_CONTENT_SCHEMA).unwrap();
         connection
-            .execute(
-                "INSERT INTO replica_identity(id, device_id, server_id, observed_server_id)
-                 VALUES (1, 'device', ?1, ?1)",
-                [&server_id],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_sync(id, cursor, next_device_sequence)
-                 VALUES (1, ?1, 3)",
-                [&cursor],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_device_operation
-                 VALUES ('operation', ?1, 1, 'content', ?2)",
-                params![server_id, first_json],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_content_operation VALUES (
-                     'operation', 'document', ?1, 'absent', NULL, NULL, NULL,
-                     ?2
-                 )",
-                params![first_digest, first_json],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_content_result(
-                     result_sequence, operation_id, status, conflict_reason, result_json
-                 ) VALUES (7, 'operation', 'accepted', NULL, ?1)",
-                [&result_json],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_device_operation
-                 VALUES ('pending', ?1, 2, 'content', ?2)",
-                params![server_id, pending_json],
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO replica_content_operation VALUES (
-                     'pending', 'document', ?1, 'revision', 1, ?2, 'operation',
-                     ?3
-                 )",
-                params![pending_digest, first_digest, pending_json],
+            .execute_batch(
+                "CREATE TABLE replica_identity(
+                     id INTEGER PRIMARY KEY, device_id TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
             )
             .unwrap();
         drop(connection);
 
-        let store = LocalReplicaStore::open(&path, "device").unwrap();
-        let preserved: (String, String, String) = store
-            .connection
-            .query_row(
-                "SELECT operation.mutation, operation.operation_json, result.result_json
-                 FROM replica_content_operation AS operation
-                 JOIN replica_content_result AS result USING(operation_id)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            preserved,
-            (
-                "put_document".into(),
-                first_json.clone(),
-                result_json.clone()
-            )
-        );
-        let violations: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(violations, 0);
-        assert_eq!(
-            store
-                .next_pending_content_operation()
-                .unwrap()
-                .unwrap()
-                .canonical_payload,
-            pending_json
-        );
-        drop(store);
+        assert!(matches!(
+            LocalReplicaStore::open(&path, "device"),
+            Err(super::LocalReplicaError::Schema)
+        ));
+    }
 
-        let replica = LocalReplica::open(&path, "device").unwrap();
-        assert_eq!(
-            replica
-                .next_content_upload()
-                .unwrap()
-                .unwrap()
-                .operation_id(),
-            "pending"
-        );
-        let results = replica.content_results(None, 10).unwrap();
-        assert_eq!(results.items.len(), 1);
-        assert_eq!(results.items[0].operation_id, "operation");
-        drop(replica);
-
+    #[test]
+    fn current_replica_schema_is_v1() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replica.sqlite");
         let store = LocalReplicaStore::open(&path, "device").unwrap();
-        store
+
+        let version: u32 = store
             .connection
-            .execute(
-                "INSERT INTO replica_device_operation
-                 VALUES ('operation-2', ?1, 3, 'content', 'operation-json-2')",
-                [&server_id],
-            )
+            .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        store
+        let application_id: u32 = store
             .connection
-            .execute(
-                "INSERT INTO replica_content_operation VALUES (
-                     'operation-2', 'document-2', 'put_document', 'document-2.org',
-                     ?1, 'absent', NULL, NULL, NULL, 'operation-json-2'
-                 )",
-                ["b".repeat(64)],
-            )
+            .pragma_query_value(None, "application_id", |row| row.get(0))
             .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO replica_content_result(
-                     operation_id, status, conflict_reason, result_json
-                 ) VALUES ('operation-2', 'accepted', NULL, 'result-json-2')",
-                [],
-            )
-            .unwrap();
-        let sequence: i64 = store
-            .connection
-            .query_row(
-                "SELECT result_sequence FROM replica_content_result
-                 WHERE operation_id = 'operation-2'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(sequence, 8);
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(application_id, APPLICATION_ID);
+        for table in [
+            "replica_projection",
+            "replica_device_operation",
+            "replica_content_operation",
+            "replica_asset_operation",
+        ] {
+            let present: bool = store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+                     )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(present, "missing {table}");
+        }
     }
 }
