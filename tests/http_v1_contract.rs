@@ -7,9 +7,9 @@ use gnosis_core::protocol::http_v1::{
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
-    ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
-    SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaWriteRequestV1,
-    UpdateSettingsRequestV1,
+    ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, ReviewStateV1,
+    SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1,
+    ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -283,6 +283,13 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         .unwrap()
         .remove("revealed_answer");
     assert!(serde_json::from_value::<ReviewAttemptV1>(missing_null).is_err());
+
+    assert_round_trip::<ReviewStateV1>(review_state_wire());
+    for field in ["stability", "difficulty"] {
+        let mut missing_state = review_state_wire();
+        missing_state.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<ReviewStateV1>(missing_state).is_err());
+    }
 }
 
 #[test]
@@ -342,6 +349,14 @@ fn public_offline_review_dtos_preserve_v1_requests_and_v2_responses() {
         serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
 
     assert_reencodes::<OfflineReviewOperationEnvelopeV1>(fixture["submission"].clone());
+    for field in ["stability", "difficulty"] {
+        let mut missing_state = fixture["submission"].clone();
+        missing_state["operation"]["proposed_transition"]["before"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(serde_json::from_value::<OfflineReviewOperationEnvelopeV1>(missing_state).is_err());
+    }
     assert_round_trip::<ReviewPackEnvelopeV2>(fixture["pack"].clone());
     assert_round_trip::<OfflineReviewResultEnvelopeV2>(fixture["result"].clone());
     assert_round_trip::<ActiveReviewPackEnvelopeV2>(json!({"version":2,"pack":null}));
@@ -719,6 +734,15 @@ fn settings_wire(include_output_fields: bool) -> Value {
     } else {
         json!({"timezone":"Europe/Athens","day_boundary_hour":0,"desired_retention":0.9})
     }
+}
+
+fn review_state_wire() -> Value {
+    json!({
+        "state_revision":0,"review_count":0,"last_reviewed_at_us":null,
+        "last_review_day":null,"next_review_day":20260715,"interval_days":null,
+        "total_successes":0,"total_failures":0,"suspended":false,
+        "stability":null,"difficulty":null
+    })
 }
 
 fn review_attempt_result() -> Value {

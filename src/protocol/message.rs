@@ -492,7 +492,7 @@ impl From<FsrsConfigSnapshot> for LocalFsrsConfigView {
             }
             .into(),
             model: match value.model {
-                FsrsModelSnapshot::Six => "fsrs_6",
+                FsrsModelSnapshot::Six => "fsrs6",
             }
             .into(),
             implementation: match value.implementation {
@@ -986,10 +986,18 @@ pub enum MessageValidationError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ErrorCode, MAX_REQUEST_ID_LEN, MAX_REVIEW_ID_LEN, MessageValidationError, ProtocolError,
-        Request, RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult,
-        ReviewSourceInput, ReviewSourceKindInput, SystemInfo,
+        ErrorCode, LocalFsrsConfigView, MAX_REQUEST_ID_LEN, MAX_REVIEW_ID_LEN,
+        MessageValidationError, ProtocolError, Request, RequestEnvelope, ResponseEnvelope,
+        ResponseOutcome, ResponseResult, ReviewSourceInput, ReviewSourceKindInput, SystemInfo,
     };
+
+    #[test]
+    fn local_fsrs_model_identity_matches_other_transports() {
+        let config = LocalFsrsConfigView::from(crate::application::FsrsConfigSnapshot::default());
+        assert_eq!(config.algorithm, "fsrs");
+        assert_eq!(config.model, "fsrs6");
+        assert_eq!(config.implementation, "fsrs-6.6.1");
+    }
 
     #[test]
     fn request_round_trips_with_versioned_method() {

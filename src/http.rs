@@ -3513,6 +3513,11 @@ mod tests {
     #[test]
     fn openapi_types_review_attempt_operations_exactly() {
         let api = openapi_document();
+        let required = api["components"]["schemas"]["ReviewStateV1"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.contains(&json!("stability")));
+        assert!(required.contains(&json!("difficulty")));
         let sessions = &api["paths"]["/v1/review/sessions"]["post"];
         assert_eq!(sessions["x-gnosis-required-scopes"], json!(["review"]));
         assert_eq!(
@@ -3769,6 +3774,11 @@ mod tests {
     #[test]
     fn openapi_offline_review_contracts_are_exact() {
         let api = openapi_document();
+        let required = api["components"]["schemas"]["OfflineReviewStateV1"]["required"]
+            .as_array()
+            .unwrap();
+        assert!(required.contains(&json!("stability")));
+        assert!(required.contains(&json!("difficulty")));
         let paths = &api["paths"];
         let create = &paths["/v1/review/packs"]["post"];
         assert_eq!(create["x-gnosis-required-scopes"], json!(["review"]));

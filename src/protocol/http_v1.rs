@@ -511,7 +511,11 @@ pub struct ReviewStateV1 {
     pub total_successes: u64,
     pub total_failures: u64,
     pub suspended: bool,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub stability: Option<f32>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(required)]
     pub difficulty: Option<f32>,
 }
 

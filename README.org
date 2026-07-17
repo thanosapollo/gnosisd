@@ -363,10 +363,9 @@ content from reappearing. Assets are SHA-256 addressed and deduplicated. An
 offline asset blob is uploaded and verified before its sequenced create
 operation, and dependent Org revisions remain behind it in the outbox.
 
-Check live Elisp parity read-only:
+Check live Org parsing parity read-only:
 
 #+begin_src sh
-tools/check-review-parity.sh
 tools/check-org-parity.sh tests/fixtures/org/basic.org
 tools/check-org-parity.sh tests/fixtures/org/no-file-id.org
 tools/check-org-parity.sh tests/fixtures/org/duplicate-links.org
@@ -416,7 +415,6 @@ cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo tree --depth 1
 nix build
-tools/check-review-parity.sh
 for fixture in basic no-file-id duplicate-links unicode compatibility; do
   tools/check-org-parity.sh "tests/fixtures/org/$fixture.org"
 done
