@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -12,18 +10,18 @@ use super::{
 };
 use crate::{
     application::{
-        AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, MAX_REVIEW_PACK_ITEMS,
-        OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot,
-        PresentationSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
-        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
-        ReviewAttemptView, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
-        ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
-        ReviewStateSnapshot, TransitionSnapshot, presentation_content, review_day_at,
-        review_question, validate_offline_thema_assets, validate_review_pack_projection,
+        AnswerInput, FsrsConfigSnapshot, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES,
+        MAX_REVIEW_PACK_ITEMS, OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult,
+        PresentationSnapshot, RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation,
+        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
+        ReviewAttemptState, ReviewAttemptView, ReviewOperationAuthority, ReviewPackAsset,
+        ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource,
+        ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, presentation_content,
+        review_day_at, review_question, validate_offline_thema_assets,
+        validate_review_pack_projection,
     },
     domain::{
-        ClozeCheck, GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition,
-        fuzz_delta, grade,
+        ClozeCheck, GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition, grade,
     },
 };
 
@@ -352,13 +350,13 @@ impl SqliteStore {
         let state = load_review_state(&self.connection, &thema_id)?;
         let presentation = presentation(&thema);
         require_safe_review_question(&presentation, require_safe_question)?;
-        let parameters = resolved_parameters(&self.connection, session_id, &thema.tags)?;
+        let config = resolved_config(&self.connection, session_id)?;
         let attempt_id = Uuid::now_v7().to_string();
         self.connection
             .execute(
                 "INSERT INTO review_attempt(
                  attempt_id, session_id, session_position, thema_id, thema_revision, state_revision,
-                 content_sha256, presentation_json, parameters_json, matcher_version,
+                 content_sha256, presentation_json, config_json, matcher_version,
                  desired_suspended, status, started_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'pending', ?11)",
                 params![
@@ -370,7 +368,7 @@ impl SqliteStore {
                     u64_to_i64(state.state_revision, "state revision")?,
                     thema.content_sha256,
                     serde_json::to_string(&presentation).map_err(StoreError::storage)?,
-                    serde_json::to_string(&ParametersSnapshot::from(&parameters))
+                    serde_json::to_string(&FsrsConfigSnapshot::from(&config))
                         .map_err(StoreError::storage)?,
                     i64::from(state.suspended),
                     u64_to_i64(started_at_us, "attempt start")?,
@@ -386,7 +384,6 @@ impl SqliteStore {
         actor_device_id: Option<&str>,
         response: &AnswerInput,
         answered_at_us: u64,
-        fuzz_sample: f64,
     ) -> Result<ReviewAttemptView, StoreError> {
         let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
         require_session_actor(
@@ -416,23 +413,17 @@ impl SqliteStore {
                 }
             })?;
         let state = load_review_state(&self.connection, &row.thema_id)?;
-        let parameters = row.parameters.clone().into();
+        let config = row.config.clone().into();
         let (timezone, boundary) = session_clock(&self.connection, &row.session_id)?;
         let review_day =
             review_day_at(answered_at_us, &timezone, boundary).map_err(StoreError::storage)?;
-        let transition = transition_with_sample(
-            &state,
-            &parameters,
-            result.success,
-            review_day,
-            answered_at_us,
-            fuzz_sample,
-        )?;
+        let transition =
+            compute_review_transition(&state, &config, result.success, review_day, answered_at_us)?;
         self.connection
             .execute(
                 "UPDATE review_attempt SET response_json = ?2, detected_success = ?3,
-                 accepted_success = ?3, proposed_transition_json = ?4, fuzz_sample = ?5,
-                 status = 'graded', answered_at_us = ?6,
+                 accepted_success = ?3, proposed_transition_json = ?4,
+                 status = 'graded', answered_at_us = ?5,
                  mutation_revision = mutation_revision + 1 WHERE attempt_id = ?1",
                 params![
                     attempt_id,
@@ -440,7 +431,6 @@ impl SqliteStore {
                     i64::from(result.success),
                     serde_json::to_string(&TransitionSnapshot::from(&transition))
                         .map_err(StoreError::storage)?,
-                    fuzz_sample,
                     u64_to_i64(answered_at_us, "answer timestamp")?,
                 ],
             )
@@ -867,10 +857,10 @@ fn operation_matches_item(operation: &OfflineReviewOperation, item: &ReviewPackI
         && operation.base_state_revision == item.review_state.state_revision
         && operation.content_sha256 == item.content_sha256
         && operation.presentation == item.presentation
-        && operation.parameters == item.parameters
+        && operation.config == item.config
         && operation.matcher_version == item.matcher_version
         && operation.proposed_transition.before == item.review_state
-        && operation.proposed_transition.parameters == item.parameters
+        && operation.proposed_transition.config == item.config
 }
 
 fn operation_transition_is_valid(
@@ -903,14 +893,13 @@ fn operation_transition_is_valid(
     let parity = (operation.detected_success == operation.accepted_success)
         == operation.override_count.is_multiple_of(2);
     let before: crate::domain::ReviewState = operation.proposed_transition.before.clone().into();
-    let parameters = operation.parameters.clone().into();
-    let Ok(expected) = transition_with_sample(
+    let parameters = operation.config.clone().into();
+    let Ok(expected) = compute_review_transition(
         &before,
         &parameters,
         operation.accepted_success,
         operation.proposed_transition.review_day,
         operation.answered_at_us,
-        operation.fuzz_sample,
     ) else {
         return false;
     };
@@ -993,14 +982,13 @@ fn authoritative_transition(
     operation: &OfflineReviewOperation,
     state: &crate::domain::ReviewState,
 ) -> Result<TransitionSnapshot, StoreError> {
-    let parameters = operation.parameters.clone().into();
-    let transition = transition_with_sample(
+    let parameters = operation.config.clone().into();
+    let transition = compute_review_transition(
         state,
         &parameters,
         operation.accepted_success,
         operation.proposed_transition.review_day,
         operation.answered_at_us,
-        operation.fuzz_sample,
     )?;
     Ok((&transition).into())
 }
@@ -1017,13 +1005,12 @@ fn offline_attempt_row(
         state_revision: operation.base_state_revision,
         content_sha256: operation.content_sha256.clone(),
         presentation: operation.presentation.clone(),
-        parameters: operation.parameters.clone(),
+        config: operation.config.clone(),
         matcher_version: operation.matcher_version,
         response: Some(operation.response.clone()),
         detected_success: Some(operation.detected_success),
         accepted_success: Some(operation.accepted_success),
         override_count: operation.override_count,
-        fuzz_sample: Some(operation.fuzz_sample),
         transition: Some(transition),
         desired_suspended: operation.desired_suspended,
         status: "graded".into(),
@@ -1040,13 +1027,13 @@ fn insert_accepted_attempt(
         .execute(
             "INSERT INTO review_attempt(
                  attempt_id, session_id, session_position, thema_id, thema_revision,
-                 state_revision, content_sha256, presentation_json, parameters_json,
+                 state_revision, content_sha256, presentation_json, config_json,
                  matcher_version, response_json, detected_success, accepted_success,
-                 override_count, fuzz_sample, proposed_transition_json, desired_suspended,
+                 override_count, proposed_transition_json, desired_suspended,
                  status, started_at_us, answered_at_us
              ) VALUES (
                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                 ?14, ?15, ?16, ?17, 'graded', ?18, ?18
+                 ?14, ?15, ?16, 'graded', ?17, ?17
              )",
             params![
                 operation.attempt_id,
@@ -1057,13 +1044,12 @@ fn insert_accepted_attempt(
                 u64_to_i64(operation.base_state_revision, "state revision")?,
                 operation.content_sha256,
                 serde_json::to_string(&operation.presentation).map_err(StoreError::storage)?,
-                serde_json::to_string(&operation.parameters).map_err(StoreError::storage)?,
+                serde_json::to_string(&operation.config).map_err(StoreError::storage)?,
                 i64::from(operation.matcher_version),
                 serde_json::to_string(&operation.response).map_err(StoreError::storage)?,
                 i64::from(operation.detected_success),
                 i64::from(operation.accepted_success),
                 i64::from(operation.override_count),
-                operation.fuzz_sample,
                 serde_json::to_string(transition).map_err(StoreError::storage)?,
                 i64::from(operation.desired_suspended),
                 u64_to_i64(operation.answered_at_us, "answer timestamp")?
@@ -1225,18 +1211,7 @@ fn cursor_identity_at_head(connection: &Connection) -> Result<(u64, String, Stri
 struct CapturedSettings {
     timezone: String,
     day_boundary_hour: u8,
-    global: ParametersSnapshot,
-    rules: BTreeMap<String, Rule>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct Rule {
-    amnesia: Option<f64>,
-    epignosis: Option<f64>,
-    agnoia: Option<f64>,
-    anagnosis: Option<u64>,
-    lethe: Option<u64>,
-    proto: Option<Vec<u32>>,
+    scheduler: FsrsConfigSnapshot,
 }
 
 struct PackIds {
@@ -1372,7 +1347,7 @@ fn capture_pack_item(
 ) -> Result<ReviewPackItem, StoreError> {
     let thema = load_thema(connection, thema_id)?.ok_or(StoreError::NotFound)?;
     let state = load_review_state(connection, thema_id)?;
-    let parameters = resolved_parameters(connection, session_id, &thema.tags)?;
+    let config = resolved_config(connection, session_id)?;
     validate_offline_thema_assets(&thema.content).map_err(|_| StoreError::InvalidReviewState)?;
     let presentation = presentation(&thema);
     Ok(ReviewPackItem {
@@ -1382,7 +1357,7 @@ fn capture_pack_item(
         content_sha256: thema.content_sha256,
         presentation,
         review_state: (&state).into(),
-        parameters: (&parameters).into(),
+        config: (&config).into(),
         matcher_version: MATCHER_VERSION,
         asset_paths: thema.asset_paths,
     })
@@ -1447,36 +1422,26 @@ fn insert_pack_assets(
 }
 
 fn captured_settings(connection: &Connection) -> Result<CapturedSettings, StoreError> {
-    let (timezone, boundary, version, scheduler): (String, i64, i64, String) = connection.query_row(
-        "SELECT timezone, day_boundary_hour, scheduler_version, scheduler_json FROM settings WHERE id = 1",
-        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    ).map_err(StoreError::storage)?;
-    let mut global: ParametersSnapshot =
-        serde_json::from_str(&scheduler).map_err(StoreError::storage)?;
-    global.scheduler_version = to_u32(version, "scheduler version")?;
-    let mut statement = connection
-        .prepare("SELECT tag, parameters_json FROM tag_rule ORDER BY tag")
+    let (timezone, boundary, scheduler): (String, i64, String) = connection
+        .query_row(
+            "SELECT timezone, day_boundary_hour, scheduler_json FROM settings WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
         .map_err(StoreError::storage)?;
-    let rules = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(StoreError::storage)?
-        .map(|row| {
-            let (tag, value) = row.map_err(StoreError::storage)?;
-            Ok((
-                tag,
-                serde_json::from_str(&value).map_err(StoreError::storage)?,
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, StoreError>>()?;
+    let scheduler: FsrsConfigSnapshot =
+        serde_json::from_str(&scheduler).map_err(StoreError::storage)?;
+    if !scheduler.valid() {
+        return Err(StoreError::CorruptData {
+            field: "FSRS configuration",
+        });
+    }
     Ok(CapturedSettings {
         timezone,
         day_boundary_hour: u8::try_from(boundary).map_err(|_| StoreError::CorruptData {
             field: "day boundary",
         })?,
-        global,
-        rules,
+        scheduler,
     })
 }
 
@@ -1964,82 +1929,70 @@ pub(super) fn load_review_state(
     connection: &Connection,
     thema_id: &str,
 ) -> Result<crate::domain::ReviewState, StoreError> {
-    let snapshot = connection
+    type RawState = (
+        i64,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        Option<i64>,
+        i64,
+        i64,
+        bool,
+        Option<f32>,
+        Option<f32>,
+    );
+    let row: RawState = connection
         .query_row(
-            "SELECT state_revision, review_count, legacy_review_count, legacy_unclassified_count,
-                last_reviewed_at_us, last_review_day, next_review_day, interval_days,
-                consecutive_successes, total_successes, consecutive_failures, total_failures,
-                suspended, gnosis_plus, gnosis_minus, gnosis_synolon
-         FROM review_state WHERE thema_id = ?1",
+            "SELECT state_revision, review_count, last_reviewed_at_us, last_review_day,
+                next_review_day, interval_days, total_successes, total_failures,
+                suspended, stability, difficulty
+             FROM review_state WHERE thema_id = ?1",
             [thema_id],
             |row| {
-                Ok(ReviewStateSnapshot {
-                    state_revision: super::row_u64(row, 0)?,
-                    review_count: super::row_u64(row, 1)?,
-                    legacy_review_count: super::row_u64(row, 2)?,
-                    legacy_unclassified_count: super::row_u64(row, 3)?,
-                    last_reviewed_at_us: row
-                        .get::<_, Option<i64>>(4)?
-                        .map(u64::try_from)
-                        .transpose()
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                rusqlite::types::Type::Integer,
-                                Box::new(e),
-                            )
-                        })?,
-                    last_review_day: row
-                        .get::<_, Option<i64>>(5)?
-                        .map(u32::try_from)
-                        .transpose()
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                5,
-                                rusqlite::types::Type::Integer,
-                                Box::new(e),
-                            )
-                        })?,
-                    next_review_day: u32::try_from(row.get::<_, i64>(6)?).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            6,
-                            rusqlite::types::Type::Integer,
-                            Box::new(e),
-                        )
-                    })?,
-                    interval_days: row
-                        .get::<_, Option<i64>>(7)?
-                        .map(u32::try_from)
-                        .transpose()
-                        .map_err(|e| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                7,
-                                rusqlite::types::Type::Integer,
-                                Box::new(e),
-                            )
-                        })?,
-                    consecutive_successes: super::row_u64(row, 8)?,
-                    total_successes: super::row_u64(row, 9)?,
-                    consecutive_failures: super::row_u64(row, 10)?,
-                    total_failures: super::row_u64(row, 11)?,
-                    suspended: row.get::<_, bool>(12)?,
-                    gnosis_plus: row.get(13)?,
-                    gnosis_minus: row.get(14)?,
-                    gnosis_synolon: row.get(15)?,
-                })
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
             },
         )
         .optional()
         .map_err(StoreError::storage)?
         .ok_or(StoreError::NotFound)?;
+    let optional_u64 =
+        |value: Option<i64>, field| value.map(|value| to_u64(value, field)).transpose();
+    let optional_u32 =
+        |value: Option<i64>, field| value.map(|value| to_u32(value, field)).transpose();
+    let snapshot = ReviewStateSnapshot {
+        state_revision: to_u64(row.0, "state revision")?,
+        review_count: to_u64(row.1, "review count")?,
+        last_reviewed_at_us: optional_u64(row.2, "last review timestamp")?,
+        last_review_day: optional_u32(row.3, "last review day")?,
+        next_review_day: to_u32(row.4, "next review day")?,
+        interval_days: optional_u32(row.5, "review interval")?,
+        total_successes: to_u64(row.6, "total successes")?,
+        total_failures: to_u64(row.7, "total failures")?,
+        suspended: row.8,
+        stability: row.9,
+        difficulty: row.10,
+    };
+    crate::domain::validate_state(&snapshot.clone().into()).map_err(StoreError::storage)?;
     Ok(snapshot.into())
 }
 
-fn resolved_parameters(
+fn resolved_config(
     connection: &Connection,
     session_id: &str,
-    tags: &[String],
-) -> Result<crate::domain::SchedulerParameters, StoreError> {
+) -> Result<crate::domain::fsrs::FsrsConfigSnapshot, StoreError> {
     let captured: String = connection
         .query_row(
             "SELECT scheduler_json FROM review_session WHERE session_id = ?1",
@@ -2049,42 +2002,12 @@ fn resolved_parameters(
         .map_err(StoreError::storage)?;
     let captured: CapturedSettings =
         serde_json::from_str(&captured).map_err(StoreError::storage)?;
-    let rules = tags
-        .iter()
-        .filter_map(|tag| captured.rules.get(tag))
-        .collect::<Vec<_>>();
-    let mut parameters = captured.global;
-    parameters.amnesia = rule_max(&rules, |rule| rule.amnesia).unwrap_or(parameters.amnesia);
-    parameters.epignosis = rule_max(&rules, |rule| rule.epignosis).unwrap_or(parameters.epignosis);
-    parameters.agnoia = rule_max(&rules, |rule| rule.agnoia).unwrap_or(parameters.agnoia);
-    parameters.anagnosis = rule_min(&rules, |rule| rule.anagnosis).unwrap_or(parameters.anagnosis);
-    parameters.lethe = rule_min(&rules, |rule| rule.lethe).unwrap_or(parameters.lethe);
-    let proto = rules
-        .iter()
-        .filter_map(|rule| rule.proto.as_deref())
-        .collect::<Vec<_>>();
-    if !proto.is_empty() {
-        parameters.proto.clear();
-        for values in proto {
-            merge_proto(&mut parameters.proto, values);
-        }
+    if !captured.scheduler.valid() {
+        return Err(StoreError::CorruptData {
+            field: "FSRS configuration",
+        });
     }
-    Ok(parameters.into())
-}
-
-fn rule_max(rules: &[&Rule], value: impl Fn(&Rule) -> Option<f64>) -> Option<f64> {
-    rules.iter().filter_map(|rule| value(rule)).reduce(f64::max)
-}
-
-fn rule_min(rules: &[&Rule], value: impl Fn(&Rule) -> Option<u64>) -> Option<u64> {
-    rules.iter().filter_map(|rule| value(rule)).min()
-}
-
-fn merge_proto(current: &mut Vec<u32>, override_values: &[u32]) {
-    current.resize(current.len().max(override_values.len()), 0);
-    for (index, value) in override_values.iter().enumerate() {
-        current[index] = current[index].max(*value);
-    }
+    Ok(captured.scheduler.into())
 }
 
 #[derive(Clone)]
@@ -2096,13 +2019,13 @@ struct AttemptRow {
     state_revision: u64,
     content_sha256: String,
     presentation: PresentationSnapshot,
-    parameters: ParametersSnapshot,
+    config: FsrsConfigSnapshot,
     matcher_version: u32,
     response: Option<AnswerInput>,
     detected_success: Option<bool>,
     accepted_success: Option<bool>,
     override_count: u32,
-    fuzz_sample: Option<f64>,
+
     transition: Option<TransitionSnapshot>,
     desired_suspended: bool,
     status: String,
@@ -2116,8 +2039,8 @@ fn load_attempt_row(
     let row = connection
         .query_row(
             "SELECT attempt_id, session_id, thema_id, thema_revision, state_revision, content_sha256,
-                presentation_json, parameters_json, matcher_version, response_json, detected_success,
-                accepted_success, override_count, fuzz_sample, proposed_transition_json,
+                presentation_json, config_json, matcher_version, response_json, detected_success,
+                accepted_success, override_count, proposed_transition_json,
                 desired_suspended, status, mutation_revision
          FROM review_attempt WHERE attempt_id = ?1",
             [attempt_id],
@@ -2136,11 +2059,10 @@ fn load_attempt_row(
                     row.get::<_, Option<bool>>(10)?,
                     row.get::<_, Option<bool>>(11)?,
                     row.get::<_, i64>(12)?,
-                    row.get::<_, Option<f64>>(13)?,
-                    row.get::<_, Option<String>>(14)?,
-                    row.get::<_, bool>(15)?,
-                    row.get::<_, String>(16)?,
-                    row.get::<_, i64>(17)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, bool>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, i64>(16)?,
                 ))
             },
         )
@@ -2163,7 +2085,6 @@ type RawAttemptRow = (
     Option<bool>,
     Option<bool>,
     i64,
-    Option<f64>,
     Option<String>,
     bool,
     String,
@@ -2179,7 +2100,7 @@ fn materialize_attempt_row(row: RawAttemptRow) -> Result<AttemptRow, StoreError>
         state_revision: to_u64(row.4, "attempt state revision")?,
         content_sha256: row.5,
         presentation: serde_json::from_str(&row.6).map_err(StoreError::storage)?,
-        parameters: serde_json::from_str(&row.7).map_err(StoreError::storage)?,
+        config: serde_json::from_str(&row.7).map_err(StoreError::storage)?,
         matcher_version: to_u32(row.8, "attempt matcher version")?,
         response: row
             .9
@@ -2189,15 +2110,14 @@ fn materialize_attempt_row(row: RawAttemptRow) -> Result<AttemptRow, StoreError>
         detected_success: row.10,
         accepted_success: row.11,
         override_count: to_u32(row.12, "override count")?,
-        fuzz_sample: row.13,
         transition: row
-            .14
+            .13
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(StoreError::storage)?,
-        desired_suspended: row.15,
-        status: row.16,
-        mutation_revision: to_u64(row.17, "attempt mutation revision")?,
+        desired_suspended: row.14,
+        status: row.15,
+        mutation_revision: to_u64(row.16, "attempt mutation revision")?,
     })
 }
 
@@ -2223,14 +2143,13 @@ fn override_review_attempt_in(
         .as_ref()
         .ok_or(StoreError::InvalidReviewState)?;
     let state = load_review_state(connection, &row.thema_id)?;
-    let parameters = row.parameters.clone().into();
-    let transition = transition_with_sample(
+    let config = row.config.clone().into();
+    let transition = compute_review_transition(
         &state,
-        &parameters,
+        &config,
         accepted,
         previous.review_day,
         previous.reviewed_at_us,
-        row.fuzz_sample.ok_or(StoreError::InvalidReviewState)?,
     )?;
     connection
         .execute(
@@ -2489,13 +2408,12 @@ fn set_attempt_accepted_success(
         .as_ref()
         .ok_or(StoreError::InvalidReviewState)?;
     let state = load_review_state(connection, &row.thema_id)?;
-    let transition = transition_with_sample(
+    let transition = compute_review_transition(
         &state,
-        &row.parameters.clone().into(),
+        &row.config.clone().into(),
         accepted,
         previous.review_day,
         previous.reviewed_at_us,
-        row.fuzz_sample.ok_or(StoreError::InvalidReviewState)?,
     )?;
     update_attempt_acceptance(connection, row, accepted, &transition)?;
     Ok(true)
@@ -2697,31 +2615,15 @@ fn session_clock(connection: &Connection, session_id: &str) -> Result<(String, u
     ))
 }
 
-fn transition_with_sample(
+fn compute_review_transition(
     state: &crate::domain::ReviewState,
-    parameters: &crate::domain::SchedulerParameters,
+    config: &crate::domain::fsrs::FsrsConfigSnapshot,
     success: bool,
     review_day: u32,
     reviewed_at_us: u64,
-    sample: f64,
 ) -> Result<crate::domain::Transition, StoreError> {
-    let probe = compute_transition(state, parameters, success, review_day, reviewed_at_us, 0.0)
-        .map_err(StoreError::storage)?;
-    let delta = fuzz_delta(
-        probe.algorithm_interval_days,
-        parameters.interval_fuzz,
-        sample,
-    )
-    .map_err(StoreError::storage)?;
-    compute_transition(
-        state,
-        parameters,
-        success,
-        review_day,
-        reviewed_at_us,
-        delta,
-    )
-    .map_err(StoreError::storage)
+    compute_transition(state, config, success, review_day, reviewed_at_us)
+        .map_err(StoreError::storage)
 }
 
 fn committed_event(
@@ -2748,10 +2650,9 @@ fn commit_state(
         .execute(
             "UPDATE review_state SET state_revision = ?2, review_count = ?3,
              last_reviewed_at_us = ?4, last_review_day = ?5, next_review_day = ?6,
-             interval_days = ?7, consecutive_successes = ?8, total_successes = ?9,
-             consecutive_failures = ?10, total_failures = ?11, suspended = ?12,
-             gnosis_plus = ?13, gnosis_minus = ?14, gnosis_synolon = ?15
-         WHERE thema_id = ?1 AND state_revision = ?16",
+             interval_days = ?7, total_successes = ?8, total_failures = ?9,
+             suspended = ?10, stability = ?11, difficulty = ?12
+             WHERE thema_id = ?1 AND state_revision = ?13",
             params![
                 row.thema_id,
                 after.state_revision,
@@ -2760,14 +2661,11 @@ fn commit_state(
                 after.last_review_day,
                 after.next_review_day,
                 after.interval_days,
-                after.consecutive_successes,
                 after.total_successes,
-                after.consecutive_failures,
                 after.total_failures,
                 i64::from(after.suspended),
-                after.gnosis_plus,
-                after.gnosis_minus,
-                after.gnosis_synolon,
+                after.stability,
+                after.difficulty,
                 row.state_revision,
             ],
         )
@@ -2790,7 +2688,7 @@ fn insert_review_event(
             "INSERT INTO review_event(
              event_id, attempt_id, thema_id, session_id, reviewed_at_us, review_day,
              matcher_version, response_json, detected_success, accepted_success,
-             override_count, scheduler_version, transition_json
+             override_count, config_json, transition_json
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 event_id,
@@ -2804,7 +2702,7 @@ fn insert_review_event(
                 i64::from(row.detected_success.ok_or(StoreError::InvalidReviewState)?),
                 i64::from(row.accepted_success.ok_or(StoreError::InvalidReviewState)?),
                 row.override_count,
-                transition.parameters.scheduler_version,
+                serde_json::to_string(&transition.config).map_err(StoreError::storage)?,
                 serde_json::to_string(transition).map_err(StoreError::storage)?,
             ],
         )
@@ -2902,8 +2800,8 @@ fn update_review_day(
             params![
                 transition.review_day,
                 i64::from(transition.first_review),
-                i64::from(transition.success),
-                i64::from(!transition.success),
+                i64::from(transition.outcome == RecallOutcomeSnapshot::Success),
+                i64::from(transition.outcome == RecallOutcomeSnapshot::Failure),
                 override_count,
             ],
         )
@@ -3053,13 +2951,12 @@ mod tests {
         let reviewed_at_us = pack.issued_at_us + 1_000;
         let review_day =
             review_day_at(reviewed_at_us, &pack.timezone, pack.day_boundary_hour).unwrap();
-        let transition = super::transition_with_sample(
+        let transition = super::compute_review_transition(
             &item.review_state.clone().into(),
-            &item.parameters.clone().into(),
+            &item.config.clone().into(),
             detected,
             review_day,
             reviewed_at_us,
-            0.0,
         )
         .unwrap();
         OfflineReviewOperation {
@@ -3075,7 +2972,7 @@ mod tests {
             base_state_revision: item.review_state.state_revision,
             content_sha256: item.content_sha256.clone(),
             presentation: item.presentation.clone(),
-            parameters: item.parameters.clone(),
+            config: item.config.clone(),
             matcher_version: item.matcher_version,
             response,
             detected_success: detected,
@@ -3084,7 +2981,6 @@ mod tests {
             proposed_transition: (&transition).into(),
             desired_suspended: false,
             answered_at_us: reviewed_at_us,
-            fuzz_sample: 0.0,
         }
     }
 
@@ -3407,13 +3303,12 @@ mod tests {
             .unwrap();
         let mut operation = offline_answer(&pack, "forged-day", 1);
         let forged_day = operation.proposed_transition.review_day + 1;
-        let transition = super::transition_with_sample(
+        let transition = super::compute_review_transition(
             &pack.items[0].review_state.clone().into(),
-            &pack.items[0].parameters.clone().into(),
+            &pack.items[0].config.clone().into(),
             operation.accepted_success,
             forged_day,
             operation.answered_at_us,
-            operation.fuzz_sample,
         )
         .unwrap();
         operation.proposed_transition = (&transition).into();
@@ -3641,7 +3536,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap();
         online
@@ -3688,7 +3582,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("ANSWER".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap();
         assert_eq!(graded.detected_success, Some(true));
@@ -3756,7 +3649,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap();
         store
@@ -3787,52 +3679,9 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap_err();
         assert!(matches!(error, crate::store::StoreError::StaleAttempt));
-    }
-
-    #[test]
-    fn tag_rules_replace_globals_and_aggregate_like_elisp() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/review/parity-v1.json"
-        ))
-        .unwrap();
-        let tags = fixture["tag_rules"]["tags"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tag| tag.as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        add_thema_with_tags(&mut store, "tagged", "Question", tags.clone(), None);
-        let session = store
-            .create_review_session(&manual_source("tagged"), None, None, 1_752_600_000_000_000)
-            .unwrap();
-        let parameters =
-            super::resolved_parameters(&store.connection, &session.session_id, &tags).unwrap();
-        let expected = &fixture["tag_rules"];
-        assert_eq!(parameters.amnesia, expected["amnesia"].as_f64().unwrap());
-        assert_eq!(
-            parameters.epignosis,
-            expected["epignosis"].as_f64().unwrap()
-        );
-        assert_eq!(parameters.agnoia, expected["agnoia"].as_f64().unwrap());
-        assert_eq!(
-            parameters.anagnosis,
-            expected["anagnosis"].as_u64().unwrap()
-        );
-        assert_eq!(parameters.lethe, expected["lethe"].as_u64().unwrap());
-        assert_eq!(
-            parameters.proto,
-            expected["proto"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|value| u32::try_from(value.as_u64().unwrap()).unwrap())
-                .collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -3886,7 +3735,6 @@ mod tests {
                     None,
                     &AnswerInput::Text("answer".into()),
                     1_752_600_000_001_000,
-                    0.0,
                 )
                 .is_err()
         );
@@ -3908,7 +3756,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap();
         store
@@ -3952,7 +3799,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap();
         assert_eq!(attempt_revision(&store, &attempt.attempt_id), 1);
@@ -3989,7 +3835,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 1_752_600_000_001_000,
-                0.0,
             )
             .unwrap();
         let operation = ReviewAttemptOperation::new(
@@ -4234,7 +4079,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 3,
-                0.0,
             )
             .unwrap();
         attempt.attempt_id

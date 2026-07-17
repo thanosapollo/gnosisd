@@ -306,8 +306,8 @@ async fn assert_legacy_thema(socket: &Path) {
     assert_eq!(thema.review_image, None);
     assert_eq!(thema.tags, ["medicine"]);
     assert_eq!(thema.links, ["7"]);
-    assert_eq!(thema.review_state.review_count, 12);
-    assert_eq!(thema.review_state.next_review_day, 20260714);
+    assert_eq!(thema.review_state.review_count, 0);
+    assert_eq!(thema.review_state.next_review_day, 19700101);
 }
 
 async fn assert_due_queue(socket: &Path) {
@@ -322,14 +322,15 @@ async fn assert_due_queue(socket: &Path) {
     let ResponseResult::DueThemata(themata) = result else {
         panic!("unexpected due response");
     };
-    assert_eq!(themata.len(), 3);
-    assert_eq!(themata[0].id, "8");
-    assert_eq!(themata[1].id, "10");
-    assert_eq!(themata[2].id, "7");
-    assert_eq!(themata[2].keimenon, "Question\ncontinued");
-    assert_eq!(themata[2].hypothesis, [None]);
-    assert_eq!(themata[2].answer, ["Answer"]);
-    assert_eq!(themata[2].review_count, 12);
+    assert_eq!(themata.len(), 4);
+    assert_eq!(themata[0].id, "7");
+    assert_eq!(themata[1].id, "8");
+    assert_eq!(themata[2].id, "9");
+    assert_eq!(themata[3].id, "10");
+    assert_eq!(themata[0].keimenon, "Question\ncontinued");
+    assert_eq!(themata[0].hypothesis, [None]);
+    assert_eq!(themata[0].answer, ["Answer"]);
+    assert_eq!(themata[0].review_count, 0);
 }
 
 async fn assert_due_pages(socket: &Path) {
@@ -345,7 +346,7 @@ async fn assert_due_pages(socket: &Path) {
     let ResponseResult::DuePage(first) = first else {
         panic!("unexpected due page response");
     };
-    assert_eq!(first.items[0].id, "8");
+    assert_eq!(first.items[0].id, "7");
     let next = first.next.expect("first page must continue");
 
     let second = successful_result(
@@ -360,7 +361,7 @@ async fn assert_due_pages(socket: &Path) {
     let ResponseResult::DuePage(second) = second else {
         panic!("unexpected due page response");
     };
-    assert_eq!(second.items[0].id, "10");
+    assert_eq!(second.items[0].id, "8");
     let next = second.next.expect("second page must continue");
 
     let third = successful_result(
@@ -375,8 +376,8 @@ async fn assert_due_pages(socket: &Path) {
     let ResponseResult::DuePage(third) = third else {
         panic!("unexpected due page response");
     };
-    assert_eq!(third.items[0].id, "7");
-    assert_eq!(third.next, None);
+    assert_eq!(third.items[0].id, "9");
+    assert!(third.next.is_some());
 }
 
 async fn successful_result(socket: &Path, request_value: Request) -> ResponseResult {
@@ -509,7 +510,7 @@ fn assert_source_is_unchanged(path: &Path) {
 
 fn assert_target_is_normalized(path: &Path) {
     let connection = Connection::open(path).unwrap();
-    assert_eq!(user_version(&connection), 1);
+    assert_eq!(user_version(&connection), 2);
     assert_eq!(table_count(&connection, "themata"), 0);
     assert_eq!(table_count(&connection, "node_tag"), 1);
     assert_eq!(table_count(&connection, "thema"), 1);

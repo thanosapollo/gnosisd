@@ -6,8 +6,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::application::{
-    AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, OfflineConflictReason,
-    OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot, PresentationSnapshot,
+    AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
+    FsrsModelSnapshot, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES, OfflineConflictReason,
+    OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot, RecallOutcomeSnapshot,
     ReconciliationStatus, ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode,
     ReviewSessionView, ReviewSource, ReviewStateSnapshot, TransitionSnapshot, presentation_content,
     review_day_at, validate_review_pack_projection,
@@ -231,7 +232,7 @@ pub struct OfflineReviewOperationV1 {
     #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
     pub content_sha256: String,
     pub presentation: OfflinePresentationV1,
-    pub parameters: OfflineParametersV1,
+    pub config: OfflineFsrsConfigV1,
     pub matcher_version: u32,
     pub response: OfflineAnswerV1,
     pub detected_success: bool,
@@ -241,7 +242,6 @@ pub struct OfflineReviewOperationV1 {
     pub desired_suspended: bool,
     #[schemars(range(min = 1))]
     pub answered_at_us: u64,
-    pub fuzz_sample: f64,
 }
 
 impl From<OfflineReviewOperationV1> for OfflineReviewOperation {
@@ -259,7 +259,7 @@ impl From<OfflineReviewOperationV1> for OfflineReviewOperation {
             base_state_revision: value.base_state_revision,
             content_sha256: value.content_sha256,
             presentation: value.presentation.into(),
-            parameters: value.parameters.into(),
+            config: value.config.into(),
             matcher_version: value.matcher_version,
             response: value.response.into(),
             detected_success: value.detected_success,
@@ -268,7 +268,6 @@ impl From<OfflineReviewOperationV1> for OfflineReviewOperation {
             proposed_transition: value.proposed_transition.into(),
             desired_suspended: value.desired_suspended,
             answered_at_us: value.answered_at_us,
-            fuzz_sample: value.fuzz_sample,
         }
     }
 }
@@ -291,7 +290,7 @@ impl TryFrom<&OfflineReviewOperation> for OfflineReviewOperationV1 {
             content_sha256: value.content_sha256.clone(),
             presentation: OfflinePresentationV1::try_from(&value.presentation)
                 .map_err(|_| OfflineReviewWireError::Operation)?,
-            parameters: (&value.parameters).into(),
+            config: (&value.config).into(),
             matcher_version: value.matcher_version,
             response: (&value.response).into(),
             detected_success: value.detected_success,
@@ -300,7 +299,6 @@ impl TryFrom<&OfflineReviewOperation> for OfflineReviewOperationV1 {
             proposed_transition: (&value.proposed_transition).into(),
             desired_suspended: value.desired_suspended,
             answered_at_us: value.answered_at_us,
-            fuzz_sample: value.fuzz_sample,
         })
     }
 }
@@ -391,8 +389,6 @@ impl TryFrom<&PresentationSnapshot> for OfflinePresentationV1 {
 pub struct OfflineReviewStateV1 {
     pub state_revision: u64,
     pub review_count: u64,
-    pub legacy_review_count: u64,
-    pub legacy_unclassified_count: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
     pub last_reviewed_at_us: Option<u64>,
@@ -403,14 +399,11 @@ pub struct OfflineReviewStateV1 {
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
     pub interval_days: Option<u32>,
-    pub consecutive_successes: u64,
     pub total_successes: u64,
-    pub consecutive_failures: u64,
     pub total_failures: u64,
     pub suspended: bool,
-    pub gnosis_plus: f64,
-    pub gnosis_minus: f64,
-    pub gnosis_synolon: f64,
+    pub stability: Option<f32>,
+    pub difficulty: Option<f32>,
 }
 
 impl From<OfflineReviewStateV1> for ReviewStateSnapshot {
@@ -418,20 +411,15 @@ impl From<OfflineReviewStateV1> for ReviewStateSnapshot {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
-            legacy_review_count: value.legacy_review_count,
-            legacy_unclassified_count: value.legacy_unclassified_count,
             last_reviewed_at_us: value.last_reviewed_at_us,
             last_review_day: value.last_review_day,
             next_review_day: value.next_review_day,
             interval_days: value.interval_days,
-            consecutive_successes: value.consecutive_successes,
             total_successes: value.total_successes,
-            consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             suspended: value.suspended,
-            gnosis_plus: value.gnosis_plus,
-            gnosis_minus: value.gnosis_minus,
-            gnosis_synolon: value.gnosis_synolon,
+            stability: value.stability,
+            difficulty: value.difficulty,
         }
     }
 }
@@ -441,66 +429,83 @@ impl From<&ReviewStateSnapshot> for OfflineReviewStateV1 {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
-            legacy_review_count: value.legacy_review_count,
-            legacy_unclassified_count: value.legacy_unclassified_count,
             last_reviewed_at_us: value.last_reviewed_at_us,
             last_review_day: value.last_review_day,
             next_review_day: value.next_review_day,
             interval_days: value.interval_days,
-            consecutive_successes: value.consecutive_successes,
             total_successes: value.total_successes,
-            consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             suspended: value.suspended,
-            gnosis_plus: value.gnosis_plus,
-            gnosis_minus: value.gnosis_minus,
-            gnosis_synolon: value.gnosis_synolon,
+            stability: value.stability,
+            difficulty: value.difficulty,
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct OfflineParametersV1 {
-    pub scheduler_version: u32,
-    pub amnesia: f64,
-    pub epignosis: f64,
-    pub agnoia: f64,
-    pub anagnosis: u64,
-    pub lethe: u64,
-    pub synolon_max: f64,
-    pub interval_fuzz: f64,
-    pub proto: Vec<u32>,
+pub struct OfflineFsrsConfigV1 {
+    pub algorithm: OfflineFsrsAlgorithmV1,
+    pub model: OfflineFsrsModelV1,
+    pub implementation: OfflineFsrsImplementationV1,
+    pub desired_retention: f32,
+    pub parameters: [f32; 21],
 }
 
-impl From<OfflineParametersV1> for ParametersSnapshot {
-    fn from(value: OfflineParametersV1) -> Self {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineFsrsAlgorithmV1 {
+    Fsrs,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineFsrsModelV1 {
+    Fsrs6,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum OfflineFsrsImplementationV1 {
+    #[serde(rename = "fsrs-6.6.1")]
+    FsrsRs1_1,
+}
+
+impl From<OfflineFsrsConfigV1> for FsrsConfigSnapshot {
+    fn from(value: OfflineFsrsConfigV1) -> Self {
         Self {
-            scheduler_version: value.scheduler_version,
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            synolon_max: value.synolon_max,
-            interval_fuzz: value.interval_fuzz,
-            proto: value.proto,
+            algorithm: match value.algorithm {
+                OfflineFsrsAlgorithmV1::Fsrs => FsrsAlgorithmSnapshot::Fsrs,
+            },
+            model: match value.model {
+                OfflineFsrsModelV1::Fsrs6 => FsrsModelSnapshot::Six,
+            },
+            implementation: match value.implementation {
+                OfflineFsrsImplementationV1::FsrsRs1_1 => {
+                    FsrsImplementationSnapshot::Crate6Dot6Dot1
+                }
+            },
+            desired_retention: value.desired_retention,
+            parameters: value.parameters,
         }
     }
 }
 
-impl From<&ParametersSnapshot> for OfflineParametersV1 {
-    fn from(value: &ParametersSnapshot) -> Self {
+impl From<&FsrsConfigSnapshot> for OfflineFsrsConfigV1 {
+    fn from(value: &FsrsConfigSnapshot) -> Self {
         Self {
-            scheduler_version: value.scheduler_version,
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            synolon_max: value.synolon_max,
-            interval_fuzz: value.interval_fuzz,
-            proto: value.proto.clone(),
+            algorithm: match value.algorithm {
+                FsrsAlgorithmSnapshot::Fsrs => OfflineFsrsAlgorithmV1::Fsrs,
+            },
+            model: match value.model {
+                FsrsModelSnapshot::Six => OfflineFsrsModelV1::Fsrs6,
+            },
+            implementation: match value.implementation {
+                FsrsImplementationSnapshot::Crate6Dot6Dot1 => {
+                    OfflineFsrsImplementationV1::FsrsRs1_1
+                }
+            },
+            desired_retention: value.desired_retention,
+            parameters: value.parameters,
         }
     }
 }
@@ -543,15 +548,22 @@ impl From<&AnswerInput> for OfflineAnswerV1 {
 pub struct OfflineTransitionV1 {
     pub before: OfflineReviewStateV1,
     pub after: OfflineReviewStateV1,
-    pub parameters: OfflineParametersV1,
+    pub config: OfflineFsrsConfigV1,
     pub reviewed_at_us: u64,
     pub review_day: u32,
-    pub success: bool,
+    pub outcome: OfflineRecallOutcomeV1,
     pub first_review: bool,
     pub elapsed_days: u32,
-    pub algorithm_interval_days: f64,
-    pub computed_interval_days: u32,
-    pub fuzz_delta: f64,
+    pub raw_interval_days: f32,
+    pub interval_days: u32,
+    pub due_day: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfflineRecallOutcomeV1 {
+    Failure,
+    Success,
 }
 
 impl From<OfflineTransitionV1> for TransitionSnapshot {
@@ -559,15 +571,18 @@ impl From<OfflineTransitionV1> for TransitionSnapshot {
         Self {
             before: value.before.into(),
             after: value.after.into(),
-            parameters: value.parameters.into(),
+            config: value.config.into(),
             reviewed_at_us: value.reviewed_at_us,
             review_day: value.review_day,
-            success: value.success,
+            outcome: match value.outcome {
+                OfflineRecallOutcomeV1::Failure => RecallOutcomeSnapshot::Failure,
+                OfflineRecallOutcomeV1::Success => RecallOutcomeSnapshot::Success,
+            },
             first_review: value.first_review,
             elapsed_days: value.elapsed_days,
-            algorithm_interval_days: value.algorithm_interval_days,
-            computed_interval_days: value.computed_interval_days,
-            fuzz_delta: value.fuzz_delta,
+            raw_interval_days: value.raw_interval_days,
+            interval_days: value.interval_days,
+            due_day: value.due_day,
         }
     }
 }
@@ -577,15 +592,18 @@ impl From<&TransitionSnapshot> for OfflineTransitionV1 {
         Self {
             before: (&value.before).into(),
             after: (&value.after).into(),
-            parameters: (&value.parameters).into(),
+            config: (&value.config).into(),
             reviewed_at_us: value.reviewed_at_us,
             review_day: value.review_day,
-            success: value.success,
+            outcome: match value.outcome {
+                RecallOutcomeSnapshot::Failure => OfflineRecallOutcomeV1::Failure,
+                RecallOutcomeSnapshot::Success => OfflineRecallOutcomeV1::Success,
+            },
             first_review: value.first_review,
             elapsed_days: value.elapsed_days,
-            algorithm_interval_days: value.algorithm_interval_days,
-            computed_interval_days: value.computed_interval_days,
-            fuzz_delta: value.fuzz_delta,
+            raw_interval_days: value.raw_interval_days,
+            interval_days: value.interval_days,
+            due_day: value.due_day,
         }
     }
 }
@@ -748,8 +766,9 @@ fn validate_decoded_pack(pack: &ReviewPackView) -> Result<(), OfflineReviewWireE
             None,
         )
         .map_err(|_| OfflineReviewWireError::Operation)?;
-        crate::domain::validate_parameters(&item.parameters.clone().into())
-            .map_err(|_| OfflineReviewWireError::Operation)?;
+        if !item.config.valid() {
+            return Err(OfflineReviewWireError::Operation);
+        }
         crate::domain::validate_state(&item.review_state.clone().into())
             .map_err(|_| OfflineReviewWireError::Operation)?;
         if item.matcher_version != crate::domain::MATCHER_VERSION {
@@ -770,7 +789,7 @@ pub struct ReviewPackItemV2 {
     pub content_sha256: String,
     pub presentation: OfflinePresentationV1,
     pub review_state: OfflineReviewStateV1,
-    pub parameters: OfflineParametersV1,
+    pub config: OfflineFsrsConfigV1,
     pub matcher_version: u32,
     pub asset_paths: Vec<String>,
 }
@@ -786,7 +805,7 @@ impl TryFrom<&ReviewPackItem> for ReviewPackItemV2 {
             content_sha256: value.content_sha256.clone(),
             presentation: OfflinePresentationV1::try_from(&value.presentation)?,
             review_state: (&value.review_state).into(),
-            parameters: (&value.parameters).into(),
+            config: (&value.config).into(),
             matcher_version: value.matcher_version,
             asset_paths: value.asset_paths.clone(),
         })
@@ -802,7 +821,7 @@ impl From<ReviewPackItemV2> for ReviewPackItem {
             content_sha256: value.content_sha256,
             presentation: value.presentation.into(),
             review_state: value.review_state.into(),
-            parameters: value.parameters.into(),
+            config: value.config.into(),
             matcher_version: value.matcher_version,
             asset_paths: value.asset_paths,
         }
@@ -1446,7 +1465,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(decoded.canonical_payload.as_bytes())),
-            "41eb0a1da2be6f8651957083f4df4d32ff7bd2fcee24536d274b59beaaf6da82"
+            "a58d4c0880167fae1c30a3576d6519db04377d704634beb4518a274dc5d711e1"
         );
 
         let mut pack = fixture["pack"]["pack"].clone();

@@ -20,7 +20,7 @@ pub use super::offline_content::{
     OfflineContentResultEnvelopeV1, OfflineContentResultV1,
 };
 pub use super::offline_review::{
-    ActiveReviewPackEnvelopeV2, OfflineAnswerV1, OfflineParametersV1, OfflinePresentationV1,
+    ActiveReviewPackEnvelopeV2, OfflineAnswerV1, OfflineFsrsConfigV1, OfflinePresentationV1,
     OfflineReviewConflictReasonV2, OfflineReviewOperationEnvelopeV1, OfflineReviewOperationV1,
     OfflineReviewResultEnvelopeV2, OfflineReviewResultV2, OfflineReviewSessionModeV2,
     OfflineReviewSessionStatusV2, OfflineReviewSessionV2, OfflineReviewSourceKindV2,
@@ -38,19 +38,19 @@ pub use content::{
     AssetHeadV1, ContentChangePageV1, ContentChangeV1, ContentEntityKindV1, ContentOperationV1,
     DocumentHeadV1, DocumentMutationRejectionV1, DocumentMutationResultV1, DocumentRevisionPageV1,
     DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
-    SchedulerParametersInputV1, SettingsV1, StagedBlobV1, TagRuleInputV1, ThemaPageV1, ThemaV1,
-    ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    SettingsV1, StagedBlobV1, ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 
-use std::{borrow::Cow, collections::BTreeMap};
+use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::application::{
-    AnswerInput, PresentationSnapshot, ReviewAttemptOperationResult, ReviewAttemptState,
-    ReviewAttemptView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
-    ReviewSourceKind, TransitionSnapshot, review_question,
+    AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
+    FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot, ReviewAttemptOperationResult,
+    ReviewAttemptState, ReviewAttemptView, ReviewResponsePrompt, ReviewSessionMode,
+    ReviewSessionView, ReviewSource, ReviewSourceKind, TransitionSnapshot, review_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -432,8 +432,7 @@ pub struct SettingsRevisionV1 {
     pub timezone: String,
     #[schemars(range(max = 23))]
     pub day_boundary_hour: u8,
-    pub scheduler: ParametersV1,
-    pub tag_rules: BTreeMap<String, TagRuleV1>,
+    pub scheduler: FsrsConfigV1,
     pub operation: SettingsOperationV1,
     pub created_at_us: u64,
     pub author_device_id: Option<String>,
@@ -441,39 +440,48 @@ pub struct SettingsRevisionV1 {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ParametersV1 {
-    pub scheduler_version: u32,
-    pub amnesia: f64,
-    pub epignosis: f64,
-    pub agnoia: f64,
-    pub anagnosis: u64,
-    pub lethe: u64,
-    pub synolon_max: f64,
-    pub interval_fuzz: f64,
-    pub proto: Vec<u32>,
+pub struct FsrsConfigV1 {
+    pub algorithm: FsrsAlgorithmV1,
+    pub model: FsrsModelV1,
+    pub implementation: FsrsImplementationV1,
+    pub desired_retention: f32,
+    pub parameters: [f32; 21],
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TagRuleV1 {
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
-    pub amnesia: Option<f64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
-    pub epignosis: Option<f64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
-    pub agnoia: Option<f64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
-    pub anagnosis: Option<u64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
-    pub lethe: Option<u64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
-    pub proto: Option<Vec<u32>>,
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsrsAlgorithmV1 {
+    Fsrs,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsrsModelV1 {
+    Fsrs6,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum FsrsImplementationV1 {
+    #[serde(rename = "fsrs-6.6.1")]
+    FsrsRs1_1,
+}
+
+impl From<&FsrsConfigSnapshot> for FsrsConfigV1 {
+    fn from(value: &FsrsConfigSnapshot) -> Self {
+        Self {
+            algorithm: match value.algorithm {
+                FsrsAlgorithmSnapshot::Fsrs => FsrsAlgorithmV1::Fsrs,
+            },
+            model: match value.model {
+                FsrsModelSnapshot::Six => FsrsModelV1::Fsrs6,
+            },
+            implementation: match value.implementation {
+                FsrsImplementationSnapshot::Crate6Dot6Dot1 => FsrsImplementationV1::FsrsRs1_1,
+            },
+            desired_retention: value.desired_retention,
+            parameters: value.parameters,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -490,8 +498,6 @@ pub struct ReviewStateRevisionV1 {
 pub struct ReviewStateV1 {
     pub state_revision: u64,
     pub review_count: u64,
-    pub legacy_review_count: u64,
-    pub legacy_unclassified_count: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
     pub last_reviewed_at_us: Option<u64>,
@@ -502,14 +508,11 @@ pub struct ReviewStateV1 {
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
     pub interval_days: Option<u32>,
-    pub consecutive_successes: u64,
     pub total_successes: u64,
-    pub consecutive_failures: u64,
     pub total_failures: u64,
     pub suspended: bool,
-    pub gnosis_plus: f64,
-    pub gnosis_minus: f64,
-    pub gnosis_synolon: f64,
+    pub stability: Option<f32>,
+    pub difficulty: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -1007,15 +1010,22 @@ impl From<ReviewAnswerV1> for AnswerInput {
 pub struct ReviewTransitionV1 {
     pub before: ReviewStateV1,
     pub after: ReviewStateV1,
-    pub parameters: ParametersV1,
+    pub config: FsrsConfigV1,
     pub reviewed_at_us: u64,
     pub review_day: u32,
-    pub success: bool,
+    pub outcome: RecallOutcomeV1,
     pub first_review: bool,
     pub elapsed_days: u32,
-    pub algorithm_interval_days: f64,
-    pub computed_interval_days: u32,
-    pub fuzz_delta: f64,
+    pub raw_interval_days: f32,
+    pub interval_days: u32,
+    pub due_day: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallOutcomeV1 {
+    Failure,
+    Success,
 }
 
 impl From<&TransitionSnapshot> for ReviewTransitionV1 {
@@ -1023,15 +1033,18 @@ impl From<&TransitionSnapshot> for ReviewTransitionV1 {
         Self {
             before: ReviewStateV1::from(&value.before),
             after: ReviewStateV1::from(&value.after),
-            parameters: ParametersV1::from(&value.parameters),
+            config: FsrsConfigV1::from(&value.config),
             reviewed_at_us: value.reviewed_at_us,
             review_day: value.review_day,
-            success: value.success,
+            outcome: match value.outcome {
+                RecallOutcomeSnapshot::Failure => RecallOutcomeV1::Failure,
+                RecallOutcomeSnapshot::Success => RecallOutcomeV1::Success,
+            },
             first_review: value.first_review,
             elapsed_days: value.elapsed_days,
-            algorithm_interval_days: value.algorithm_interval_days,
-            computed_interval_days: value.computed_interval_days,
-            fuzz_delta: value.fuzz_delta,
+            raw_interval_days: value.raw_interval_days,
+            interval_days: value.interval_days,
+            due_day: value.due_day,
         }
     }
 }

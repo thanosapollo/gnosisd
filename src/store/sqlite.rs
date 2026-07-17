@@ -1,11 +1,6 @@
 use std::{
-    collections::{BTreeMap, HashSet},
-    error::Error,
-    fmt::Write as _,
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::Path,
-    time::Duration,
+    collections::HashSet, error::Error, fmt::Write as _, fs, os::unix::fs::PermissionsExt,
+    path::Path, time::Duration,
 };
 
 use rusqlite::{
@@ -25,8 +20,8 @@ use crate::{
         DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision, NewDevice,
         NodeRecord, PreparedAsset, PreparedNote, PreparedThema, ReplicaChange, ReplicaProjection,
         ReplicaState, ReviewStateRevision, SettingsInput, SettingsRecord, SettingsRevision,
-        SnapshotPage, SnapshotPosition, TagRule, ThemaRecord, ThemaRevision, parse_stored_scopes,
-        path_key, stored_scopes, stored_thema_content, validate_org_path,
+        SnapshotPage, SnapshotPosition, ThemaRecord, ThemaRevision, parse_stored_scopes, path_key,
+        stored_scopes, stored_thema_content, validate_org_path,
     },
     blob::BlobMeta,
 };
@@ -41,7 +36,7 @@ pub(crate) use mutation::DeviceMutationExecution;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -961,37 +956,21 @@ impl SqliteStore {
             .map_err(StoreError::storage)?;
         check_expected_number(Some(expected_revision), Some(current))?;
         let revision = next_number(Some(current))?;
+        let scheduler = input.scheduler();
         transaction
             .execute(
                 "UPDATE settings SET revision = ?1, timezone = ?2,
-                     day_boundary_hour = ?3, scheduler_version = ?4,
-                     scheduler_json = ?5, updated_at_us = ?6 WHERE id = 1",
+                     day_boundary_hour = ?3, scheduler_json = ?4, updated_at_us = ?5
+                 WHERE id = 1",
                 params![
                     u64_to_i64(revision, "settings revision")?,
                     input.timezone,
                     i64::from(input.day_boundary_hour),
-                    i64::from(input.scheduler.scheduler_version),
-                    serde_json::to_string(&input.scheduler).map_err(StoreError::storage)?,
+                    serde_json::to_string(&scheduler).map_err(StoreError::storage)?,
                     updated_at_us,
                 ],
             )
             .map_err(StoreError::storage)?;
-        transaction
-            .execute("DELETE FROM tag_rule", [])
-            .map_err(StoreError::storage)?;
-        {
-            let mut insert = transaction
-                .prepare_cached("INSERT INTO tag_rule(tag, parameters_json) VALUES (?1, ?2)")
-                .map_err(StoreError::storage)?;
-            for (tag, rule) in &input.tag_rules {
-                insert
-                    .execute(params![
-                        tag,
-                        serde_json::to_string(rule).map_err(StoreError::storage)?
-                    ])
-                    .map_err(StoreError::storage)?;
-            }
-        }
         let settings = load_settings(&transaction)?;
         insert_settings_history(
             &transaction,
@@ -2003,9 +1982,8 @@ fn load_settings_revision(
 ) -> Result<SettingsRevision, StoreError> {
     let row = connection
         .query_row(
-            "SELECT revision, timezone, day_boundary_hour, scheduler_version,
-                    scheduler_json, tag_rules_json, operation, created_at_us,
-                    author_device_id
+            "SELECT revision, timezone, day_boundary_hour, scheduler_json,
+                    operation, created_at_us, author_device_id
              FROM settings_revision WHERE revision = ?1",
             [u64_to_i64(revision, "settings revision")?],
             |row| {
@@ -2013,21 +1991,17 @@ fn load_settings_revision(
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
         .optional()
         .map_err(StoreError::storage)?
         .ok_or(StoreError::ReplicaCursor)?;
-    let mut scheduler: crate::application::ParametersSnapshot =
-        serde_json::from_str(&row.4).map_err(StoreError::storage)?;
-    scheduler.scheduler_version = to_u32(row.3, "scheduler version")?;
+    let scheduler = serde_json::from_str(&row.3).map_err(StoreError::storage)?;
     Ok(SettingsRevision {
         settings: SettingsRecord {
             revision: to_u64(row.0, "settings revision")?,
@@ -2036,12 +2010,10 @@ fn load_settings_revision(
                 field: "day boundary",
             })?,
             scheduler,
-            tag_rules: serde_json::from_str::<BTreeMap<String, TagRule>>(&row.5)
-                .map_err(StoreError::storage)?,
         },
-        operation: row.6,
-        created_at_us: to_u64(row.7, "settings revision timestamp")?,
-        author_device_id: row.8,
+        operation: row.4,
+        created_at_us: to_u64(row.5, "settings revision timestamp")?,
+        author_device_id: row.6,
     })
 }
 
@@ -2078,42 +2050,15 @@ fn load_review_state_revision(
 }
 
 fn load_settings(connection: &Connection) -> Result<SettingsRecord, StoreError> {
-    let (revision, timezone, boundary, version, scheduler): (i64, String, i64, i64, String) =
-        connection
-            .query_row(
-                "SELECT revision, timezone, day_boundary_hour, scheduler_version,
-                        scheduler_json FROM settings WHERE id = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .map_err(StoreError::storage)?;
-    let mut scheduler: crate::application::ParametersSnapshot =
-        serde_json::from_str(&scheduler).map_err(StoreError::storage)?;
-    scheduler.scheduler_version = u32::try_from(version).map_err(|_| StoreError::CorruptData {
-        field: "scheduler version",
-    })?;
-    let mut statement = connection
-        .prepare("SELECT tag, parameters_json FROM tag_rule ORDER BY tag")
+    let (revision, timezone, boundary, scheduler): (i64, String, i64, String) = connection
+        .query_row(
+            "SELECT revision, timezone, day_boundary_hour, scheduler_json
+             FROM settings WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
         .map_err(StoreError::storage)?;
-    let tag_rules = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(StoreError::storage)?
-        .map(|row| {
-            let (tag, json) = row.map_err(StoreError::storage)?;
-            let rule = serde_json::from_str::<TagRule>(&json).map_err(StoreError::storage)?;
-            Ok((tag, rule))
-        })
-        .collect::<Result<_, StoreError>>()?;
+    let scheduler = serde_json::from_str(&scheduler).map_err(StoreError::storage)?;
     Ok(SettingsRecord {
         revision: u64::try_from(revision).map_err(|_| StoreError::CorruptData {
             field: "settings revision",
@@ -2123,7 +2068,6 @@ fn load_settings(connection: &Connection) -> Result<SettingsRecord, StoreError> 
             field: "day boundary",
         })?,
         scheduler,
-        tag_rules,
     })
 }
 
@@ -2827,10 +2771,11 @@ fn insert_initial_review_state(
 ) -> Result<(), StoreError> {
     transaction
         .execute(
-            "INSERT OR IGNORE INTO review_state VALUES (
-             ?1, 0, 0, 0, 0, NULL, NULL, ?2, NULL, 0, 0, 0, 0, 0,
-             0.35, 0.30, 1.3
-         )",
+            "INSERT OR IGNORE INTO review_state(
+                 thema_id, state_revision, review_count, last_reviewed_at_us,
+                 last_review_day, next_review_day, interval_days, total_successes,
+                 total_failures, suspended, stability, difficulty
+             ) VALUES (?1, 0, 0, NULL, NULL, ?2, NULL, 0, 0, 0, NULL, NULL)",
             params![prepared.thema_id.as_str(), i64::from(initial_review_day)],
         )
         .map_err(StoreError::storage)?;
@@ -2912,17 +2857,14 @@ fn insert_settings_history(
     transaction
         .execute(
             "INSERT INTO settings_revision(
-                 revision, timezone, day_boundary_hour, scheduler_version,
-                 scheduler_json, tag_rules_json, operation, created_at_us,
-                 author_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 revision, timezone, day_boundary_hour, scheduler_json,
+                 operation, created_at_us, author_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 u64_to_i64(settings.revision, "settings revision")?,
                 settings.timezone,
                 i64::from(settings.day_boundary_hour),
-                i64::from(settings.scheduler.scheduler_version),
                 serde_json::to_string(&settings.scheduler).map_err(StoreError::storage)?,
-                serde_json::to_string(&settings.tag_rules).map_err(StoreError::storage)?,
                 operation,
                 created_at_us,
                 author_device_id,
@@ -3521,11 +3463,10 @@ fn load_legacy_thema(
 const LEGACY_THEMA_QUERY: &str = "SELECT thema.thema_id, thema.kind, thema.keimenon, \
      thema.hypothesis_json, thema.answer_json, thema.source_guid, thema.archived_at_us, \
      thema.parathema, thema.review_image, \
-     state.state_revision, state.review_count, state.legacy_review_count, \
-     state.legacy_unclassified_count, state.last_reviewed_at_us, state.last_review_day, \
-     state.next_review_day, state.interval_days, state.consecutive_successes, \
-     state.total_successes, state.consecutive_failures, state.total_failures, \
-     state.suspended, state.gnosis_plus, state.gnosis_minus, state.gnosis_synolon \
+     state.state_revision, state.review_count, state.last_reviewed_at_us, \
+     state.last_review_day, state.next_review_day, state.interval_days, \
+     state.total_successes, state.total_failures, state.suspended, \
+     state.stability, state.difficulty \
      FROM thema \
      JOIN review_state AS state ON state.thema_id = thema.thema_id \
      WHERE thema.thema_id = ?1";
@@ -3561,20 +3502,15 @@ fn legacy_thema_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegacyThemaRow>
 struct LegacyReviewRow {
     state_revision: i64,
     review_count: i64,
-    legacy_review_count: i64,
-    legacy_unclassified_count: i64,
     last_reviewed_at_us: Option<i64>,
     last_review_day: Option<i64>,
     next_review_day: i64,
     interval_days: Option<i64>,
-    consecutive_successes: i64,
     total_successes: i64,
-    consecutive_failures: i64,
     total_failures: i64,
     suspended: i64,
-    gnosis_plus: f64,
-    gnosis_minus: f64,
-    gnosis_synolon: f64,
+    stability: Option<f64>,
+    difficulty: Option<f64>,
 }
 
 impl LegacyReviewRow {
@@ -3582,20 +3518,15 @@ impl LegacyReviewRow {
         Ok(Self {
             state_revision: row.get(start)?,
             review_count: row.get(start + 1)?,
-            legacy_review_count: row.get(start + 2)?,
-            legacy_unclassified_count: row.get(start + 3)?,
-            last_reviewed_at_us: row.get(start + 4)?,
-            last_review_day: row.get(start + 5)?,
-            next_review_day: row.get(start + 6)?,
-            interval_days: row.get(start + 7)?,
-            consecutive_successes: row.get(start + 8)?,
-            total_successes: row.get(start + 9)?,
-            consecutive_failures: row.get(start + 10)?,
-            total_failures: row.get(start + 11)?,
-            suspended: row.get(start + 12)?,
-            gnosis_plus: row.get(start + 13)?,
-            gnosis_minus: row.get(start + 14)?,
-            gnosis_synolon: row.get(start + 15)?,
+            last_reviewed_at_us: row.get(start + 2)?,
+            last_review_day: row.get(start + 3)?,
+            next_review_day: row.get(start + 4)?,
+            interval_days: row.get(start + 5)?,
+            total_successes: row.get(start + 6)?,
+            total_failures: row.get(start + 7)?,
+            suspended: row.get(start + 8)?,
+            stability: row.get(start + 9)?,
+            difficulty: row.get(start + 10)?,
         })
     }
 }
@@ -3629,23 +3560,15 @@ fn materialize_legacy_review_state(row: LegacyReviewRow) -> Result<LegacyReviewS
     Ok(LegacyReviewState {
         state_revision: to_u64(row.state_revision, "legacy state revision")?,
         review_count: to_u64(row.review_count, "legacy review count")?,
-        legacy_review_count: to_u64(row.legacy_review_count, "legacy imported review count")?,
-        legacy_unclassified_count: to_u64(
-            row.legacy_unclassified_count,
-            "legacy unclassified review count",
-        )?,
         last_reviewed_at_us: optional_u64(row.last_reviewed_at_us, "legacy review timestamp")?,
         last_review_day: optional_u32(row.last_review_day, "legacy last review day")?,
         next_review_day: to_u32(row.next_review_day, "legacy next review day")?,
         interval_days: optional_u32(row.interval_days, "legacy interval")?,
-        consecutive_successes: to_u64(row.consecutive_successes, "legacy success streak")?,
-        total_successes: to_u64(row.total_successes, "legacy total successes")?,
-        consecutive_failures: to_u64(row.consecutive_failures, "legacy failure streak")?,
-        total_failures: to_u64(row.total_failures, "legacy total failures")?,
-        suspended: stored_bool(row.suspended, "legacy suspension")?,
-        gnosis_plus: row.gnosis_plus,
-        gnosis_minus: row.gnosis_minus,
-        gnosis_synolon: row.gnosis_synolon,
+        total_successes: to_u64(row.total_successes, "total successes")?,
+        total_failures: to_u64(row.total_failures, "total failures")?,
+        suspended: row.suspended != 0,
+        stability: row.stability,
+        difficulty: row.difficulty,
     })
 }
 
@@ -3789,14 +3712,6 @@ fn count_rows(connection: &Connection, query: &str) -> Result<u64, StoreError> {
         .query_row(query, [], |row| row.get(0))
         .map_err(StoreError::storage)?;
     to_u64(count, "legacy row count")
-}
-
-fn stored_bool(value: i64, field: &'static str) -> Result<bool, StoreError> {
-    match value {
-        0 => Ok(false),
-        1 => Ok(true),
-        _ => Err(StoreError::CorruptData { field }),
-    }
 }
 
 fn optional_u64(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
@@ -4692,8 +4607,7 @@ mod tests {
                 &SettingsInput {
                     timezone: "UTC".into(),
                     day_boundary_hour: settings.day_boundary_hour,
-                    scheduler: settings.scheduler,
-                    tag_rules: settings.tag_rules,
+                    desired_retention: settings.scheduler.desired_retention,
                 },
                 revision,
                 timestamp,
@@ -4805,7 +4719,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE marker(value TEXT);
                  INSERT INTO marker VALUES ('preserved');
-                 PRAGMA user_version = 2;",
+                 PRAGMA user_version = 3;",
             )
             .unwrap();
 
@@ -4814,11 +4728,11 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::UnsupportedSchemaVersion {
-                found: 2,
+                found: 3,
                 supported: SCHEMA_VERSION
             }
         ));
-        assert_eq!(schema_version(&connection).unwrap(), 2);
+        assert_eq!(schema_version(&connection).unwrap(), 3);
         assert_eq!(
             connection
                 .query_row("SELECT value FROM marker", [], |row| row
@@ -4862,18 +4776,18 @@ mod tests {
 
         assert!(matches!(
             error,
-            StoreError::UnsupportedApplicationId {
-                found: 0,
-                expected: APPLICATION_ID
+            StoreError::UnsupportedSchemaVersion {
+                found: 1,
+                supported: SCHEMA_VERSION
             }
         ));
     }
 
     #[test]
-    fn current_schema_is_v1_without_migration_history() {
+    fn current_schema_is_v2_without_migration_history() {
         let store = SqliteStore::open_in_memory().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(application_id(&store.connection).unwrap(), APPLICATION_ID);
         assert!(!schema_table_exists(&store.connection, "schema_migration"));
         for table in [

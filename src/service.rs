@@ -877,13 +877,11 @@ impl ServiceHandle {
         answer: AnswerInput,
         answered_at_us: u64,
     ) -> Result<ReviewAttemptView, ServiceError> {
-        let fuzz_sample = random_fuzz_sample()?;
         request(&self.sender, |response| StoreCommand::GradeReviewAttempt {
             attempt_id,
             actor_device_id,
             answer,
             answered_at_us,
-            fuzz_sample,
             response,
         })
         .await?
@@ -1576,7 +1574,6 @@ enum StoreCommand {
         actor_device_id: Option<String>,
         answer: AnswerInput,
         answered_at_us: u64,
-        fuzz_sample: f64,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
     OverrideReviewAttempt {
@@ -2299,7 +2296,6 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             actor_device_id,
             answer,
             answered_at_us,
-            fuzz_sample,
             response,
         } => send(
             response,
@@ -2308,7 +2304,6 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
                 actor_device_id.as_deref(),
                 &answer,
                 answered_at_us,
-                fuzz_sample,
             ),
         ),
         StoreCommand::OverrideReviewAttempt {
@@ -2606,13 +2601,6 @@ fn validate_blob_metadata(bytes: &[u8], media_type: &str) -> Result<(), ServiceE
     }
 }
 
-fn random_fuzz_sample() -> Result<f64, ServiceError> {
-    let mut bytes = [0_u8; 2];
-    getrandom::fill(&mut bytes).map_err(|_| ServiceError::Corrupt)?;
-    let value = u16::from_le_bytes(bytes) % 1001;
-    Ok(2.0 * (f64::from(value) / 1000.0) - 1.0)
-}
-
 fn system_time_us() -> Result<i64, ServiceError> {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2636,7 +2624,6 @@ pub(crate) enum ServiceStartError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
         sync::{Arc, mpsc},
         thread,
     };
@@ -2647,9 +2634,9 @@ mod tests {
     use super::{ServiceError, ServiceHandle, ServiceRuntime, StoreCommand, store_actor};
     use crate::application::{
         AssetReconciliationStatus, ImportDocument, OfflineAssetConflictReason,
-        OfflineAssetOperation, ParametersSnapshot, ReplicaProjection, SettingsInput,
-        canonical_asset_path, generate_device, prepare_asset, prepare_device_document_mutation,
-        prepare_note, prepare_thema, thema_content,
+        OfflineAssetOperation, ReplicaProjection, SettingsInput, canonical_asset_path,
+        generate_device, prepare_asset, prepare_device_document_mutation, prepare_note,
+        prepare_thema, thema_content,
     };
     use crate::blob::BlobStore;
     use crate::protocol::canonical_asset_operation;
@@ -3390,28 +3377,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_updates_are_revisioned_and_preserve_rules() {
+    async fn settings_updates_are_revisioned() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = runtime(&directory).await;
         let service = runtime.handle();
         let initial = service.settings().await.unwrap();
         assert_eq!(initial.timezone, "Europe/Athens");
-        assert!(initial.tag_rules.contains_key("Amboss"));
         let input = SettingsInput {
             timezone: "Europe/Sofia".into(),
             day_boundary_hour: 4,
-            scheduler: ParametersSnapshot {
-                scheduler_version: 1,
-                amnesia: 0.5,
-                epignosis: 0.1,
-                agnoia: 0.2,
-                anagnosis: 3,
-                lethe: 2,
-                synolon_max: 3.0,
-                interval_fuzz: 0.1,
-                proto: vec![0, 1, 2],
-            },
-            tag_rules: BTreeMap::new(),
+            desired_retention: 0.9,
         };
         let updated = service.update_settings(input, 1, 10, None).await.unwrap();
         assert_eq!(updated.revision, 2);

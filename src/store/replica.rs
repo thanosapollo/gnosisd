@@ -1919,7 +1919,6 @@ fn replayed_answer(
         && accepted_matches
         && operation.desired_suspended == input.desired_suspended
         && operation.answered_at_us == input.answered_at_us
-        && operation.fuzz_sample == input.fuzz_sample
     {
         Ok(Some(operation))
     } else {

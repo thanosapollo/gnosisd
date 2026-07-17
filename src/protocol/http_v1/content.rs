@@ -1,13 +1,11 @@
-use std::collections::BTreeMap;
-
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{DocumentOperationV1, ParametersV1, TagRuleV1, ThemaKindV1};
+use super::{DocumentOperationV1, FsrsConfigV1, ThemaKindV1};
 use crate::application::{
     AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
-    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, ParametersSnapshot,
-    SettingsInput, SettingsRecord, TagRule, ThemaRecord,
+    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, SettingsInput,
+    SettingsRecord, ThemaRecord,
 };
 use crate::domain::ThemaKind;
 
@@ -451,8 +449,7 @@ pub struct SettingsV1 {
     pub timezone: String,
     #[schemars(range(max = 23))]
     pub day_boundary_hour: u8,
-    pub scheduler: ParametersV1,
-    pub tag_rules: BTreeMap<String, TagRuleV1>,
+    pub scheduler: FsrsConfigV1,
 }
 
 impl SettingsV1 {
@@ -461,47 +458,9 @@ impl SettingsV1 {
             revision: value.revision,
             timezone: value.timezone.clone(),
             day_boundary_hour: value.day_boundary_hour,
-            scheduler: ParametersV1::from(&value.scheduler),
-            tag_rules: value
-                .tag_rules
-                .iter()
-                .map(|(tag, rule)| (tag.clone(), TagRuleV1::from(rule)))
-                .collect(),
+            scheduler: FsrsConfigV1::from(&value.scheduler),
         }
     }
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchedulerParametersInputV1 {
-    #[serde(default)]
-    #[schemars(default)]
-    pub scheduler_version: u32,
-    pub amnesia: f64,
-    pub epignosis: f64,
-    pub agnoia: f64,
-    pub anagnosis: u64,
-    pub lethe: u64,
-    pub synolon_max: f64,
-    pub interval_fuzz: f64,
-    pub proto: Vec<u32>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TagRuleInputV1 {
-    #[schemars(default)]
-    pub amnesia: Option<f64>,
-    #[schemars(default)]
-    pub epignosis: Option<f64>,
-    #[schemars(default)]
-    pub agnoia: Option<f64>,
-    #[schemars(default)]
-    pub anagnosis: Option<u64>,
-    #[schemars(default)]
-    pub lethe: Option<u64>,
-    #[schemars(default)]
-    pub proto: Option<Vec<u32>>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -510,10 +469,7 @@ pub struct UpdateSettingsRequestV1 {
     pub timezone: String,
     #[schemars(range(max = 23))]
     pub day_boundary_hour: u8,
-    pub scheduler: SchedulerParametersInputV1,
-    #[serde(default)]
-    #[schemars(default)]
-    pub tag_rules: BTreeMap<String, TagRuleInputV1>,
+    pub desired_retention: f32,
 }
 
 impl UpdateSettingsRequestV1 {
@@ -521,41 +477,7 @@ impl UpdateSettingsRequestV1 {
         SettingsInput {
             timezone: self.timezone,
             day_boundary_hour: self.day_boundary_hour,
-            scheduler: self.scheduler.into_application(),
-            tag_rules: self
-                .tag_rules
-                .into_iter()
-                .map(|(tag, rule)| (tag, rule.into_application()))
-                .collect(),
-        }
-    }
-}
-
-impl SchedulerParametersInputV1 {
-    fn into_application(self) -> ParametersSnapshot {
-        ParametersSnapshot {
-            scheduler_version: self.scheduler_version,
-            amnesia: self.amnesia,
-            epignosis: self.epignosis,
-            agnoia: self.agnoia,
-            anagnosis: self.anagnosis,
-            lethe: self.lethe,
-            synolon_max: self.synolon_max,
-            interval_fuzz: self.interval_fuzz,
-            proto: self.proto,
-        }
-    }
-}
-
-impl TagRuleInputV1 {
-    fn into_application(self) -> TagRule {
-        TagRule {
-            amnesia: self.amnesia,
-            epignosis: self.epignosis,
-            agnoia: self.agnoia,
-            anagnosis: self.anagnosis,
-            lethe: self.lethe,
-            proto: self.proto,
+            desired_retention: self.desired_retention,
         }
     }
 }

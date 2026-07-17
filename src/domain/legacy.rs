@@ -30,20 +30,15 @@ pub(crate) struct LegacyThema {
 pub(crate) struct LegacyReviewState {
     pub(crate) state_revision: u64,
     pub(crate) review_count: u64,
-    pub(crate) legacy_review_count: u64,
-    pub(crate) legacy_unclassified_count: u64,
     pub(crate) last_reviewed_at_us: Option<u64>,
     pub(crate) last_review_day: Option<u32>,
     pub(crate) next_review_day: u32,
     pub(crate) interval_days: Option<u32>,
-    pub(crate) consecutive_successes: u64,
     pub(crate) total_successes: u64,
-    pub(crate) consecutive_failures: u64,
     pub(crate) total_failures: u64,
     pub(crate) suspended: bool,
-    pub(crate) gnosis_plus: f64,
-    pub(crate) gnosis_minus: f64,
-    pub(crate) gnosis_synolon: f64,
+    pub(crate) stability: Option<f64>,
+    pub(crate) difficulty: Option<f64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

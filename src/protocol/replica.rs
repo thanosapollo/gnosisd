@@ -3,19 +3,21 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::application::{
-    DocumentProjectionSnapshot, ParametersSnapshot, ProjectionEdge, ProjectionLinkOccurrence,
+    DocumentProjectionSnapshot, FsrsAlgorithmSnapshot, FsrsConfigSnapshot,
+    FsrsImplementationSnapshot, FsrsModelSnapshot, ProjectionEdge, ProjectionLinkOccurrence,
     ProjectionNode, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateSnapshot,
-    SettingsInput, SnapshotPage, SnapshotPosition, TagRule, prepare_thema, thema_content,
+    SettingsInput, SnapshotPage, SnapshotPosition, prepare_thema, thema_content,
     validate_asset_path, validate_org_path,
 };
 use crate::is_canonical_sha256;
 
 use super::http_v1::{
     AssetOperationV1, AssetRevisionV1, DocumentOperationV1, DocumentProjectionV1,
-    DocumentRevisionV1, ParametersV1, ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1,
-    ReplicaChangePageV1, ReplicaChangeV1, ReplicaProjectionV1, ReplicaSnapshotPageV1,
-    ReplicaStateV1, ReviewStateRevisionV1, ReviewStateV1, SettingsOperationV1, SettingsRevisionV1,
-    TagRuleV1, ThemaKindV1, ThemaOperationV1, ThemaRevisionV1,
+    DocumentRevisionV1, FsrsAlgorithmV1, FsrsConfigV1, FsrsImplementationV1, FsrsModelV1,
+    ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1, ReplicaChangePageV1, ReplicaChangeV1,
+    ReplicaProjectionV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewStateRevisionV1,
+    ReviewStateV1, SettingsOperationV1, SettingsRevisionV1, ThemaKindV1, ThemaOperationV1,
+    ThemaRevisionV1,
 };
 
 pub(crate) const REPLICA_VERSION: u32 = 1;
@@ -585,17 +587,19 @@ fn thema_identity(value: &ThemaRevisionV1) -> Result<ProjectionIdentity, Replica
     ))
 }
 
-fn parameters_snapshot(value: &ParametersV1) -> ParametersSnapshot {
-    ParametersSnapshot {
-        scheduler_version: value.scheduler_version,
-        amnesia: value.amnesia,
-        epignosis: value.epignosis,
-        agnoia: value.agnoia,
-        anagnosis: value.anagnosis,
-        lethe: value.lethe,
-        synolon_max: value.synolon_max,
-        interval_fuzz: value.interval_fuzz,
-        proto: value.proto.clone(),
+fn fsrs_config_snapshot(value: &FsrsConfigV1) -> FsrsConfigSnapshot {
+    FsrsConfigSnapshot {
+        algorithm: match value.algorithm {
+            FsrsAlgorithmV1::Fsrs => FsrsAlgorithmSnapshot::Fsrs,
+        },
+        model: match value.model {
+            FsrsModelV1::Fsrs6 => FsrsModelSnapshot::Six,
+        },
+        implementation: match value.implementation {
+            FsrsImplementationV1::FsrsRs1_1 => FsrsImplementationSnapshot::Crate6Dot6Dot1,
+        },
+        desired_retention: value.desired_retention,
+        parameters: value.parameters,
     }
 }
 
@@ -603,27 +607,14 @@ fn settings_identity(value: &SettingsRevisionV1) -> Result<ProjectionIdentity, R
     if value.timezone.is_empty() || value.day_boundary_hour > 23 {
         return Err(ReplicaWireError::Response);
     }
+    let config = fsrs_config_snapshot(&value.scheduler);
+    if !config.valid() {
+        return Err(ReplicaWireError::Response);
+    }
     let settings = SettingsInput {
         timezone: value.timezone.clone(),
         day_boundary_hour: value.day_boundary_hour,
-        scheduler: parameters_snapshot(&value.scheduler),
-        tag_rules: value
-            .tag_rules
-            .iter()
-            .map(|(tag, rule)| {
-                (
-                    tag.clone(),
-                    TagRule {
-                        amnesia: rule.amnesia,
-                        epignosis: rule.epignosis,
-                        agnoia: rule.agnoia,
-                        anagnosis: rule.anagnosis,
-                        lethe: rule.lethe,
-                        proto: rule.proto.clone(),
-                    },
-                )
-            })
-            .collect(),
+        desired_retention: value.scheduler.desired_retention,
     };
     settings
         .validate()
@@ -648,20 +639,15 @@ fn review_identity(value: &ReviewStateRevisionV1) -> Result<ProjectionIdentity, 
     let state = ReviewStateSnapshot {
         state_revision: value.state.state_revision,
         review_count: value.state.review_count,
-        legacy_review_count: value.state.legacy_review_count,
-        legacy_unclassified_count: value.state.legacy_unclassified_count,
         last_reviewed_at_us: value.state.last_reviewed_at_us,
         last_review_day: value.state.last_review_day,
         next_review_day: value.state.next_review_day,
         interval_days: value.state.interval_days,
-        consecutive_successes: value.state.consecutive_successes,
         total_successes: value.state.total_successes,
-        consecutive_failures: value.state.consecutive_failures,
         total_failures: value.state.total_failures,
         suspended: value.state.suspended,
-        gnosis_plus: value.state.gnosis_plus,
-        gnosis_minus: value.state.gnosis_minus,
-        gnosis_synolon: value.state.gnosis_synolon,
+        stability: value.state.stability,
+        difficulty: value.state.difficulty,
     };
     crate::domain::validate_state(&state.into()).map_err(|_| ReplicaWireError::Response)?;
     Ok((
@@ -843,46 +829,11 @@ impl TryFrom<&crate::application::SettingsRevision> for SettingsRevisionV1 {
             revision: value.settings.revision,
             timezone: value.settings.timezone.clone(),
             day_boundary_hour: value.settings.day_boundary_hour,
-            scheduler: ParametersV1::from(&value.settings.scheduler),
-            tag_rules: value
-                .settings
-                .tag_rules
-                .iter()
-                .map(|(tag, rule)| (tag.clone(), TagRuleV1::from(rule)))
-                .collect(),
+            scheduler: FsrsConfigV1::from(&value.settings.scheduler),
             operation: settings_operation(&value.operation)?,
             created_at_us: value.created_at_us,
             author_device_id: value.author_device_id.clone(),
         })
-    }
-}
-
-impl From<&crate::application::ParametersSnapshot> for ParametersV1 {
-    fn from(value: &crate::application::ParametersSnapshot) -> Self {
-        Self {
-            scheduler_version: value.scheduler_version,
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            synolon_max: value.synolon_max,
-            interval_fuzz: value.interval_fuzz,
-            proto: value.proto.clone(),
-        }
-    }
-}
-
-impl From<&TagRule> for TagRuleV1 {
-    fn from(value: &TagRule) -> Self {
-        Self {
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            proto: value.proto.clone(),
-        }
     }
 }
 
@@ -891,27 +842,21 @@ impl From<&ReviewStateSnapshot> for ReviewStateV1 {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
-            legacy_review_count: value.legacy_review_count,
-            legacy_unclassified_count: value.legacy_unclassified_count,
             last_reviewed_at_us: value.last_reviewed_at_us,
             last_review_day: value.last_review_day,
             next_review_day: value.next_review_day,
             interval_days: value.interval_days,
-            consecutive_successes: value.consecutive_successes,
             total_successes: value.total_successes,
-            consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             suspended: value.suspended,
-            gnosis_plus: value.gnosis_plus,
-            gnosis_minus: value.gnosis_minus,
-            gnosis_synolon: value.gnosis_synolon,
+            stability: value.stability,
+            difficulty: value.difficulty,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use serde_json::{Value, json};
 
@@ -922,9 +867,9 @@ mod tests {
     };
     use crate::application::{
         AssetRevision, DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision,
-        ParametersSnapshot, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
+        FsrsConfigSnapshot, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
         ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, ReviewStateSnapshot,
-        SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition, TagRule, ThemaRecord,
+        SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition, ThemaRecord,
         ThemaRevision, prepare_thema, thema_content,
     };
 
@@ -1244,24 +1189,7 @@ mod tests {
                 revision: 2,
                 timezone: "UTC".into(),
                 day_boundary_hour: 4,
-                scheduler: ParametersSnapshot {
-                    scheduler_version: 1,
-                    amnesia: 0.5,
-                    epignosis: 0.1,
-                    agnoia: 0.2,
-                    anagnosis: 3,
-                    lethe: 2,
-                    synolon_max: 3.0,
-                    interval_fuzz: 0.1,
-                    proto: vec![0, 1, 2],
-                },
-                tag_rules: BTreeMap::from([(
-                    "tag".into(),
-                    TagRule {
-                        amnesia: Some(0.6),
-                        ..TagRule::default()
-                    },
-                )]),
+                scheduler: FsrsConfigSnapshot::default(),
             },
             operation: "update".into(),
             created_at_us: 23,
@@ -1275,20 +1203,15 @@ mod tests {
             state: ReviewStateSnapshot {
                 state_revision: 1,
                 review_count: 1,
-                legacy_review_count: 0,
-                legacy_unclassified_count: 0,
                 last_reviewed_at_us: Some(24),
                 last_review_day: Some(20260715),
                 next_review_day: 20260716,
                 interval_days: Some(1),
-                consecutive_successes: 1,
                 total_successes: 1,
-                consecutive_failures: 0,
                 total_failures: 0,
                 suspended: false,
-                gnosis_plus: 0.4,
-                gnosis_minus: 0.3,
-                gnosis_synolon: 1.4,
+                stability: Some(1.4),
+                difficulty: Some(5.0),
             },
             event_id: Some("event".into()),
             created_at_us: 24,

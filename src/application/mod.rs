@@ -55,9 +55,10 @@ pub use query_document::QueryDocument;
 pub(crate) use query_legacy::DueCursor;
 pub use query_legacy::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema};
 pub(crate) use review::{
-    AnswerInput, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,
-    OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, ParametersSnapshot,
-    PresentationSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
+    AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
+    FsrsModelSnapshot, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,
+    OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot,
+    RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
     ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
     ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
     ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
@@ -65,7 +66,7 @@ pub(crate) use review::{
     presentation_content, review_day_at, review_question, valid_operation_id,
     validate_review_pack_projection,
 };
-pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord, TagRule};
+pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord};
 pub(crate) use sync::{
     ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsRevision,
     SnapshotPage, SnapshotPosition,

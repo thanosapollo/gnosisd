@@ -7,9 +7,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unicode_script::{Script, UnicodeScript};
 
+use crate::domain::fsrs::{
+    FsrsAlgorithm, FsrsConfigSnapshot as DomainFsrsConfigSnapshot, FsrsImplementation, FsrsModel,
+    RecallOutcome,
+};
 use crate::domain::{
-    ReviewState, SchedulerParameters, StructuredResponse, ThemaContent, ThemaKind, Transition,
-    compute_transition, fuzz_delta, grade,
+    ReviewState, StructuredResponse, ThemaContent, ThemaKind, Transition, compute_transition, grade,
 };
 use crate::is_canonical_sha256;
 
@@ -181,20 +184,15 @@ pub(crate) enum ReviewResponsePrompt {
 pub(crate) struct ReviewStateSnapshot {
     pub(crate) state_revision: u64,
     pub(crate) review_count: u64,
-    pub(crate) legacy_review_count: u64,
-    pub(crate) legacy_unclassified_count: u64,
     pub(crate) last_reviewed_at_us: Option<u64>,
     pub(crate) last_review_day: Option<u32>,
     pub(crate) next_review_day: u32,
     pub(crate) interval_days: Option<u32>,
-    pub(crate) consecutive_successes: u64,
     pub(crate) total_successes: u64,
-    pub(crate) consecutive_failures: u64,
     pub(crate) total_failures: u64,
     pub(crate) suspended: bool,
-    pub(crate) gnosis_plus: f64,
-    pub(crate) gnosis_minus: f64,
-    pub(crate) gnosis_synolon: f64,
+    pub(crate) stability: Option<f32>,
+    pub(crate) difficulty: Option<f32>,
 }
 
 impl From<ReviewStateSnapshot> for ReviewState {
@@ -202,20 +200,15 @@ impl From<ReviewStateSnapshot> for ReviewState {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
-            legacy_review_count: value.legacy_review_count,
-            legacy_unclassified_count: value.legacy_unclassified_count,
             last_reviewed_at_us: value.last_reviewed_at_us,
             last_review_day: value.last_review_day,
             next_review_day: value.next_review_day,
             interval_days: value.interval_days,
-            consecutive_successes: value.consecutive_successes,
             total_successes: value.total_successes,
-            consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             suspended: value.suspended,
-            gnosis_plus: value.gnosis_plus,
-            gnosis_minus: value.gnosis_minus,
-            gnosis_synolon: value.gnosis_synolon,
+            stability: value.stability,
+            difficulty: value.difficulty,
         }
     }
 }
@@ -225,68 +218,88 @@ impl From<&ReviewState> for ReviewStateSnapshot {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
-            legacy_review_count: value.legacy_review_count,
-            legacy_unclassified_count: value.legacy_unclassified_count,
             last_reviewed_at_us: value.last_reviewed_at_us,
             last_review_day: value.last_review_day,
             next_review_day: value.next_review_day,
             interval_days: value.interval_days,
-            consecutive_successes: value.consecutive_successes,
             total_successes: value.total_successes,
-            consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             suspended: value.suspended,
-            gnosis_plus: value.gnosis_plus,
-            gnosis_minus: value.gnosis_minus,
-            gnosis_synolon: value.gnosis_synolon,
+            stability: value.stability,
+            difficulty: value.difficulty,
         }
+    }
+}
+
+impl Default for ReviewStateSnapshot {
+    fn default() -> Self {
+        Self::from(&ReviewState::default())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ParametersSnapshot {
-    #[serde(default)]
-    pub(crate) scheduler_version: u32,
-    pub(crate) amnesia: f64,
-    pub(crate) epignosis: f64,
-    pub(crate) agnoia: f64,
-    pub(crate) anagnosis: u64,
-    pub(crate) lethe: u64,
-    pub(crate) synolon_max: f64,
-    pub(crate) interval_fuzz: f64,
-    pub(crate) proto: Vec<u32>,
+pub(crate) struct FsrsConfigSnapshot {
+    pub(crate) algorithm: FsrsAlgorithmSnapshot,
+    pub(crate) model: FsrsModelSnapshot,
+    pub(crate) implementation: FsrsImplementationSnapshot,
+    pub(crate) desired_retention: f32,
+    pub(crate) parameters: [f32; 21],
 }
 
-impl From<ParametersSnapshot> for SchedulerParameters {
-    fn from(value: ParametersSnapshot) -> Self {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FsrsAlgorithmSnapshot {
+    Fsrs,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FsrsModelSnapshot {
+    #[serde(rename = "fsrs6")]
+    Six,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FsrsImplementationSnapshot {
+    #[serde(rename = "fsrs-6.6.1")]
+    Crate6Dot6Dot1,
+}
+
+impl From<FsrsConfigSnapshot> for DomainFsrsConfigSnapshot {
+    fn from(value: FsrsConfigSnapshot) -> Self {
         Self {
-            scheduler_version: value.scheduler_version,
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            synolon_max: value.synolon_max,
-            interval_fuzz: value.interval_fuzz,
-            proto: value.proto,
+            algorithm: FsrsAlgorithm::Fsrs,
+            model: FsrsModel::Six,
+            implementation: FsrsImplementation::Crate6Dot6Dot1,
+            desired_retention: value.desired_retention,
+            parameters: value.parameters,
         }
     }
 }
 
-impl From<&SchedulerParameters> for ParametersSnapshot {
-    fn from(value: &SchedulerParameters) -> Self {
+impl From<&DomainFsrsConfigSnapshot> for FsrsConfigSnapshot {
+    fn from(value: &DomainFsrsConfigSnapshot) -> Self {
         Self {
-            scheduler_version: value.scheduler_version,
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            synolon_max: value.synolon_max,
-            interval_fuzz: value.interval_fuzz,
-            proto: value.proto.clone(),
+            algorithm: FsrsAlgorithmSnapshot::Fsrs,
+            model: FsrsModelSnapshot::Six,
+            implementation: FsrsImplementationSnapshot::Crate6Dot6Dot1,
+            desired_retention: value.desired_retention,
+            parameters: value.parameters,
         }
+    }
+}
+
+impl FsrsConfigSnapshot {
+    pub(crate) fn valid(&self) -> bool {
+        crate::domain::fsrs::validate_config(&self.clone().into()).is_ok()
+    }
+}
+
+impl Default for FsrsConfigSnapshot {
+    fn default() -> Self {
+        Self::from(&DomainFsrsConfigSnapshot::default())
     }
 }
 
@@ -318,15 +331,22 @@ impl From<AnswerInput> for StructuredResponse {
 pub(crate) struct TransitionSnapshot {
     pub(crate) before: ReviewStateSnapshot,
     pub(crate) after: ReviewStateSnapshot,
-    pub(crate) parameters: ParametersSnapshot,
+    pub(crate) config: FsrsConfigSnapshot,
     pub(crate) reviewed_at_us: u64,
     pub(crate) review_day: u32,
-    pub(crate) success: bool,
+    pub(crate) outcome: RecallOutcomeSnapshot,
     pub(crate) first_review: bool,
     pub(crate) elapsed_days: u32,
-    pub(crate) algorithm_interval_days: f64,
-    pub(crate) computed_interval_days: u32,
-    pub(crate) fuzz_delta: f64,
+    pub(crate) raw_interval_days: f32,
+    pub(crate) interval_days: u32,
+    pub(crate) due_day: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecallOutcomeSnapshot {
+    Failure,
+    Success,
 }
 
 impl From<&Transition> for TransitionSnapshot {
@@ -334,15 +354,18 @@ impl From<&Transition> for TransitionSnapshot {
         Self {
             before: (&value.before).into(),
             after: (&value.after).into(),
-            parameters: (&value.parameters).into(),
+            config: (&value.config).into(),
             reviewed_at_us: value.reviewed_at_us,
             review_day: value.review_day,
-            success: value.success,
+            outcome: match value.outcome {
+                RecallOutcome::Failure => RecallOutcomeSnapshot::Failure,
+                RecallOutcome::Success => RecallOutcomeSnapshot::Success,
+            },
             first_review: value.first_review,
             elapsed_days: value.elapsed_days,
-            algorithm_interval_days: value.algorithm_interval_days,
-            computed_interval_days: value.computed_interval_days,
-            fuzz_delta: value.fuzz_delta,
+            raw_interval_days: value.raw_interval_days,
+            interval_days: value.interval_days,
+            due_day: value.due_day,
         }
     }
 }
@@ -520,7 +543,7 @@ pub(crate) struct ReviewPackItem {
     pub(crate) content_sha256: String,
     pub(crate) presentation: PresentationSnapshot,
     pub(crate) review_state: ReviewStateSnapshot,
-    pub(crate) parameters: ParametersSnapshot,
+    pub(crate) config: FsrsConfigSnapshot,
     pub(crate) matcher_version: u32,
     pub(crate) asset_paths: Vec<String>,
 }
@@ -631,7 +654,7 @@ pub(crate) struct OfflineReviewOperation {
     pub(crate) base_state_revision: u64,
     pub(crate) content_sha256: String,
     pub(crate) presentation: PresentationSnapshot,
-    pub(crate) parameters: ParametersSnapshot,
+    pub(crate) config: FsrsConfigSnapshot,
     pub(crate) matcher_version: u32,
     pub(crate) response: AnswerInput,
     pub(crate) detected_success: bool,
@@ -640,7 +663,6 @@ pub(crate) struct OfflineReviewOperation {
     pub(crate) proposed_transition: TransitionSnapshot,
     pub(crate) desired_suspended: bool,
     pub(crate) answered_at_us: u64,
-    pub(crate) fuzz_sample: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -651,7 +673,6 @@ pub(crate) struct OfflineAnswerInput {
     pub(crate) accepted_success: Option<bool>,
     pub(crate) desired_suspended: bool,
     pub(crate) answered_at_us: u64,
-    pub(crate) fuzz_sample: f64,
 }
 
 pub(crate) fn prepare_offline_operation(
@@ -695,8 +716,6 @@ fn validate_offline_answer(
     if input.attempt_id.is_empty()
         || input.attempt_id.len() > 128
         || input.answered_at_us < pack.issued_at_us
-        || !input.fuzz_sample.is_finite()
-        || !(-1.0..=1.0).contains(&input.fuzz_sample)
     {
         return Err(OfflineAnswerError::Input);
     }
@@ -723,31 +742,9 @@ fn offline_transition(
     let day = review_day_at(input.answered_at_us, &pack.timezone, pack.day_boundary_hour)
         .map_err(|_| OfflineAnswerError::Clock)?;
     let state = item.review_state.clone().into();
-    let parameters = item.parameters.clone().into();
-    let probe = compute_transition(
-        &state,
-        &parameters,
-        accepted,
-        day,
-        input.answered_at_us,
-        0.0,
-    )
-    .map_err(|_| OfflineAnswerError::Schedule)?;
-    let delta = fuzz_delta(
-        probe.algorithm_interval_days,
-        parameters.interval_fuzz,
-        input.fuzz_sample,
-    )
-    .map_err(|_| OfflineAnswerError::Schedule)?;
-    compute_transition(
-        &state,
-        &parameters,
-        accepted,
-        day,
-        input.answered_at_us,
-        delta,
-    )
-    .map_err(|_| OfflineAnswerError::Schedule)
+    let config = item.config.clone().into();
+    compute_transition(&state, &config, accepted, day, input.answered_at_us)
+        .map_err(|_| OfflineAnswerError::Schedule)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -773,7 +770,7 @@ fn build_offline_operation(
         base_state_revision: item.review_state.state_revision,
         content_sha256: item.content_sha256.clone(),
         presentation: item.presentation.clone(),
-        parameters: item.parameters.clone(),
+        config: item.config.clone(),
         matcher_version: item.matcher_version,
         response: input.response,
         detected_success,
@@ -782,7 +779,6 @@ fn build_offline_operation(
         proposed_transition: (&transition).into(),
         desired_suspended: input.desired_suspended,
         answered_at_us: input.answered_at_us,
-        fuzz_sample: input.fuzz_sample,
     }
 }
 

@@ -339,7 +339,6 @@ async fn client_acquires_a_complete_review_pack_and_resumes_after_restart() {
                 accepted_success: None,
                 desired_suspended: false,
                 answered_at_us: pack.issued_at_us + 1,
-                fuzz_sample: 0.0,
             },
         )
         .unwrap();
@@ -749,8 +748,7 @@ async fn cli_review_pack_answers_offline_replays_and_reconciles() {
         "response": {"kind": "text", "value": "Answer"},
         "accepted_success": null,
         "desired_suspended": false,
-        "answered_at_us": answered_at_us,
-        "fuzz_sample": 0.0
+        "answered_at_us": answered_at_us
     });
     let first_bytes = serde_json::to_vec(&first_answer).unwrap();
     let lost = run_cli_without_token_with_input_to_full(
@@ -808,8 +806,7 @@ async fn cli_review_pack_answers_offline_replays_and_reconciles() {
         "response": {"kind": "text", "value": "Answer"},
         "accepted_success": null,
         "desired_suspended": false,
-        "answered_at_us": answered_at_us + 1,
-        "fuzz_sample": 0.0
+        "answered_at_us": answered_at_us + 1
     });
     let second = run_cli_without_token_with_input(
         offline,
@@ -912,8 +909,7 @@ async fn cli_review_pack_surfaces_conflicts_without_captured_answers() {
         "response": {"kind": "text", "value": "Answer"},
         "accepted_success": null,
         "desired_suspended": false,
-        "answered_at_us": u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap(),
-        "fuzz_sample": 0.0
+        "answered_at_us": u64::try_from(chrono::Utc::now().timestamp_micros()).unwrap()
     });
     assert!(
         run_cli_without_token_with_input(

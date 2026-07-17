@@ -333,7 +333,6 @@ pub struct OfflineAnswer {
     pub accepted_success: Option<bool>,
     pub desired_suspended: bool,
     pub answered_at_us: u64,
-    pub fuzz_sample: f64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1815,7 +1814,6 @@ impl From<OfflineAnswer> for OfflineAnswerInput {
             accepted_success: value.accepted_success,
             desired_suspended: value.desired_suspended,
             answered_at_us: value.answered_at_us,
-            fuzz_sample: value.fuzz_sample,
         }
     }
 }
@@ -3702,7 +3700,6 @@ mod tests {
             accepted_success: None,
             desired_suspended: false,
             answered_at_us,
-            fuzz_sample: -0.25,
         }
     }
 

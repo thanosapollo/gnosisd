@@ -128,7 +128,7 @@ pub(crate) fn compute_fsrs_transition(
     })
 }
 
-fn validate_config(config: &FsrsConfigSnapshot) -> Result<(), FsrsError> {
+pub(crate) fn validate_config(config: &FsrsConfigSnapshot) -> Result<(), FsrsError> {
     if config.algorithm == FsrsAlgorithm::Fsrs
         && config.model == FsrsModel::Six
         && config.implementation == FsrsImplementation::Crate6Dot6Dot1

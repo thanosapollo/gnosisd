@@ -396,7 +396,7 @@ async fn online_review_commit_is_idempotent_after_lost_response() {
     let transition_count: u64 = connection
         .query_row(
             "SELECT count(*) FROM review_state_revision
-             WHERE thema_id = '7' AND state_revision = 2",
+             WHERE thema_id = '7' AND state_revision = 1",
             [],
             |row| row.get(0),
         )
@@ -1032,6 +1032,8 @@ async fn sigterm_drains_daemon_and_removes_socket() {
             socket.to_str().unwrap(),
             "--database",
             database.to_str().unwrap(),
+            "--http-listen",
+            "127.0.0.1:0",
         ])
         .spawn()
         .unwrap();

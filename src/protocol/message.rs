@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::application::{
-    AnswerInput, ParametersSnapshot, PresentationSnapshot, ReviewAttemptOperationResult,
+    AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
+    FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot, ReviewAttemptOperationResult,
     ReviewAttemptState, ReviewAttemptView, ReviewSessionView, ReviewSource, ReviewSourceKind,
     ReviewStateSnapshot, TransitionSnapshot, valid_operation_id,
 };
@@ -443,20 +444,15 @@ impl From<PresentationSnapshot> for LocalPresentationView {
 pub struct LocalReviewStateView {
     pub state_revision: u64,
     pub review_count: u64,
-    pub legacy_review_count: u64,
-    pub legacy_unclassified_count: u64,
     pub last_reviewed_at_us: Option<u64>,
     pub last_review_day: Option<u32>,
     pub next_review_day: u32,
     pub interval_days: Option<u32>,
-    pub consecutive_successes: u64,
     pub total_successes: u64,
-    pub consecutive_failures: u64,
     pub total_failures: u64,
     pub suspended: bool,
-    pub gnosis_plus: f64,
-    pub gnosis_minus: f64,
-    pub gnosis_synolon: f64,
+    pub stability: Option<f32>,
+    pub difficulty: Option<f32>,
 }
 
 impl From<ReviewStateSnapshot> for LocalReviewStateView {
@@ -464,50 +460,47 @@ impl From<ReviewStateSnapshot> for LocalReviewStateView {
         Self {
             state_revision: value.state_revision,
             review_count: value.review_count,
-            legacy_review_count: value.legacy_review_count,
-            legacy_unclassified_count: value.legacy_unclassified_count,
+
             last_reviewed_at_us: value.last_reviewed_at_us,
             last_review_day: value.last_review_day,
             next_review_day: value.next_review_day,
             interval_days: value.interval_days,
-            consecutive_successes: value.consecutive_successes,
             total_successes: value.total_successes,
-            consecutive_failures: value.consecutive_failures,
             total_failures: value.total_failures,
             suspended: value.suspended,
-            gnosis_plus: value.gnosis_plus,
-            gnosis_minus: value.gnosis_minus,
-            gnosis_synolon: value.gnosis_synolon,
+            stability: value.stability,
+            difficulty: value.difficulty,
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct LocalParametersView {
-    pub scheduler_version: u32,
-    pub amnesia: f64,
-    pub epignosis: f64,
-    pub agnoia: f64,
-    pub anagnosis: u64,
-    pub lethe: u64,
-    pub synolon_max: f64,
-    pub interval_fuzz: f64,
-    pub proto: Vec<u32>,
+pub struct LocalFsrsConfigView {
+    pub algorithm: String,
+    pub model: String,
+    pub implementation: String,
+    pub desired_retention: f32,
+    pub parameters: [f32; 21],
 }
 
-impl From<ParametersSnapshot> for LocalParametersView {
-    fn from(value: ParametersSnapshot) -> Self {
+impl From<FsrsConfigSnapshot> for LocalFsrsConfigView {
+    fn from(value: FsrsConfigSnapshot) -> Self {
         Self {
-            scheduler_version: value.scheduler_version,
-            amnesia: value.amnesia,
-            epignosis: value.epignosis,
-            agnoia: value.agnoia,
-            anagnosis: value.anagnosis,
-            lethe: value.lethe,
-            synolon_max: value.synolon_max,
-            interval_fuzz: value.interval_fuzz,
-            proto: value.proto,
+            algorithm: match value.algorithm {
+                FsrsAlgorithmSnapshot::Fsrs => "fsrs",
+            }
+            .into(),
+            model: match value.model {
+                FsrsModelSnapshot::Six => "fsrs_6",
+            }
+            .into(),
+            implementation: match value.implementation {
+                FsrsImplementationSnapshot::Crate6Dot6Dot1 => "fsrs-6.6.1",
+            }
+            .into(),
+            desired_retention: value.desired_retention,
+            parameters: value.parameters,
         }
     }
 }
@@ -517,15 +510,15 @@ impl From<ParametersSnapshot> for LocalParametersView {
 pub struct LocalTransitionView {
     pub before: LocalReviewStateView,
     pub after: LocalReviewStateView,
-    pub parameters: LocalParametersView,
+    pub config: LocalFsrsConfigView,
     pub reviewed_at_us: u64,
     pub review_day: u32,
-    pub success: bool,
+    pub outcome: String,
     pub first_review: bool,
     pub elapsed_days: u32,
-    pub algorithm_interval_days: f64,
-    pub computed_interval_days: u32,
-    pub fuzz_delta: f64,
+    pub raw_interval_days: f32,
+    pub interval_days: u32,
+    pub due_day: u32,
 }
 
 impl From<TransitionSnapshot> for LocalTransitionView {
@@ -533,15 +526,19 @@ impl From<TransitionSnapshot> for LocalTransitionView {
         Self {
             before: value.before.into(),
             after: value.after.into(),
-            parameters: value.parameters.into(),
+            config: value.config.into(),
             reviewed_at_us: value.reviewed_at_us,
             review_day: value.review_day,
-            success: value.success,
+            outcome: match value.outcome {
+                RecallOutcomeSnapshot::Failure => "failure",
+                RecallOutcomeSnapshot::Success => "success",
+            }
+            .into(),
             first_review: value.first_review,
             elapsed_days: value.elapsed_days,
-            algorithm_interval_days: value.algorithm_interval_days,
-            computed_interval_days: value.computed_interval_days,
-            fuzz_delta: value.fuzz_delta,
+            raw_interval_days: value.raw_interval_days,
+            interval_days: value.interval_days,
+            due_day: value.due_day,
         }
     }
 }
@@ -763,20 +760,15 @@ impl From<LegacyThema> for ThemaView {
 pub struct ReviewStateView {
     pub state_revision: u64,
     pub review_count: u64,
-    pub legacy_review_count: u64,
-    pub legacy_unclassified_count: u64,
     pub last_reviewed_at_us: Option<u64>,
     pub last_review_day: Option<u32>,
     pub next_review_day: u32,
     pub interval_days: Option<u32>,
-    pub consecutive_successes: u64,
     pub total_successes: u64,
-    pub consecutive_failures: u64,
     pub total_failures: u64,
     pub suspended: bool,
-    pub gnosis_plus: f64,
-    pub gnosis_minus: f64,
-    pub gnosis_synolon: f64,
+    pub stability: Option<f64>,
+    pub difficulty: Option<f64>,
 }
 
 impl From<LegacyReviewState> for ReviewStateView {
@@ -784,20 +776,16 @@ impl From<LegacyReviewState> for ReviewStateView {
         Self {
             state_revision: state.state_revision,
             review_count: state.review_count,
-            legacy_review_count: state.legacy_review_count,
-            legacy_unclassified_count: state.legacy_unclassified_count,
+
             last_reviewed_at_us: state.last_reviewed_at_us,
             last_review_day: state.last_review_day,
             next_review_day: state.next_review_day,
             interval_days: state.interval_days,
-            consecutive_successes: state.consecutive_successes,
             total_successes: state.total_successes,
-            consecutive_failures: state.consecutive_failures,
             total_failures: state.total_failures,
             suspended: state.suspended,
-            gnosis_plus: state.gnosis_plus,
-            gnosis_minus: state.gnosis_minus,
-            gnosis_synolon: state.gnosis_synolon,
+            stability: state.stability,
+            difficulty: state.difficulty,
         }
     }
 }

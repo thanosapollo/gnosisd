@@ -3239,8 +3239,7 @@ mod tests {
         review_day_at, thema_content,
     };
     use crate::domain::{
-        DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, fuzz_delta,
-        grade,
+        DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, grade,
     };
     use crate::protocol::{
         MAX_REPLICA_PAGE_BYTES, canonical_asset_operation, decode_cursor, encode_cursor,
@@ -4419,9 +4418,12 @@ mod tests {
             schemas["ThemaWriteRequestV1"]["properties"]["kind"]["pattern"],
             "^(basic|cloze|mcq|mc-cloze)$"
         );
-        assert_eq!(
-            schemas["SchedulerParametersInputV1"]["properties"]["scheduler_version"]["default"],
-            0
+        assert!(schemas.get("SchedulerParametersInputV1").is_none());
+        assert!(
+            schemas["UpdateSettingsRequestV1"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("desired_retention"))
         );
         assert_eq!(
             schemas["ContentChangePageV1"]["properties"]["items"]["maxItems"],
@@ -4681,9 +4683,12 @@ mod tests {
             .unwrap();
         assert_eq!(missing_graph.status(), StatusCode::NOT_FOUND);
 
-        let mut settings = serde_json::to_value(service.settings().await.unwrap()).unwrap();
-        settings.as_object_mut().unwrap().remove("revision");
-        let settings = serde_json::to_vec(&settings).unwrap();
+        let settings = serde_json::to_vec(&json!({
+            "timezone": "UTC",
+            "day_boundary_hour": 0,
+            "desired_retention": 0.9
+        }))
+        .unwrap();
         let forbidden = app
             .clone()
             .oneshot(authorized(
@@ -6369,8 +6374,7 @@ mod tests {
                 SettingsInput {
                     timezone: "UTC".into(),
                     day_boundary_hour: settings.day_boundary_hour,
-                    scheduler: settings.scheduler,
-                    tag_rules: settings.tag_rules,
+                    desired_retention: settings.scheduler.desired_retention,
                 },
                 settings.revision,
                 3,
@@ -7297,25 +7301,13 @@ mod tests {
         let review_day =
             review_day_at(answered_at_us, &pack.timezone, pack.day_boundary_hour).unwrap();
         let state = item.review_state.clone().into();
-        let parameters = item.parameters.clone().into();
-        let probe = compute_transition(
-            &state,
-            &parameters,
-            detected_success,
-            review_day,
-            answered_at_us,
-            0.0,
-        )
-        .unwrap();
-        let delta =
-            fuzz_delta(probe.algorithm_interval_days, parameters.interval_fuzz, 0.0).unwrap();
+        let config = item.config.clone().into();
         let transition = compute_transition(
             &state,
-            &parameters,
+            &config,
             detected_success,
             review_day,
             answered_at_us,
-            delta,
         )
         .unwrap();
         OfflineReviewOperation {
@@ -7331,7 +7323,7 @@ mod tests {
             base_state_revision: item.review_state.state_revision,
             content_sha256: item.content_sha256.clone(),
             presentation: item.presentation.clone(),
-            parameters: item.parameters.clone(),
+            config: item.config.clone(),
             matcher_version: item.matcher_version,
             response,
             detected_success,
@@ -7340,7 +7332,6 @@ mod tests {
             proposed_transition: (&transition).into(),
             desired_suspended: false,
             answered_at_us,
-            fuzz_sample: 0.0,
         }
     }
 }

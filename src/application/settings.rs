@@ -1,19 +1,16 @@
-use std::collections::BTreeMap;
-
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::ParametersSnapshot;
-use crate::domain::{SchedulerParameters, validate_parameters};
+use super::FsrsConfigSnapshot;
+use crate::domain::fsrs::FsrsConfigSnapshot as DomainFsrsConfigSnapshot;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SettingsRecord {
     pub(crate) revision: u64,
     pub(crate) timezone: String,
     pub(crate) day_boundary_hour: u8,
-    pub(crate) scheduler: ParametersSnapshot,
-    pub(crate) tag_rules: BTreeMap<String, TagRule>,
+    pub(crate) scheduler: FsrsConfigSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -21,20 +18,7 @@ pub(crate) struct SettingsRecord {
 pub(crate) struct SettingsInput {
     pub(crate) timezone: String,
     pub(crate) day_boundary_hour: u8,
-    pub(crate) scheduler: ParametersSnapshot,
-    #[serde(default)]
-    pub(crate) tag_rules: BTreeMap<String, TagRule>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TagRule {
-    pub(crate) amnesia: Option<f64>,
-    pub(crate) epignosis: Option<f64>,
-    pub(crate) agnoia: Option<f64>,
-    pub(crate) anagnosis: Option<u64>,
-    pub(crate) lethe: Option<u64>,
-    pub(crate) proto: Option<Vec<u32>>,
+    pub(crate) desired_retention: f32,
 }
 
 impl SettingsInput {
@@ -45,31 +29,28 @@ impl SettingsInput {
         if self.day_boundary_hour > 23 {
             return Err(SettingsError::Boundary);
         }
-        validate_parameters(&SchedulerParameters::from(self.scheduler.clone()))
-            .map_err(|_| SettingsError::Scheduler)?;
-        for (tag, rule) in &self.tag_rules {
-            if tag.trim().is_empty() || tag.len() > 128 {
-                return Err(SettingsError::Tag);
-            }
-            validate_parameters(&rule.apply(&self.scheduler)).map_err(|_| SettingsError::Rule)?;
-        }
+        let config = DomainFsrsConfigSnapshot {
+            desired_retention: self.desired_retention,
+            ..DomainFsrsConfigSnapshot::default()
+        };
+        crate::domain::fsrs::compute_fsrs_transition(
+            None,
+            0,
+            20260101,
+            1,
+            crate::domain::fsrs::RecallOutcome::Success,
+            &config,
+        )
+        .map_err(|_| SettingsError::Scheduler)?;
         Ok(self)
     }
-}
 
-impl TagRule {
-    pub(crate) fn apply(&self, global: &ParametersSnapshot) -> SchedulerParameters {
-        SchedulerParameters {
-            scheduler_version: global.scheduler_version,
-            amnesia: self.amnesia.unwrap_or(global.amnesia),
-            epignosis: self.epignosis.unwrap_or(global.epignosis),
-            agnoia: self.agnoia.unwrap_or(global.agnoia),
-            anagnosis: self.anagnosis.unwrap_or(global.anagnosis),
-            lethe: self.lethe.unwrap_or(global.lethe),
-            synolon_max: global.synolon_max,
-            interval_fuzz: global.interval_fuzz,
-            proto: self.proto.clone().unwrap_or_else(|| global.proto.clone()),
-        }
+    pub(crate) fn scheduler(&self) -> FsrsConfigSnapshot {
+        let config = DomainFsrsConfigSnapshot {
+            desired_retention: self.desired_retention,
+            ..DomainFsrsConfigSnapshot::default()
+        };
+        (&config).into()
     }
 }
 
@@ -77,60 +58,33 @@ impl TagRule {
 pub(crate) enum SettingsError {
     #[error("timezone is invalid")]
     Timezone,
-    #[error("scheduler parameters are invalid")]
+    #[error("desired retention is invalid")]
     Scheduler,
     #[error("day boundary is invalid")]
     Boundary,
-    #[error("tag rule name is invalid")]
-    Tag,
-    #[error("tag rule parameters are invalid")]
-    Rule,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{SettingsError, SettingsInput, TagRule};
-    use crate::application::ParametersSnapshot;
+    use super::{SettingsError, SettingsInput};
 
     fn settings() -> SettingsInput {
         SettingsInput {
             timezone: "Europe/Athens".into(),
             day_boundary_hour: 0,
-            scheduler: ParametersSnapshot {
-                scheduler_version: 1,
-                amnesia: 0.5,
-                epignosis: 0.1,
-                agnoia: 0.2,
-                anagnosis: 3,
-                lethe: 2,
-                synolon_max: 3.0,
-                interval_fuzz: 0.1,
-                proto: vec![0, 1, 2],
-            },
-            tag_rules: BTreeMap::from([(
-                "vocabulary".into(),
-                TagRule {
-                    amnesia: Some(0.65),
-                    ..TagRule::default()
-                },
-            )]),
+            desired_retention: 0.9,
         }
     }
 
     #[test]
-    fn validates_timezone_and_merged_tag_rules() {
+    fn validates_timezone_and_desired_retention() {
         assert!(settings().validate().is_ok());
         let mut invalid = settings();
         invalid.timezone = "Mars/Olympus".into();
         assert_eq!(invalid.validate().unwrap_err(), SettingsError::Timezone);
-    }
 
-    #[test]
-    fn rejects_invalid_rule_after_global_merge() {
         let mut invalid = settings();
-        invalid.tag_rules.get_mut("vocabulary").unwrap().amnesia = Some(1.5);
-        assert_eq!(invalid.validate().unwrap_err(), SettingsError::Rule);
+        invalid.desired_retention = 1.0;
+        assert_eq!(invalid.validate().unwrap_err(), SettingsError::Scheduler);
     }
 }

@@ -341,7 +341,7 @@ fn public_offline_review_dtos_preserve_v1_requests_and_v2_responses() {
     let fixture: Value =
         serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
 
-    assert_round_trip::<OfflineReviewOperationEnvelopeV1>(fixture["submission"].clone());
+    assert_reencodes::<OfflineReviewOperationEnvelopeV1>(fixture["submission"].clone());
     assert_round_trip::<ReviewPackEnvelopeV2>(fixture["pack"].clone());
     assert_round_trip::<OfflineReviewResultEnvelopeV2>(fixture["result"].clone());
     assert_round_trip::<ActiveReviewPackEnvelopeV2>(json!({"version":2,"pack":null}));
@@ -636,7 +636,7 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
             "tags":[],"level":2,"active":true,"thema_ids":["thema"]}],
         "next":"node"
     }));
-    assert_round_trip::<SettingsV1>(settings_wire(true));
+    assert_reencodes::<SettingsV1>(settings_wire(true));
 }
 
 #[test]
@@ -660,8 +660,7 @@ fn public_content_requests_are_strict_and_preserve_defaults() {
     assert!(thema.asset_paths.is_empty());
 
     let settings: UpdateSettingsRequestV1 = serde_json::from_value(settings_wire(false)).unwrap();
-    assert_eq!(settings.scheduler.scheduler_version, 0);
-    assert!(settings.tag_rules.is_empty());
+    assert_eq!(settings.desired_retention, 0.9);
 }
 
 #[test]
@@ -691,6 +690,15 @@ where
     assert_eq!(serde_json::to_value(value).unwrap(), wire);
 }
 
+fn assert_reencodes<T>(wire: Value)
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let value: T = serde_json::from_value(wire).unwrap();
+    let encoded = serde_json::to_value(value).unwrap();
+    serde_json::from_value::<T>(encoded).unwrap();
+}
+
 fn thema_wire() -> Value {
     json!({
         "thema_id":"thema","revision":1,"kind":"basic","keimenon":"Question",
@@ -701,18 +709,16 @@ fn thema_wire() -> Value {
 }
 
 fn settings_wire(include_output_fields: bool) -> Value {
-    let mut value = json!({
-        "timezone":"Europe/Athens","day_boundary_hour":0,
-        "scheduler":{"amnesia":0.5,"epignosis":0.1,"agnoia":0.2,"anagnosis":3,
-            "lethe":2,"synolon_max":3.0,"interval_fuzz":0.1,"proto":[0,1,2]}
-    });
     if include_output_fields {
-        value["revision"] = json!(1);
-        value["scheduler"]["scheduler_version"] = json!(1);
-        value["tag_rules"] = json!({"tag":{"amnesia":null,"epignosis":null,"agnoia":null,
-            "anagnosis":null,"lethe":null,"proto":null}});
+        json!({
+            "revision":1,"timezone":"Europe/Athens","day_boundary_hour":0,
+            "scheduler":{"algorithm":"fsrs","model":"fsrs6","implementation":"fsrs-6.6.1",
+                "desired_retention":0.9,"parameters":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,
+                    0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}
+        })
+    } else {
+        json!({"timezone":"Europe/Athens","day_boundary_hour":0,"desired_retention":0.9})
     }
-    value
 }
 
 fn review_attempt_result() -> Value {

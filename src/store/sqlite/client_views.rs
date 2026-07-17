@@ -483,7 +483,6 @@ mod tests {
                 None,
                 &AnswerInput::Text("answer".into()),
                 REVIEWED_AT_US + 2,
-                0.0,
             )
             .unwrap();
         store

@@ -14,7 +14,7 @@ pub(crate) use message::MessageValidationError;
 pub use message::{
     ActiveReviewSessionView, AssetChunkView, BackupView, BackupsPrunedView, DeviceCreatedView,
     DeviceView, DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
-    LinkOccurrenceView, LocalParametersView, LocalPresentationView, LocalReviewAttemptMutationV2,
+    LinkOccurrenceView, LocalFsrsConfigView, LocalPresentationView, LocalReviewAttemptMutationV2,
     LocalReviewAttemptStateV2, LocalReviewAttemptView, LocalReviewSessionView,
     LocalReviewStateView, LocalTransitionView, MAX_ASSET_CHUNK_BYTES, MAX_FRAME_SIZE,
     MAX_REQUEST_ID_LEN, MAX_REVIEW_ID_LEN, NodeEdgeView, NodeView, PROTOCOL_VERSION, ProtocolError,

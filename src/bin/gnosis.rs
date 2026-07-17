@@ -736,7 +736,6 @@ fn offline_answer(input: OfflineReviewAnswerRequestV1) -> (String, OfflineAnswer
             accepted_success: input.accepted_success,
             desired_suspended: input.desired_suspended,
             answered_at_us: input.answered_at_us,
-            fuzz_sample: input.fuzz_sample,
         },
     )
 }

@@ -36,7 +36,6 @@ pub struct OfflineReviewAnswerRequestV1 {
     pub desired_suspended: bool,
     #[schemars(range(min = 1))]
     pub answered_at_us: u64,
-    pub fuzz_sample: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

@@ -209,8 +209,7 @@ fn answer_request() -> Value {
         "response": {"kind": "text", "value": "Answer"},
         "accepted_success": null,
         "desired_suspended": false,
-        "answered_at_us": 2,
-        "fuzz_sample": 0.0
+        "answered_at_us": 2
     })
 }
 

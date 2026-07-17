@@ -1569,7 +1569,6 @@ mod tests {
             accepted_success: None,
             desired_suspended: false,
             answered_at_us: 1_784_106_000_001_000,
-            fuzz_sample: -0.25,
         }
     }
 

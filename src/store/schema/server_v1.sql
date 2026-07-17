@@ -169,37 +169,27 @@ CREATE TABLE review_state(
   thema_id TEXT PRIMARY KEY,
   state_revision INTEGER NOT NULL CHECK(state_revision >= 0),
   review_count INTEGER NOT NULL CHECK(review_count >= 0),
-  legacy_review_count INTEGER NOT NULL CHECK(legacy_review_count >= 0),
-  legacy_unclassified_count INTEGER NOT NULL CHECK(legacy_unclassified_count >= 0),
   last_reviewed_at_us INTEGER CHECK(last_reviewed_at_us IS NULL OR last_reviewed_at_us > 0),
   last_review_day INTEGER,
   next_review_day INTEGER NOT NULL,
-  interval_days INTEGER CHECK(interval_days IS NULL OR interval_days >= 0),
-  consecutive_successes INTEGER NOT NULL CHECK(consecutive_successes >= 0),
+  interval_days INTEGER CHECK(interval_days IS NULL OR interval_days >= 1),
   total_successes INTEGER NOT NULL CHECK(total_successes >= 0),
-  consecutive_failures INTEGER NOT NULL CHECK(consecutive_failures >= 0),
   total_failures INTEGER NOT NULL CHECK(total_failures >= 0),
   suspended INTEGER NOT NULL CHECK(suspended IN(0, 1)),
-  gnosis_plus REAL NOT NULL CHECK(gnosis_plus >= 0),
-  gnosis_minus REAL NOT NULL CHECK(gnosis_minus >= 0),
-  gnosis_synolon REAL NOT NULL CHECK(gnosis_synolon >= 1.3),
+  stability REAL CHECK(stability IS NULL OR stability > 0),
+  difficulty REAL CHECK(difficulty IS NULL OR (difficulty >= 1 AND difficulty <= 10)),
   FOREIGN KEY(thema_id) REFERENCES thema(thema_id) ON DELETE RESTRICT,
-  CHECK(review_count = total_successes + total_failures + legacy_unclassified_count),
-  CHECK(legacy_unclassified_count <= legacy_review_count AND legacy_review_count <= review_count),
-  CHECK(consecutive_successes = 0 OR consecutive_failures = 0)
+  CHECK(review_count = total_successes + total_failures),
+  CHECK((review_count = 0 AND interval_days IS NULL AND stability IS NULL AND difficulty IS NULL)
+    OR (review_count > 0 AND interval_days IS NOT NULL AND stability IS NOT NULL AND difficulty IS NOT NULL))
 ) STRICT;
 CREATE TABLE settings(
   id INTEGER PRIMARY KEY CHECK(id = 1),
   revision INTEGER NOT NULL CHECK(revision > 0),
   timezone TEXT NOT NULL CHECK(length(timezone) > 0),
   day_boundary_hour INTEGER NOT NULL CHECK(day_boundary_hour BETWEEN 0 AND 23),
-  scheduler_version INTEGER NOT NULL CHECK(scheduler_version = 1),
-  scheduler_json TEXT NOT NULL,
+  scheduler_json TEXT NOT NULL CHECK(json_valid(scheduler_json)),
   updated_at_us INTEGER NOT NULL CHECK(updated_at_us > 0)
-) STRICT;
-CREATE TABLE tag_rule(
-  tag TEXT PRIMARY KEY CHECK(length(tag) > 0),
-  parameters_json TEXT NOT NULL
 ) STRICT;
 CREATE TABLE review_session(
   session_id TEXT PRIMARY KEY CHECK(length(session_id) > 0),
@@ -254,16 +244,7 @@ CREATE TABLE review_attempt(
   committed_at_us INTEGER,
   thema_revision INTEGER NOT NULL DEFAULT 1
   CHECK(thema_revision > 0),
-  parameters_json TEXT NOT NULL DEFAULT
-  '{"agnoia":0.2,
-  "amnesia":0.5,
-  "anagnosis":3,
-  "epignosis":0.1,
-  "interval_fuzz":0.1,
-  "lethe":2,
-  "proto":[0,1,2],
-  "scheduler_version":1,
-  "synolon_max":3.0}', fuzz_sample REAL, mutation_revision INTEGER NOT NULL DEFAULT 0
+  config_json TEXT NOT NULL CHECK(json_valid(config_json)), mutation_revision INTEGER NOT NULL DEFAULT 0
 CHECK(mutation_revision >= 0),
 UNIQUE(session_id, session_position),
 FOREIGN KEY(session_id) REFERENCES review_session(session_id) ON DELETE RESTRICT,
@@ -281,7 +262,7 @@ CREATE TABLE review_event(
   detected_success INTEGER NOT NULL CHECK(detected_success IN(0, 1)),
   accepted_success INTEGER NOT NULL CHECK(accepted_success IN(0, 1)),
   override_count INTEGER NOT NULL CHECK(override_count >= 0),
-  scheduler_version INTEGER NOT NULL CHECK(scheduler_version >= 1),
+  config_json TEXT NOT NULL CHECK(json_valid(config_json)),
   transition_json TEXT NOT NULL,
   imported_payload_json TEXT,
   FOREIGN KEY(attempt_id) REFERENCES review_attempt(attempt_id) ON DELETE RESTRICT,
@@ -329,7 +310,7 @@ CREATE TABLE import_table_count(
   table_name TEXT PRIMARY KEY CHECK(length(table_name) > 0),
   source_rows INTEGER NOT NULL CHECK(source_rows >= 0),
   imported_rows INTEGER NOT NULL CHECK(imported_rows >= 0),
-  CHECK(source_rows = imported_rows)
+  CHECK(imported_rows <= source_rows)
 ) STRICT;
 CREATE TABLE import_path_rewrite(
   source_path TEXT PRIMARY KEY,
@@ -521,9 +502,7 @@ CREATE TABLE settings_revision(
   revision INTEGER PRIMARY KEY CHECK(revision > 0),
   timezone TEXT NOT NULL,
   day_boundary_hour INTEGER NOT NULL CHECK(day_boundary_hour BETWEEN 0 AND 23),
-  scheduler_version INTEGER NOT NULL CHECK(scheduler_version >= 1),
-  scheduler_json TEXT NOT NULL,
-  tag_rules_json TEXT NOT NULL,
+  scheduler_json TEXT NOT NULL CHECK(json_valid(scheduler_json)),
   operation TEXT NOT NULL CHECK(operation IN('update', 'snapshot')),
   created_at_us INTEGER NOT NULL CHECK(created_at_us >= 0),
   author_device_id TEXT,
@@ -842,19 +821,12 @@ BEGIN
 END;
 
 INSERT INTO settings(
-  id, revision, timezone, day_boundary_hour, scheduler_version,
-  scheduler_json, updated_at_us
+  id, revision, timezone, day_boundary_hour, scheduler_json, updated_at_us
 ) VALUES (
-  1, 1, 'Europe/Athens', 0, 1,
-  '{"agnoia":0.2,"amnesia":0.5,"anagnosis":3,"epignosis":0.1,"interval_fuzz":0.1,"lethe":2,"proto":[0,1,2],"synolon_max":3.0}',
+  1, 1, 'Europe/Athens', 0,
+  '{"algorithm":"fsrs","model":"fsrs6","implementation":"fsrs-6.6.1","desired_retention":0.9,"parameters":[0.212,1.2931,2.3065,8.2956,6.4133,0.8334,3.0194,0.001,1.8722,0.1666,0.796,1.4835,0.0614,0.2629,1.6483,0.6014,1.8729,0.5425,0.0912,0.0658,0.1542]}',
   1
 );
-
-INSERT INTO tag_rule(tag, parameters_json) VALUES
-  ('Amboss', '{"agnoia":0.4,"amnesia":0.45,"anagnosis":3,"epignosis":0.5,"lethe":2,"proto":[1,3]}'),
-  ('Bulgarian', '{"amnesia":0.55,"lethe":2,"proto":[0,1,3]}'),
-  ('Unking', '{"amnesia":0.45,"proto":[1,3]}'),
-  ('vocabulary', '{"amnesia":0.65,"proto":[0,1,3]}');
 
 INSERT INTO server_identity(id, server_id)
 VALUES (1, lower(hex(randomblob(16))));
@@ -864,24 +836,19 @@ INSERT INTO sync_feed_state(
 ) VALUES (1, 0, lower(hex(randomblob(16))));
 
 INSERT INTO settings_revision(
-  revision, timezone, day_boundary_hour, scheduler_version, scheduler_json,
-  tag_rules_json, operation, created_at_us
+  revision, timezone, day_boundary_hour, scheduler_json,
+  operation, created_at_us
 )
 SELECT
   settings.revision,
   settings.timezone,
   settings.day_boundary_hour,
-  settings.scheduler_version,
   settings.scheduler_json,
-  coalesce((
-    SELECT json_group_object(tag, json(parameters_json))
-    FROM (SELECT tag, parameters_json FROM tag_rule ORDER BY tag)
-  ), '{}'),
   'snapshot',
   settings.updated_at_us
 FROM settings WHERE id = 1;
 
 PRAGMA application_id = 1196314451;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 COMMIT;

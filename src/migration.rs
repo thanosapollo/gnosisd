@@ -12,11 +12,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{
-    Connection, OpenFlags, Transaction, TransactionBehavior, params, params_from_iter,
-    types::{Value as SqlValue, ValueRef},
-};
-use serde_json::{Map, Value, json};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -89,8 +86,7 @@ pub enum LegacyMigrationError {
     SameDatabase,
     #[error("source database is currently leased by Emacs")]
     SourceLeased,
-    #[error("legacy database has an active review session")]
-    ActiveReviewSession,
+
     #[error("target database already exists")]
     TargetExists,
     #[error("migration staging database already exists")]
@@ -186,7 +182,6 @@ fn migrate_legacy(
     let version = source_schema_version(&source)?;
     let manifest = legacy_manifest(&source)?;
     require_legacy_schema(&source, &manifest)?;
-    reject_active_session(&source)?;
 
     let mut staging = StagingDatabase::create(paths.staging)?;
     import_native_snapshot(
@@ -358,28 +353,6 @@ const REQUIRED_LEGACY_SCHEMA: &[(&str, &[&str])] = &[
     ("thema_links", &["source", "dest"]),
     ("nodes", &["id", "file", "title", "level"]),
     ("node_tag", &["node_id", "tag"]),
-    (
-        "review_state",
-        &[
-            "thema_id",
-            "state_revision",
-            "review_count",
-            "legacy_review_count",
-            "legacy_unclassified_count",
-            "last_reviewed_at_us",
-            "last_review_day",
-            "next_review_day",
-            "interval_days",
-            "consecutive_successes",
-            "total_successes",
-            "consecutive_failures",
-            "total_failures",
-            "suspended",
-            "gnosis_plus",
-            "gnosis_minus",
-            "gnosis_synolon",
-        ],
-    ),
 ];
 
 fn has_columns(
@@ -392,30 +365,6 @@ fn has_columns(
         .query_map([table], |row| row.get::<_, String>(0))?
         .collect::<Result<BTreeSet<_>, _>>()?;
     Ok(required.iter().all(|name| columns.contains(*name)))
-}
-
-fn reject_active_session(connection: &Connection) -> Result<(), LegacyMigrationError> {
-    if !table_exists(connection, "review_session")? {
-        return Ok(());
-    }
-    let active: i64 = connection.query_row(
-        "SELECT count(*) FROM review_session WHERE status = 'active'",
-        [],
-        |row| row.get(0),
-    )?;
-    if active == 0 {
-        Ok(())
-    } else {
-        Err(LegacyMigrationError::ActiveReviewSession)
-    }
-}
-
-fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
-    connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
-        [table],
-        |row| row.get(0),
-    )
 }
 
 fn import_native_snapshot(
@@ -431,12 +380,9 @@ fn import_native_snapshot(
     let imported_at_us = now_us()?;
     let transaction = target.transaction_with_behavior(TransactionBehavior::Immediate)?;
     import_themata(source, &transaction, imported_at_us)?;
-    import_review_state(source, &transaction)?;
+    initialize_review_state(&transaction)?;
     import_thema_tags(source, &transaction)?;
     import_thema_links(source, &transaction)?;
-    import_review_sessions(source, &transaction)?;
-    import_review_events(source, &transaction)?;
-    import_review_days(source, &transaction)?;
     record_manifest(
         &transaction,
         version,
@@ -584,32 +530,17 @@ fn thema_digest(
     Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
-fn import_review_state(
-    source: &Connection,
-    target: &Transaction<'_>,
-) -> Result<(), LegacyMigrationError> {
-    let mut query = source.prepare(
-        "SELECT thema_id, state_revision, review_count, legacy_review_count,
-                legacy_unclassified_count, last_reviewed_at_us, last_review_day,
-                next_review_day, interval_days, consecutive_successes,
-                total_successes, consecutive_failures, total_failures, suspended,
-                gnosis_plus, gnosis_minus, gnosis_synolon
-         FROM review_state ORDER BY thema_id",
+fn initialize_review_state(target: &Transaction<'_>) -> Result<(), LegacyMigrationError> {
+    target.execute(
+        "INSERT INTO review_state(
+             thema_id, state_revision, review_count, last_reviewed_at_us,
+             last_review_day, next_review_day, interval_days, total_successes,
+             total_failures, suspended, stability, difficulty
+         )
+         SELECT thema_id, 0, 0, NULL, NULL, 19700101, NULL, 0, 0, 0, NULL, NULL
+         FROM thema",
+        [],
     )?;
-    let mut rows = query.query([])?;
-    let mut insert = target.prepare_cached(
-        "INSERT INTO review_state VALUES (
-             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-             ?14, ?15, ?16, ?17
-         )",
-    )?;
-    while let Some(row) = rows.next()? {
-        let mut values = vec![SqlValue::Text(row.get::<_, i64>(0)?.to_string())];
-        for index in 1..=16 {
-            values.push(row.get(index)?);
-        }
-        insert.execute(params_from_iter(values))?;
-    }
     Ok(())
 }
 
@@ -644,152 +575,6 @@ fn import_thema_links(
     Ok(())
 }
 
-fn import_review_sessions(
-    source: &Connection,
-    target: &Transaction<'_>,
-) -> Result<(), LegacyMigrationError> {
-    if !table_exists(source, "review_session")? {
-        return Ok(());
-    }
-    let mut query = source.prepare("SELECT * FROM review_session ORDER BY started_at_us")?;
-    let columns = query
-        .column_names()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let mut rows = query.query([])?;
-    let scheduler_json: String = target.query_row(
-        "SELECT scheduler_json FROM settings WHERE id = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    let mut insert = target.prepare_cached(
-        "INSERT INTO review_session(
-             session_id, source_kind, source_json, target_count, timezone,
-             day_boundary_hour, scheduler_json, status, started_at_us,
-             ended_at_us, current_position
-         ) VALUES (?1, ?2, ?3, ?4, 'Europe/Athens', ?5, ?6, ?7, ?8, ?9, ?10)",
-    )?;
-    while let Some(row) = rows.next()? {
-        let payload = row_json(row, &columns)?;
-        insert.execute(params![
-            json_string(&payload, "session_id")?,
-            json_string(&payload, "source_kind")?,
-            serde_json::to_string(&payload)?,
-            json_optional_i64(&payload, "planned_count")?,
-            json_i64(&payload, "day_start_hour")?,
-            scheduler_json,
-            json_string(&payload, "status")?,
-            json_i64(&payload, "started_at_us")?,
-            json_optional_i64(&payload, "ended_at_us")?,
-            json_i64(&payload, "event_count")?,
-        ])?;
-    }
-    Ok(())
-}
-
-fn import_review_events(
-    source: &Connection,
-    target: &Transaction<'_>,
-) -> Result<(), LegacyMigrationError> {
-    if !table_exists(source, "review_event")? {
-        return Ok(());
-    }
-    let mut query =
-        source.prepare("SELECT * FROM review_event ORDER BY reviewed_at_us, event_id")?;
-    let columns = query
-        .column_names()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let mut rows = query.query([])?;
-    let mut insert = target.prepare_cached(
-        "INSERT INTO review_event(
-             event_id, thema_id, session_id, reviewed_at_us, review_day,
-             matcher_version, response_json, detected_success, accepted_success,
-             override_count, scheduler_version, transition_json, imported_payload_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
-    )?;
-    while let Some(row) = rows.next()? {
-        let mut payload = row_json(row, &columns)?;
-        let event_id = json_string(&payload, "event_id")?.to_owned();
-        payload.insert(
-            "proto".into(),
-            event_children(source, "review_event_proto", &event_id)?,
-        );
-        payload.insert(
-            "nodes".into(),
-            event_children(source, "review_event_node", &event_id)?,
-        );
-        let payload_json = serde_json::to_string(&payload)?;
-        insert.execute(params![
-            event_id,
-            json_i64(&payload, "thema_id")?.to_string(),
-            json_string(&payload, "session_id")?,
-            json_i64(&payload, "reviewed_at_us")?,
-            json_i64(&payload, "review_day")?,
-            outcome_value(json_string(&payload, "detected_outcome")?)?,
-            outcome_value(json_string(&payload, "accepted_outcome")?)?,
-            json_i64(&payload, "override_count")?,
-            json_i64(&payload, "scheduler_version")?,
-            payload_json,
-            payload_json,
-        ])?;
-    }
-    Ok(())
-}
-
-fn event_children(
-    source: &Connection,
-    table: &str,
-    event_id: &str,
-) -> Result<Value, LegacyMigrationError> {
-    if !table_exists(source, table)? {
-        return Ok(Value::Array(Vec::new()));
-    }
-    let mut query = source.prepare(&format!(
-        "SELECT * FROM {} WHERE event_id = ?1 ORDER BY 1, 2",
-        quoted_identifier(table)
-    ))?;
-    let columns = query
-        .column_names()
-        .into_iter()
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    let rows = query
-        .query_map([event_id], |row| {
-            row_json_sql(row, &columns).map(Value::Object)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Value::Array(rows))
-}
-
-fn import_review_days(
-    source: &Connection,
-    target: &Transaction<'_>,
-) -> Result<(), LegacyMigrationError> {
-    if !table_exists(source, "review_day")? {
-        return Ok(());
-    }
-    let mut query = source.prepare(
-        "SELECT review_day,
-                legacy_review_count + exact_review_count,
-                coalesce(legacy_new_count, 0) + exact_new_count,
-                exact_success_count, exact_failure_count, exact_override_count
-         FROM review_day ORDER BY review_day",
-    )?;
-    let mut rows = query.query([])?;
-    let mut insert =
-        target.prepare_cached("INSERT INTO review_day VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
-    while let Some(row) = rows.next()? {
-        let values = (0..6)
-            .map(|index| row.get::<_, SqlValue>(index))
-            .collect::<Result<Vec<_>, _>>()?;
-        insert.execute(params_from_iter(values))?;
-    }
-    Ok(())
-}
-
 fn record_manifest(
     target: &Transaction<'_>,
     version: u32,
@@ -817,12 +602,26 @@ fn record_manifest(
     )?;
     let mut insert = target.prepare_cached(
         "INSERT INTO import_table_count(table_name, source_rows, imported_rows)
-         VALUES (?1, ?2, ?2)",
+         VALUES (?1, ?2, ?3)",
     )?;
     for (table, rows) in manifest {
+        let imported_rows = if matches!(
+            table.as_str(),
+            "review_state"
+                | "review_session"
+                | "review_event"
+                | "review_event_proto"
+                | "review_event_node"
+                | "review_day"
+        ) {
+            0
+        } else {
+            *rows
+        };
         insert.execute(params![
             table,
-            i64::try_from(*rows).map_err(|_| LegacyMigrationError::SourceIntegrity)?
+            i64::try_from(*rows).map_err(|_| LegacyMigrationError::SourceIntegrity)?,
+            i64::try_from(imported_rows).map_err(|_| LegacyMigrationError::SourceIntegrity)?,
         ])?;
     }
     Ok(())
@@ -834,7 +633,7 @@ fn validate_native_counts(
 ) -> Result<(), LegacyMigrationError> {
     for (source_table, target_table) in [
         ("themata", "thema"),
-        ("review_state", "review_state"),
+        ("themata", "review_state"),
         ("thema_tag", "thema_tag"),
         ("thema_links", "thema_node_link"),
     ] {
@@ -851,82 +650,6 @@ fn validate_native_counts(
         }
     }
     Ok(())
-}
-
-fn row_json(
-    row: &rusqlite::Row<'_>,
-    columns: &[String],
-) -> Result<Map<String, Value>, LegacyMigrationError> {
-    row_json_sql(row, columns).map_err(Into::into)
-}
-
-fn row_json_sql(
-    row: &rusqlite::Row<'_>,
-    columns: &[String],
-) -> rusqlite::Result<Map<String, Value>> {
-    columns
-        .iter()
-        .enumerate()
-        .map(|(index, name)| Ok((name.clone(), value_json(row.get_ref(index)?))))
-        .collect()
-}
-
-fn value_json(value: ValueRef<'_>) -> Value {
-    match value {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(value) => Value::from(value),
-        ValueRef::Real(value) => Value::from(value),
-        ValueRef::Text(value) => Value::String(String::from_utf8_lossy(value).into_owned()),
-        ValueRef::Blob(value) => Value::String(hex_bytes(value)),
-    }
-}
-
-fn hex_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    output
-}
-
-fn json_string<'a>(
-    object: &'a Map<String, Value>,
-    key: &str,
-) -> Result<&'a str, LegacyMigrationError> {
-    object
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or(LegacyMigrationError::SourceIntegrity)
-}
-
-fn json_i64(object: &Map<String, Value>, key: &str) -> Result<i64, LegacyMigrationError> {
-    object
-        .get(key)
-        .and_then(Value::as_i64)
-        .ok_or(LegacyMigrationError::SourceIntegrity)
-}
-
-fn json_optional_i64(
-    object: &Map<String, Value>,
-    key: &str,
-) -> Result<Option<i64>, LegacyMigrationError> {
-    match object.get(key) {
-        Some(Value::Null) | None => Ok(None),
-        Some(value) => value
-            .as_i64()
-            .map(Some)
-            .ok_or(LegacyMigrationError::SourceIntegrity),
-    }
-}
-
-fn outcome_value(value: &str) -> Result<i64, LegacyMigrationError> {
-    match value {
-        "success" => Ok(1),
-        "failure" => Ok(0),
-        _ => Err(LegacyMigrationError::SourceIntegrity),
-    }
 }
 
 fn sha256_file(path: &Path) -> Result<String, LegacyMigrationError> {
