@@ -63,6 +63,34 @@ fn offline_answer_request_requires_explicit_nullable_override() {
 }
 
 #[test]
+fn readme_offline_answer_matches_the_fsrs_contract() {
+    let readme = include_str!("../README.org");
+    let documented = readme
+        .split_once("#+name: offline-answer-v1\n#+begin_src json\n")
+        .unwrap()
+        .1
+        .split_once("\n#+end_src")
+        .unwrap()
+        .0;
+
+    let decoded: OfflineReviewAnswerRequestV1 = serde_json::from_str(documented).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), answer_request());
+    for obsolete in [
+        "fuzz sample",
+        "interval fuzz",
+        "Amboss",
+        "Bulgarian",
+        "Unking",
+        "vocabulary rules",
+    ] {
+        assert!(
+            !readme.contains(obsolete),
+            "stale scheduler term: {obsolete}"
+        );
+    }
+}
+
+#[test]
 fn offline_review_cli_responses_are_closed_and_versioned() {
     let current = json!({"version": 1, "question": question()});
     let receipt = json!({

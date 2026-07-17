@@ -97,8 +97,13 @@ gnosis --token-file "$HOME/.config/gnosis/client.token" \
 The current question and answer recording work without a token or daemon. The
 question projection never contains the captured answer. Answer input includes
 the immutable attempt ID, pack position, structured response, explicit nullable
-override, timestamp, and fuzz sample so the same document can be replayed after
-lost output.
+override, desired suspension state, and timestamp so the same operation can be
+replayed after lost output.
+
+#+name: offline-answer-v1
+#+begin_src json
+{"version":1,"pack_id":"pack","attempt_id":"attempt","session_position":0,"response":{"kind":"text","value":"Answer"},"accepted_success":null,"desired_suspended":false,"answered_at_us":2}
+#+end_src
 
 #+begin_src sh
 gnosis review-pack current \
@@ -286,14 +291,11 @@ outside the imported Notes root are rejected.
 
 Matcher version 1 preserves current case, whitespace, quote, and Levenshtein
 behavior for basic and cloze themata. Multiple-choice variants require one
-exact captured choice. Scheduler version 1 is a pure Rust transition with
-captured server time, timezone, day boundary, resolved tag rules, and replayable
-interval fuzz.
-
-Canonical settings start with timezone ~Europe/Athens~, day boundary ~0~, and
-the current Amboss, Bulgarian, Unking, and vocabulary rules. Settings are
-revisioned. Existing sessions keep their captured settings when canonical
-settings change.
+exact captured choice. Scheduling uses the FSRS-6 model through implementation
+~fsrs-6.6.1~ with fixed canonical parameters. Desired retention is the only
+scheduler configuration. Canonical settings also start with timezone
+~Europe/Athens~ and day boundary ~0~. Settings are revisioned; existing sessions
+keep their captured settings when canonical settings change.
 
 * Emacs review dogfood
 
