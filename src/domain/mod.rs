@@ -1,4 +1,6 @@
 mod document;
+#[allow(dead_code, reason = "FSRS kernel lands before call-site migration")]
+pub(crate) mod fsrs;
 mod grading;
 mod graph;
 mod ids;
