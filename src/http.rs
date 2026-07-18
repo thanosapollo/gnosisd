@@ -18,7 +18,7 @@ use axum::{
 };
 use chrono::NaiveDate;
 use schemars::generate::SchemaSettings;
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
@@ -35,13 +35,14 @@ use crate::{
         prepare_device_document_rename, prepare_device_document_tombstone, prepare_note,
         prepare_thema, review_day_at, thema_content, validate_org_path,
     },
-    domain::DocumentId,
+    domain::{DocumentId, DueThema},
     is_canonical_sha256,
     protocol::{
-        DocumentView, DuePageView, ImportResult, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
-        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
-        OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
-        ThemaView, active_review_pack_response, decode_cursor, decode_snapshot_cursor,
+        DocumentView, DuePageView, ImportResult, MAX_FRAME_SIZE,
+        MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
+        OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
+        OfflineReviewWireError, ReplicaWireError, ThemaView, active_review_pack_response,
+        decode_cursor, decode_snapshot_cursor,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
@@ -421,11 +422,16 @@ async fn get_document_projection(
         .await
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(DocumentView::from_projection(
-        document.document_id(),
-        document.revision(),
-        document.projection(),
-    )))
+    run_blocking(move || {
+        let view = DocumentView::from_projection(
+            document.document_id(),
+            document.revision(),
+            document.projection(),
+        );
+        ensure_projection_response_budget(&view)?;
+        Ok(Json(view))
+    })
+    .await
 }
 
 async fn get_legacy_thema(
@@ -467,19 +473,53 @@ async fn legacy_due_page(
         .due_themata_page(query)
         .await
         .map_err(ApiError::service)?;
-    let page_len = usize::from(limit);
-    let has_more = due.len() > page_len;
-    let next = if has_more {
-        due.get(page_len - 1)
+    run_blocking(move || bounded_due_page(due, usize::from(limit)))
+        .await
+        .map(Json)
+}
+
+fn bounded_due_page(due: Vec<DueThema>, limit: usize) -> Result<DuePageView, ApiError> {
+    let max_items = due.len().min(limit);
+    let mut low = 0;
+    let mut high = max_items;
+    while low < high {
+        let count = low + (high - low).div_ceil(2);
+        let page = due_page_with_count(&due, count);
+        if serde_json::to_vec(&page).is_ok_and(|bytes| bytes.len() <= MAX_FRAME_SIZE) {
+            low = count;
+        } else {
+            high = count - 1;
+        }
+    }
+    if max_items > 0 && low == 0 {
+        return Err(ApiError::invalid_content(
+            "due item exceeds the projection response limit",
+        ));
+    }
+    Ok(due_page_with_count(&due, low))
+}
+
+fn due_page_with_count(due: &[DueThema], count: usize) -> DuePageView {
+    let next = if due.len() > count && count > 0 {
+        due.get(count - 1)
             .map(DueCursor::after)
             .map(DueCursor::encode)
     } else {
         None
     };
-    Ok(Json(DuePageView::new(
-        due.into_iter().take(page_len).collect(),
-        next,
-    )))
+    DuePageView::new(due.iter().take(count).cloned().collect(), next)
+}
+
+fn ensure_projection_response_budget(value: &impl Serialize) -> Result<(), ApiError> {
+    let size = serde_json::to_vec(value)
+        .map_err(|_| ApiError::internal())?
+        .len();
+    if size > MAX_FRAME_SIZE {
+        return Err(ApiError::invalid_content(
+            "projection exceeds the response limit",
+        ));
+    }
+    Ok(())
 }
 
 fn import_result(summary: ImportSummary) -> ImportResult {
@@ -3416,7 +3456,10 @@ mod tests {
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
 
-    use super::{ApiError, OPENAPI_OPERATIONS, openapi_document, optional_if_match, router};
+    use super::{
+        ApiError, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page, openapi_document,
+        optional_if_match, router,
+    };
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
         PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
@@ -3424,7 +3467,8 @@ mod tests {
         review_day_at, thema_content,
     };
     use crate::domain::{
-        DocumentId, DocumentProjection, DocumentProjectionInput, compute_transition, grade,
+        DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, ThemaId,
+        compute_transition, grade,
     };
     use crate::protocol::{
         MAX_REPLICA_PAGE_BYTES, canonical_asset_operation, decode_cursor, encode_cursor,
@@ -3595,7 +3639,7 @@ mod tests {
             ])
         );
         let schemas = &api["components"]["schemas"];
-        for name in [
+        for schema in [
             "ImportResult",
             "DocumentView",
             "NodeView",
@@ -3603,11 +3647,30 @@ mod tests {
             "NodeEdgeView",
             "ThemaView",
             "ReviewStateView",
-            "DuePageView",
             "DueThemaView",
+            "DuePageView",
         ] {
-            assert_eq!(schemas[name]["additionalProperties"], false, "{name}");
+            assert_eq!(
+                api["components"]["schemas"][schema]["additionalProperties"],
+                false
+            );
         }
+        assert_eq!(
+            api["components"]["schemas"]["ImportResult"]["properties"]["revision"]["minimum"],
+            1
+        );
+        assert_eq!(
+            api["components"]["schemas"]["ImportResult"]["properties"]["content_sha256"]["minLength"],
+            64
+        );
+        assert_eq!(
+            api["components"]["schemas"]["ImportResult"]["properties"]["content_sha256"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            api["components"]["schemas"]["DocumentView"]["properties"]["compatibility_sha1"]["maxLength"],
+            40
+        );
         for (name, field) in [
             ("DocumentView", "file_node_id"),
             ("NodeView", "parent_id"),
@@ -4870,6 +4933,24 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn due_pages_fit_the_shared_projection_budget() {
+        let due = |id: &str, bytes: usize| DueThema {
+            id: ThemaId::new(id.to_owned()).unwrap(),
+            kind: "basic".into(),
+            keimenon: "x".repeat(bytes),
+            hypothesis: Vec::new(),
+            answer: vec!["answer".into()],
+            next_review_day: 1,
+            review_count: 0,
+        };
+        let page = bounded_due_page(vec![due("a", 600_000), due("b", 600_000)], 2).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.next.as_deref(), Some("0:1:a"));
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_FRAME_SIZE);
+        assert!(bounded_due_page(vec![due("large", MAX_FRAME_SIZE)], 1).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

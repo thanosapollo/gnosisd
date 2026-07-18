@@ -7,7 +7,7 @@
 //! failure, or invalid response after dispatch has unknown delivery: callers
 //! must retain the durable outbox item and retry its same operation identity.
 
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
 
 use chrono::NaiveDate;
 use reqwest::{
@@ -26,7 +26,7 @@ use crate::{
     },
     is_canonical_sha256,
     protocol::{
-        DocumentView, DuePageView, ImportResult, MAX_OFFLINE_ASSET_OPERATION_BYTES,
+        DocumentView, DuePageView, ImportResult, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
         MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
         MAX_OFFLINE_CONTENT_RESULT_BYTES, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
         MAX_OFFLINE_REVIEW_RESULT_BYTES, MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
@@ -348,25 +348,35 @@ impl HttpClient {
     ) -> Result<ImportResult, HttpClientError> {
         let url = self.resource_endpoint("v1/documents", document_id)?;
         let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
-        execute_json_exact(
+        let result = execute_json_exact(
             self.client
                 .put(url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
                 .body(body),
-            MAX_REPLICA_PAGE_BYTES,
+            MAX_FRAME_SIZE,
             StatusCode::OK,
         )
-        .await
+        .await?;
+        validate_import_result(&result, document_id, input)?;
+        Ok(result)
     }
 
     pub async fn document(&self, document_id: &str) -> Result<DocumentView, HttpClientError> {
         let url = self.resource_endpoint("v1/documents", document_id)?;
-        execute_json_exact(self.client.get(url), MAX_REPLICA_PAGE_BYTES, StatusCode::OK).await
+        let document =
+            execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        validate_document_view(&document, document_id)?;
+        Ok(document)
     }
 
     pub async fn legacy_thema(&self, thema_id: &str) -> Result<ThemaView, HttpClientError> {
         let url = self.resource_endpoint("v1/legacy-themata", thema_id)?;
-        execute_json_exact(self.client.get(url), MAX_REPLICA_PAGE_BYTES, StatusCode::OK).await
+        let thema: ThemaView =
+            execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        if thema.id != thema_id {
+            return Err(invalid_response());
+        }
+        Ok(thema)
     }
 
     pub async fn legacy_due_page(
@@ -383,7 +393,9 @@ impl HttpClient {
             pairs.append_pair("after", after);
         }
         drop(pairs);
-        execute_json_exact(self.client.get(url), MAX_REPLICA_PAGE_BYTES, StatusCode::OK).await
+        let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        validate_due_page(&page, limit)?;
+        Ok(page)
     }
 
     pub async fn review_sessions(
@@ -763,6 +775,98 @@ fn append_cursor(url: &mut Url, cursor: &str) -> Result<(), HttpClientError> {
     }
     url.query_pairs_mut().append_pair("cursor", cursor);
     Ok(())
+}
+
+fn validate_import_result(
+    result: &ImportResult,
+    document_id: &str,
+    input: &DocumentImportRequestV1,
+) -> Result<(), HttpClientError> {
+    let expected_digest = format!("{:x}", Sha256::digest(input.org.as_bytes()));
+    if result.document_id != document_id
+        || result.revision == 0
+        || result.content_sha256 != expected_digest
+    {
+        return Err(invalid_response());
+    }
+    Ok(())
+}
+
+fn validate_document_view(
+    document: &DocumentView,
+    document_id: &str,
+) -> Result<(), HttpClientError> {
+    if document.document_id != document_id
+        || document.revision == 0
+        || !canonical_hex(&document.content_sha256, 64)
+        || !canonical_hex(&document.compatibility_sha1, 40)
+    {
+        return Err(invalid_response());
+    }
+    let node_ids: HashSet<&str> = document.nodes.iter().map(|node| node.id.as_str()).collect();
+    if document.nodes.iter().any(|node| node.id.trim().is_empty())
+        || node_ids.len() != document.nodes.len()
+        || document
+            .file_node_id
+            .as_deref()
+            .is_some_and(|id| !node_ids.contains(id))
+        || document.nodes.iter().any(|node| {
+            node.parent_id
+                .as_deref()
+                .is_some_and(|id| !node_ids.contains(id))
+        })
+        || document.link_occurrences.iter().any(|occurrence| {
+            !node_ids.contains(occurrence.owner_id.as_str())
+                || occurrence.start_byte >= occurrence.end_byte
+        })
+        || document
+            .semantic_edges
+            .iter()
+            .any(|edge| !node_ids.contains(edge.source_id.as_str()))
+    {
+        return Err(invalid_response());
+    }
+    Ok(())
+}
+
+fn validate_due_page(page: &DuePageView, limit: u16) -> Result<(), HttpClientError> {
+    if page.items.len() > usize::from(limit)
+        || page.items.iter().any(|item| item.id.trim().is_empty())
+        || page
+            .items
+            .windows(2)
+            .any(|pair| due_key(&pair[0]) >= due_key(&pair[1]))
+    {
+        return Err(invalid_response());
+    }
+    let expected_cursor = page.items.last().map(|item| {
+        format!(
+            "{}:{}:{}",
+            u8::from(item.review_count > 0),
+            item.next_review_day,
+            item.id
+        )
+    });
+    match page.next.as_deref() {
+        Some(next) if expected_cursor.as_deref() == Some(next) => Ok(()),
+        None => Ok(()),
+        _ => Err(invalid_response()),
+    }
+}
+
+fn due_key(item: &crate::protocol::DueThemaView) -> (bool, u32, &str) {
+    (
+        item.review_count > 0,
+        item.next_review_day,
+        item.id.as_str(),
+    )
+}
+
+fn canonical_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_review_page(after: Option<&str>, limit: Option<u16>) -> Result<(), HttpClientError> {

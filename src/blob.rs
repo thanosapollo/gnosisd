@@ -65,6 +65,27 @@ impl BlobStore {
         })
     }
 
+    pub(crate) fn contains(&self, digest: &str) -> Result<bool, BlobError> {
+        match fs::metadata(self.blob_path(digest)?) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn discard(&self, digest: &str) -> Result<(), BlobError> {
+        let path = self.blob_path(digest)?;
+        let parent = path.parent().ok_or(BlobError::InvalidDigest)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                sync_directory(parent)?;
+                sync_directory(&self.root)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub(crate) fn read(&self, digest: &str) -> Result<Vec<u8>, BlobError> {
         let path = self.blob_path(digest)?;
         let bytes = fs::read(path)?;

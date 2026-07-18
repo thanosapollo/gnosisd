@@ -1452,6 +1452,151 @@ async fn legacy_projection_clients_reject_non_strict_responses() {
 }
 
 #[tokio::test]
+async fn legacy_projection_clients_reject_semantic_mismatches() {
+    let input = DocumentImportRequestV1 {
+        org: "#+TITLE: Expected\n".into(),
+        expected_revision: None,
+    };
+    for response in [
+        json!({
+            "document_id": "other",
+            "revision": 1,
+            "content_sha256": format!("{:x}", Sha256::digest(input.org.as_bytes())),
+            "node_count": 0,
+            "occurrence_count": 0,
+            "semantic_edge_count": 0
+        }),
+        json!({
+            "document_id": "document",
+            "revision": 1,
+            "content_sha256": "0".repeat(64),
+            "node_count": 0,
+            "occurrence_count": 0,
+            "semantic_edge_count": 0
+        }),
+    ] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.import_document("document", &input).await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+
+    for response in [
+        json!({
+            "document_id": "other",
+            "revision": 1,
+            "title": "Title",
+            "file_node_id": null,
+            "file_tags": [],
+            "nodes": [],
+            "link_occurrences": [],
+            "semantic_edges": [],
+            "compatibility_sha1": "0".repeat(40),
+            "content_sha256": "0".repeat(64)
+        }),
+        json!({
+            "document_id": "document",
+            "revision": 0,
+            "title": "Title",
+            "file_node_id": null,
+            "file_tags": [],
+            "nodes": [],
+            "link_occurrences": [],
+            "semantic_edges": [],
+            "compatibility_sha1": "0".repeat(40),
+            "content_sha256": "0".repeat(64)
+        }),
+        json!({
+            "document_id": "document",
+            "revision": 1,
+            "title": "x".repeat(1024 * 1024),
+            "file_node_id": null,
+            "file_tags": [],
+            "nodes": [],
+            "link_occurrences": [],
+            "semantic_edges": [],
+            "compatibility_sha1": "0".repeat(40),
+            "content_sha256": "0".repeat(64)
+        }),
+    ] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.document("document").await,
+            Err(HttpClientError::InvalidResponse { .. })
+                | Err(HttpClientError::ResponseTooLarge { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+
+    let thema = json!({
+        "id": "other",
+        "kind": "basic",
+        "source_document_id": "document",
+        "source_node_id": "node",
+        "source_revision": 1,
+        "source_guid": null,
+        "source_keimenon_hash": "hash",
+        "archived": null,
+        "parathema": null,
+        "keimenon": "Question",
+        "hypothesis": [],
+        "answer": ["Answer"],
+        "review_image": null,
+        "review_state": {
+            "state_revision": 0,
+            "last_reviewed_at_us": null,
+            "last_review_day": null,
+            "next_review_day": 1,
+            "review_count": 0,
+            "interval_days": null,
+            "ease_milli": 2500,
+            "consecutive_correct": 0,
+            "total_successes": 0,
+            "total_failures": 0,
+            "suspended": false,
+            "stability": null,
+            "difficulty": null
+        }
+    });
+    let raw = spawn_json_server(thema).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert!(matches!(
+        client.legacy_thema("thema").await,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
+    raw.task.await.unwrap();
+
+    let item = |id: &str, day: u32| {
+        json!({
+            "id": id,
+            "kind": "basic",
+            "keimenon": "Question",
+            "hypothesis": [],
+            "answer": ["Answer"],
+            "next_review_day": day,
+            "review_count": 0
+        })
+    };
+    for response in [
+        json!({"items": [item("b", 1), item("a", 1)], "next": null}),
+        json!({"items": [item("a", 1)], "next": "0:1:other"}),
+        json!({"items": [item("a", 1), item("b", 1)], "next": null}),
+    ] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.legacy_due_page(20260101, 1, None).await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn device_identity_client_rejects_invalid_responses() {
     for body in [
         json!({"version": 2, "device_id": "device"}),

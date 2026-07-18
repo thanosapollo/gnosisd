@@ -1720,8 +1720,18 @@ fn replace_command(
     prepared: &PreparedServerImport,
     created_at_us: i64,
 ) -> Result<ImportSummary, ServiceError> {
+    let digest = format!("{:x}", Sha256::digest(prepared.org.as_bytes()));
+    let existed = blobs.contains(&digest)?;
     let blob = blobs.put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
-    persist_server_import(store, prepared, &blob, created_at_us).map_err(ServiceError::Application)
+    match persist_server_import(store, prepared, &blob, created_at_us) {
+        Ok(summary) => Ok(summary),
+        Err(error) => {
+            if !existed {
+                blobs.discard(&blob.sha256)?;
+            }
+            Err(ServiceError::Application(error))
+        }
+    }
 }
 
 fn replace_note_command(
@@ -3040,6 +3050,60 @@ mod tests {
                 .unwrap()
                 .archived
         );
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_document_imports_do_not_publish_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob_root = directory.path().join("blobs");
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let accepted = ImportDocument::new("document", "#+TITLE: First\n".into(), None)
+            .unwrap()
+            .prepare_server()
+            .unwrap();
+        service.replace(accepted).await.unwrap();
+
+        let stale_org = "#+TITLE: Stale\n";
+        let stale_digest = format!("{:x}", sha2::Sha256::digest(stale_org.as_bytes()));
+        for _ in 0..2 {
+            let stale = ImportDocument::new("document", stale_org.into(), Some(0))
+                .unwrap()
+                .prepare_server()
+                .unwrap();
+            assert!(matches!(
+                service.replace(stale).await,
+                Err(ServiceError::Application(
+                    crate::application::ApplicationError::Conflict { .. }
+                ))
+            ));
+            assert!(
+                !blob_root
+                    .join(&stale_digest[..2])
+                    .join(&stale_digest)
+                    .exists()
+            );
+        }
+
+        let missing_asset_org = "#+TITLE: Missing asset\n";
+        let missing_asset_digest =
+            format!("{:x}", sha2::Sha256::digest(missing_asset_org.as_bytes()));
+        let mut missing_asset =
+            ImportDocument::new("missing-asset", missing_asset_org.into(), None)
+                .unwrap()
+                .prepare_server()
+                .unwrap();
+        missing_asset.asset_paths.push("assets/missing.png".into());
+        assert!(service.replace(missing_asset).await.is_err());
+        assert!(
+            !blob_root
+                .join(&missing_asset_digest[..2])
+                .join(&missing_asset_digest)
+                .exists()
+        );
+
         drop(service);
         runtime.finish().await.unwrap();
     }
