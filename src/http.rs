@@ -26,12 +26,12 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 
 use crate::{
     application::{
-        ApplicationError, DevicePrincipal, DeviceScope, DueCursor, MAX_OFFLINE_ASSET_BYTES,
-        PreparedDeviceDocumentLifecycleMutation, PreparedNote, QueryDocument, QueryDueThemataPage,
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptOperationStatus, ReviewHistoryQuery, ReviewOperationAuthority,
-        ReviewSessionQuery, SettingsRecord, canonical_asset_path, prepare_asset,
-        prepare_device_document_mutation, prepare_device_document_rename,
+        ApplicationError, DevicePrincipal, DeviceScope, DueCursor, MAX_DUE_CURSOR_BYTES,
+        MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation, PreparedNote,
+        QueryDocument, QueryDueThemataPage, ReviewAttemptMutation, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewHistoryQuery,
+        ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord, canonical_asset_path,
+        prepare_asset, prepare_device_document_mutation, prepare_device_document_rename,
         prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
         thema_content, validate_org_path,
     },
@@ -2979,7 +2979,7 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
         return vec![
             json!({"name":"day","in":"query","required":true,"description":"Valid YYYYMMDD calendar date","schema":{"type":"integer","format":"uint32","minimum":10101}}),
             json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}}),
-            json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
+            json!({"name":"after","in":"query","required":false,"schema":{"type":"string","minLength":1,"maxLength":MAX_DUE_CURSOR_BYTES}}),
         ];
     }
     let paged = matches!(
@@ -3552,8 +3552,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        ApiError, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page, bounded_projection_page,
-        ensure_thema_response_budget, openapi_document, optional_if_match, router,
+        ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page,
+        bounded_projection_page, ensure_thema_response_budget, openapi_document, optional_if_match,
+        router,
     };
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
@@ -3728,7 +3729,7 @@ mod tests {
             json!([
                 {"name":"day","in":"query","required":true,"description":"Valid YYYYMMDD calendar date","schema":{"type":"integer","format":"uint32","minimum":10101}},
                 {"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}},
-                {"name":"after","in":"query","required":false,"schema":{"type":"string"}}
+                {"name":"after","in":"query","required":false,"schema":{"type":"string","minLength":1,"maxLength":MAX_DUE_CURSOR_BYTES}}
             ])
         );
         let schemas = &api["components"]["schemas"];
