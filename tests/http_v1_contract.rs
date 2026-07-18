@@ -61,21 +61,14 @@ fn snapshot_pages_must_continue_or_finish_exclusively() {
 }
 
 #[test]
-fn replica_state_accepts_equal_sequence_aliases_and_emits_legacy_wire_name() {
+fn replica_state_rejects_retired_sequence_name() {
     let mut state = fixture()["state"].clone();
-    state["next_device_sequence"] = json!(3);
-
-    let state: ReplicaStateV1 = serde_json::from_value(state).unwrap();
-    let wire = serde_json::to_value(state).unwrap();
-
-    assert_eq!(wire["next_review_sequence"], 3);
-    assert!(wire.get("next_device_sequence").is_none());
-}
-
-#[test]
-fn replica_state_rejects_inconsistent_sequence_aliases() {
-    let mut state = fixture()["state"].clone();
-    state["next_device_sequence"] = json!(4);
+    let sequence = state
+        .as_object_mut()
+        .unwrap()
+        .remove("next_device_sequence")
+        .unwrap();
+    state["next_review_sequence"] = sequence;
 
     assert!(serde_json::from_value::<ReplicaStateV1>(state).is_err());
 }

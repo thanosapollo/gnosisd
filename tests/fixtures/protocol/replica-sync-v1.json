@@ -3,7 +3,7 @@
     "version": 1,
     "server_id": "0123456789abcdef0123456789abcdef",
     "cursor": "eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsInBvc2l0aW9uIjo3LCJ0b2tlbiI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0",
-    "next_review_sequence": 3,
+    "next_device_sequence": 3,
     "snapshot_required": true
   },
   "snapshot_partial": {

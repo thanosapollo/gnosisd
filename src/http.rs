@@ -3760,11 +3760,11 @@ mod tests {
             schemas["ReplicaStateV1"]["required"]
                 .as_array()
                 .unwrap()
-                .contains(&json!("next_review_sequence"))
+                .contains(&json!("next_device_sequence"))
         );
         assert!(
             schemas["ReplicaStateV1"]["properties"]
-                .get("next_device_sequence")
+                .get("next_review_sequence")
                 .is_none()
         );
         assert!(

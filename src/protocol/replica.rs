@@ -861,7 +861,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        CursorV1, MAX_REPLICA_CURSOR_BYTES, ReplicaWireError, decode_cursor, decode_replica_state,
+        CursorV1, MAX_REPLICA_CURSOR_BYTES, ReplicaWireError, decode_cursor,
         decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor, encode_token,
         replica_change_page, replica_snapshot_page, replica_state_response,
     };
@@ -967,52 +967,23 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sequence_name_is_accepted_but_dual_names_must_agree() {
-        let fixture: Value = serde_json::from_str(include_str!(
+    fn retired_sequence_name_is_rejected() {
+        let mut fixture: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/protocol/replica-sync-v1.json"
         ))
         .unwrap();
-        let legacy = serde_json::from_value(fixture["state"].clone()).unwrap();
-        assert_eq!(
-            decode_replica_state(legacy).unwrap().next_device_sequence,
-            3
-        );
-
-        let mut inconsistent = fixture["state"].clone();
-        inconsistent["next_device_sequence"] = json!(4);
+        let sequence = fixture["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("next_device_sequence")
+            .unwrap();
+        fixture["state"]["next_review_sequence"] = sequence;
         assert!(
-            serde_json::from_value::<crate::protocol::http_v1::ReplicaStateV1>(inconsistent)
-                .is_err()
+            serde_json::from_value::<crate::protocol::http_v1::ReplicaStateV1>(
+                fixture["state"].clone()
+            )
+            .is_err()
         );
-    }
-
-    #[test]
-    fn current_v1_state_is_accepted_by_the_frozen_legacy_decoder() {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct LegacyState {
-            version: u32,
-            server_id: String,
-            cursor: String,
-            next_review_sequence: u64,
-            snapshot_required: bool,
-        }
-        let wire = replica_state_response(&ReplicaState {
-            server_id: "0".repeat(32),
-            cursor: 0,
-            cursor_token: "1".repeat(32),
-            next_device_sequence: 3,
-        })
-        .unwrap();
-
-        let legacy: LegacyState =
-            serde_json::from_value(serde_json::to_value(wire).unwrap()).unwrap();
-
-        assert_eq!(legacy.version, 1);
-        assert_eq!(legacy.server_id, "0".repeat(32));
-        assert!(!legacy.cursor.is_empty());
-        assert_eq!(legacy.next_review_sequence, 3);
-        assert!(legacy.snapshot_required);
     }
 
     #[test]

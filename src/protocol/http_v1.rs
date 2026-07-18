@@ -1,10 +1,8 @@
 //! Public JSON contracts for authenticated HTTP `/v1` clients.
 //!
-//! These DTOs preserve their exact versioned JSON shapes. In particular,
-//! [`ReplicaStateV1::next_device_sequence`] is serialized with the legacy
-//! `next_review_sequence` field name. Deserialization enforces wire shape;
-//! `LocalReplica` performs cursor, identity, projection, and ordering validation
-//! before persistence.
+//! These DTOs preserve their exact versioned JSON shapes. `LocalReplica`
+//! performs cursor, identity, projection, and ordering validation before
+//! persistence.
 
 mod client_views;
 mod content;
@@ -76,7 +74,7 @@ pub struct DeviceIdentityV1 {
     pub device_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 /// Server identity, durable cursor, and next device sequence used to bootstrap a replica.
 pub struct ReplicaStateV1 {
@@ -86,44 +84,9 @@ pub struct ReplicaStateV1 {
     pub server_id: String,
     #[schemars(length(min = 1, max = 512))]
     pub cursor: String,
-    #[serde(rename = "next_review_sequence")]
-    #[schemars(rename = "next_review_sequence")]
     pub next_device_sequence: u64,
     #[schemars(extend("const" = true))]
     pub snapshot_required: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReplicaStateWireV1 {
-    version: u32,
-    server_id: String,
-    cursor: String,
-    next_device_sequence: Option<u64>,
-    next_review_sequence: u64,
-    snapshot_required: bool,
-}
-
-impl<'de> Deserialize<'de> for ReplicaStateV1 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let wire = ReplicaStateWireV1::deserialize(deserializer)?;
-        if wire
-            .next_device_sequence
-            .is_some_and(|sequence| sequence != wire.next_review_sequence)
-        {
-            return Err(de::Error::custom("replica sequence aliases disagree"));
-        }
-        Ok(Self {
-            version: wire.version,
-            server_id: wire.server_id,
-            cursor: wire.cursor,
-            next_device_sequence: wire.next_review_sequence,
-            snapshot_required: wire.snapshot_required,
-        })
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
