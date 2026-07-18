@@ -4145,17 +4145,19 @@ mod tests {
     fn initializes_and_reopens_database() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("gnosis.db");
-        assert_eq!(
-            SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            SCHEMA_VERSION
-        );
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(application_id(&store.connection).unwrap(), APPLICATION_ID);
+        drop(store);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), SCHEMA_VERSION);
         assert_eq!(
-            SqliteStore::open(&path).unwrap().schema_version().unwrap(),
-            SCHEMA_VERSION
+            application_id(&reopened.connection).unwrap(),
+            APPLICATION_ID
         );
     }
 
@@ -4210,39 +4212,36 @@ mod tests {
     }
 
     #[test]
-    fn current_schema_is_v1_without_migration_history() {
-        let store = SqliteStore::open_in_memory().unwrap();
+    fn rejects_wrong_application_id_without_changes() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let wrong_application_id = APPLICATION_ID + 1;
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE marker(value TEXT);
+                 INSERT INTO marker VALUES ('preserved');
+                 PRAGMA user_version = {SCHEMA_VERSION};
+                 PRAGMA application_id = {wrong_application_id};"
+            ))
+            .unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(application_id(&store.connection).unwrap(), APPLICATION_ID);
-        assert!(!schema_table_exists(&store.connection, "schema_migration"));
-        for table in [
-            "document",
-            "review_attempt_operation",
-            "device_mutation_receipt",
-            "offline_asset_operation",
-            "replica_snapshot",
-        ] {
-            assert!(
-                schema_table_exists(&store.connection, table),
-                "missing {table}"
-            );
-        }
-        for retired in [
-            "import_manifest",
-            "import_table_count",
-            "import_path_rewrite",
-        ] {
-            assert!(!schema_table_exists(&store.connection, retired));
-        }
-        assert!(!store
-            .connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('thema') WHERE name = 'legacy_id')",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .unwrap());
+        let error = initialize_schema(&connection).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::UnsupportedApplicationId {
+                found,
+                expected: APPLICATION_ID
+            } if found == wrong_application_id
+        ));
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
+        assert_eq!(application_id(&connection).unwrap(), wrong_application_id);
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM marker", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
     }
 
     fn schema_table_exists(connection: &rusqlite::Connection, table: &str) -> bool {
