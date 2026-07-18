@@ -250,8 +250,7 @@ resources use UUIDv7.
 The replica database retains its distinct canonical schema v1. Server and
 replica databases use distinct SQLite application IDs. Startup creates the
 applicable schema only for an empty database and rejects every other version or
-database identity; historical server data must enter through the explicit
-migration path.
+database identity.
 
 Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
 tracks logical paths, heads, revisions, renames, tombstones, and the monotonic
@@ -266,29 +265,6 @@ The domain layer contains no SQLite, Tokio, JSON, socket, filesystem, orgize,
 clock, or randomness types. Textual link occurrences, unique semantic graph
 edges, and thema-to-node learning associations remain distinct.
 
-* Legacy cutover
-
-Close the legacy Emacs database before the final snapshot. Import schema v9
-and the Notes tree into new staging targets:
-
-#+begin_src sh
-gnosisd \
-  --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
-  --blob-root "$HOME/.local/share/gnosis/blobs" \
-  --notes-root "$HOME/Notes" \
-  --migrate-legacy "$HOME/.config/emacs/gnosis/gnosis.db"
-#+end_src
-
-The importer refuses existing targets, active Emacs leases, symlinks, path
-escapes, unsupported files, case collisions, malformed Org, and malformed
-legacy values. It reads the source without modifying or embedding it, records
-its SHA-256 and mtime, validates table counts, integrity, and foreign keys, then
-publishes through a recoverable protocol with the database as the final commit
-point.
-
-In-tree assets are normalized into the shared asset model and managed Org and
-thema references are rewritten. External URLs remain external. Local links
-outside the imported Notes root are rejected.
 
 * Reviews and settings
 

@@ -97,9 +97,6 @@ fn readme_storage_versions_match_the_canonical_schemas() {
     assert!(readme.contains("replica database retains its distinct canonical schema v1"));
     assert!(include_str!("../src/store/sqlite.rs").contains("const SCHEMA_VERSION: u32 = 2;"));
     assert!(include_str!("../src/store/replica.rs").contains("const SCHEMA_VERSION: u32 = 1;"));
-    assert!(
-        include_str!("../src/migration.rs").contains("new canonical server schema-v2 database")
-    );
 }
 
 #[test]

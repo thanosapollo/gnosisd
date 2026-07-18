@@ -386,106 +386,6 @@ impl SqliteStore {
             .map_err(StoreError::storage)
     }
 
-    pub(crate) fn rewrite_imported_thema_content(
-        &mut self,
-        record: &ThemaRecord,
-    ) -> Result<(), StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(StoreError::storage)?;
-        transaction
-            .execute(
-                "UPDATE thema SET keimenon = ?2, hypothesis_json = ?3,
-                     answer_json = ?4, parathema = ?5, review_image = ?6,
-                     content_sha256 = ?7
-                 WHERE thema_id = ?1",
-                params![
-                    record.thema_id,
-                    record.content.keimenon,
-                    serde_json::to_string(&record.content.hypothesis)
-                        .map_err(StoreError::storage)?,
-                    serde_json::to_string(&record.content.answer).map_err(StoreError::storage)?,
-                    record.content.parathema,
-                    record.content.review_image,
-                    record.content_sha256,
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        transaction
-            .execute(
-                "DELETE FROM thema_asset WHERE thema_id = ?1",
-                [&record.thema_id],
-            )
-            .map_err(StoreError::storage)?;
-        let mut insert = transaction
-            .prepare_cached(
-                "INSERT INTO thema_asset(thema_id, asset_path, role) VALUES (?1, ?2, ?3)",
-            )
-            .map_err(StoreError::storage)?;
-        for asset_path in &record.asset_paths {
-            let role = if record.content.review_image.as_deref() == Some(asset_path) {
-                "review_image"
-            } else {
-                "content"
-            };
-            insert
-                .execute(params![record.thema_id, asset_path, role])
-                .map_err(StoreError::storage)?;
-        }
-        drop(insert);
-        let updated = transaction
-            .execute(
-                "UPDATE thema_revision SET
-                     kind = ?3, keimenon = ?4, hypothesis_json = ?5,
-                     answer_json = ?6, source_guid = ?7, parathema = ?8,
-                     review_image = ?9, tags_json = ?10, node_ids_json = ?11,
-                     asset_paths_json = ?12, content_sha256 = ?13,
-                     archived = ?14
-                 WHERE thema_id = ?1 AND revision = ?2",
-                params![
-                    record.thema_id,
-                    u64_to_i64(record.revision, "thema revision")?,
-                    record.content.kind.as_str(),
-                    record.content.keimenon,
-                    serde_json::to_string(&record.content.hypothesis)
-                        .map_err(StoreError::storage)?,
-                    serde_json::to_string(&record.content.answer).map_err(StoreError::storage)?,
-                    record.content.source_guid,
-                    record.content.parathema,
-                    record.content.review_image,
-                    serde_json::to_string(&record.tags).map_err(StoreError::storage)?,
-                    serde_json::to_string(&record.node_ids).map_err(StoreError::storage)?,
-                    serde_json::to_string(&record.asset_paths).map_err(StoreError::storage)?,
-                    record.content_sha256,
-                    i64::from(record.archived),
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        if updated != 1 {
-            return Err(StoreError::CorruptData {
-                field: "thema revision history",
-            });
-        }
-        transaction.commit().map_err(StoreError::storage)
-    }
-
-    pub(crate) fn record_import_path_rewrite(
-        &self,
-        source_path: &str,
-        logical_path: &str,
-        reason: &str,
-    ) -> Result<(), StoreError> {
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO import_path_rewrite(source_path, logical_path, reason)
-                 VALUES (?1, ?2, ?3)",
-                params![source_path, logical_path, reason],
-            )
-            .map_err(StoreError::storage)?;
-        Ok(())
-    }
-
     pub(crate) fn document_head(
         &self,
         document_id: &DocumentId,
@@ -3383,13 +3283,6 @@ fn backfill_review_state_revisions(transaction: &Transaction<'_>) -> Result<(), 
             .map_err(StoreError::storage)?;
     }
     Ok(())
-}
-
-pub(crate) fn initialize_native_database(connection: &Connection) -> Result<(), StoreError> {
-    connection
-        .pragma_update(None, "foreign_keys", true)
-        .map_err(StoreError::storage)?;
-    initialize_schema(connection)
 }
 
 fn schema_version(connection: &Connection) -> Result<u32, StoreError> {

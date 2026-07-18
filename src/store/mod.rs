@@ -1,4 +1,3 @@
-pub(crate) mod legacy_value;
 mod replica;
 mod sqlite;
 
@@ -10,5 +9,4 @@ pub(crate) use replica::{
 };
 pub(crate) use sqlite::{
     DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
-    initialize_native_database,
 };
