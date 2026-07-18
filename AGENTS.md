@@ -1,182 +1,85 @@
 # Agents.md
 
-Keep this file current as the project develops.
+Keep this file current and concise.
 
-Gnosis Core is the source of truth for Gnosis storage and shared domain
-behavior. It serves the `gnosis` Emacs frontend, command-line, and future web
-clients. The package in `~/Projects/emacs-lisp/gnosis/` is the Emacs frontend,
-not a separate product named emacs-gnosis. Its established UI and behavior are
-the compatibility contract for the migration. Coordinated frontend changes are
-expected when a core operation lands.
+Gnosis Core is a standalone daemon/server. `gnosisd` owns canonical documents,
+parsed roam-like nodes and links, themata linked to nodes, review state, grading,
+FSRS scheduling, persistence, blobs, and synchronization. Clients consume typed
+authenticated HTTP `/v1`; they never open the canonical database or calculate
+scheduling.
 
-The deployed daemon exclusively owns
-`~/.local/share/gnosis/gnosis.sqlite`. Ordinary clients use authenticated HTTP
-`/v1`; the Unix socket is the privileged local trust, administration, recovery,
-and diagnostics boundary. No client may open the core database
-directly.
+The Unix socket is a privileged local operator boundary for system information,
+device bootstrap and revocation, backup, recovery, and diagnostics. Ordinary
+data, content, and review operations use HTTP only.
 
 ## Architecture
 
 - `src/domain` is the functional core. It contains no SQLite, Tokio, Serde JSON,
   sockets, filesystem, or orgize types.
 - `src/application` validates typed commands and builds projections before a
-  write can enter the database queue.
-- `src/parser` is the concrete Org adapter. Do not add a parser trait until a
-  second implementation creates a real substitution boundary.
+  write enters the persistence queue.
+- `src/parser` is the concrete Org adapter. Add no parser trait until a second
+  implementation creates a real substitution boundary.
 - `src/store` is the only SQLite adapter. SQLite files are mode `0600`.
-- `src/service` is the concrete imperative shell for server imports, backups,
-  blobs, and persistence coordination. One daemon-owned thread holds the
-  canonical connection and handles reads and atomic writes through a bounded
-  queue. The concrete client replica store owns a separate local connection.
+- `src/service` owns imports, backups, blobs, and persistence coordination. One
+  daemon-owned thread holds the canonical connection and handles reads and
+  atomic writes through bounded queues.
+- `src/protocol` owns versioned wire DTOs, HTTP routes, OpenAPI, and privileged
+  Unix framing. Public IDs are opaque strings, never SQLite row IDs.
+- `src/protocol/http_v1.rs` is the client HTTP contract kernel. Runtime DTOs and
+  OpenAPI schemas must remain identical; do not maintain parallel JSON models.
+- `src/bin/gnosisd.rs` is the only shipped canonical database owner.
+- `src/bin/gnosis.rs` uses `HttpClient` for ordinary online operations. Offline
+  commands may use the concrete client replica, never the canonical database.
 
-- Legacy themata remain exposed through a read-only adapter. Normalized review
-  writes use immutable attempts and events plus atomic scheduling transitions.
-- `src/protocol` owns the versioned wire DTOs, HTTP API, and privileged Unix
-  framing. Public fields use opaque string IDs, never SQLite row IDs.
-  `src/protocol/http_v1.rs` is the client-facing HTTP contract kernel. Generate
-  OpenAPI schemas from these DTOs instead of maintaining parallel JSON models.
-- Local online review DTOs remain in `src/protocol`. Pure validation and
-  transition construction remain in `src/application`, concrete server
-  orchestration remains in `src/service`, and persistence remains in
-  `src/store`. The daemon owns grading, scheduling transitions, session
-  progress, suspension, daily totals, and immutable review events. Do not move
-  that authority into a frontend.
-- Review attempt envelope IDs are disposable correlation IDs. Desired-state
-  mutations carry a separate durable operation ID and expected attempt
-  revision. Operation identity is scoped to the authenticated device or local
-  Unix actor. Exact retries return the retained result; competing revisions
-  and stale captures remain explicit. Legacy toggle methods are compatibility
-  adapters and advance the same monotonic attempt revision.
-- Pending HTTP review attempts expose only a server-materialized question and
-  typed response prompt. Raw answer-bearing keimenon and captured answers stay
-  server-side until grading. Keep concealment and response cardinality in the
-  pure application projection instead of duplicating them in clients.
-- Offline review HTTP uses a typed v1 operation envelope and typed v2 pack and
-  reconciliation responses. Pack, session, source, status, and conflict
-  discriminants are closed enums. Keep the runtime response types and OpenAPI
-  schemas identical instead of returning generic JSON values.
-- Offline document reconciliation uses typed v1 operation and result envelopes.
-  Mutation, base, status, and conflict variants are closed, and accepted versus
-  conflict results are disjoint wire states.
-- Offline asset reconciliation uses typed v1 operation and result envelopes.
-  The only v1 mutation is a bounded content-addressed put against an absent base;
-  bytes must be staged separately before its device-sequenced commit.
-- Frozen direct note routes retain their original v1 status and response shapes.
-  Retry-safe direct document writes and lifecycle changes use the additive
-  document-mutation routes, device-scoped immutable receipts, exact request
-  fingerprints, retained typed results, and durable replica cursors. A changed
-  operation key must fail before blob I/O; rejected and no-op mutations must not
-  publish unreferenced blobs or advance document revisions and cursors.
-- Replica bootstrap uses a device-bound immutable snapshot manifest captured at
-  one content cursor. Cursorless retries reuse a resumable manifest. Clients
-  must install every page atomically before promoting the terminal delta cursor.
-- Delta cursors bind the stable server identity, numeric position, and unique
-  feed token so restored branches cannot reuse a cursor silently. Every feed
-  row resolves to an exact immutable revision. SSE is only a wakeup.
-- `src/client_replica.rs` is the concrete offline client foundation. Partial
-  snapshots stay in staging tables, terminal pages atomically replace active
-  projections, and snapshot recovery never deletes review packs, content or
-  review operations, results, or device sequence state. Reconciliation cursors
-  are hints and must never fast-forward the replica feed cursor.
-- `src/client_sync.rs` is the concrete HTTP replica coordinator. It observes
-  the bearer token's device identity before changing local state, resumes or
-  recovers snapshots, pulls durable deltas, fetches required blobs, and drains
-  the shared outbox strictly by device sequence. Unknown mutation delivery
-  stops synchronization with the operation identity intact; the next explicit
-  run replays that exact immutable operation.
-- `src/client_review.rs` owns explicit review-pack acquisition. It persists the
-  typed pack before downloading its content-addressed assets, verifies every
-  asset, resumes an incomplete download through the server's active-pack
-  resource after a client restart, and exposes only answer-concealed question
-  projections to user interfaces. Periodic replica sync never creates a pack.
-- `src/protocol/client_v1.rs` owns versioned DTOs exchanged with local replica
-  clients. It exposes answer-concealed questions, verified pack assets, safe
-  reconciliation summaries, and machine-readable client failures. Raw review
-  packs, captured answers, and immutable outbox payloads are persistence
-  records, not user-interface responses.
-- `src/bin/gnosisd.rs` is the only shipped database owner.
-  `src/bin/gnosis.rs` routes replica synchronization, offline review-pack
-  lifecycle, review attempt recovery, and revisioned desired-state operations
-  through `HttpClient`. Offline pack inspection and answer recording reopen the
-  durable replica without network access. Online pack operations verify the
-  replica binding without draining its outbox, and abandonment never depends on
-  downloading pack assets. Local asset and result queries are offline and never
-  expose captured answers. Only diagnostics, device administration, and backup
-  administration use the Unix socket; ordinary commands use authenticated HTTP.
+## Data and review invariants
 
-Keep textual link occurrences, unique semantic node edges, and `ThemaConcept`
-learning associations separate. Node titles are local values; title paths
-contain only indexed ancestors. Source spans are zero-based, half-open UTF-8
-byte ranges covering the complete Org link.
+- Keep textual link occurrences, unique semantic node edges, and
+  `ThemaConcept` learning associations separate.
+- Node titles are local values. Title paths contain indexed ancestors only.
+  Source spans are zero-based, half-open UTF-8 byte ranges covering complete
+  Org links.
+- The daemon owns grading, FSRS transitions, session progress, suspension,
+  daily totals, revisions, conflicts, and immutable review events.
+- Pending HTTP attempts expose only server-materialized questions and typed
+  response prompts. Keep answers server-side until grading.
+- Desired-state mutations use durable device-scoped operation IDs and expected
+  revisions. Exact retries return retained results; stale or competing
+  revisions remain explicit.
+- Review and content operations share one contiguous per-device sequence.
+  Accepted and conflict results are immutable; invalid operations change no
+  canonical state.
+- Document revisions bind to captured content digests. Numeric revision alone
+  never authorizes an offline write.
+- Canonical Org writes reference active content-addressed assets only. Verify
+  asset path, digest, size, and state before publication or use.
+- Replica bootstrap installs complete snapshots atomically before advancing its
+  durable cursor. Reconciliation cursors never fast-forward the replica feed.
+- Unknown mutation delivery stops synchronization with operation identity
+  intact. Next explicit sync replays that exact immutable operation.
+- Review pack acquisition is explicit. Persist typed packs before downloading
+  and verifying assets. Periodic replica sync never creates a pack.
 
-Do not put transactions, clocks, randomness, socket I/O, filesystem access, or
-async types in the domain. Do not use `Arc<Mutex<Connection>>`. Accepted writes
-must finish even if their client disconnects, and no blocking guard or
-transaction may cross `.await`.
+## Safety
 
-Socket startup uses an atomic `.startup-lock` directory to serialize stale
-cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
-SIGTERM both enter graceful shutdown.
+- Keep transactions, clocks, randomness, socket I/O, filesystem access, and
+  async types out of `src/domain`.
+- Do not use `Arc<Mutex<Connection>>`.
+- Accepted writes finish after client disconnect. No blocking guard or
+  transaction crosses `.await`.
+- Bound request bodies, responses, queues, and parsing work. CPU-heavy parsing
+  and projection preparation must not run on Tokio runtime workers.
+- HTTP mutations require exact scopes and statuses. Do not follow redirects,
+  trust proxies implicitly, retry mutations automatically, or hide delivery
+  uncertainty.
+- Socket startup uses atomic `.startup-lock` directory ownership for stale
+  cleanup and bind. SIGINT and SIGTERM enter graceful shutdown.
+- Never expose secrets, tokens, private topology, operator paths, or live data
+  in source, tests, logs, docs, commits, or handoffs.
 
-The Emacs review dogfood path is explicitly opt-in. `gnosis-review-backend`
-defaults to `legacy`; `core` uses typed authenticated HTTP review DTOs,
-desired-state operations, and raw digest-addressed asset downloads while
-preserving the private verified cache. Review-loop edit and delete remain
-disabled until typed daemon operations can fail or commit before any local
-mutation.
+## Verification
 
-This milestone does not migrate the full Emacs frontend. Dashboard, history,
-content authoring, edit, archive and delete, capture, import, note indexing,
-link maintenance, and some topic or tag prompt reads remain compatibility
-operations. Core review events are not mirrored into the legacy database.
-Rollback means selecting the legacy review backend and preserving both
-databases for inspection. Never overwrite core with the old database,
-reverse-migrate events, or merge divergence by timestamps.
-
-Emacs integration, authenticated remote transport, and replica synchronization
-are active work. Online reviews and device-bound offline review packs reconcile
-through immutable operations. The daemon remains authoritative, conflicts stay
-explicit, and review or content state must never use last-write-wins.
-Offline review v1 submissions remain accepted; v2 pack and result envelopes
-return durable replica cursors.
-Review and content operations share one contiguous per-device sequence. Offline
-document puts retain their complete submitted Org revision. Renames and
-tombstones retain their captured base. Every mutation receives an immutable
-accepted or conflict result. Invalid, stale, or expired-cursor mutations must
-leave the canonical document head and index unchanged.
-Lifecycle operations may be queued only after the replica installs the
-server-bound content capability. Keep that negotiation separate from the
-strict v1 sync-state response so old clients remain compatible. Replica path
-lookup overlays the active server's accepted and pending content chain, and
-supplies stable document IDs for frontends whose Org files have no file ID.
-Reject a locally known path collision before enqueue so optimistic lookup never
-turns an expected conflict into apparent replica corruption.
-Queued document mutations bind every revision to its captured content digest.
-Downloaded bases must predate the captured cursor; predicted bases require an
-accepted predecessor operation. A numeric revision alone must never authorize
-an offline write. A queued or accepted tombstone closes its local operation
-chain until a newer active canonical projection is downloaded.
-Canonical Org writes may reference only active content-addressed assets. Store
-current and historical document asset associations, rebuild them from retained
-Org blobs before daemon startup completes, and reject asset tombstones while
-active documents or themata still reference them. If an active legacy document
-has no source blob, asset deletion fails closed because its references cannot be
-verified. Offline review packs reject external assets. Replica asset lookup must
-distinguish missing, tombstoned, and available state and verify the downloaded
-bytes against the canonical path, digest, and recorded size.
-Offline asset creation uses a separate strict capability and wire protocol but
-shares the contiguous device operation sequence. A replica must store the bytes
-and immutable operation in one local transaction. It uploads the blob before
-the operation; missing server bytes must not create a journal result or consume
-the sequence. Server reconciliation atomically commits the asset head, revision,
-feed row, result, and sequence. Asset rename, deletion, and reactivation remain
-online-only until their offline reference-rewrite and resurrection contracts are
-explicit.
-
-## Commands
-
-The ambient host may not have Cargo on `PATH`. Enter the pinned development
-environment when needed:
+Enter pinned environment when Cargo is unavailable:
 
 ```sh
 nix develop
@@ -207,26 +110,11 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo tree --depth 1
 ```
 
-Org parity checks run the live Elisp code read-only:
-
-```sh
-tools/check-org-parity.sh tests/fixtures/org/basic.org
-tools/check-org-parity.sh tests/fixtures/org/no-file-id.org
-tools/check-org-parity.sh tests/fixtures/org/duplicate-links.org
-tools/check-org-parity.sh tests/fixtures/org/unicode.org
-tools/check-org-parity.sh tests/fixtures/org/compatibility.org
-```
-
-Never run a Gnosis Emacs build target for parity because it may write compiled
-files into the live checkout.
-
 ## Git
 
-- Commit completed work without asking for separate permission.
-- Split work into coherent logical commits. Keep a feature and its tests in the
-  same commit.
-- Use `module: Change` subjects. Add a minimal body only when the reason or an
-  important constraint is not clear from the subject and diff.
-- Preserve unrelated user changes and never commit planning notes, local
-  assistant configuration, generated metadata, or other unrelated files.
-- Never amend, rebase, or push without explicit permission.
+- Commit completed work in coherent signed commits. Keep behavior and matching
+  tests together.
+- Use `module: Change` subjects.
+- Preserve unrelated work. Never commit plans, agent artifacts, generated
+  metadata, secrets, or private operational details.
+- Never amend, rebase, push, deploy, or activate without explicit permission.
