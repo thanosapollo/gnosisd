@@ -261,6 +261,57 @@ async fn client_runs_the_typed_online_review_lifecycle() {
 }
 
 #[tokio::test]
+async fn client_reports_the_appended_online_relearning_item() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let thema_id = create_review_thema(&daemon.base_url, &raw_token).await;
+    let session = client
+        .create_review_session(&ReviewSessionRequestV1 {
+            source: manual_source(thema_id.clone()),
+            target_count: Some(1),
+        })
+        .await
+        .unwrap();
+    let attempt = client
+        .begin_review_attempt(&session.session_id)
+        .await
+        .unwrap();
+    let graded = client
+        .answer_review_attempt(&attempt.attempt_id, &ReviewAnswerV1::Text("wrong".into()))
+        .await
+        .unwrap();
+    assert_eq!(graded.detected_success, Some(false));
+    client
+        .commit_review_attempt(&attempt.attempt_id)
+        .await
+        .unwrap();
+
+    let active = client
+        .active_review_session()
+        .await
+        .unwrap()
+        .session
+        .unwrap();
+    assert_eq!(active.session_id, session.session_id);
+    assert_eq!(active.target_count, Some(1));
+    assert_eq!((active.current_position, active.queue_length), (1, 2));
+    assert_eq!(
+        client
+            .begin_review_attempt(&active.session_id)
+            .await
+            .unwrap()
+            .thema_id,
+        thema_id
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn client_acquires_a_complete_review_pack_and_resumes_after_restart() {
     let daemon = RunningDaemon::start().await;
     let (device_id, raw_token) = create_device(&daemon.socket).await;

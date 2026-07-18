@@ -406,6 +406,83 @@ async fn online_review_commit_is_idempotent_after_lost_response() {
 }
 
 #[tokio::test]
+async fn local_protocol_reports_the_appended_online_relearning_item() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("legacy.db");
+    let database = directory.path().join("gnosis.sqlite");
+    let socket = directory.path().join("gnosis.sock");
+    create_review_fixture(&source);
+    migrate_legacy_database(&source, &database).unwrap();
+    let daemon = DaemonProcess::start(&socket, &database).await;
+    let session = successful_review_result(
+        &socket,
+        "session",
+        Request::ReviewSessionCreate {
+            source: manual_review_source(),
+            target_count: Some(1),
+        },
+    )
+    .await;
+    let ResponseResult::ReviewSession(session) = session else {
+        panic!("unexpected session response");
+    };
+    let attempt = successful_review_result(
+        &socket,
+        "begin",
+        Request::ReviewAttemptBegin {
+            session_id: session.session_id.clone(),
+        },
+    )
+    .await;
+    let ResponseResult::ReviewAttempt(attempt) = attempt else {
+        panic!("unexpected attempt response");
+    };
+    let graded = successful_review_result(
+        &socket,
+        "answer",
+        Request::ReviewAttemptAnswer {
+            attempt_id: attempt.attempt_id.clone(),
+            response: ReviewAnswerInput::Text("wrong".into()),
+        },
+    )
+    .await;
+    let ResponseResult::ReviewAttempt(graded) = graded else {
+        panic!("unexpected grade response");
+    };
+    assert_eq!(graded.detected_success, Some(false));
+    successful_review_result(
+        &socket,
+        "commit",
+        Request::ReviewAttemptCommit {
+            attempt_id: attempt.attempt_id,
+        },
+    )
+    .await;
+
+    let active = successful_review_result(&socket, "active", Request::ReviewSessionActive {}).await;
+    let ResponseResult::ActiveReviewSession(active) = active else {
+        panic!("unexpected active-session response");
+    };
+    let active = active.session.unwrap();
+    assert_eq!(active.session_id, session.session_id);
+    assert_eq!(active.target_count, Some(1));
+    assert_eq!((active.current_position, active.queue_length), (1, 2));
+    let repeated = successful_review_result(
+        &socket,
+        "repeat",
+        Request::ReviewAttemptBegin {
+            session_id: active.session_id,
+        },
+    )
+    .await;
+    let ResponseResult::ReviewAttempt(repeated) = repeated else {
+        panic!("unexpected repeated attempt response");
+    };
+    assert_eq!(repeated.thema_id, "7");
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn online_review_session_recovers_and_has_explicit_lifecycle() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("legacy.db");

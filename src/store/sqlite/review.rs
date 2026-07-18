@@ -634,6 +634,9 @@ impl SqliteStore {
             &event_id,
             committed_at_us,
         )?;
+        if row.accepted_success == Some(false) && !row.desired_suspended {
+            append_relearning_item(&transaction, &row.session_id, &row.thema_id)?;
+        }
         finish_attempt(&transaction, &row, &event_id, committed_at_us)?;
         update_review_day(&transaction, &transition, row.override_count)?;
         super::insert_content_change(
@@ -2782,6 +2785,23 @@ fn finish_attempt(
     Ok(())
 }
 
+fn append_relearning_item(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    thema_id: &str,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO review_session_item(session_id, position, thema_id)
+             SELECT ?1, count(*), ?2
+             FROM review_session_item
+             WHERE session_id = ?1",
+            params![session_id, thema_id],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
 fn update_review_day(
     transaction: &Transaction<'_>,
     transition: &TransitionSnapshot,
@@ -2851,6 +2871,10 @@ mod tests {
     }
 
     fn manual_source(id: &str) -> ReviewSource {
+        manual_source_many(&[id])
+    }
+
+    fn manual_source_many(ids: &[&str]) -> ReviewSource {
         ReviewSource {
             kind: ReviewSourceKind::Manual,
             tags: vec![],
@@ -2858,8 +2882,31 @@ mod tests {
             topic_node_id: None,
             topic_forward_depth: None,
             topic_backward_depth: None,
-            manual_ids: vec![id.into()],
+            manual_ids: ids.iter().map(|id| (*id).into()).collect(),
         }
+    }
+
+    fn grade_and_commit(
+        store: &mut SqliteStore,
+        session_id: &str,
+        answer: &str,
+        started_at_us: u64,
+    ) -> (crate::application::ReviewAttemptView, String) {
+        let attempt = store
+            .begin_review_attempt(session_id, None, started_at_us)
+            .unwrap();
+        let graded = store
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text(answer.into()),
+                started_at_us + 1,
+            )
+            .unwrap();
+        let event_id = store
+            .commit_review_attempt(&attempt.attempt_id, None, started_at_us + 2)
+            .unwrap();
+        (graded, event_id)
     }
 
     fn add_device(store: &mut SqliteStore, name: &str) -> String {
@@ -3626,6 +3673,292 @@ mod tests {
             )
             .unwrap();
         assert_eq!(totals, (1, 1, 1, 0, 0));
+    }
+
+    #[test]
+    fn failed_online_reviews_return_at_session_tail_until_passed() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "a", "A", None);
+        add_thema(&mut store, "b", "B", None);
+        let session = store
+            .create_review_session(
+                &manual_source_many(&["a", "b"]),
+                Some(2),
+                None,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+
+        let (first_failure, first_event) = grade_and_commit(
+            &mut store,
+            &session.session_id,
+            "wrong",
+            1_752_600_000_001_000,
+        );
+        assert_eq!(first_failure.thema_id, "a");
+        let after_failure = store.review_session(&session.session_id).unwrap().unwrap();
+        assert_eq!(
+            (after_failure.current_position, after_failure.queue_length),
+            (1, 3)
+        );
+        assert_eq!(after_failure.status, "active");
+        assert_eq!(
+            store
+                .commit_review_attempt(&first_failure.attempt_id, None, 1_752_600_000_002_000,)
+                .unwrap(),
+            first_event
+        );
+        assert_eq!(
+            store
+                .review_session(&session.session_id)
+                .unwrap()
+                .unwrap()
+                .queue_length,
+            3
+        );
+        let failed_state = super::load_review_state(&store.connection, "a").unwrap();
+        assert!(failed_state.next_review_day > failed_state.last_review_day.unwrap());
+
+        let (second, _) = grade_and_commit(
+            &mut store,
+            &session.session_id,
+            "answer",
+            1_752_600_000_003_000,
+        );
+        assert_eq!(second.thema_id, "b");
+        let repeated = store
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_004_000)
+            .unwrap();
+        assert_eq!(repeated.thema_id, "a");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT state_revision FROM review_attempt WHERE attempt_id = ?1",
+                    [&repeated.attempt_id],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let repeated_failure = store
+            .grade_review_attempt(
+                &repeated.attempt_id,
+                None,
+                &AnswerInput::Text("wrong".into()),
+                1_752_600_000_004_001,
+            )
+            .unwrap();
+        assert_eq!(
+            repeated_failure
+                .proposed_transition
+                .as_ref()
+                .unwrap()
+                .elapsed_days,
+            0
+        );
+        store
+            .commit_review_attempt(&repeated.attempt_id, None, 1_752_600_000_004_002)
+            .unwrap();
+        let repeated_session = store.review_session(&session.session_id).unwrap().unwrap();
+        assert_eq!(
+            (
+                repeated_session.current_position,
+                repeated_session.queue_length
+            ),
+            (3, 4)
+        );
+        assert_eq!(repeated_session.status, "active");
+
+        let (final_attempt, _) = grade_and_commit(
+            &mut store,
+            &session.session_id,
+            "answer",
+            1_752_600_000_005_000,
+        );
+        assert_eq!(final_attempt.thema_id, "a");
+        let completed = store.review_session(&session.session_id).unwrap().unwrap();
+        assert_eq!((completed.current_position, completed.queue_length), (4, 4));
+        assert_eq!(completed.status, "completed");
+
+        let totals = store
+            .connection
+            .query_row(
+                "SELECT review_count, new_count, success_count, failure_count FROM review_day",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, u32>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(totals, (4, 2, 2, 2));
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM review_event", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn suspended_failure_does_not_append_a_relearning_item() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let session = store
+            .create_review_session(
+                &manual_source("thema"),
+                Some(1),
+                None,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        let attempt = store
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_001_000)
+            .unwrap();
+        store
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text("wrong".into()),
+                1_752_600_000_001_001,
+            )
+            .unwrap();
+        store
+            .toggle_attempt_suspension(&attempt.attempt_id, None)
+            .unwrap();
+        store
+            .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_001_002)
+            .unwrap();
+
+        let completed = store.review_session(&session.session_id).unwrap().unwrap();
+        assert_eq!((completed.current_position, completed.queue_length), (1, 1));
+        assert_eq!(completed.status, "completed");
+    }
+
+    #[test]
+    fn failed_attempt_and_relearning_append_roll_back_together() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let session = store
+            .create_review_session(
+                &manual_source("thema"),
+                Some(1),
+                None,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        let attempt = store
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_001_000)
+            .unwrap();
+        store
+            .grade_review_attempt(
+                &attempt.attempt_id,
+                None,
+                &AnswerInput::Text("wrong".into()),
+                1_752_600_000_001_001,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_online_commit
+                 BEFORE UPDATE OF status ON review_attempt
+                 WHEN NEW.status = 'committed'
+                 BEGIN SELECT RAISE(ABORT, 'fail'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_001_002)
+                .is_err()
+        );
+        let unchanged = store.review_session(&session.session_id).unwrap().unwrap();
+        assert_eq!((unchanged.current_position, unchanged.queue_length), (0, 1));
+        assert_eq!(unchanged.status, "active");
+        assert_eq!(
+            super::load_review_state(&store.connection, "thema")
+                .unwrap()
+                .review_count,
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM review_event", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .unwrap(),
+            0
+        );
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_online_commit")
+            .unwrap();
+        store
+            .commit_review_attempt(&attempt.attempt_id, None, 1_752_600_000_001_003)
+            .unwrap();
+        let committed = store.review_session(&session.session_id).unwrap().unwrap();
+        assert_eq!((committed.current_position, committed.queue_length), (1, 2));
+    }
+
+    #[test]
+    fn quit_resume_preserves_relearning_tail_and_abort_stops_it() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let session = store
+            .create_review_session(
+                &manual_source("thema"),
+                Some(1),
+                None,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        grade_and_commit(
+            &mut store,
+            &session.session_id,
+            "wrong",
+            1_752_600_000_001_000,
+        );
+
+        let quit = store
+            .stop_review_session(&session.session_id, None, false, 1_752_600_000_002_000)
+            .unwrap();
+        assert_eq!((quit.current_position, quit.queue_length), (1, 2));
+        assert_eq!(quit.status, "quit");
+        let resumed = store
+            .resume_review_session(&session.session_id, None)
+            .unwrap();
+        assert_eq!((resumed.current_position, resumed.queue_length), (1, 2));
+        assert_eq!(resumed.status, "active");
+        let resumed_attempt = store
+            .begin_review_attempt(&session.session_id, None, 1_752_600_000_003_000)
+            .unwrap();
+        assert_eq!(resumed_attempt.thema_id, "thema");
+        let aborted = store
+            .stop_review_session(&session.session_id, None, true, 1_752_600_000_004_000)
+            .unwrap();
+        assert_eq!((aborted.current_position, aborted.queue_length), (1, 2));
+        assert_eq!(aborted.status, "aborted");
+        assert_eq!(store.active_review_session(None).unwrap(), None);
+        assert!(matches!(
+            store.grade_review_attempt(
+                &resumed_attempt.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                1_752_600_000_005_000,
+            ),
+            Err(crate::store::StoreError::InvalidReviewState)
+        ));
     }
 
     #[test]
