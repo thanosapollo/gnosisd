@@ -25,6 +25,7 @@ static PLAIN_FILE_LINK: LazyLock<Regex> = LazyLock::new(|| {
 pub(crate) struct PreparedNote {
     pub(crate) document_id: DocumentId,
     pub(crate) explicit_document_id: bool,
+    pub(crate) logical_path_is_request_input: bool,
     pub(crate) logical_path: String,
     pub(crate) path_key: String,
     pub(crate) org: String,
@@ -457,6 +458,7 @@ pub(crate) fn prepare_note(
     Ok(PreparedNote {
         document_id: DocumentId::new(document_id).map_err(|_| ContentError::DocumentId)?,
         explicit_document_id,
+        logical_path_is_request_input: true,
         path_key: path_key(&logical_path),
         blob_sha256: format!("{:x}", Sha256::digest(org.as_bytes())),
         logical_path,

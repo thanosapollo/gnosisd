@@ -255,7 +255,7 @@ struct DocumentMutationPayload<'a> {
     format_version: u32,
     mutation_kind: DeviceMutationKind,
     document_id: Option<&'a str>,
-    logical_path: &'a str,
+    logical_path: Option<&'a str>,
     org: &'a str,
     blob_sha256: &'a str,
     expected_revision: Option<u64>,
@@ -454,7 +454,9 @@ fn document_request_json(
         document_id: prepared
             .explicit_document_id
             .then_some(prepared.document_id.as_str()),
-        logical_path: &prepared.logical_path,
+        logical_path: prepared
+            .logical_path_is_request_input
+            .then_some(prepared.logical_path.as_str()),
         org: &prepared.org,
         blob_sha256: &prepared.blob_sha256,
         expected_revision: prepared.expected_revision,
@@ -583,6 +585,33 @@ mod tests {
                 .identity
                 .request_json
                 .contains("\"document_id\":\"document\"")
+        );
+    }
+
+    #[test]
+    fn server_derived_path_does_not_change_import_fingerprint() {
+        let prepared = |path: &str| {
+            let mut note = note("document", "#+title: Note\n", Some(7));
+            note.logical_path = path.into();
+            note.logical_path_is_request_input = false;
+            prepare_device_document_mutation(1, "operation".into(), "device".into(), note).unwrap()
+        };
+
+        let before_rename = prepared("old.org");
+        let after_rename = prepared("renamed.org");
+        assert_eq!(
+            before_rename.identity.request_json,
+            after_rename.identity.request_json
+        );
+        assert_eq!(
+            before_rename.identity.request_sha256,
+            after_rename.identity.request_sha256
+        );
+        assert!(
+            before_rename
+                .identity
+                .request_json
+                .contains("\"logical_path\":null")
         );
     }
 

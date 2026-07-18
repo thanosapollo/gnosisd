@@ -4,8 +4,8 @@ use sha2::{Digest as _, Sha256};
 use super::{
     DeviceOperationInsert, SqliteStore, StoreError, advance_device_sequence,
     current_content_cursor, insert_blob, insert_content_change, insert_device_operation,
-    replayed_device_operation, replica_cursor_token, require_device_sequence, server_id,
-    u64_to_i64, validate_replica_cursor,
+    replayed_device_operation, replica_cursor_token, require_device_sequence, scoped_operation_id,
+    server_id, u64_to_i64, validate_replica_cursor,
 };
 use crate::application::{
     AssetReconciliationStatus, AuthoritativeAsset, OfflineAssetConflictReason,
@@ -29,7 +29,7 @@ impl SqliteStore {
             &operation.operation_id,
             "content",
             &payload_digest,
-            actor_device_id,
+            &operation.device_id,
         )? {
             return Ok(false);
         }
@@ -58,9 +58,13 @@ impl SqliteStore {
             &operation.operation_id,
             "content",
             &payload_digest,
-            actor_device_id,
+            &operation.device_id,
         )? {
-            return commit_replayed_result(transaction, &operation.operation_id);
+            return commit_replayed_result(
+                transaction,
+                &operation.device_id,
+                &operation.operation_id,
+            );
         }
         require_device_sequence(
             &transaction,
@@ -89,7 +93,7 @@ impl SqliteStore {
             &operation.device_id,
             operation.device_sequence,
         )?;
-        insert_asset_result(&transaction, &result, received_at_us)?;
+        insert_asset_result(&transaction, &operation.device_id, &result, received_at_us)?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(result)
     }
@@ -187,7 +191,7 @@ fn retain_conflict_evidence(
                      operation_id, content_sha256, size_bytes, media_type, retained_at_us
                  ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    operation.operation_id,
+                    scoped_operation_id(&operation.device_id, &operation.operation_id),
                     operation.content_sha256,
                     u64_to_i64(size_bytes, "asset evidence size")?,
                     operation.media_type,
@@ -226,6 +230,7 @@ fn insert_asset_journal(
             received_at_us,
         },
     )?;
+    let operation_id = scoped_operation_id(&operation.device_id, &operation.operation_id);
     transaction
         .execute(
             "INSERT INTO offline_asset_operation(
@@ -233,7 +238,7 @@ fn insert_asset_journal(
                  media_type, cursor_server_id, cursor, cursor_token, authored_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                operation.operation_id,
+                operation_id,
                 operation.logical_path,
                 operation.original_name,
                 operation.content_sha256,
@@ -397,6 +402,7 @@ fn current_asset_projection(
 
 fn insert_asset_result(
     transaction: &Transaction<'_>,
+    device_id: &str,
     result: &OfflineAssetResult,
     reconciled_at_us: u64,
 ) -> Result<(), StoreError> {
@@ -414,7 +420,7 @@ fn insert_asset_result(
                  reconciled_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                result.operation_id,
+                scoped_operation_id(device_id, &result.operation_id),
                 i64::from(result.format_version),
                 result.status.as_str(),
                 result.conflict_reason.map(|reason| reason.as_str()),
@@ -431,25 +437,30 @@ fn insert_asset_result(
 
 fn commit_replayed_result(
     transaction: Transaction<'_>,
+    device_id: &str,
     operation_id: &str,
 ) -> Result<OfflineAssetResult, StoreError> {
-    let result = load_asset_result(&transaction, operation_id)?.ok_or(StoreError::CorruptData {
-        field: "offline asset result",
-    })?;
+    let result = load_asset_result(&transaction, device_id, operation_id)?.ok_or(
+        StoreError::CorruptData {
+            field: "offline asset result",
+        },
+    )?;
     transaction.commit().map_err(StoreError::storage)?;
     Ok(result)
 }
 
 fn load_asset_result(
     connection: &Connection,
+    device_id: &str,
     operation_id: &str,
 ) -> Result<Option<OfflineAssetResult>, StoreError> {
+    let scoped_id = scoped_operation_id(device_id, operation_id);
     connection
         .query_row(
             "SELECT format_version, status, conflict_reason, authoritative_json,
                     cursor, cursor_server_id, cursor_token
              FROM offline_asset_result WHERE operation_id = ?1",
-            [operation_id],
+            [&scoped_id],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -574,6 +585,54 @@ mod tests {
     }
 
     #[test]
+    fn operation_ids_are_scoped_to_device() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let devices = [
+            generate_device("first".into(), vec!["content:write".into()]).unwrap(),
+            generate_device("second".into(), vec!["content:write".into()]).unwrap(),
+        ];
+        for device in &devices {
+            store.create_device(device, 1).unwrap();
+        }
+        let operations = [
+            operation(&store, &devices[0].device_id),
+            operation(&store, &devices[1].device_id),
+        ];
+        store
+            .stage_blob(
+                &BlobMeta {
+                    sha256: operations[0].content_sha256.clone(),
+                    size_bytes: operations[0].size_bytes,
+                    media_type: operations[0].media_type.clone(),
+                },
+                5,
+            )
+            .unwrap();
+
+        for (index, operation) in operations.iter().enumerate() {
+            let payload = canonical_asset_operation(operation).unwrap();
+            store
+                .reconcile_asset_operation(
+                    1,
+                    operation,
+                    &payload,
+                    Some(&operation.device_id),
+                    20 + u64::try_from(index).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM offline_asset_operation", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn accepts_exact_replay_and_preserves_active_collision() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let device = generate_device("offline".into(), vec!["content:write".into()]).unwrap();
@@ -672,7 +731,10 @@ mod tests {
                 "SELECT EXISTS(
                      SELECT 1 FROM offline_asset_evidence WHERE operation_id = ?1
                  )",
-                [&operation.operation_id],
+                [super::scoped_operation_id(
+                    &operation.device_id,
+                    &operation.operation_id,
+                )],
                 |row| row.get(0),
             )
             .unwrap();

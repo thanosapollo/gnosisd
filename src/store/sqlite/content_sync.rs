@@ -5,8 +5,8 @@ use super::{
     DeviceOperationInsert, SqliteStore, StoreError, advance_device_sequence,
     current_content_cursor, insert_device_operation, load_document_head,
     load_document_replica_revision, rename_document_in, replace_note_in, replayed_device_operation,
-    replica_cursor_token, require_device_sequence, server_id, tombstone_document_in, u64_to_i64,
-    validate_replica_cursor,
+    replica_cursor_token, require_device_sequence, scoped_operation_id, server_id,
+    tombstone_document_in, u64_to_i64, validate_replica_cursor,
 };
 use crate::{
     application::{
@@ -38,7 +38,7 @@ impl SqliteStore {
             &operation.operation_id,
             "content",
             &digest,
-            actor_device_id,
+            &operation.device_id,
         )? {
             return Ok(false);
         }
@@ -71,9 +71,13 @@ impl SqliteStore {
             &operation.operation_id,
             "content",
             &digest,
-            actor_device_id,
+            &operation.device_id,
         )? {
-            return commit_replayed_result(transaction, &operation.operation_id);
+            return commit_replayed_result(
+                transaction,
+                &operation.device_id,
+                &operation.operation_id,
+            );
         }
         require_device_sequence(
             &transaction,
@@ -100,7 +104,7 @@ impl SqliteStore {
             &operation.device_id,
             operation.device_sequence,
         )?;
-        insert_content_result(&transaction, &result, received_at_us)?;
+        insert_content_result(&transaction, &operation.device_id, &result, received_at_us)?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(result)
     }
@@ -119,12 +123,14 @@ fn require_content_actor(
 
 fn commit_replayed_result(
     transaction: Transaction<'_>,
+    device_id: &str,
     operation_id: &str,
 ) -> Result<OfflineContentResult, StoreError> {
-    let result =
-        load_content_result(&transaction, operation_id)?.ok_or(StoreError::CorruptData {
+    let result = load_content_result(&transaction, device_id, operation_id)?.ok_or(
+        StoreError::CorruptData {
             field: "offline content result",
-        })?;
+        },
+    )?;
     transaction.commit().map_err(StoreError::storage)?;
     Ok(result)
 }
@@ -167,9 +173,12 @@ fn insert_content_operation(
             "revision",
             Some(u64_to_i64(*revision, "document base revision")?),
             content_sha256.as_deref(),
-            predecessor_operation_id.as_deref(),
+            predecessor_operation_id
+                .as_deref()
+                .map(|id| scoped_operation_id(&operation.device_id, id)),
         ),
     };
+    let operation_id = scoped_operation_id(&operation.device_id, &operation.operation_id);
     transaction
         .execute(
             "INSERT INTO offline_content_operation(
@@ -178,7 +187,7 @@ fn insert_content_operation(
                  cursor, cursor_token, authored_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                operation.operation_id,
+                operation_id,
                 operation.document_id(),
                 operation.submitted_content_sha256(),
                 operation.mutation_kind(),
@@ -406,13 +415,14 @@ fn predecessor_matches(
     let Some(predecessor_id) = predecessor_id else {
         return base_was_observed_at_cursor(connection, operation);
     };
+    let scoped_predecessor_id = scoped_operation_id(&operation.device_id, predecessor_id);
     let owner = connection
         .query_row(
             "SELECT device.device_id, content.document_id
              FROM device_operation AS device
              JOIN offline_content_operation AS content USING(operation_id)
              WHERE device.operation_id = ?1",
-            [predecessor_id],
+            [&scoped_predecessor_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
@@ -425,7 +435,8 @@ fn predecessor_matches(
     {
         return Ok(false);
     }
-    let Some(result) = load_content_result(connection, predecessor_id)? else {
+    let Some(result) = load_content_result(connection, &operation.device_id, predecessor_id)?
+    else {
         return Ok(false);
     };
     Ok(result.status == ContentReconciliationStatus::Accepted
@@ -525,6 +536,7 @@ fn current_document_projection(
 
 fn insert_content_result(
     transaction: &Transaction<'_>,
+    device_id: &str,
     result: &OfflineContentResult,
     reconciled_at_us: u64,
 ) -> Result<(), StoreError> {
@@ -542,7 +554,7 @@ fn insert_content_result(
                  reconciled_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                result.operation_id,
+                scoped_operation_id(device_id, &result.operation_id),
                 i64::from(result.format_version),
                 result.status.as_str(),
                 result.conflict_reason.map(|reason| reason.as_str()),
@@ -559,14 +571,16 @@ fn insert_content_result(
 
 fn load_content_result(
     connection: &Connection,
+    device_id: &str,
     operation_id: &str,
 ) -> Result<Option<OfflineContentResult>, StoreError> {
+    let scoped_id = scoped_operation_id(device_id, operation_id);
     connection
         .query_row(
             "SELECT format_version, status, conflict_reason, authoritative_json,
                     cursor, cursor_server_id, cursor_token
              FROM offline_content_result WHERE operation_id = ?1",
-            [operation_id],
+            [&scoped_id],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -807,6 +821,59 @@ mod tests {
             ),
             Err(crate::store::StoreError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn operation_ids_are_scoped_to_device() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first_device = add_device(&mut store);
+        let second_device = add_device(&mut store);
+        let first = operation(
+            &store,
+            &first_device,
+            "shared-operation",
+            1,
+            ContentBase::Absent,
+            "#+title: First\n",
+        );
+        let second = operation(
+            &store,
+            &second_device,
+            "shared-operation",
+            1,
+            ContentBase::Absent,
+            "#+title: Second\n",
+        );
+
+        for (operation, device, payload, received_at) in [
+            (&first, &first_device, "payload-first", 100),
+            (&second, &second_device, "payload-second", 101),
+        ] {
+            let prepared = prepare_offline_document(operation).unwrap();
+            let blob = blob(operation);
+            store
+                .reconcile_content_operation(
+                    1,
+                    operation,
+                    payload,
+                    Some(device),
+                    received_at,
+                    Ok((prepared.as_ref(), Some(&blob))),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM device_operation WHERE operation_kind = 'content'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -1069,14 +1136,15 @@ mod tests {
         assert_eq!(store.content_changes(0, 10).unwrap(), changes);
         assert_eq!(store.latest_content_cursor().unwrap(), cursor);
         assert_eq!(
-            super::load_content_result(&store.connection, "operation-invalid").unwrap(),
+            super::load_content_result(&store.connection, &device_id, "operation-invalid",)
+                .unwrap(),
             Some(result)
         );
         let stored_payload = store
             .connection
             .query_row(
                 "SELECT payload_json FROM device_operation WHERE operation_id = ?1",
-                ["operation-invalid"],
+                [super::scoped_operation_id(&device_id, "operation-invalid")],
                 |row| row.get::<_, String>(0),
             )
             .unwrap();

@@ -20,7 +20,10 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    application::{MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, valid_operation_id},
+    application::{
+        MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_thema, thema_content,
+        valid_operation_id, validate_org_path,
+    },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
@@ -43,8 +46,8 @@ use crate::{
             ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
             ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
             ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaReviewStateV1,
-            ThemaV1, valid_bearer_token,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaKindV1,
+            ThemaReviewStateV1, ThemaV1, valid_bearer_token,
         },
     },
 };
@@ -263,7 +266,7 @@ impl HttpClient {
             .header("Idempotency-Key", operation_id)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, operation_id, None).await
+        execute_document_mutation(request, StatusCode::OK, operation_id, None).await
     }
 
     pub async fn replace_note(
@@ -283,7 +286,7 @@ impl HttpClient {
             .header("If-Match", expected_revision)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, operation_id, Some(document_id)).await
+        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
     }
 
     pub async fn rename_note(
@@ -303,7 +306,7 @@ impl HttpClient {
             .header("If-Match", expected_revision)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, operation_id, Some(document_id)).await
+        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
     }
 
     pub async fn tombstone_note(
@@ -319,7 +322,7 @@ impl HttpClient {
             .delete(url)
             .header("Idempotency-Key", operation_id)
             .header("If-Match", expected_revision);
-        execute_document_mutation(request, operation_id, Some(document_id)).await
+        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
     }
 
     pub async fn create_review_session(
@@ -361,7 +364,7 @@ impl HttpClient {
             .header("Idempotency-Key", operation_id)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, operation_id, Some(document_id)).await
+        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
     }
 
     pub async fn document(&self, document_id: &str) -> Result<DocumentView, HttpClientError> {
@@ -376,7 +379,7 @@ impl HttpClient {
         let url = self.resource_endpoint("v1/themata", thema_id)?;
         let thema: ThemaV1 =
             execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
-        if thema.thema_id != thema_id {
+        if !validate_thema(&thema, thema_id) {
             return Err(invalid_response());
         }
         Ok(thema)
@@ -1114,10 +1117,12 @@ fn checked_attempt_operation(
 
 async fn execute_document_mutation(
     request: RequestBuilder,
+    expected_status: StatusCode,
     operation_id: &str,
     expected_document_id: Option<&str>,
 ) -> Result<DocumentMutationResultV1, HttpClientError> {
-    let result = execute_json(request, MAX_OFFLINE_CONTENT_RESULT_BYTES).await?;
+    let result =
+        execute_json_exact(request, MAX_OFFLINE_CONTENT_RESULT_BYTES, expected_status).await?;
     document_mutation_matches(&result, operation_id, expected_document_id)
         .then_some(result)
         .ok_or_else(invalid_response)
@@ -1138,7 +1143,7 @@ fn document_mutation_matches(
         } => {
             *format_version == 1
                 && operation_id == expected_operation_id
-                && expected_document_id.is_none_or(|expected| authoritative.document_id == expected)
+                && validate_document_head(authoritative, expected_document_id)
                 && valid_result_cursor(cursor)
         }
         DocumentMutationResultV1::Rejected {
@@ -1152,6 +1157,55 @@ fn document_mutation_matches(
                 && valid_result_cursor(cursor)
         }
     }
+}
+
+fn validate_document_head(
+    head: &crate::protocol::http_v1::DocumentHeadV1,
+    expected_id: Option<&str>,
+) -> bool {
+    expected_id.is_none_or(|expected| head.document_id == expected)
+        && DocumentId::new(head.document_id.clone()).is_ok()
+        && validate_org_path(&head.logical_path).is_ok()
+        && head.revision > 0
+        && match head.content_sha256.as_deref() {
+            Some(digest) => head.active && is_canonical_sha256(digest),
+            None => !head.active,
+        }
+}
+
+fn validate_thema(thema: &ThemaV1, expected_id: &str) -> bool {
+    if thema.thema_id != expected_id
+        || thema.revision == 0
+        || !is_canonical_sha256(&thema.content_sha256)
+    {
+        return false;
+    }
+    let kind = match thema.kind {
+        ThemaKindV1::Basic => "basic",
+        ThemaKindV1::Cloze => "cloze",
+        ThemaKindV1::Mcq => "mcq",
+        ThemaKindV1::McCloze => "mc-cloze",
+    };
+    let Ok(content) = thema_content(
+        kind,
+        thema.keimenon.clone(),
+        thema.hypothesis.clone(),
+        thema.answer.clone(),
+        thema.source_guid.clone(),
+        thema.parathema.clone(),
+        thema.review_image.clone(),
+    ) else {
+        return false;
+    };
+    prepare_thema(
+        Some(thema.thema_id.clone()),
+        content,
+        thema.tags.clone(),
+        thema.node_ids.clone(),
+        thema.asset_paths.clone(),
+        None,
+    )
+    .is_ok_and(|prepared| prepared.content_sha256 == thema.content_sha256)
 }
 
 fn valid_result_cursor(cursor: &str) -> bool {
@@ -1473,6 +1527,56 @@ mod tests {
         },
         service::ServiceRuntime,
     };
+
+    #[test]
+    fn response_validators_reject_semantically_invalid_content() {
+        let digest = "a".repeat(64);
+        let mut head = crate::protocol::http_v1::DocumentHeadV1 {
+            document_id: "document".into(),
+            logical_path: "note.org".into(),
+            revision: 1,
+            content_sha256: Some(digest),
+            active: true,
+        };
+        assert!(validate_document_head(&head, Some("document")));
+        head.logical_path = "../note.org".into();
+        assert!(!validate_document_head(&head, Some("document")));
+
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![],
+            vec!["Answer".into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let prepared =
+            prepare_thema(Some("thema".into()), content, vec![], vec![], vec![], None).unwrap();
+        let mut thema = ThemaV1 {
+            thema_id: "thema".into(),
+            revision: 1,
+            kind: ThemaKindV1::Basic,
+            keimenon: "Question".into(),
+            hypothesis: vec![],
+            answer: vec!["Answer".into()],
+            source_guid: None,
+            parathema: None,
+            review_image: None,
+            tags: vec![],
+            node_ids: vec![],
+            asset_paths: vec![],
+            content_sha256: prepared.content_sha256,
+            archived: false,
+        };
+        assert!(validate_thema(&thema, "thema"));
+        thema.revision = 0;
+        assert!(!validate_thema(&thema, "thema"));
+        thema.revision = 1;
+        thema.asset_paths.push("../asset".into());
+        assert!(!validate_thema(&thema, "thema"));
+    }
 
     #[test]
     fn base_url_policy_requires_https_outside_loopback() {

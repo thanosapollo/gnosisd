@@ -341,11 +341,12 @@ CREATE TABLE offline_review_operation(
   device_id TEXT NOT NULL,
   device_sequence INTEGER NOT NULL CHECK(device_sequence > 0),
   format_version INTEGER NOT NULL CHECK(format_version = 1),
-  payload_sha256 TEXT NOT NULL UNIQUE
+  payload_sha256 TEXT NOT NULL
   CHECK(length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
 payload_json TEXT NOT NULL CHECK(length(payload_json) > 0),
 received_at_us INTEGER NOT NULL CHECK(received_at_us > 0),
 UNIQUE(device_id, device_sequence),
+UNIQUE(device_id, payload_sha256),
 FOREIGN KEY(pack_id) REFERENCES review_pack(pack_id) ON DELETE RESTRICT,
 FOREIGN KEY(device_id) REFERENCES device(device_id) ON DELETE RESTRICT
 ) STRICT;

@@ -380,13 +380,14 @@ async fn import_document_projection(
         .map(|(head, _)| head.logical_path)
         .unwrap_or_else(|| protocol_logical_path(&document_id));
     let prepared = run_blocking(move || {
-        let prepared = prepare_note(
+        let mut prepared = prepare_note(
             Some(document_id.to_string()),
             logical_path,
             input.org,
             input.expected_revision,
         )
         .map_err(ApiError::invalid_content)?;
+        prepared.logical_path_is_request_input = false;
         let view =
             DocumentView::from_projection(&prepared.document_id, u64::MAX, &prepared.projection);
         let projection_size = serde_json::to_vec(&view)
@@ -2547,7 +2548,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DocumentMutationResultV1",
             &[
-                "400", "401", "403", "408", "412", "413", "422", "500", "503",
+                "400", "401", "403", "408", "409", "412", "413", "422", "500", "503",
             ],
         )),
         ("/v1/review/due", "get") => Some(json_contract(

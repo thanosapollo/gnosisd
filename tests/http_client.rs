@@ -2654,6 +2654,22 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         .await
         .unwrap();
     assert_eq!(retry, imported);
+    client
+        .rename_note(
+            "http-only-doc",
+            "rename-http-only-doc",
+            1,
+            &NoteRenameRequestV1 {
+                logical_path: "renamed-http-only.org".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let retry_after_rename = client
+        .import_document("http-only-doc", "import-http-only-doc", &input)
+        .await
+        .unwrap();
+    assert_eq!(retry_after_rename, imported);
     let changed_input = DocumentImportRequestV1 {
         org: "#+TITLE: Changed\n".into(),
         expected_revision: None,
@@ -2668,7 +2684,7 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
             .await,
         Err(HttpClientError::Server(error)) if error.status() == 409
     ));
-    assert_eq!(client.document("http-only-doc").await.unwrap().revision, 1);
+    assert_eq!(client.document("http-only-doc").await.unwrap().revision, 2);
 
     let thema_id = create_review_thema(&daemon.base_url, &token).await;
     assert_eq!(client.thema(&thema_id).await.unwrap().thema_id, thema_id);

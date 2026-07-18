@@ -1257,29 +1257,21 @@ fn replayed_device_operation(
     operation_id: &str,
     operation_kind: &str,
     payload_sha256: &str,
-    actor_device_id: Option<&str>,
+    device_id: &str,
 ) -> Result<bool, StoreError> {
+    let operation_id = scoped_operation_id(device_id, operation_id);
     let existing = connection
         .query_row(
-            "SELECT operation_kind, payload_sha256, device_id
+            "SELECT operation_kind, payload_sha256
              FROM device_operation WHERE operation_id = ?1",
-            [operation_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
+            [&operation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
         .map_err(StoreError::storage)?;
-    let Some((stored_kind, stored_digest, stored_device)) = existing else {
+    let Some((stored_kind, stored_digest)) = existing else {
         return Ok(false);
     };
-    if actor_device_id.is_some_and(|actor| actor != stored_device) {
-        return Err(StoreError::ReviewOwnership);
-    }
     if stored_kind != operation_kind || stored_digest != payload_sha256 {
         return Err(StoreError::IdempotencyConflict);
     }
@@ -1342,6 +1334,7 @@ fn insert_device_operation(
     if reused {
         return Err(StoreError::IdempotencyConflict);
     }
+    let operation_id = scoped_operation_id(operation.device_id, operation.operation_id);
     transaction
         .execute(
             "INSERT INTO device_operation(
@@ -1349,7 +1342,7 @@ fn insert_device_operation(
                  format_version, payload_sha256, payload_json, received_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                operation.operation_id,
+                operation_id,
                 operation.device_id,
                 u64_to_i64(operation.device_sequence, "device sequence")?,
                 operation.operation_kind,
@@ -1361,6 +1354,10 @@ fn insert_device_operation(
         )
         .map_err(StoreError::storage)?;
     Ok(())
+}
+
+fn scoped_operation_id(device_id: &str, operation_id: &str) -> String {
+    format!("{}:{device_id}{operation_id}", device_id.len())
 }
 
 fn advance_device_sequence(

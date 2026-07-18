@@ -27,6 +27,7 @@ pub(super) fn persist_server_import(
     let note = PreparedNote {
         document_id: prepared.document_id.clone(),
         explicit_document_id: true,
+        logical_path_is_request_input: false,
         path_key: path_key(&logical_path),
         logical_path,
         org: server_import.org.clone(),

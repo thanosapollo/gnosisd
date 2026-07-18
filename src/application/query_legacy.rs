@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::domain::{DueThema, ThemaId};
 
 pub const MAX_DUE_THEMATA: u16 = 100;
-const MAX_DUE_CURSOR_BYTES: usize = 256;
+const MAX_DUE_CURSOR_BYTES: usize = 512;
 const DUE_CURSOR_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +220,20 @@ mod tests {
         assert!(!cursor.reviewed());
         assert_eq!(cursor.next_review_day(), 20260713);
         assert_eq!(cursor.thema_id(), "thema-b");
+
+        let longest_id = "t".repeat(128);
+        let longest = DueThema {
+            id: ThemaId::new(longest_id.clone()).unwrap(),
+            kind: "basic".into(),
+            keimenon: "Question".into(),
+            hypothesis: Vec::new(),
+            answer: vec!["Answer".into()],
+            next_review_day: 20260713,
+            review_count: 1,
+        };
+        let token = DueCursor::after(&longest).encode(20260714, KEY);
+        let decoded = QueryDueThemataPage::new(20260714, 25, Some(token.clone()), KEY).unwrap();
+        assert_eq!(decoded.after().unwrap().thema_id(), longest_id);
 
         assert!(QueryDueThemataPage::new(20260715, 25, Some(token.clone()), KEY).is_err());
         assert!(QueryDueThemataPage::new(20260714, 25, Some(token), "another-server").is_err());

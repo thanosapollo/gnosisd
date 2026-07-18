@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::{
     DeviceOperationInsert, SqliteStore, StoreError, advance_device_sequence,
     insert_device_operation, load_thema, replayed_device_operation, require_device_sequence,
-    to_u32, to_u64, u64_to_i64,
+    scoped_operation_id, to_u32, to_u64, u64_to_i64,
 };
 use crate::{
     application::{
@@ -590,13 +590,13 @@ impl SqliteStore {
             &operation.attempt_id,
             "review",
             &digest,
-            actor_device_id,
+            &operation.device_id,
         )? {
-            let result = load_offline_result(&transaction, &operation.attempt_id)?.ok_or(
-                StoreError::CorruptData {
-                    field: "offline review result",
-                },
-            )?;
+            let result =
+                load_offline_result(&transaction, &operation.device_id, &operation.attempt_id)?
+                    .ok_or(StoreError::CorruptData {
+                        field: "offline review result",
+                    })?;
             transaction.commit().map_err(StoreError::storage)?;
             return Ok(result);
         }
@@ -680,7 +680,7 @@ fn insert_offline_operation(
                  payload_sha256, payload_json, received_at_us
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                operation.attempt_id,
+                scoped_operation_id(&operation.device_id, &operation.attempt_id),
                 operation.pack_id,
                 operation.device_id,
                 u64_to_i64(operation.device_sequence, "device sequence")?,
@@ -727,7 +727,7 @@ fn reconcile_new_operation(
         )?,
     };
     advance_pack_sequence(transaction, operation, &result)?;
-    insert_offline_result(transaction, &result, reconciled_at_us)?;
+    insert_offline_result(transaction, &operation.device_id, &result, reconciled_at_us)?;
     Ok(result)
 }
 
@@ -921,7 +921,7 @@ fn offline_attempt_row(
     transition: TransitionSnapshot,
 ) -> AttemptRow {
     AttemptRow {
-        attempt_id: operation.attempt_id.clone(),
+        attempt_id: scoped_operation_id(&operation.device_id, &operation.attempt_id),
         session_id: operation.session_id.clone(),
         thema_id: operation.thema_id.clone(),
         thema_revision: operation.thema_revision,
@@ -959,7 +959,7 @@ fn insert_accepted_attempt(
                  ?14, ?15, ?16, 'graded', ?17, ?17
              )",
             params![
-                operation.attempt_id,
+                scoped_operation_id(&operation.device_id, &operation.attempt_id),
                 operation.session_id,
                 i64::from(operation.session_position),
                 operation.thema_id,
@@ -1001,6 +1001,7 @@ fn advance_pack_sequence(
 
 fn insert_offline_result(
     transaction: &Transaction<'_>,
+    device_id: &str,
     result: &OfflineReviewResult,
     reconciled_at_us: u64,
 ) -> Result<(), StoreError> {
@@ -1012,7 +1013,7 @@ fn insert_offline_result(
                  cursor_server_id, cursor_token
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                result.attempt_id,
+                scoped_operation_id(device_id, &result.attempt_id),
                 i64::from(result.format_version),
                 result.status.as_str(),
                 result.conflict_reason.map(OfflineConflictReason::as_str),
@@ -1031,15 +1032,17 @@ fn insert_offline_result(
 
 fn load_offline_result(
     connection: &Connection,
+    device_id: &str,
     attempt_id: &str,
 ) -> Result<Option<OfflineReviewResult>, StoreError> {
+    let storage_attempt_id = scoped_operation_id(device_id, attempt_id);
     let row = connection
         .query_row(
             "SELECT format_version, status, conflict_reason, event_id,
                     authoritative_state_json, session_json, cursor,
                     cursor_server_id, cursor_token
              FROM offline_review_result WHERE attempt_id = ?1",
-            [attempt_id],
+            [&storage_attempt_id],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -2896,6 +2899,46 @@ mod tests {
     ) -> Result<crate::application::OfflineReviewResult, crate::store::StoreError> {
         let payload = crate::protocol::canonical_offline_operation(1, operation).unwrap();
         store.reconcile_offline_operation(1, operation, &payload, Some(device_id), received_at_us)
+    }
+
+    #[test]
+    fn offline_attempt_ids_are_scoped_to_device() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let devices = [
+            add_device(&mut store, "first-offline"),
+            add_device(&mut store, "second-offline"),
+        ];
+
+        for (index, device_id) in devices.iter().enumerate() {
+            let pack = store
+                .create_review_pack(
+                    1,
+                    &manual_source("thema"),
+                    Some(1),
+                    device_id,
+                    1_752_600_000_000_000 + u64::try_from(index).unwrap() * 10_000,
+                )
+                .unwrap();
+            let operation = offline_answer(&pack, "shared-attempt", 1);
+            reconcile(
+                &mut store,
+                &operation,
+                device_id,
+                1_752_600_000_002_000 + u64::try_from(index).unwrap() * 10_000,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM offline_review_operation", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
