@@ -1102,6 +1102,8 @@ pub enum ApiErrorMetaV1 {
     },
     Revision {
         expected_revision: u64,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        #[schemars(required)]
         current_revision: Option<u64>,
     },
     DeviceSequence {
@@ -1126,6 +1128,7 @@ pub struct ApiErrorBodyV1 {
 struct ApiErrorBodyWireV1 {
     code: ApiErrorCodeV1,
     message: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
     meta: Option<ApiErrorMetaV1>,
 }
 
@@ -1272,6 +1275,7 @@ mod error_schema {
     #[serde(deny_unknown_fields)]
     struct RevisionErrorMetaSchemaV1 {
         expected_revision: u64,
+        #[schemars(required)]
         current_revision: Option<u64>,
     }
 

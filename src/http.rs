@@ -510,6 +510,31 @@ fn due_page_with_count(due: &[DueThema], count: usize, day: u32, cursor_key: &st
     DuePageView::new(due.iter().take(count).cloned().collect(), next)
 }
 
+fn bounded_projection_page<T, P>(
+    items: &[T],
+    page: impl Fn(&[T]) -> Result<P, ApiError>,
+    oversized_item_message: &'static str,
+) -> Result<P, ApiError>
+where
+    P: Serialize,
+{
+    let mut low = 0;
+    let mut high = items.len();
+    while low < high {
+        let count = low + (high - low).div_ceil(2);
+        let candidate = page(&items[..count])?;
+        if serde_json::to_vec(&candidate).is_ok_and(|bytes| bytes.len() <= MAX_FRAME_SIZE) {
+            low = count;
+        } else {
+            high = count - 1;
+        }
+    }
+    if !items.is_empty() && low == 0 {
+        return Err(ApiError::invalid_content(oversized_item_message));
+    }
+    page(&items[..low])
+}
+
 fn ensure_projection_response_budget(value: &impl Serialize) -> Result<(), ApiError> {
     let size = serde_json::to_vec(value)
         .map_err(|_| ApiError::internal())?
@@ -539,9 +564,15 @@ async fn changes(
         .changes(after, page_limit(query.limit)?)
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(
-        ContentChangePageV1::from_application(&items).map_err(|_| ApiError::internal())?,
-    ))
+    run_blocking(move || {
+        bounded_projection_page(
+            &items,
+            |page| ContentChangePageV1::from_application(page).map_err(|_| ApiError::internal()),
+            "content change exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 
 async fn device_identity(
@@ -918,9 +949,15 @@ async fn note_revisions(
         .note_revisions(id, after, page_limit(query.limit)?)
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(
-        DocumentRevisionPageV1::from_application(&items).map_err(|_| ApiError::internal())?,
-    ))
+    run_blocking(move || {
+        bounded_projection_page(
+            &items,
+            |page| DocumentRevisionPageV1::from_application(page).map_err(|_| ApiError::internal()),
+            "document revision exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 
 async fn note_revision(
@@ -1251,7 +1288,15 @@ async fn search_themata(
         )
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(ThemaPageV1::from_application(&items)))
+    run_blocking(move || {
+        bounded_projection_page(
+            &items,
+            |page| Ok(ThemaPageV1::from_application(page)),
+            "thema exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 
 async fn archive_thema(
@@ -1337,7 +1382,15 @@ async fn search_nodes(
         )
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(NodePageV1::from_application(&items)))
+    run_blocking(move || {
+        bounded_projection_page(
+            &items,
+            |page| Ok(NodePageV1::from_application(page)),
+            "node exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 async fn inbound_nodes(
     state: State<HttpState>,
@@ -1368,7 +1421,15 @@ async fn graph(
         .graph_nodes(id, inbound, page_limit(query.limit)?, query.after)
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(NodePageV1::from_application(&items)))
+    run_blocking(move || {
+        bounded_projection_page(
+            &items,
+            |page| Ok(NodePageV1::from_application(page)),
+            "node exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -1395,9 +1456,15 @@ async fn review_sessions(
         })
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(
-        ReviewSessionPageV1::from_application(&sessions).map_err(|_| ApiError::internal())?,
-    ))
+    run_blocking(move || {
+        bounded_projection_page(
+            &sessions,
+            |page| ReviewSessionPageV1::from_application(page).map_err(|_| ApiError::internal()),
+            "review session exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 
 async fn review_session(
@@ -1467,7 +1534,15 @@ async fn review_history(
         .review_history(query.into_application()?)
         .await
         .map_err(ApiError::service)?;
-    Ok(Json(ReviewHistoryPageV1::from_application(&events)))
+    run_blocking(move || {
+        bounded_projection_page(
+            &events,
+            |page| Ok(ReviewHistoryPageV1::from_application(page)),
+            "review history event exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
 }
 
 async fn review_queue_summary(
@@ -3477,7 +3552,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        ApiError, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page,
+        ApiError, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page, bounded_projection_page,
         ensure_thema_response_budget, openapi_document, optional_if_match, router,
     };
     use crate::application::{
@@ -3786,6 +3861,12 @@ mod tests {
         assert_eq!(
             schemas["SnapshotApiErrorSchemaV1"]["properties"]["code"]["const"],
             "snapshot_required"
+        );
+        assert!(
+            schemas["RevisionErrorMetaSchemaV1"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("current_revision"))
         );
         assert_eq!(
             schemas["ReplicaSnapshotPageV1"]["oneOf"]
@@ -4999,6 +5080,35 @@ mod tests {
                 1,
                 20260718,
                 "server".into(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn projection_pages_shrink_to_the_shared_budget() {
+        let items = vec!["x".repeat(600_000), "y".repeat(600_000)];
+        let page = bounded_projection_page(
+            &items,
+            |items| {
+                Ok(json!({
+                    "items": items,
+                    "next": items.last().map(|_| "cursor"),
+                }))
+            },
+            "item too large",
+        )
+        .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["next"], "cursor");
+        assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_FRAME_SIZE);
+
+        let oversized = vec!["x".repeat(MAX_FRAME_SIZE)];
+        assert!(
+            bounded_projection_page(
+                &oversized,
+                |items| Ok(json!({ "items": items, "next": null })),
+                "item too large",
             )
             .is_err()
         );

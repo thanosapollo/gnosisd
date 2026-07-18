@@ -7,7 +7,7 @@
 //! failure, or invalid response after dispatch has unknown delivery: callers
 //! must retain the durable outbox item and retry its same operation identity.
 
-use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
+use std::{fmt, net::IpAddr, time::Duration};
 
 use chrono::NaiveDate;
 use reqwest::{
@@ -21,13 +21,16 @@ use thiserror::Error;
 
 use crate::{
     application::{
-        MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_thema, thema_content,
-        valid_operation_id, validate_org_path,
+        MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_thema,
+        thema_content, valid_operation_id, validate_org_path,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
-    domain::DocumentId,
+    domain::{
+        DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
+        SourceSpan, TitlePath,
+    },
     is_canonical_sha256,
     protocol::{
         DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
@@ -228,7 +231,8 @@ impl HttpClient {
             .put(url)
             .header(CONTENT_TYPE, media_type)
             .body(upload.bytes().to_vec());
-        let response: StagedBlobV1 = execute_json(request, MAX_ERROR_BODY_BYTES).await?;
+        let response: StagedBlobV1 =
+            execute_json_exact(request, MAX_ERROR_BODY_BYTES, StatusCode::CREATED).await?;
         if response.content_sha256 != upload.content_sha256()
             || response.size_bytes != upload.size_bytes()
         {
@@ -266,7 +270,19 @@ impl HttpClient {
             .header("Idempotency-Key", operation_id)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, StatusCode::OK, operation_id, None).await
+        execute_document_mutation(
+            request,
+            StatusCode::OK,
+            operation_id,
+            DocumentMutationExpectation {
+                document_id: None,
+                active: true,
+                logical_path: Some(input.logical_path.clone()),
+                content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
+                revision: 1,
+            },
+        )
+        .await
     }
 
     pub async fn replace_note(
@@ -286,7 +302,21 @@ impl HttpClient {
             .header("If-Match", expected_revision)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
+        execute_document_mutation(
+            request,
+            StatusCode::OK,
+            operation_id,
+            DocumentMutationExpectation {
+                document_id: Some(document_id.to_owned()),
+                active: true,
+                logical_path: None,
+                content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
+                revision: expected_revision
+                    .checked_add(1)
+                    .ok_or(HttpClientError::InvalidMutation)?,
+            },
+        )
+        .await
     }
 
     pub async fn rename_note(
@@ -306,7 +336,21 @@ impl HttpClient {
             .header("If-Match", expected_revision)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
+        execute_document_mutation(
+            request,
+            StatusCode::OK,
+            operation_id,
+            DocumentMutationExpectation {
+                document_id: Some(document_id.to_owned()),
+                active: true,
+                logical_path: Some(input.logical_path.clone()),
+                content_sha256: None,
+                revision: expected_revision
+                    .checked_add(1)
+                    .ok_or(HttpClientError::InvalidMutation)?,
+            },
+        )
+        .await
     }
 
     pub async fn tombstone_note(
@@ -322,7 +366,21 @@ impl HttpClient {
             .delete(url)
             .header("Idempotency-Key", operation_id)
             .header("If-Match", expected_revision);
-        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
+        execute_document_mutation(
+            request,
+            StatusCode::OK,
+            operation_id,
+            DocumentMutationExpectation {
+                document_id: Some(document_id.to_owned()),
+                active: false,
+                logical_path: None,
+                content_sha256: None,
+                revision: expected_revision
+                    .checked_add(1)
+                    .ok_or(HttpClientError::InvalidMutation)?,
+            },
+        )
+        .await
     }
 
     pub async fn create_review_session(
@@ -330,7 +388,12 @@ impl HttpClient {
         input: &ReviewSessionRequestV1,
     ) -> Result<ReviewSessionV1, HttpClientError> {
         let request = self.post_review_json("v1/review/sessions", input)?;
-        let session = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        let session = execute_json_exact(
+            request,
+            MAX_OFFLINE_REVIEW_RESULT_BYTES,
+            StatusCode::CREATED,
+        )
+        .await?;
         checked_online_session(session, None)
     }
 
@@ -364,7 +427,22 @@ impl HttpClient {
             .header("Idempotency-Key", operation_id)
             .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
             .body(body);
-        execute_document_mutation(request, StatusCode::OK, operation_id, Some(document_id)).await
+        execute_document_mutation(
+            request,
+            StatusCode::OK,
+            operation_id,
+            DocumentMutationExpectation {
+                document_id: Some(document_id.to_owned()),
+                active: true,
+                logical_path: None,
+                content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
+                revision: input
+                    .expected_revision
+                    .map_or(Some(1), |revision| revision.checked_add(1))
+                    .ok_or(HttpClientError::InvalidMutation)?,
+            },
+        )
+        .await
     }
 
     pub async fn document(&self, document_id: &str) -> Result<DocumentView, HttpClientError> {
@@ -524,7 +602,12 @@ impl HttpClient {
     ) -> Result<ReviewAttemptV1, HttpClientError> {
         require_review_id(session_id)?;
         let url = self.review_resource_endpoint("sessions", session_id, Some("attempts"))?;
-        let attempt = execute_json(self.client.post(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        let attempt = execute_json_exact(
+            self.client.post(url),
+            MAX_OFFLINE_REVIEW_RESULT_BYTES,
+            StatusCode::CREATED,
+        )
+        .await?;
         checked_attempt(attempt, None, Some(session_id))
     }
 
@@ -799,32 +882,67 @@ fn validate_document_view(
 ) -> Result<(), HttpClientError> {
     if document.document_id != document_id
         || document.revision == 0
+        || DocumentId::new(document.document_id.clone()).is_err()
         || !canonical_hex(&document.content_sha256, 64)
         || !canonical_hex(&document.compatibility_sha1, 40)
     {
         return Err(invalid_response());
     }
-    let node_ids: HashSet<&str> = document.nodes.iter().map(|node| node.id.as_str()).collect();
-    if document.nodes.iter().any(|node| node.id.trim().is_empty())
-        || node_ids.len() != document.nodes.len()
-        || document
+    let nodes = document
+        .nodes
+        .iter()
+        .map(|node| {
+            Node::new(
+                NodeId::new(node.id.clone()).map_err(|_| invalid_response())?,
+                node.title.clone(),
+                TitlePath::new(node.title_path.clone()).map_err(|_| invalid_response())?,
+                node.tags.clone(),
+                node.parent_id
+                    .clone()
+                    .map(NodeId::new)
+                    .transpose()
+                    .map_err(|_| invalid_response())?,
+                node.level,
+            )
+            .map_err(|_| invalid_response())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let links = document
+        .link_occurrences
+        .iter()
+        .map(|link| {
+            Ok(LinkOccurrence::new(
+                NodeId::new(link.owner_id.clone()).map_err(|_| invalid_response())?,
+                NodeId::new(link.target_id.clone()).map_err(|_| invalid_response())?,
+                SourceSpan::from_offsets(link.start_byte, link.end_byte)
+                    .map_err(|_| invalid_response())?,
+            ))
+        })
+        .collect::<Result<Vec<_>, HttpClientError>>()?;
+    let projection = DocumentProjection::new(DocumentProjectionInput {
+        title: document.title.clone(),
+        file_node_id: document
             .file_node_id
-            .as_deref()
-            .is_some_and(|id| !node_ids.contains(id))
-        || document.nodes.iter().any(|node| {
-            node.parent_id
-                .as_deref()
-                .is_some_and(|id| !node_ids.contains(id))
-        })
-        || document.link_occurrences.iter().any(|occurrence| {
-            !node_ids.contains(occurrence.owner_id.as_str())
-                || occurrence.start_byte >= occurrence.end_byte
-        })
-        || document
-            .semantic_edges
-            .iter()
-            .any(|edge| !node_ids.contains(edge.source_id.as_str()))
-    {
+            .clone()
+            .map(NodeId::new)
+            .transpose()
+            .map_err(|_| invalid_response())?,
+        file_tags: document.file_tags.clone(),
+        nodes,
+        link_occurrences: links,
+        compatibility_sha1: document.compatibility_sha1.clone(),
+        content_sha256: document.content_sha256.clone(),
+    })
+    .map_err(|_| invalid_response())?;
+    let expected_edges = projection
+        .semantic_edges()
+        .iter()
+        .map(|edge| (edge.source().as_str(), edge.target().as_str()));
+    let actual_edges = document
+        .semantic_edges
+        .iter()
+        .map(|edge| (edge.source_id.as_str(), edge.target_id.as_str()));
+    if !expected_edges.eq(actual_edges) {
         return Err(invalid_response());
     }
     Ok(())
@@ -841,7 +959,11 @@ fn validate_due_page(page: &DuePageView, limit: u16) -> Result<(), HttpClientErr
         return Err(invalid_response());
     }
     match page.next.as_deref() {
-        Some(next) if !page.items.is_empty() && !next.is_empty() && next.len() <= 512 => Ok(()),
+        Some(next)
+            if !page.items.is_empty() && !next.is_empty() && next.len() <= MAX_DUE_CURSOR_BYTES =>
+        {
+            Ok(())
+        }
         None => Ok(()),
         _ => Err(invalid_response()),
     }
@@ -1119,19 +1241,27 @@ async fn execute_document_mutation(
     request: RequestBuilder,
     expected_status: StatusCode,
     operation_id: &str,
-    expected_document_id: Option<&str>,
+    expectation: DocumentMutationExpectation,
 ) -> Result<DocumentMutationResultV1, HttpClientError> {
     let result =
         execute_json_exact(request, MAX_OFFLINE_CONTENT_RESULT_BYTES, expected_status).await?;
-    document_mutation_matches(&result, operation_id, expected_document_id)
+    validate_document_mutation_result(&result, operation_id, &expectation)
         .then_some(result)
         .ok_or_else(invalid_response)
 }
 
-fn document_mutation_matches(
+struct DocumentMutationExpectation {
+    document_id: Option<String>,
+    active: bool,
+    logical_path: Option<String>,
+    content_sha256: Option<String>,
+    revision: u64,
+}
+
+fn validate_document_mutation_result(
     result: &DocumentMutationResultV1,
     expected_operation_id: &str,
-    expected_document_id: Option<&str>,
+    expectation: &DocumentMutationExpectation,
 ) -> bool {
     match result {
         DocumentMutationResultV1::Applied {
@@ -1143,7 +1273,7 @@ fn document_mutation_matches(
         } => {
             *format_version == 1
                 && operation_id == expected_operation_id
-                && validate_document_head(authoritative, expected_document_id)
+                && validate_document_head(authoritative, expectation)
                 && valid_result_cursor(cursor)
         }
         DocumentMutationResultV1::Rejected {
@@ -1161,15 +1291,29 @@ fn document_mutation_matches(
 
 fn validate_document_head(
     head: &crate::protocol::http_v1::DocumentHeadV1,
-    expected_id: Option<&str>,
+    expectation: &DocumentMutationExpectation,
 ) -> bool {
-    expected_id.is_none_or(|expected| head.document_id == expected)
+    expectation
+        .document_id
+        .as_deref()
+        .is_none_or(|expected| head.document_id == expected)
         && DocumentId::new(head.document_id.clone()).is_ok()
         && validate_org_path(&head.logical_path).is_ok()
-        && head.revision > 0
-        && match head.content_sha256.as_deref() {
-            Some(digest) => head.active && is_canonical_sha256(digest),
-            None => !head.active,
+        && expectation
+            .logical_path
+            .as_deref()
+            .is_none_or(|expected| head.logical_path == expected)
+        && head.revision == expectation.revision
+        && head.active == expectation.active
+        && match (
+            head.content_sha256.as_deref(),
+            expectation.content_sha256.as_deref(),
+            expectation.active,
+        ) {
+            (Some(actual), Some(expected), true) => actual == expected,
+            (Some(actual), None, true) => is_canonical_sha256(actual),
+            (None, None, false) => true,
+            _ => false,
         }
 }
 
@@ -1262,7 +1406,7 @@ async fn execute_json<T: DeserializeOwned>(
     request: RequestBuilder,
     max_bytes: usize,
 ) -> Result<T, HttpClientError> {
-    execute_json_response(request, max_bytes, None).await
+    execute_json_response(request, max_bytes, Some(StatusCode::OK)).await
 }
 
 async fn execute_json_exact<T: DeserializeOwned>(
@@ -1303,8 +1447,11 @@ async fn execute_bytes(
     max_bytes: usize,
 ) -> Result<Vec<u8>, HttpClientError> {
     let response = request.send().await.map_err(transport_error)?;
-    if response.status().is_success() {
+    if response.status() == StatusCode::OK {
         return read_bounded(response, max_bytes).await;
+    }
+    if response.status().is_success() {
+        return Err(invalid_response());
     }
     if !is_json(&response) {
         return Err(invalid_response());
@@ -1379,13 +1526,53 @@ async fn read_bounded(mut response: Response, limit: usize) -> Result<Vec<u8>, H
 }
 
 fn server_error<T>(status: StatusCode, bytes: &[u8]) -> Result<T, HttpClientError> {
-    let body = serde_json::from_slice(bytes).map_err(|_| invalid_response())?;
+    let body: ApiErrorResponseV1 = serde_json::from_slice(bytes).map_err(|_| invalid_response())?;
+    if !error_status_matches(status, body.error.code()) {
+        return Err(invalid_response());
+    }
     let delivery = server_error_delivery(&body);
     Err(HttpClientError::Server(HttpServerError {
         status: status.as_u16(),
         body,
         delivery,
     }))
+}
+
+fn error_status_matches(status: StatusCode, code: ApiErrorCodeV1) -> bool {
+    let expected = match code {
+        ApiErrorCodeV1::Unauthorized => StatusCode::UNAUTHORIZED,
+        ApiErrorCodeV1::Forbidden => StatusCode::FORBIDDEN,
+        ApiErrorCodeV1::NotFound => StatusCode::NOT_FOUND,
+        ApiErrorCodeV1::InvalidRequest
+        | ApiErrorCodeV1::UnsupportedOfflineReviewVersion
+        | ApiErrorCodeV1::UnsupportedOfflineContentVersion
+        | ApiErrorCodeV1::UnsupportedOfflineAssetVersion => StatusCode::BAD_REQUEST,
+        ApiErrorCodeV1::PreconditionRequired => StatusCode::PRECONDITION_REQUIRED,
+        ApiErrorCodeV1::Internal | ApiErrorCodeV1::ReplicaProjectionTooLarge => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        ApiErrorCodeV1::InvalidContent
+        | ApiErrorCodeV1::InvalidBody
+        | ApiErrorCodeV1::InvalidOfflineReviewOperation
+        | ApiErrorCodeV1::InvalidOfflineContentOperation
+        | ApiErrorCodeV1::InvalidOfflineAssetOperation
+        | ApiErrorCodeV1::RenameRequired
+        | ApiErrorCodeV1::InvalidBlobMetadata => StatusCode::UNPROCESSABLE_ENTITY,
+        ApiErrorCodeV1::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        ApiErrorCodeV1::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+        ApiErrorCodeV1::SnapshotRequired
+        | ApiErrorCodeV1::ActiveSession
+        | ApiErrorCodeV1::ReviewStateConflict
+        | ApiErrorCodeV1::IdempotencyConflict
+        | ApiErrorCodeV1::DeviceSequenceGap
+        | ApiErrorCodeV1::BlobRequired
+        | ApiErrorCodeV1::BlobMetadataConflict => StatusCode::CONFLICT,
+        ApiErrorCodeV1::RevisionConflict | ApiErrorCodeV1::StaleAttempt => {
+            StatusCode::PRECONDITION_FAILED
+        }
+        ApiErrorCodeV1::Busy => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    status == expected
 }
 
 fn server_error_delivery(body: &ApiErrorResponseV1) -> DeliveryStatus {
@@ -1531,6 +1718,13 @@ mod tests {
     #[test]
     fn response_validators_reject_semantically_invalid_content() {
         let digest = "a".repeat(64);
+        let expectation = DocumentMutationExpectation {
+            document_id: Some("document".into()),
+            active: true,
+            logical_path: Some("note.org".into()),
+            content_sha256: Some(digest.clone()),
+            revision: 1,
+        };
         let mut head = crate::protocol::http_v1::DocumentHeadV1 {
             document_id: "document".into(),
             logical_path: "note.org".into(),
@@ -1538,9 +1732,30 @@ mod tests {
             content_sha256: Some(digest),
             active: true,
         };
-        assert!(validate_document_head(&head, Some("document")));
+        assert!(validate_document_head(&head, &expectation));
+        let mutation = DocumentMutationResultV1::Applied {
+            format_version: 1,
+            operation_id: "operation".into(),
+            authoritative: head.clone(),
+            cursor: "cursor".into(),
+            changed: true,
+        };
+        assert!(validate_document_mutation_result(
+            &mutation,
+            "operation",
+            &expectation
+        ));
         head.logical_path = "../note.org".into();
-        assert!(!validate_document_head(&head, Some("document")));
+        assert!(!validate_document_head(&head, &expectation));
+        head.logical_path = "note.org".into();
+        head.revision = 2;
+        assert!(!validate_document_head(&head, &expectation));
+        head.revision = 1;
+        head.content_sha256 = Some("b".repeat(64));
+        assert!(!validate_document_head(&head, &expectation));
+        head.content_sha256 = expectation.content_sha256.clone();
+        head.active = false;
+        assert!(!validate_document_head(&head, &expectation));
 
         let content = thema_content(
             "basic",
@@ -1576,6 +1791,30 @@ mod tests {
         thema.revision = 1;
         thema.asset_paths.push("../asset".into());
         assert!(!validate_thema(&thema, "thema"));
+    }
+
+    #[test]
+    fn server_errors_require_complete_shapes_and_matching_statuses() {
+        let conflict =
+            br#"{"error":{"code":"idempotency_conflict","message":"conflict","meta":null}}"#;
+        assert!(matches!(
+            server_error::<()>(StatusCode::CONFLICT, conflict).unwrap_err(),
+            HttpClientError::Server(_)
+        ));
+        assert!(matches!(
+            server_error::<()>(StatusCode::INTERNAL_SERVER_ERROR, conflict).unwrap_err(),
+            HttpClientError::InvalidResponse { .. }
+        ));
+
+        for incomplete in [
+            br#"{"error":{"code":"internal","message":"failure"}}"#.as_slice(),
+            br#"{"error":{"code":"revision_conflict","message":"conflict","meta":{"expected_revision":1}}}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                server_error::<()>(StatusCode::INTERNAL_SERVER_ERROR, incomplete).unwrap_err(),
+                HttpClientError::InvalidResponse { .. }
+            ));
+        }
     }
 
     #[test]

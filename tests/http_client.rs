@@ -1484,6 +1484,37 @@ async fn projection_clients_reject_semantic_mismatches() {
         json!({
             "document_id": "document",
             "revision": 1,
+            "title": " ",
+            "file_node_id": null,
+            "file_tags": [],
+            "nodes": [],
+            "link_occurrences": [],
+            "semantic_edges": [],
+            "compatibility_sha1": "0".repeat(40),
+            "content_sha256": "0".repeat(64)
+        }),
+        json!({
+            "document_id": "document",
+            "revision": 1,
+            "title": "Title",
+            "file_node_id": null,
+            "file_tags": [],
+            "nodes": [{
+                "id": "node",
+                "title": "Node",
+                "title_path": ["Other"],
+                "tags": [],
+                "parent_id": null,
+                "level": 1
+            }],
+            "link_occurrences": [],
+            "semantic_edges": [],
+            "compatibility_sha1": "0".repeat(40),
+            "content_sha256": "0".repeat(64)
+        }),
+        json!({
+            "document_id": "document",
+            "revision": 1,
             "title": "x".repeat(1024 * 1024),
             "file_node_id": null,
             "file_tags": [],

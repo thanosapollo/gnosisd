@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::domain::{DueThema, ThemaId};
 
 pub const MAX_DUE_THEMATA: u16 = 100;
-const MAX_DUE_CURSOR_BYTES: usize = 512;
+pub const MAX_DUE_CURSOR_BYTES: usize = 2_048;
 const DUE_CURSOR_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,7 +182,7 @@ const fn leap_year(year: u32) -> bool {
 mod tests {
     use crate::domain::{DueThema, ThemaId};
 
-    use super::{DueCursor, LegacyQueryError, QueryDueThemataPage};
+    use super::{DueCursor, LegacyQueryError, MAX_DUE_CURSOR_BYTES, QueryDueThemataPage};
 
     const KEY: &str = "server-identity";
 
@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(cursor.next_review_day(), 20260713);
         assert_eq!(cursor.thema_id(), "thema-b");
 
-        let longest_id = "t".repeat(128);
+        let longest_id = "\0".repeat(128);
         let longest = DueThema {
             id: ThemaId::new(longest_id.clone()).unwrap(),
             kind: "basic".into(),
@@ -232,6 +232,8 @@ mod tests {
             review_count: 1,
         };
         let token = DueCursor::after(&longest).encode(20260714, KEY);
+        assert!(token.len() > 512);
+        assert!(token.len() <= MAX_DUE_CURSOR_BYTES);
         let decoded = QueryDueThemataPage::new(20260714, 25, Some(token.clone()), KEY).unwrap();
         assert_eq!(decoded.after().unwrap().thema_id(), longest_id);
 
