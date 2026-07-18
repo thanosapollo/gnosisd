@@ -1465,8 +1465,7 @@ fn select_topic(
          JOIN thema ON thema.thema_id = link.thema_id
          JOIN review_state AS state ON state.thema_id = thema.thema_id
          WHERE thema.archived_at_us IS NULL AND state.suspended = 0
-         ORDER BY (state.review_count > 0), state.next_review_day,
-                  coalesce(thema.legacy_id, 9223372036854775807), thema.thema_id",
+         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id",
         )
         .map_err(StoreError::storage)?;
     statement
@@ -1505,8 +1504,7 @@ fn select_filtered(
                SELECT 1 FROM thema_tag
                WHERE thema_id = thema.thema_id AND tag IN (SELECT value FROM json_each(?3))
            )
-         ORDER BY (state.review_count > 0), state.next_review_day,
-                  coalesce(thema.legacy_id, 9223372036854775807), thema.thema_id"
+         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id"
     );
     let mut statement = connection.prepare(&query).map_err(StoreError::storage)?;
     statement
@@ -2695,11 +2693,11 @@ mod tests {
 
     use super::{ATTEMPT_OPERATION_REPLAY_SQL, MAX_REVIEW_PACK_ITEMS, SqliteStore};
     use crate::application::{
-        AnswerInput, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_ID_CHARS, OfflineConflictReason,
-        OfflineReviewOperation, ReconciliationStatus, ReviewAttemptMutation,
-        ReviewAttemptOperation, ReviewAttemptOperationStatus, ReviewOperationAuthority,
-        ReviewSource, ReviewSourceKind, canonical_asset_path, generate_device, prepare_asset,
-        prepare_thema, presentation_content, review_day_at, thema_content,
+        AnswerInput, MAX_OFFLINE_ASSET_BYTES, OfflineConflictReason, OfflineReviewOperation,
+        ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
+        ReviewAttemptOperationStatus, ReviewOperationAuthority, ReviewSource, ReviewSourceKind,
+        canonical_asset_path, generate_device, prepare_asset, prepare_thema, presentation_content,
+        review_day_at, thema_content,
     };
     use crate::blob::BlobMeta;
 
@@ -3350,27 +3348,6 @@ mod tests {
             store.create_review_pack(
                 1,
                 &manual_source("thema"),
-                Some(1),
-                &device_id,
-                1_752_600_000_000_000,
-            ),
-            Err(crate::store::StoreError::InvalidReviewState)
-        ));
-        assert_eq!(store.active_review_pack(Some(&device_id)).unwrap(), None);
-        assert_eq!(store.active_review_session(Some(&device_id)).unwrap(), None);
-    }
-
-    #[test]
-    fn review_pack_rejects_overlong_thema_ids_without_starting_a_session() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let thema_id = "x".repeat(MAX_REVIEW_PACK_ID_CHARS + 1);
-        add_thema(&mut store, &thema_id, "Question", None);
-        let device_id = add_device(&mut store, "offline");
-
-        assert!(matches!(
-            store.create_review_pack(
-                1,
-                &manual_source(&thema_id),
                 Some(1),
                 &device_id,
                 1_752_600_000_000_000,

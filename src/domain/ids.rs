@@ -6,6 +6,8 @@ use thiserror::Error;
 pub enum IdError {
     #[error("{kind} must not be empty")]
     Empty { kind: &'static str },
+    #[error("{kind} must not exceed 128 bytes")]
+    TooLong { kind: &'static str },
 }
 
 macro_rules! opaque_id {
@@ -18,6 +20,8 @@ macro_rules! opaque_id {
                 let value = value.into();
                 if value.trim().is_empty() {
                     Err(IdError::Empty { kind: $kind })
+                } else if value.len() > 128 {
+                    Err(IdError::TooLong { kind: $kind })
                 } else {
                     Ok(Self(value))
                 }
@@ -73,5 +77,14 @@ mod tests {
         ] {
             assert!(matches!(error, IdError::Empty { .. }));
         }
+    }
+
+    #[test]
+    fn rejects_ids_over_128_bytes() {
+        assert!(DocumentId::new("a".repeat(128)).is_ok());
+        assert!(matches!(
+            DocumentId::new("a".repeat(129)),
+            Err(IdError::TooLong { .. })
+        ));
     }
 }

@@ -1,6 +1,6 @@
 use std::{
-    collections::HashSet, error::Error, fmt::Write as _, fs, os::unix::fs::PermissionsExt,
-    path::Path, time::Duration,
+    collections::HashSet, error::Error, fs, os::unix::fs::PermissionsExt, path::Path,
+    time::Duration,
 };
 
 use rusqlite::{
@@ -148,7 +148,7 @@ impl SqliteStore {
             .busy_timeout(Duration::from_secs(5))
             .map_err(StoreError::storage)?;
         initialize_schema(&connection)?;
-        backfill_current_replica_history(&connection)?;
+        validate_current_schema(&connection)?;
         Ok(Self { connection })
     }
 
@@ -3058,209 +3058,60 @@ fn user_schema_is_empty(connection: &Connection) -> Result<bool, StoreError> {
         .map_err(StoreError::storage)
 }
 
-fn backfill_current_replica_history(connection: &Connection) -> Result<(), StoreError> {
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(StoreError::storage)?;
-    backfill_projection_only_documents(&transaction)?;
-    backfill_document_projections(&transaction)?;
-    backfill_thema_revisions(&transaction)?;
-    backfill_settings_revision(&transaction)?;
-    backfill_review_state_revisions(&transaction)?;
-    transaction.commit().map_err(StoreError::storage)
-}
-
-fn backfill_projection_only_documents(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    let rows = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT document_id, revision, logical_path, updated_at_us
-                 FROM document WHERE active = 1 AND NOT EXISTS(
+fn validate_current_schema(connection: &Connection) -> Result<(), StoreError> {
+    let inconsistent = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE name IN (
+                     'thema_legacy_id_unique', 'import_manifest',
+                     'import_table_count', 'import_path_rewrite'
+                 )
+                 UNION ALL
+                 SELECT 1 FROM pragma_table_info('thema') WHERE name = 'legacy_id'
+                 UNION ALL
+                 SELECT 1 FROM document
+                 WHERE active = 1 AND NOT EXISTS(
                      SELECT 1 FROM document_revision AS revision
                      WHERE revision.document_id = document.document_id
                        AND revision.revision = document.revision
-                 ) ORDER BY document_id",
-            )
-            .map_err(StoreError::storage)?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })
-            .map_err(StoreError::storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::storage)?
-    };
-    for (id, revision, stored_path, updated_at_us) in rows {
-        let document_id = DocumentId::new(id).map_err(|_| StoreError::CorruptData {
-            field: "document ID",
-        })?;
-        let logical_path = stored_path
-            .filter(|path| validate_org_path(path).is_ok())
-            .unwrap_or_else(|| legacy_projection_path(&document_id));
-        update_projection_only_path(transaction, &document_id, &logical_path)?;
-        insert_document_history(
-            transaction,
-            &document_id,
-            &logical_path,
-            None,
-            to_u64(revision, "document revision")?,
-            "snapshot",
-            updated_at_us.max(1),
-            None,
-        )?;
-    }
-    Ok(())
-}
-
-fn legacy_projection_path(document_id: &DocumentId) -> String {
-    let mut encoded = String::with_capacity(document_id.as_str().len() * 2);
-    for byte in document_id.as_str().as_bytes() {
-        write!(encoded, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    format!("legacy/{encoded}.org")
-}
-
-fn update_projection_only_path(
-    transaction: &Transaction<'_>,
-    document_id: &DocumentId,
-    logical_path: &str,
-) -> Result<(), StoreError> {
-    transaction
-        .execute(
-            "UPDATE document SET logical_path = ?2, path_key = ?3 WHERE document_id = ?1",
-            params![document_id.as_str(), logical_path, path_key(logical_path)],
-        )
-        .map_err(StoreError::storage)?;
-    Ok(())
-}
-
-fn backfill_document_projections(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    let ids = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT document.document_id FROM document
-                 JOIN document_revision USING(document_id, revision)
-                 WHERE document.active = 1 AND NOT EXISTS(
+                 )
+                 UNION ALL
+                 SELECT 1 FROM document
+                 WHERE active = 1 AND NOT EXISTS(
                      SELECT 1 FROM document_projection_revision AS projection
                      WHERE projection.document_id = document.document_id
                        AND projection.revision = document.revision
                  )
-                 ORDER BY document.document_id",
-            )
-            .map_err(StoreError::storage)?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(StoreError::storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::storage)?
-    };
-    for id in ids {
-        let document_id = DocumentId::new(id).map_err(|_| StoreError::CorruptData {
-            field: "document ID",
-        })?;
-        let document = load_document(transaction, &document_id)?.ok_or(StoreError::NotFound)?;
-        insert_document_projection_history(
-            transaction,
-            &document_id,
-            document.revision(),
-            document.projection(),
-        )?;
-    }
-    Ok(())
-}
-
-fn backfill_thema_revisions(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    let rows = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT thema.thema_id, thema.updated_at_us FROM thema
+                 UNION ALL
+                 SELECT 1 FROM thema
                  WHERE NOT EXISTS(
                      SELECT 1 FROM thema_revision AS revision
                      WHERE revision.thema_id = thema.thema_id
                        AND revision.revision = thema.revision
-                 ) ORDER BY thema.thema_id",
-            )
-            .map_err(StoreError::storage)?;
-        statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(StoreError::storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::storage)?
-    };
-    for (id, created_at_us) in rows {
-        let record = load_thema(transaction, &id)?.ok_or(StoreError::NotFound)?;
-        insert_thema_history(transaction, &record, "snapshot", created_at_us, None)?;
-    }
-    Ok(())
-}
-
-fn backfill_settings_revision(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    let missing = transaction
-        .query_row(
-            "SELECT NOT EXISTS(
-                 SELECT 1 FROM settings_revision AS revision
-                 JOIN settings ON settings.revision = revision.revision
-                 WHERE settings.id = 1
+                 )
+                 UNION ALL
+                 SELECT 1 FROM settings
+                 WHERE id = 1 AND NOT EXISTS(
+                     SELECT 1 FROM settings_revision AS revision
+                     WHERE revision.revision = settings.revision
+                 )
+                 UNION ALL
+                 SELECT 1 FROM review_state AS state
+                 WHERE NOT EXISTS(
+                     SELECT 1 FROM review_state_revision AS revision
+                     WHERE revision.thema_id = state.thema_id
+                       AND revision.state_revision = state.state_revision
+                 )
              )",
             [],
             |row| row.get::<_, bool>(0),
         )
         .map_err(StoreError::storage)?;
-    if missing {
-        let settings = load_settings(transaction)?;
-        let created_at_us = transaction
-            .query_row(
-                "SELECT updated_at_us FROM settings WHERE id = 1",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(StoreError::storage)?;
-        insert_settings_history(transaction, &settings, "snapshot", created_at_us, None)?;
-    }
-    Ok(())
-}
-
-fn backfill_review_state_revisions(transaction: &Transaction<'_>) -> Result<(), StoreError> {
-    let ids = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT state.thema_id FROM review_state AS state
-                 WHERE NOT EXISTS(
-                     SELECT 1 FROM review_state_revision AS revision
-                     WHERE revision.thema_id = state.thema_id
-                       AND revision.state_revision = state.state_revision
-                 ) ORDER BY state.thema_id",
-            )
-            .map_err(StoreError::storage)?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(StoreError::storage)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::storage)?
-    };
-    for id in ids {
-        let state = review::load_review_state(transaction, &id)?;
-        let snapshot = crate::application::ReviewStateSnapshot::from(&state);
-        transaction
-            .execute(
-                "INSERT INTO review_state_revision(
-                     thema_id, state_revision, state_json, event_id, created_at_us
-                 ) VALUES (?1, ?2, ?3, NULL, ?4)",
-                params![
-                    id,
-                    u64_to_i64(snapshot.state_revision, "state revision")?,
-                    serde_json::to_string(&snapshot).map_err(StoreError::storage)?,
-                    snapshot.last_reviewed_at_us.unwrap_or(0),
-                ],
-            )
-            .map_err(StoreError::storage)?;
+    if inconsistent {
+        return Err(StoreError::CorruptData {
+            field: "current schema history",
+        });
     }
     Ok(())
 }
@@ -4458,6 +4309,43 @@ mod tests {
                 schema_table_exists(&store.connection, table),
                 "missing {table}"
             );
+        }
+        for retired in [
+            "import_manifest",
+            "import_table_count",
+            "import_path_rewrite",
+        ] {
+            assert!(!schema_table_exists(&store.connection, retired));
+        }
+        assert!(!store
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('thema') WHERE name = 'legacy_id')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn current_schema_remnants_and_missing_history_fail_closed() {
+        for mutation in [
+            "CREATE TABLE import_manifest(id INTEGER PRIMARY KEY) STRICT;",
+            "DELETE FROM settings_revision;",
+        ] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("gnosis.db");
+            drop(SqliteStore::open(&path).unwrap());
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection.execute_batch(mutation).unwrap();
+            drop(connection);
+
+            assert!(matches!(
+                SqliteStore::open(&path),
+                Err(StoreError::CorruptData {
+                    field: "current schema history"
+                })
+            ));
         }
     }
 

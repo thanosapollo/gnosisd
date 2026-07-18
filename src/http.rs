@@ -1106,6 +1106,7 @@ async fn create_thema(
     ApiJson(input): ApiJson<ThemaWriteRequestV1>,
 ) -> Result<(StatusCode, Json<ThemaV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
+    ensure_thema_response_budget(&input)?;
     let prepared = prepared_thema(None, input, None)?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
     let record = state
@@ -1119,10 +1120,7 @@ async fn create_thema(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(ThemaV1::from_application(&record)),
-    ))
+    Ok((StatusCode::CREATED, bounded_thema(&record)?))
 }
 
 async fn update_thema(
@@ -1133,6 +1131,7 @@ async fn update_thema(
     ApiJson(input): ApiJson<ThemaWriteRequestV1>,
 ) -> Result<Json<ThemaV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
+    ensure_thema_response_budget(&input)?;
     let prepared = prepared_thema(Some(id), input, Some(if_match(&headers)?))?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
     let record = state
@@ -1146,7 +1145,7 @@ async fn update_thema(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(ThemaV1::from_application(&record)))
+    bounded_thema(&record)
 }
 
 fn prepared_thema(
@@ -1175,6 +1174,46 @@ fn prepared_thema(
     .map_err(ApiError::invalid_content)
 }
 
+fn ensure_thema_response_budget(input: &ThemaWriteRequestV1) -> Result<(), ApiError> {
+    let upper_bound = serde_json::to_vec(&json!({
+        "thema_id": "x".repeat(128),
+        "revision": u64::MAX,
+        "kind": input.kind,
+        "keimenon": input.keimenon,
+        "hypothesis": input.hypothesis,
+        "answer": input.answer,
+        "source_guid": input.source_guid,
+        "parathema": input.parathema,
+        "review_image": input.review_image,
+        "tags": input.tags,
+        "node_ids": input.node_ids,
+        "asset_paths": input.asset_paths,
+        "content_sha256": "0".repeat(64),
+        "archived": true
+    }))
+    .map_err(|_| ApiError::internal())?
+    .len();
+    if upper_bound > MAX_FRAME_SIZE {
+        return Err(ApiError::invalid_content(
+            "thema response exceeds the response limit",
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_thema(record: &crate::application::ThemaRecord) -> Result<Json<ThemaV1>, ApiError> {
+    let response = ThemaV1::from_application(record);
+    let size = serde_json::to_vec(&response)
+        .map_err(|_| ApiError::internal())?
+        .len();
+    if size > MAX_FRAME_SIZE {
+        return Err(ApiError::invalid_content(
+            "thema response exceeds the response limit",
+        ));
+    }
+    Ok(Json(response))
+}
+
 async fn get_thema(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -1187,7 +1226,7 @@ async fn get_thema(
         .await
         .map_err(ApiError::service)?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(ThemaV1::from_application(&record)))
+    bounded_thema(&record)
 }
 
 async fn search_themata(
@@ -1259,7 +1298,7 @@ async fn set_archive(
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(ThemaV1::from_application(&record)))
+    bounded_thema(&record)
 }
 
 async fn get_node(
@@ -2510,7 +2549,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             None,
             "200",
             "DuePageView",
-            &["400", "401", "403", "408", "500", "503"],
+            &["400", "401", "403", "408", "422", "500", "503"],
         )),
         ("/v1/content/offline-operations", "post") => Some(json_contract(
             "content:write",
@@ -2855,7 +2894,7 @@ fn idempotency_key_parameter() -> Value {
 fn content_query_parameters(path: &str) -> Vec<Value> {
     if path == "/v1/review/due" {
         return vec![
-            json!({"name":"day","in":"query","required":true,"schema":{"type":"integer","format":"uint32","minimum":0}}),
+            json!({"name":"day","in":"query","required":true,"description":"Valid YYYYMMDD calendar date","schema":{"type":"integer","format":"uint32","minimum":10101}}),
             json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}}),
             json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
         ];
@@ -3432,8 +3471,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        ApiError, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page, openapi_document,
-        optional_if_match, router,
+        ApiError, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page,
+        ensure_thema_response_budget, openapi_document, optional_if_match, router,
     };
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
@@ -3441,19 +3480,16 @@ mod tests {
         SettingsInput, generate_device, prepare_asset, prepare_thema, presentation_content,
         review_day_at, thema_content,
     };
-    use crate::domain::{
-        DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, ThemaId,
-        compute_transition, grade,
-    };
+    use crate::domain::{DocumentId, DueThema, ThemaId, compute_transition, grade};
     use crate::protocol::{
-        MAX_REPLICA_PAGE_BYTES, canonical_asset_operation, decode_cursor, encode_cursor,
+        canonical_asset_operation, decode_cursor, encode_cursor,
         http_v1::{
             ApiErrorCodeV1, ApiErrorMetaV1, ApiErrorResponseV1, ContentCapabilitiesV1,
-            ReplicaStateV1, ReviewAttemptV1,
+            ReplicaStateV1, ReviewAttemptV1, ThemaWriteRequestV1,
         },
     };
     use crate::service::{ServiceError, ServiceHandle, ServiceRuntime};
-    use crate::store::{SqliteStore, StoreError};
+    use crate::store::StoreError;
 
     #[tokio::test]
     async fn health_fails_when_the_store_actor_is_stopped() {
@@ -3605,10 +3641,11 @@ mod tests {
             operation["x-gnosis-required-scopes"],
             json!(["read", "review"])
         );
+        assert!(operation["responses"].get("422").is_some());
         assert_eq!(
             operation["parameters"],
             json!([
-                {"name":"day","in":"query","required":true,"schema":{"type":"integer","format":"uint32","minimum":0}},
+                {"name":"day","in":"query","required":true,"description":"Valid YYYYMMDD calendar date","schema":{"type":"integer","format":"uint32","minimum":10101}},
                 {"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}},
                 {"name":"after","in":"query","required":false,"schema":{"type":"string"}}
             ])
@@ -3663,6 +3700,27 @@ mod tests {
                 "200", "400", "401", "403", "404", "408", "422", "500", "503"
             ])
         );
+    }
+
+    #[test]
+    fn thema_response_budget_rejects_request_that_would_overflow_response() {
+        let mut input = ThemaWriteRequestV1 {
+            kind: "basic".into(),
+            keimenon: String::new(),
+            hypothesis: vec![],
+            answer: vec!["answer".into()],
+            source_guid: None,
+            parathema: None,
+            review_image: None,
+            tags: vec![],
+            node_ids: vec![],
+            asset_paths: vec![],
+        };
+        let base_size = serde_json::to_vec(&input).unwrap().len();
+        input.keimenon = "x".repeat(MAX_FRAME_SIZE - base_size);
+
+        assert!(serde_json::to_vec(&input).unwrap().len() <= MAX_FRAME_SIZE);
+        assert!(ensure_thema_response_budget(&input).is_err());
     }
 
     #[test]
@@ -6840,52 +6898,6 @@ mod tests {
         assert_eq!(service.latest_content_cursor().await.unwrap(), before);
 
         drop(app);
-        drop(service);
-        runtime.finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn replica_http_reports_an_unsyncable_projection() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("gnosis.sqlite");
-        let mut store = SqliteStore::open(&database).unwrap();
-        let projection = DocumentProjection::new(DocumentProjectionInput {
-            title: "x".repeat(MAX_REPLICA_PAGE_BYTES),
-            file_node_id: None,
-            file_tags: vec![],
-            nodes: vec![],
-            link_occurrences: vec![],
-            compatibility_sha1: "a".repeat(40),
-            content_sha256: "b".repeat(64),
-        })
-        .unwrap();
-        store
-            .replace_document(&DocumentId::new("oversized").unwrap(), &projection, None)
-            .unwrap();
-        drop(store);
-
-        let runtime = ServiceRuntime::start(database, directory.path().join("blobs"), 8)
-            .await
-            .unwrap();
-        let service = runtime.handle();
-        let device = generate_device("replica".into(), vec!["read".into()]).unwrap();
-        let token = device.token.clone();
-        service.create_device(device, 1).await.unwrap();
-        let response = router(service.clone())
-            .oneshot(authorized(
-                "GET",
-                "/v1/sync/snapshot?limit=1",
-                &token,
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            response_json(response).await["error"]["code"],
-            "replica_projection_too_large"
-        );
         drop(service);
         runtime.finish().await.unwrap();
     }

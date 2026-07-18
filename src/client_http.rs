@@ -20,10 +20,13 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    application::{MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, valid_operation_id},
+    application::{
+        MAX_OFFLINE_ASSET_BYTES, QueryDueThemataPage, canonical_asset_path, valid_operation_id,
+    },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
+    domain::DocumentId,
     is_canonical_sha256,
     protocol::{
         DocumentView, DuePageView, ImportResult, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
@@ -346,6 +349,7 @@ impl HttpClient {
         document_id: &str,
         input: &DocumentImportRequestV1,
     ) -> Result<ImportResult, HttpClientError> {
+        DocumentId::new(document_id).map_err(|_| HttpClientError::InvalidMutation)?;
         let url = self.resource_endpoint("v1/documents", document_id)?;
         let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
         if body.len() > MAX_FRAME_SIZE {
@@ -388,6 +392,8 @@ impl HttpClient {
         limit: u16,
         after: Option<&str>,
     ) -> Result<DuePageView, HttpClientError> {
+        QueryDueThemataPage::new(day, limit, after.map(str::to_owned))
+            .map_err(|_| HttpClientError::InvalidMutation)?;
         let mut url = self.endpoint("v1/review/due")?;
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("day", &day.to_string());
@@ -1519,6 +1525,33 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, HttpClientError::InvalidMutation));
         assert_eq!(error.delivery(), DeliveryStatus::NotSent);
+    }
+
+    #[tokio::test]
+    async fn invalid_import_id_and_due_query_are_not_sent() {
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
+        let input = DocumentImportRequestV1 {
+            org: "* Note".into(),
+            expected_revision: None,
+        };
+
+        let import_error = client
+            .import_document(&"x".repeat(129), &input)
+            .await
+            .unwrap_err();
+        assert!(matches!(import_error, HttpClientError::InvalidMutation));
+        assert_eq!(import_error.delivery(), DeliveryStatus::NotSent);
+
+        for result in [
+            client.due_page(0, 1, None).await,
+            client.due_page(20_260_718, 0, None).await,
+            client.due_page(20_260_718, 1, Some("bad")).await,
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, HttpClientError::InvalidMutation));
+            assert_eq!(error.delivery(), DeliveryStatus::NotSent);
+        }
     }
 
     #[tokio::test]

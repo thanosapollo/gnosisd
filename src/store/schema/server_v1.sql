@@ -68,9 +68,7 @@ CREATE TABLE node_edge(
   ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE thema(
-  thema_id TEXT PRIMARY KEY
-  ,
-  legacy_id INTEGER,
+  thema_id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
   kind TEXT NOT NULL DEFAULT 'basic'
   CHECK(kind IN('basic', 'cloze', 'mcq', 'mc-cloze')),
@@ -98,11 +96,7 @@ ON document(
   path_key
 )
 WHERE path_key IS NOT NULL;
-CREATE UNIQUE INDEX thema_legacy_id_unique
-ON thema(
-  legacy_id
-)
-WHERE legacy_id IS NOT NULL;
+
 CREATE TABLE blob(
   content_sha256 TEXT PRIMARY KEY
   CHECK(length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
@@ -298,25 +292,7 @@ CREATE TABLE audit_event(
   created_at_us INTEGER NOT NULL CHECK(created_at_us > 0),
   FOREIGN KEY(device_id) REFERENCES device(device_id) ON DELETE RESTRICT
 ) STRICT;
-CREATE TABLE import_manifest(
-  id INTEGER PRIMARY KEY CHECK(id = 1),
-  source_schema_version INTEGER NOT NULL,
-  source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
-  source_size_bytes INTEGER NOT NULL CHECK(source_size_bytes >= 0),
-  source_mtime_ns INTEGER NOT NULL,
-  imported_at_us INTEGER NOT NULL CHECK(imported_at_us > 0)
-) STRICT;
-CREATE TABLE import_table_count(
-  table_name TEXT PRIMARY KEY CHECK(length(table_name) > 0),
-  source_rows INTEGER NOT NULL CHECK(source_rows >= 0),
-  imported_rows INTEGER NOT NULL CHECK(imported_rows >= 0),
-  CHECK(imported_rows <= source_rows)
-) STRICT;
-CREATE TABLE import_path_rewrite(
-  source_path TEXT PRIMARY KEY,
-  logical_path TEXT NOT NULL,
-  reason TEXT NOT NULL CHECK(reason IN('case_collision', 'asset_normalization'))
-) STRICT;
+
 CREATE TABLE retired_node_edge(
   document_id TEXT NOT NULL,
   source_id TEXT NOT NULL,

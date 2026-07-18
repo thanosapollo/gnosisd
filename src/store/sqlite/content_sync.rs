@@ -649,7 +649,7 @@ mod tests {
             prepare_offline_document,
         },
         blob::BlobMeta,
-        domain::{DocumentId, DocumentProjection, DocumentProjectionInput},
+        domain::DocumentId,
         protocol::canonical_content_operation,
     };
 
@@ -989,63 +989,6 @@ mod tests {
             Some(OfflineContentConflictReason::PathConflict)
         );
         assert_eq!(result.authoritative.unwrap().logical_path, "note.org");
-        assert_eq!(
-            store
-                .replica_state(&device_id)
-                .unwrap()
-                .next_device_sequence,
-            2
-        );
-    }
-
-    #[test]
-    fn projection_only_rename_is_preserved_as_an_invalid_content_conflict() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
-        let projection = DocumentProjection::new(DocumentProjectionInput {
-            title: "Projection".into(),
-            file_node_id: None,
-            file_tags: vec![],
-            nodes: vec![],
-            link_occurrences: vec![],
-            compatibility_sha1: "a".repeat(40),
-            content_sha256: "b".repeat(64),
-        })
-        .unwrap();
-        let id = DocumentId::new("document").unwrap();
-        store.replace_document(&id, &projection, None).unwrap();
-        super::super::backfill_current_replica_history(&store.connection).unwrap();
-        let device_id = add_device(&mut store);
-        let rename = rename_operation(
-            &store,
-            &device_id,
-            "projection-rename",
-            1,
-            "renamed.org",
-            ContentBase::Revision {
-                revision: 1,
-                content_sha256: Some("b".repeat(64)),
-                predecessor_operation_id: None,
-            },
-        );
-        let result = store
-            .reconcile_content_operation(
-                1,
-                &rename,
-                "projection-rename-payload",
-                Some(&device_id),
-                2,
-                Ok((None, None)),
-            )
-            .unwrap();
-        assert_eq!(
-            result.conflict_reason,
-            Some(OfflineContentConflictReason::InvalidContent)
-        );
-        assert_eq!(
-            result.authoritative.unwrap().content_sha256,
-            Some("b".repeat(64))
-        );
-        assert_eq!(store.document_head(&id).unwrap().unwrap().revision, 1);
         assert_eq!(
             store
                 .replica_state(&device_id)
