@@ -25,13 +25,6 @@ use crate::{
     },
 };
 
-struct LocalReviewReplay<'a> {
-    request_id: &'a str,
-    request_sha256: &'a str,
-    action: &'a str,
-    created_at_us: u64,
-}
-
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
 struct StoredAttemptOperationPayload<'a> {
@@ -307,6 +300,7 @@ impl SqliteStore {
         self.review_session(session_id)?.ok_or(StoreError::NotFound)
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_review_attempt(
         &mut self,
         session_id: &str,
@@ -474,86 +468,12 @@ impl SqliteStore {
         override_review_attempt_in(&self.connection, attempt_id, actor_device_id)
     }
 
-    pub(crate) fn override_local_review_attempt(
-        &mut self,
-        attempt_id: &str,
-        actor_device_id: Option<&str>,
-        request_id: &str,
-        request_sha256: &str,
-        created_at_us: u64,
-    ) -> Result<ReviewAttemptView, StoreError> {
-        self.local_review_action(
-            attempt_id,
-            actor_device_id,
-            LocalReviewReplay {
-                request_id,
-                request_sha256,
-                action: "override",
-                created_at_us,
-            },
-            override_review_attempt_in,
-        )
-    }
-
     pub(crate) fn toggle_attempt_suspension(
         &mut self,
         attempt_id: &str,
         actor_device_id: Option<&str>,
     ) -> Result<ReviewAttemptView, StoreError> {
         toggle_attempt_suspension_in(&self.connection, attempt_id, actor_device_id)
-    }
-
-    pub(crate) fn toggle_local_attempt_suspension(
-        &mut self,
-        attempt_id: &str,
-        actor_device_id: Option<&str>,
-        request_id: &str,
-        request_sha256: &str,
-        created_at_us: u64,
-    ) -> Result<ReviewAttemptView, StoreError> {
-        self.local_review_action(
-            attempt_id,
-            actor_device_id,
-            LocalReviewReplay {
-                request_id,
-                request_sha256,
-                action: "suspension_toggle",
-                created_at_us,
-            },
-            toggle_attempt_suspension_in,
-        )
-    }
-
-    fn local_review_action(
-        &mut self,
-        attempt_id: &str,
-        actor_device_id: Option<&str>,
-        replay: LocalReviewReplay<'_>,
-        apply: fn(&Connection, &str, Option<&str>) -> Result<ReviewAttemptView, StoreError>,
-    ) -> Result<ReviewAttemptView, StoreError> {
-        let transaction = self.write_transaction()?;
-        if let Some(attempt) = replayed_local_review_action(
-            &transaction,
-            replay.request_id,
-            replay.request_sha256,
-            attempt_id,
-            replay.action,
-        )? {
-            transaction.commit().map_err(StoreError::storage)?;
-            return Ok(attempt);
-        }
-        let attempt = apply(&transaction, attempt_id, actor_device_id)?;
-        insert_local_review_replay(
-            &transaction,
-            replay.request_id,
-            replay.request_sha256,
-            attempt_id,
-            replay.action,
-            &attempt,
-            replay.created_at_us,
-        )?;
-        transaction.commit().map_err(StoreError::storage)?;
-        Ok(attempt)
     }
 
     pub(crate) fn apply_review_attempt_operation(
@@ -2195,67 +2115,6 @@ fn toggle_attempt_suspension_in(
         return Err(StoreError::InvalidReviewState);
     }
     load_attempt(connection, attempt_id)?.ok_or(StoreError::NotFound)
-}
-
-fn replayed_local_review_action(
-    connection: &Connection,
-    request_id: &str,
-    request_sha256: &str,
-    attempt_id: &str,
-    action: &str,
-) -> Result<Option<ReviewAttemptView>, StoreError> {
-    let replay = connection
-        .query_row(
-            "SELECT request_sha256, attempt_id, action, result_json
-             FROM local_review_replay WHERE request_id = ?1",
-            [request_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(StoreError::storage)?;
-    let Some((stored_sha256, stored_attempt, stored_action, result_json)) = replay else {
-        return Ok(None);
-    };
-    if stored_sha256 != request_sha256 || stored_attempt != attempt_id || stored_action != action {
-        return Err(StoreError::IdempotencyConflict);
-    }
-    serde_json::from_str(&result_json)
-        .map(Some)
-        .map_err(StoreError::storage)
-}
-
-fn insert_local_review_replay(
-    connection: &Connection,
-    request_id: &str,
-    request_sha256: &str,
-    attempt_id: &str,
-    action: &str,
-    attempt: &ReviewAttemptView,
-    created_at_us: u64,
-) -> Result<(), StoreError> {
-    connection
-        .execute(
-            "INSERT INTO local_review_replay(
-             request_id, request_sha256, attempt_id, action, result_json, created_at_us
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                request_id,
-                request_sha256,
-                attempt_id,
-                action,
-                serde_json::to_string(attempt).map_err(StoreError::storage)?,
-                u64_to_i64(created_at_us, "local replay timestamp")?,
-            ],
-        )
-        .map_err(StoreError::storage)?;
-    Ok(())
 }
 
 fn canonical_attempt_operation(operation: &ReviewAttemptOperation) -> Result<String, StoreError> {

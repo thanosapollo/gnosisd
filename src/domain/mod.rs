@@ -15,7 +15,7 @@ pub(crate) use grading::{
 };
 pub use graph::{NodeEdge, project_unique_edges};
 pub use ids::{DocumentId, IdError, NodeId, ThemaId};
-pub(crate) use legacy::{DueThema, LegacyDatabaseInfo, LegacyReviewState, LegacyThema};
+pub(crate) use legacy::{DueThema, LegacyReviewState, LegacyThema};
 pub(crate) use scheduling::{ReviewState, Transition, compute_transition, validate_state};
 pub use thema::{ThemaConcept, ThemaConceptRelation};
 pub(crate) use thema::{ThemaContent, ThemaContentError, ThemaKind};

@@ -1,16 +1,6 @@
 use super::ThemaId;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct LegacyDatabaseInfo {
-    pub(crate) source_schema_version: u32,
-    pub(crate) legacy_table_count: u64,
-    pub(crate) legacy_row_count: u64,
-    pub(crate) thema_count: u64,
-    pub(crate) active_thema_count: u64,
-    pub(crate) review_state_count: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LegacyThema {
     pub(crate) id: ThemaId,
     pub(crate) kind: String,

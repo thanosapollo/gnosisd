@@ -26,17 +26,18 @@ use crate::{
     },
     is_canonical_sha256,
     protocol::{
-        MAX_OFFLINE_ASSET_OPERATION_BYTES, MAX_OFFLINE_ASSET_RESULT_BYTES,
-        MAX_OFFLINE_CONTENT_OPERATION_BYTES, MAX_OFFLINE_CONTENT_RESULT_BYTES,
-        MAX_OFFLINE_REVIEW_OPERATION_BYTES, MAX_OFFLINE_REVIEW_RESULT_BYTES,
-        MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES, decode_review_pack,
+        DocumentView, DuePageView, ImportResult, MAX_OFFLINE_ASSET_OPERATION_BYTES,
+        MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
+        MAX_OFFLINE_CONTENT_RESULT_BYTES, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
+        MAX_OFFLINE_REVIEW_RESULT_BYTES, MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
+        ThemaView, decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1, DeviceIdentityV1,
-            DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1,
-            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
-            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
-            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
+            DocumentImportRequestV1, DocumentMutationResultV1, NoteRenameRequestV1,
+            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
+            ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
+            ReviewAttemptV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
             ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
             ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
             ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
@@ -340,6 +341,51 @@ impl HttpClient {
         execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
     }
 
+    pub async fn import_document(
+        &self,
+        document_id: &str,
+        input: &DocumentImportRequestV1,
+    ) -> Result<ImportResult, HttpClientError> {
+        let url = self.resource_endpoint("v1/documents", document_id)?;
+        let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
+        execute_json_exact(
+            self.client
+                .put(url)
+                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                .body(body),
+            MAX_REPLICA_PAGE_BYTES,
+            StatusCode::OK,
+        )
+        .await
+    }
+
+    pub async fn document(&self, document_id: &str) -> Result<DocumentView, HttpClientError> {
+        let url = self.resource_endpoint("v1/documents", document_id)?;
+        execute_json_exact(self.client.get(url), MAX_REPLICA_PAGE_BYTES, StatusCode::OK).await
+    }
+
+    pub async fn legacy_thema(&self, thema_id: &str) -> Result<ThemaView, HttpClientError> {
+        let url = self.resource_endpoint("v1/legacy-themata", thema_id)?;
+        execute_json_exact(self.client.get(url), MAX_REPLICA_PAGE_BYTES, StatusCode::OK).await
+    }
+
+    pub async fn legacy_due_page(
+        &self,
+        day: u32,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<DuePageView, HttpClientError> {
+        let mut url = self.endpoint("v1/legacy-review/due")?;
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("day", &day.to_string());
+        pairs.append_pair("limit", &limit.to_string());
+        if let Some(after) = after {
+            pairs.append_pair("after", after);
+        }
+        drop(pairs);
+        execute_json_exact(self.client.get(url), MAX_REPLICA_PAGE_BYTES, StatusCode::OK).await
+    }
+
     pub async fn review_sessions(
         &self,
         query: &ReviewSessionListRequestV1,
@@ -546,6 +592,15 @@ impl HttpClient {
         self.base_url
             .join(path)
             .map_err(|_| HttpClientError::InvalidBaseUrl)
+    }
+
+    fn resource_endpoint(&self, collection: &str, id: &str) -> Result<Url, HttpClientError> {
+        let mut url = self.endpoint(&format!("{collection}/"))?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .pop_if_empty()
+            .push(id);
+        Ok(url)
     }
 
     fn document_mutation_endpoint(&self, document_id: &str) -> Result<Url, HttpClientError> {

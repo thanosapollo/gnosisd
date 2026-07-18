@@ -8,7 +8,7 @@ local administration protocol and an authenticated HTTP API.
 
 ~gnosisd~ is the only process that opens the database. Ordinary clients use the
 authenticated HTTP API and never send SQL. The Unix socket is reserved for
-local trust bootstrap, administration, recovery, and temporary compatibility.
+local trust bootstrap, administration, and recovery.
 The daemon is single-user and creates its socket and SQLite database with mode
 ~0600~. HTTP binds only to loopback; Tailscale Serve is the remote Tailnet entry
 point.
@@ -45,7 +45,6 @@ The operator client uses local protocol version 1:
 
 #+begin_src sh
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" legacy-info
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   device-create phone --scope read --scope review
 #+end_src
@@ -55,7 +54,7 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 actor.  A stopped or unavailable store returns HTTP 503 with
 ~{"status":"unavailable"}~.
 
-Ordinary review recovery and desired-state commands use authenticated HTTP.
+All ordinary document, thema, review, and replica commands use authenticated HTTP.
 The URL defaults to ~http://127.0.0.1:7842~. Store the one-time device token in
 a private file without placing it in shell history or argv:
 
@@ -64,6 +63,8 @@ install -d -m 700 "$HOME/.config/gnosis"
 install -m 600 /dev/null "$HOME/.config/gnosis/client.token"
 # Copy the one-time device token into client.token.
 
+gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  get-document DOCUMENT_ID
 gnosis --token-file "$HOME/.config/gnosis/client.token" \
   review-attempt-state ATTEMPT_ID
 gnosis --token-file "$HOME/.config/gnosis/client.token" \
@@ -145,10 +146,8 @@ rejected the request. Human-readable errors remain the default for terminals.
 
 The Unix message format is a four-byte big-endian length followed by UTF-8
 JSON. It is the privileged local and administrative transport for diagnostics,
-legacy inspection, device token administration, and backup commands. Online
-review and managed-asset methods remain only as temporary Emacs compatibility
-operations. Stable errors never expose SQL, paths, dependency failures, or
-backtraces.
+device token administration, and backup commands. Stable errors never expose
+SQL, paths, dependency failures, or backtraces.
 
 * HTTP API
 

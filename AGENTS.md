@@ -12,7 +12,7 @@ expected when a core operation lands.
 The deployed daemon exclusively owns
 `~/.local/share/gnosis/gnosis.sqlite`. Ordinary clients use authenticated HTTP
 `/v1`; the Unix socket is the privileged local trust, administration, recovery,
-and temporary compatibility boundary. No client may open the core database
+and diagnostics boundary. No client may open the core database
 directly.
 
 ## Architecture
@@ -28,9 +28,7 @@ directly.
   blobs, and persistence coordination. One daemon-owned thread holds the
   canonical connection and handles reads and atomic writes through a bounded
   queue. The concrete client replica store owns a separate local connection.
-- `src/migration.rs` owns the offline schema-v9 snapshot path. It must never
-  modify or replace the source database, and it publishes only a fully checked
-  target.
+
 - Legacy themata remain exposed through a read-only adapter. Normalized review
   writes use immutable attempts and events plus atomic scheduling transitions.
 - `src/protocol` owns the versioned wire DTOs, HTTP API, and privileged Unix
@@ -103,9 +101,8 @@ directly.
   durable replica without network access. Online pack operations verify the
   replica binding without draining its outbox, and abandonment never depends on
   downloading pack assets. Local asset and result queries are offline and never
-  expose captured answers. Operator commands and remaining compatibility
-  methods still use the Unix socket; ordinary commands must migrate before the
-  corresponding Unix methods are removed.
+  expose captured answers. Only diagnostics, device administration, and backup
+  administration use the Unix socket; ordinary commands use authenticated HTTP.
 
 Keep textual link occurrences, unique semantic node edges, and `ThemaConcept`
 learning associations separate. Node titles are local values; title paths
@@ -122,12 +119,11 @@ cleanup and bind. Do not weaken it to a stat-then-unlink sequence. SIGINT and
 SIGTERM both enter graceful shutdown.
 
 The Emacs review dogfood path is explicitly opt-in. `gnosis-review-backend`
-defaults to `legacy`; `core` still uses the Unix compatibility protocol until
-the frontend moves to authenticated HTTP. That migration must use the typed
-online review DTOs, desired-state operations, and raw digest-addressed asset
-downloads while preserving the private verified cache. Review-loop edit and
-delete remain disabled until typed daemon operations can fail or commit before
-any local mutation.
+defaults to `legacy`; `core` uses typed authenticated HTTP review DTOs,
+desired-state operations, and raw digest-addressed asset downloads while
+preserving the private verified cache. Review-loop edit and delete remain
+disabled until typed daemon operations can fail or commit before any local
+mutation.
 
 This milestone does not migrate the full Emacs frontend. Dashboard, history,
 content authoring, edit, archive and delete, capture, import, note indexing,

@@ -10,9 +10,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
-    DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LegacyDatabaseInfo,
-    LegacyReviewState, LegacyThema, LinkOccurrence, Node, NodeEdge, NodeId, SourceSpan, ThemaId,
-    TitlePath,
+    DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LegacyReviewState,
+    LegacyThema, LinkOccurrence, Node, NodeEdge, NodeId, SourceSpan, ThemaId, TitlePath,
 };
 use crate::{
     application::{
@@ -165,23 +164,11 @@ impl SqliteStore {
         load_document(&self.connection, document_id)
     }
 
-    pub(crate) fn legacy_database_info(&self) -> Result<Option<LegacyDatabaseInfo>, StoreError> {
-        load_legacy_database_info(&self.connection)
-    }
-
     pub(crate) fn get_legacy_thema(
         &self,
         thema_id: &ThemaId,
     ) -> Result<Option<LegacyThema>, StoreError> {
         load_legacy_thema(&self.connection, thema_id)
-    }
-
-    pub(crate) fn due_legacy_themata(
-        &self,
-        day: u32,
-        limit: u16,
-    ) -> Result<Vec<DueThema>, StoreError> {
-        load_due_legacy_themata(&self.connection, day, limit, None)
     }
 
     pub(crate) fn due_legacy_themata_page(
@@ -3300,47 +3287,6 @@ fn application_id(connection: &Connection) -> Result<u32, StoreError> {
         .map_err(StoreError::storage)
 }
 
-fn load_legacy_database_info(
-    connection: &Connection,
-) -> Result<Option<LegacyDatabaseInfo>, StoreError> {
-    if !table_exists(connection, "import_manifest")? {
-        return Ok(None);
-    }
-    let source = connection
-        .query_row(
-            "SELECT manifest.source_schema_version,
-                    (SELECT count(*) FROM import_table_count),
-                    (SELECT coalesce(sum(source_rows), 0) FROM import_table_count)
-             FROM import_manifest AS manifest WHERE manifest.id = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(StoreError::storage)?;
-    source
-        .map(|(version, tables, rows)| legacy_database_info(connection, version, tables, rows))
-        .transpose()
-}
-
-fn legacy_database_info(
-    connection: &Connection,
-    version: i64,
-    tables: i64,
-    rows: i64,
-) -> Result<LegacyDatabaseInfo, StoreError> {
-    Ok(LegacyDatabaseInfo {
-        source_schema_version: to_u32(version, "legacy schema version")?,
-        legacy_table_count: to_u64(tables, "legacy table count")?,
-        legacy_row_count: to_u64(rows, "legacy row count")?,
-        thema_count: count_rows(connection, "SELECT count(*) FROM thema")?,
-        active_thema_count: count_rows(
-            connection,
-            "SELECT count(*) FROM thema WHERE archived_at_us IS NULL",
-        )?,
-        review_state_count: count_rows(connection, "SELECT count(*) FROM review_state")?,
-    })
-}
-
 fn load_legacy_thema(
     connection: &Connection,
     thema_id: &ThemaId,
@@ -3588,23 +3534,6 @@ fn materialize_due_thema(
         next_review_day: to_u32(next_review_day, "legacy next review day")?,
         review_count: to_u64(review_count, "legacy review count")?,
     })
-}
-
-fn table_exists(connection: &Connection, name: &str) -> Result<bool, StoreError> {
-    connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
-            [name],
-            |row| row.get(0),
-        )
-        .map_err(StoreError::storage)
-}
-
-fn count_rows(connection: &Connection, query: &str) -> Result<u64, StoreError> {
-    let count: i64 = connection
-        .query_row(query, [], |row| row.get(0))
-        .map_err(StoreError::storage)?;
-    to_u64(count, "legacy row count")
 }
 
 fn optional_u64(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {

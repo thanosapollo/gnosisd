@@ -21,10 +21,10 @@ use gnosis_core::{
         ResponseResult, ServerError,
         client_v1::{ClientDeliveryV1, ClientFailureCodeV1, ClientFailureV1},
         http_v1::{
-            ApiErrorCodeV1, DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1,
-            ReviewAnswerV1, ReviewPackAssetV2, ReviewSessionRequestV1, ReviewSourceInputV1,
-            ReviewSourceKindV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
-            ThemaWriteRequestV1,
+            ApiErrorCodeV1, DocumentImportRequestV1, DocumentMutationResultV1, NoteRenameRequestV1,
+            NoteWriteRequestV1, ReviewAnswerV1, ReviewPackAssetV2, ReviewSessionRequestV1,
+            ReviewSourceInputV1, ReviewSourceKindV1, SetAcceptedSuccessRequestV1,
+            SetSuspensionRequestV1, ThemaWriteRequestV1,
         },
         request,
     },
@@ -439,7 +439,7 @@ async fn invalid_pack_capture_rolls_back_the_pack_and_session() {
         Err(HttpClientError::Server(_))
     ));
     assert!(client.active_review_pack().await.unwrap().pack.is_none());
-    assert_no_active_session(&daemon.socket).await;
+    assert_no_active_session(&client).await;
     daemon.stop().await;
 }
 
@@ -1021,7 +1021,7 @@ async fn cli_review_pack_rejects_another_device_before_creating_a_lease() {
     let daemon = RunningDaemon::start().await;
     let (first_id, first_token) = create_device(&daemon.socket).await;
     let (_, second_token) = create_device(&daemon.socket).await;
-    let _client = HttpClient::new(
+    let client = HttpClient::new(
         &daemon.base_url,
         SecretToken::new(first_token.clone()).unwrap(),
     )
@@ -1068,7 +1068,7 @@ async fn cli_review_pack_rejects_another_device_before_creating_a_lease() {
             .unwrap(),
         before
     );
-    assert_no_active_session(&daemon.socket).await;
+    assert_no_active_session(&client).await;
     daemon.stop().await;
 }
 
@@ -1076,7 +1076,7 @@ async fn cli_review_pack_rejects_another_device_before_creating_a_lease() {
 async fn cli_review_pack_resumes_unknown_creation_and_abandons_the_active_lease() {
     let daemon = RunningDaemon::start().await;
     let (device_id, raw_token) = create_device(&daemon.socket).await;
-    let _client = HttpClient::new(
+    let client = HttpClient::new(
         &daemon.base_url,
         SecretToken::new(raw_token.clone()).unwrap(),
     )
@@ -1184,7 +1184,7 @@ async fn cli_review_pack_resumes_unknown_creation_and_abandons_the_active_lease(
             .unwrap()
             .is_none()
     );
-    assert_no_active_session(&daemon.socket).await;
+    assert_no_active_session(&client).await;
     assert_eq!(
         LocalReplica::open(&replica_path, &device_id)
             .unwrap()
@@ -1268,7 +1268,7 @@ async fn cli_review_pack_abandon_releases_a_lease_without_fetching_assets() {
             .status,
         "abandoned"
     );
-    assert_no_active_session(&daemon.socket).await;
+    assert_no_active_session(&client).await;
     daemon.stop().await;
 }
 
@@ -2402,7 +2402,176 @@ async fn bootstrap_replica(
     replica
 }
 
+#[tokio::test]
+async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_back() {
+    let daemon = RunningDaemon::start().await;
+    let (_, token) = create_device(&daemon.socket).await;
+    let (_, read_only_token) = create_device_with_scopes(&daemon.socket, vec!["read".into()]).await;
+    let (_, review_only_token) =
+        create_device_with_scopes(&daemon.socket, vec!["review".into()]).await;
+    let client =
+        HttpClient::new(&daemon.base_url, SecretToken::new(token.clone()).unwrap()).unwrap();
+    let input = DocumentImportRequestV1 {
+        org: include_str!("fixtures/org/no-file-id.org").to_owned(),
+        expected_revision: None,
+    };
+
+    let imported = client
+        .import_document("http-only-doc", &input)
+        .await
+        .unwrap();
+    assert_eq!(imported.document_id, "http-only-doc");
+    assert_eq!(client.document("http-only-doc").await.unwrap().revision, 1);
+
+    let thema_id = create_review_thema(&daemon.base_url, &token).await;
+    assert_eq!(client.legacy_thema(&thema_id).await.unwrap().id, thema_id);
+    client.legacy_due_page(20991231, 10, None).await.unwrap();
+
+    let unauthenticated = raw_http_client()
+        .get(format!("{}/v1/documents/http-only-doc", daemon.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let read_only = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(read_only_token.clone()).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        read_only.import_document("forbidden-doc", &input).await,
+        Err(HttpClientError::Server(error)) if error.status() == 403
+    ));
+    assert!(matches!(
+        read_only.legacy_due_page(20991231, 10, None).await,
+        Err(HttpClientError::Server(error)) if error.status() == 403
+    ));
+
+    let review_only = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(review_only_token.clone()).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        review_only.document("http-only-doc").await,
+        Err(HttpClientError::Server(error)) if error.status() == 403
+    ));
+    assert!(matches!(
+        review_only.legacy_thema(&thema_id).await,
+        Err(HttpClientError::Server(error)) if error.status() == 403
+    ));
+    assert!(matches!(
+        review_only.legacy_due_page(20991231, 10, None).await,
+        Err(HttpClientError::Server(error)) if error.status() == 403
+    ));
+
+    let token_path = daemon._directory.path().join("ordinary.token");
+    write_token(&token_path, &token);
+    let read_only_token_path = daemon._directory.path().join("read-only.token");
+    write_token(&read_only_token_path, &read_only_token);
+    let review_only_token_path = daemon._directory.path().join("review-only.token");
+    write_token(&review_only_token_path, &review_only_token);
+    let socket = daemon.socket.to_str().unwrap();
+    let cli_import = run_cli_with_input(
+        &daemon.base_url,
+        &token_path,
+        &["import-org", "http-only-doc", "--if-revision", "1"],
+        include_bytes!("fixtures/org/no-file-id.org"),
+    )
+    .await;
+    assert!(
+        cli_import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_import.stderr)
+    );
+    for args in [
+        vec!["get-document", "http-only-doc"],
+        vec!["get-thema", thema_id.as_str()],
+        vec!["due-themata", "20991231", "--limit", "10"],
+        vec!["due-page", "20991231", "--limit", "10"],
+    ] {
+        let output = run_cli(&daemon.base_url, &token_path, &args).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for args in [
+        vec!["get-document", "http-only-doc"],
+        vec!["get-thema", thema_id.as_str()],
+        vec!["due-themata", "20991231", "--limit", "10"],
+        vec!["due-page", "20991231", "--limit", "10"],
+    ] {
+        assert!(
+            !run_cli_without_token(&daemon.base_url, &args)
+                .await
+                .status
+                .success()
+        );
+        assert!(
+            !run_cli(&daemon.base_url, &review_only_token_path, &args)
+                .await
+                .status
+                .success()
+        );
+    }
+    assert!(
+        !run_cli_without_token_with_input(
+            &daemon.base_url,
+            &["import-org", "unauthenticated-doc"],
+            include_bytes!("fixtures/org/no-file-id.org"),
+        )
+        .await
+        .status
+        .success()
+    );
+    assert!(
+        !run_cli_with_input(
+            &daemon.base_url,
+            &read_only_token_path,
+            &["import-org", "forbidden-doc"],
+            include_bytes!("fixtures/org/no-file-id.org"),
+        )
+        .await
+        .status
+        .success()
+    );
+    let ordinary_with_socket = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["--socket", socket, "get-document", "http-only-doc"],
+    )
+    .await;
+    assert!(!ordinary_with_socket.status.success());
+    assert!(
+        String::from_utf8_lossy(&ordinary_with_socket.stderr)
+            .contains("--socket is only valid for local operator commands")
+    );
+
+    let operator_without_socket = run_cli(&daemon.base_url, &token_path, &["system-info"]).await;
+    assert!(!operator_without_socket.status.success());
+    let operator = run_cli(
+        &daemon.base_url,
+        &token_path,
+        &["--socket", socket, "system-info"],
+    )
+    .await;
+    assert!(operator.status.success());
+
+    daemon.stop().await;
+}
+
 async fn create_device(socket: &Path) -> (String, String) {
+    create_device_with_scopes(
+        socket,
+        vec!["read".into(), "review".into(), "content:write".into()],
+    )
+    .await
+}
+
+async fn create_device_with_scopes(socket: &Path, scopes: Vec<String>) -> (String, String) {
     let response = request(
         socket,
         &RequestEnvelope {
@@ -2410,7 +2579,7 @@ async fn create_device(socket: &Path) -> (String, String) {
             id: "create-device".into(),
             request: Request::DeviceCreate {
                 name: "client".into(),
-                scopes: vec!["read".into(), "review".into(), "content:write".into()],
+                scopes,
             },
         },
     )
@@ -2584,24 +2753,15 @@ async fn put_review_asset_with_media(
     path
 }
 
-async fn assert_no_active_session(socket: &Path) {
-    let response = request(
-        socket,
-        &RequestEnvelope {
-            version: PROTOCOL_VERSION,
-            id: "active-session".into(),
-            request: Request::ReviewSessionActive {},
-        },
-    )
-    .await
-    .unwrap();
-    let ResponseOutcome::Success { result } = response.outcome else {
-        panic!("active session query failed");
-    };
-    let ResponseResult::ActiveReviewSession(active) = *result else {
-        panic!("unexpected active session response");
-    };
-    assert!(active.session.is_none());
+async fn assert_no_active_session(client: &HttpClient) {
+    assert!(
+        client
+            .active_review_session()
+            .await
+            .unwrap()
+            .session
+            .is_none()
+    );
 }
 
 async fn create_review_thema_with_asset(base_url: &str, token: &str, asset_path: &str) -> String {

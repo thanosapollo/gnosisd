@@ -22,12 +22,6 @@ impl QueryLegacyThema {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct QueryDueThemata {
-    day: u32,
-    limit: u16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DueCursor {
     reviewed: bool,
     next_review_day: u32,
@@ -97,7 +91,12 @@ pub struct QueryDueThemataPage {
 
 impl QueryDueThemataPage {
     pub fn new(day: u32, limit: u16, after: Option<String>) -> Result<Self, LegacyQueryError> {
-        QueryDueThemata::new(day, limit)?;
+        if !valid_day(day) {
+            return Err(LegacyQueryError::Day);
+        }
+        if limit == 0 || limit > MAX_DUE_THEMATA {
+            return Err(LegacyQueryError::Limit);
+        }
         Ok(Self {
             day,
             limit,
@@ -115,26 +114,6 @@ impl QueryDueThemataPage {
 
     pub(crate) const fn after(&self) -> Option<DueCursor> {
         self.after
-    }
-}
-
-impl QueryDueThemata {
-    pub fn new(day: u32, limit: u16) -> Result<Self, LegacyQueryError> {
-        if !valid_day(day) {
-            return Err(LegacyQueryError::Day);
-        }
-        if limit == 0 || limit > MAX_DUE_THEMATA {
-            return Err(LegacyQueryError::Limit);
-        }
-        Ok(Self { day, limit })
-    }
-
-    pub const fn day(self) -> u32 {
-        self.day
-    }
-
-    pub const fn limit(self) -> u16 {
-        self.limit
     }
 }
 
@@ -182,7 +161,7 @@ const fn leap_year(year: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema};
+    use super::{LegacyQueryError, QueryDueThemataPage, QueryLegacyThema};
 
     #[test]
     fn validates_legacy_query_boundaries() {
@@ -191,10 +170,10 @@ mod tests {
             QueryLegacyThema::new(" ").unwrap_err(),
             LegacyQueryError::ThemaId
         );
-        assert!(QueryDueThemata::new(20260229, 1).is_err());
-        assert!(QueryDueThemata::new(20240229, 100).is_ok());
+        assert!(QueryDueThemataPage::new(20260229, 1, None).is_err());
+        assert!(QueryDueThemataPage::new(20240229, 100, None).is_ok());
         assert_eq!(
-            QueryDueThemata::new(20260714, 101).unwrap_err(),
+            QueryDueThemataPage::new(20260714, 101, None).unwrap_err(),
             LegacyQueryError::Limit
         );
     }

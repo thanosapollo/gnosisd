@@ -9,6 +9,16 @@ use crate::application::{
 };
 use crate::domain::ThemaKind;
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Complete Org source for an explicit document projection.
+pub struct DocumentImportRequestV1 {
+    pub org: String,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub expected_revision: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentEntityKindV1 {

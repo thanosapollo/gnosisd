@@ -28,8 +28,8 @@ use crate::{
         OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
         OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
         PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation, PreparedNote,
-        PreparedServerImport, PreparedThema, QueryDueThemata, QueryDueThemataPage, ReplicaChange,
-        ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
+        PreparedServerImport, PreparedThema, QueryDueThemataPage, ReplicaChange, ReplicaState,
+        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
         ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
         ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
         ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
@@ -38,8 +38,7 @@ use crate::{
         validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
-    domain::{ClozeCheck, DocumentId, DueThema, LegacyDatabaseInfo, LegacyThema, ThemaId},
-    is_canonical_sha256,
+    domain::{ClozeCheck, DocumentId, DueThema, LegacyThema, ThemaId},
     store::{
         DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
     },
@@ -93,32 +92,12 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
-    pub(crate) async fn legacy_info(&self) -> Result<Option<LegacyDatabaseInfo>, ServiceError> {
-        request(&self.sender, |response| StoreCommand::LegacyInfo {
-            response,
-        })
-        .await?
-        .map_err(ServiceError::Store)
-    }
-
     pub(crate) async fn get_legacy_thema(
         &self,
         thema_id: ThemaId,
     ) -> Result<Option<LegacyThema>, ServiceError> {
         request(&self.sender, |response| StoreCommand::GetLegacyThema {
             thema_id,
-            response,
-        })
-        .await?
-        .map_err(ServiceError::Store)
-    }
-
-    pub(crate) async fn due_themata(
-        &self,
-        query: QueryDueThemata,
-    ) -> Result<Vec<DueThema>, ServiceError> {
-        request(&self.sender, |response| StoreCommand::DueThemata {
-            query,
             response,
         })
         .await?
@@ -836,22 +815,6 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
-    pub(crate) async fn begin_review_attempt(
-        &self,
-        session_id: String,
-        actor_device_id: Option<String>,
-        started_at_us: u64,
-    ) -> Result<ReviewAttemptView, ServiceError> {
-        request(&self.sender, |response| StoreCommand::BeginReviewAttempt {
-            session_id,
-            actor_device_id,
-            started_at_us,
-            response,
-        })
-        .await?
-        .map_err(ServiceError::Store)
-    }
-
     pub(crate) async fn begin_http_review_attempt(
         &self,
         session_id: String,
@@ -904,27 +867,6 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
-    pub(crate) async fn override_local_review_attempt(
-        &self,
-        attempt_id: String,
-        request_id: String,
-        request_sha256: String,
-        operated_at_us: u64,
-    ) -> Result<ReviewAttemptView, ServiceError> {
-        validate_local_review_replay(&request_id, &request_sha256, operated_at_us)?;
-        request(&self.sender, |response| {
-            StoreCommand::OverrideLocalReviewAttempt {
-                attempt_id,
-                request_id,
-                request_sha256,
-                operated_at_us,
-                response,
-            }
-        })
-        .await?
-        .map_err(ServiceError::Store)
-    }
-
     pub(crate) async fn toggle_attempt_suspension(
         &self,
         attempt_id: String,
@@ -934,27 +876,6 @@ impl ServiceHandle {
             StoreCommand::ToggleAttemptSuspension {
                 attempt_id,
                 actor_device_id,
-                response,
-            }
-        })
-        .await?
-        .map_err(ServiceError::Store)
-    }
-
-    pub(crate) async fn toggle_local_attempt_suspension(
-        &self,
-        attempt_id: String,
-        request_id: String,
-        request_sha256: String,
-        operated_at_us: u64,
-    ) -> Result<ReviewAttemptView, ServiceError> {
-        validate_local_review_replay(&request_id, &request_sha256, operated_at_us)?;
-        request(&self.sender, |response| {
-            StoreCommand::ToggleLocalAttemptSuspension {
-                attempt_id,
-                request_id,
-                request_sha256,
-                operated_at_us,
                 response,
             }
         })
@@ -1306,16 +1227,9 @@ enum StoreCommand {
         document_id: DocumentId,
         response: oneshot::Sender<StoreResult<Option<StoredDocument>>>,
     },
-    LegacyInfo {
-        response: oneshot::Sender<StoreResult<Option<LegacyDatabaseInfo>>>,
-    },
     GetLegacyThema {
         thema_id: ThemaId,
         response: oneshot::Sender<StoreResult<Option<LegacyThema>>>,
-    },
-    DueThemata {
-        query: QueryDueThemata,
-        response: oneshot::Sender<StoreResult<Vec<DueThema>>>,
     },
     DueThemataPage {
         query: QueryDueThemataPage,
@@ -1557,12 +1471,6 @@ enum StoreCommand {
         ended_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewSessionView>>,
     },
-    BeginReviewAttempt {
-        session_id: String,
-        actor_device_id: Option<String>,
-        started_at_us: u64,
-        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
-    },
     BeginHttpReviewAttempt {
         session_id: String,
         actor_device_id: Option<String>,
@@ -1581,23 +1489,9 @@ enum StoreCommand {
         actor_device_id: Option<String>,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
-    OverrideLocalReviewAttempt {
-        attempt_id: String,
-        request_id: String,
-        request_sha256: String,
-        operated_at_us: u64,
-        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
-    },
     ToggleAttemptSuspension {
         attempt_id: String,
         actor_device_id: Option<String>,
-        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
-    },
-    ToggleLocalAttemptSuspension {
-        attempt_id: String,
-        request_id: String,
-        request_sha256: String,
-        operated_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
     },
     ReviewAttemptState {
@@ -1921,14 +1815,9 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             document_id,
             response,
         } => send(response, store.get_document(&document_id)),
-        StoreCommand::LegacyInfo { response } => send(response, store.legacy_database_info()),
         StoreCommand::GetLegacyThema { thema_id, response } => {
             send(response, store.get_legacy_thema(&thema_id))
         }
-        StoreCommand::DueThemata { query, response } => send(
-            response,
-            store.due_legacy_themata(query.day(), query.limit()),
-        ),
         StoreCommand::DueThemataPage { query, response } => run_due_page(store, query, response),
         StoreCommand::ReplaceNote {
             prepared,
@@ -2273,15 +2162,6 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             response,
             store.stop_review_session(&session_id, actor_device_id.as_deref(), abort, ended_at_us),
         ),
-        StoreCommand::BeginReviewAttempt {
-            session_id,
-            actor_device_id,
-            started_at_us,
-            response,
-        } => send(
-            response,
-            store.begin_review_attempt(&session_id, actor_device_id.as_deref(), started_at_us),
-        ),
         StoreCommand::BeginHttpReviewAttempt {
             session_id,
             actor_device_id,
@@ -2314,22 +2194,6 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             response,
             store.override_review_attempt(&attempt_id, actor_device_id.as_deref()),
         ),
-        StoreCommand::OverrideLocalReviewAttempt {
-            attempt_id,
-            request_id,
-            request_sha256,
-            operated_at_us,
-            response,
-        } => send(
-            response,
-            store.override_local_review_attempt(
-                &attempt_id,
-                None,
-                &request_id,
-                &request_sha256,
-                operated_at_us,
-            ),
-        ),
         StoreCommand::ToggleAttemptSuspension {
             attempt_id,
             actor_device_id,
@@ -2337,22 +2201,6 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         } => send(
             response,
             store.toggle_attempt_suspension(&attempt_id, actor_device_id.as_deref()),
-        ),
-        StoreCommand::ToggleLocalAttemptSuspension {
-            attempt_id,
-            request_id,
-            request_sha256,
-            operated_at_us,
-            response,
-        } => send(
-            response,
-            store.toggle_local_attempt_suspension(
-                &attempt_id,
-                None,
-                &request_id,
-                &request_sha256,
-                operated_at_us,
-            ),
         ),
         StoreCommand::ReviewAttemptState {
             attempt_id,
@@ -2552,8 +2400,7 @@ pub(crate) enum ServiceError {
     Corrupt,
     #[error("asset digest does not match its canonical path")]
     AssetDigest,
-    #[error("local review replay identity is invalid")]
-    InvalidReviewReplay,
+
     #[error("blob metadata is invalid")]
     InvalidBlobMetadata,
     #[error("blob operation failed")]
@@ -2568,22 +2415,6 @@ pub(crate) enum ServiceError {
     Settings(#[source] SettingsError),
     #[error("backup operation failed")]
     Backup(#[source] BackupError),
-}
-
-fn validate_local_review_replay(
-    request_id: &str,
-    request_sha256: &str,
-    operated_at_us: u64,
-) -> Result<(), ServiceError> {
-    if request_id.is_empty()
-        || request_id.len() > 128
-        || !is_canonical_sha256(request_sha256)
-        || operated_at_us == 0
-    {
-        Err(ServiceError::InvalidReviewReplay)
-    } else {
-        Ok(())
-    }
 }
 
 fn validate_blob_metadata(bytes: &[u8], media_type: &str) -> Result<(), ServiceError> {
@@ -3214,7 +3045,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unix_imports_enter_the_replica_feed_without_changing_the_response() {
+    async fn document_imports_enter_the_replica_feed_without_changing_the_response() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = runtime(&directory).await;
         let service = runtime.handle();

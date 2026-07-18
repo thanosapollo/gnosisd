@@ -39,7 +39,7 @@ pub(crate) use device_mutation::{
     prepare_device_document_mutation, prepare_device_document_rename,
     prepare_device_document_tombstone,
 };
-pub use import_document::{ApplicationError, ImportDocument, ImportSummary, PreparedImport};
+pub use import_document::{ApplicationError, ImportDocument, ImportSummary};
 pub(crate) use import_document::{PreparedServerImport, summarize_import};
 pub(crate) use offline_asset::{
     AssetReconciliationStatus, AuthoritativeAsset, MAX_OFFLINE_ASSET_BYTES,
@@ -52,7 +52,7 @@ pub(crate) use offline_content::{
 };
 pub use query_document::QueryDocument;
 pub(crate) use query_legacy::DueCursor;
-pub use query_legacy::{LegacyQueryError, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema};
+pub use query_legacy::{LegacyQueryError, QueryDueThemataPage, QueryLegacyThema};
 pub(crate) use review::{
     AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
     FsrsModelSnapshot, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,

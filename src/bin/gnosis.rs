@@ -27,7 +27,10 @@ use gnosis_core::{
             OfflineReviewResultPageV1, OfflineReviewResultV1, ReviewPackAcquireRequestV1,
             ReviewPackCurrentV1, ReviewPackReceiptV1, valid_client_operation_id,
         },
-        http_v1::{OfflineAnswerV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1},
+        http_v1::{
+            DocumentImportRequestV1, OfflineAnswerV1, SetAcceptedSuccessRequestV1,
+            SetSuspensionRequestV1,
+        },
         request,
     },
 };
@@ -64,7 +67,6 @@ enum Command {
         command: ReviewPackCommand,
     },
     SystemInfo,
-    LegacyInfo,
     ImportOrg {
         document_id: String,
         #[arg(long, value_name = "N")]
@@ -225,8 +227,10 @@ enum CliError {
     Sync(Box<ReplicaSyncError>),
     #[error(transparent)]
     ReviewPack(Box<ReviewPackAcquisitionError>),
-    #[error("--socket is required for this local operator or compatibility command")]
+    #[error("--socket is required for this local operator command")]
     MissingSocket,
+    #[error("--socket is only valid for local operator commands")]
+    SocketReservedForOperator,
     #[error("--token-file is required for this HTTP command")]
     MissingTokenFile,
     #[error("could not read Gnosis device token file")]
@@ -342,7 +346,7 @@ fn client_failure(error: &CliError) -> ClientFailureV1 {
         | CliError::ClientInputTooLarge
         | CliError::DecodeClientInput(_)
         | CliError::InvalidClientInput => local_failure(ClientFailureCodeV1::Input),
-        CliError::Client(_) | CliError::MissingSocket => {
+        CliError::Client(_) | CliError::MissingSocket | CliError::SocketReservedForOperator => {
             local_failure(ClientFailureCodeV1::Protocol)
         }
         CliError::Encode(_) | CliError::WriteOutput(_) => {
@@ -452,6 +456,9 @@ fn print_client_error(error: &CliError) {
 }
 
 async fn run(cli: Cli) -> Result<(), RunError> {
+    if cli.socket.is_some() && !cli.command.is_operator() {
+        return Err(CliError::SocketReservedForOperator.into());
+    }
     match cli.command {
         Command::Sync { replica } => run_http_sync(&cli.http_url, cli.token_file, replica).await,
         Command::ReviewPack { command } => {
@@ -492,8 +499,83 @@ async fn run(cli: Cli) -> Result<(), RunError> {
             )
             .await
         }
-        command => run_socket(cli.socket, command).await,
+        Command::ImportOrg {
+            document_id,
+            if_revision,
+        } => run_http_import(&cli.http_url, cli.token_file, document_id, if_revision).await,
+        Command::GetDocument { document_id } => {
+            let client = http_client(&cli.http_url, cli.token_file)?;
+            write_json(
+                &client
+                    .document(&document_id)
+                    .await
+                    .map_err(CliError::from)?,
+            )
+            .map_err(Into::into)
+        }
+        Command::GetThema { thema_id } => {
+            let client = http_client(&cli.http_url, cli.token_file)?;
+            write_json(
+                &client
+                    .legacy_thema(&thema_id)
+                    .await
+                    .map_err(CliError::from)?,
+            )
+            .map_err(Into::into)
+        }
+        Command::DueThemata { day, limit } => {
+            let client = http_client(&cli.http_url, cli.token_file)?;
+            let page = client
+                .legacy_due_page(day, limit, None)
+                .await
+                .map_err(CliError::from)?;
+            write_json(&page.items).map_err(Into::into)
+        }
+        Command::DuePage { day, limit, after } => {
+            let client = http_client(&cli.http_url, cli.token_file)?;
+            let page = client
+                .legacy_due_page(day, limit, after.as_deref())
+                .await
+                .map_err(CliError::from)?;
+            write_json(&page).map_err(Into::into)
+        }
+        command @ (Command::SystemInfo
+        | Command::DeviceCreate { .. }
+        | Command::DeviceList
+        | Command::DeviceRevoke { .. }
+        | Command::Admin { .. }) => run_socket(cli.socket, command).await,
     }
+}
+
+impl Command {
+    const fn is_operator(&self) -> bool {
+        matches!(
+            self,
+            Self::SystemInfo
+                | Self::DeviceCreate { .. }
+                | Self::DeviceList
+                | Self::DeviceRevoke { .. }
+                | Self::Admin { .. }
+        )
+    }
+}
+
+async fn run_http_import(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    document_id: String,
+    expected_revision: Option<u64>,
+) -> Result<(), RunError> {
+    let client = http_client(base_url, token_file)?;
+    let input = DocumentImportRequestV1 {
+        org: read_org()?,
+        expected_revision,
+    };
+    let result = client
+        .import_document(&document_id, &input)
+        .await
+        .map_err(CliError::from)?;
+    write_json(&result).map_err(Into::into)
 }
 
 async fn run_http_sync(
@@ -889,20 +971,12 @@ fn command_request(command: Command) -> Result<Request, CliError> {
         Command::Sync { .. } => unreachable!("HTTP command reached socket"),
         Command::ReviewPack { .. } => unreachable!("HTTP command reached socket"),
         Command::SystemInfo => Ok(Request::SystemInfo {}),
-        Command::LegacyInfo => Ok(Request::LegacyInfo {}),
-        Command::ImportOrg {
-            document_id,
-            if_revision,
-        } => Ok(Request::DocumentImport {
-            document_id,
-            org: read_org()?,
-            expected_revision: if_revision,
-        }),
-        Command::GetDocument { document_id } => Ok(Request::DocumentGet { document_id }),
-        Command::GetThema { thema_id } => Ok(Request::ThemaGet { thema_id }),
-        Command::DueThemata { day, limit } => Ok(Request::ReviewDue { day, limit }),
-        Command::DuePage { day, limit, after } => Ok(Request::ReviewDuePage { day, limit, after }),
-        Command::ReviewAttemptState { .. }
+        Command::ImportOrg { .. }
+        | Command::GetDocument { .. }
+        | Command::GetThema { .. }
+        | Command::DueThemata { .. }
+        | Command::DuePage { .. }
+        | Command::ReviewAttemptState { .. }
         | Command::ReviewAttemptSetAccepted { .. }
         | Command::ReviewAttemptSetSuspended { .. } => unreachable!("HTTP command reached socket"),
         Command::DeviceCreate { name, scopes } => Ok(Request::DeviceCreate { name, scopes }),
@@ -988,19 +1062,6 @@ where
 fn write_result(result: &ResponseResult) -> Result<(), CliError> {
     match result {
         ResponseResult::SystemInfo(value) => write_json(value),
-        ResponseResult::DocumentImported(value) => write_json(value),
-        ResponseResult::Document(value) => write_json(value),
-        ResponseResult::LegacyInfo(value) => write_json(value),
-        ResponseResult::Thema(value) => write_json(value),
-        ResponseResult::DueThemata(value) => write_json(value),
-        ResponseResult::DuePage(value) => write_json(value),
-        ResponseResult::ReviewSession(value) => write_json(value),
-        ResponseResult::ActiveReviewSession(value) => write_json(value),
-        ResponseResult::ReviewAttempt(value) => write_json(value),
-        ResponseResult::ReviewAttemptStateV2(value) => write_json(value),
-        ResponseResult::ReviewAttemptMutationV2(value) => write_json(value),
-        ResponseResult::ReviewEvent(value) => write_json(value),
-        ResponseResult::AssetChunk(value) => write_json(value),
         ResponseResult::DeviceCreated(value) => write_json(value),
         ResponseResult::Devices(value) => write_json(value),
         ResponseResult::Device(value) => write_json(value),

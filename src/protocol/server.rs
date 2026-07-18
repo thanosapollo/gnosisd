@@ -7,8 +7,6 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
     net::{TcpListener, UnixListener, UnixStream},
@@ -18,19 +16,11 @@ use tokio::{
 };
 
 use crate::{
-    application::{
-        ApplicationError, DueCursor, ImportDocument, ImportSummary, LegacyQueryError,
-        PreparedImport, QueryDocument, QueryDueThemata, QueryDueThemataPage, QueryLegacyThema,
-        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptOperationStatus, ReviewOperationAuthority, generate_device,
-    },
+    application::{ApplicationError, generate_device},
     protocol::{
-        ActiveReviewSessionView, AssetChunkView, BackupView, BackupsPrunedView, DeviceCreatedView,
-        DeviceView, DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult,
-        LegacyInfoView, LocalReviewAttemptMutationV2, LocalReviewAttemptStateV2,
-        LocalReviewAttemptView, LocalReviewSessionView, MessageValidationError, PROTOCOL_VERSION,
-        ProtocolError, Request, RequestEnvelope, ResponseEnvelope, ResponseResult,
-        ReviewAnswerInput, ReviewEventView, ReviewSourceInput, SystemInfo, ThemaView, frame,
+        BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, ErrorCode,
+        MessageValidationError, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
+        ResponseEnvelope, ResponseResult, SystemInfo, frame,
     },
     service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError},
     store::StoreError,
@@ -222,96 +212,11 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
     if let Err(error) = request.validate() {
         return validation_response(id, error);
     }
-    let request_sha256 = match request_sha256(&request.request) {
-        Ok(value) => value,
-        Err(error) => return ResponseEnvelope::error(id, error),
-    };
     let result = match request.request {
         Request::SystemInfo {} => Ok(ResponseResult::SystemInfo(SystemInfo {
             protocol_version: PROTOCOL_VERSION,
         })),
-        Request::DocumentImport {
-            document_id,
-            org,
-            expected_revision,
-        } => import_document(state, document_id, org, expected_revision).await,
-        Request::DocumentGet { document_id } => get_document(state, document_id).await,
-        Request::LegacyInfo {} => legacy_info(state).await,
-        Request::ThemaGet { thema_id } => get_thema(state, thema_id).await,
-        Request::ReviewDue { day, limit } => due_themata(state, day, limit).await,
-        Request::ReviewDuePage { day, limit, after } => {
-            due_themata_page(state, day, limit, after).await
-        }
-        Request::ReviewSessionCreate {
-            source,
-            target_count,
-        } => create_review_session(state, source, target_count).await,
-        Request::ReviewSessionActive {} => active_review_session(state).await,
-        Request::ReviewSessionResume { session_id } => {
-            resume_review_session(state, session_id).await
-        }
-        Request::ReviewSessionQuit { session_id } => {
-            stop_review_session(state, session_id, false).await
-        }
-        Request::ReviewSessionAbort { session_id } => {
-            stop_review_session(state, session_id, true).await
-        }
-        Request::ReviewAttemptBegin { session_id } => begin_review_attempt(state, session_id).await,
-        Request::ReviewAttemptAnswer {
-            attempt_id,
-            response,
-        } => answer_review_attempt(state, attempt_id, response).await,
-        Request::ReviewAttemptOverride { attempt_id } => {
-            override_review_attempt(state, attempt_id, id.clone(), request_sha256.clone()).await
-        }
-        Request::ReviewAttemptSuspensionToggle { attempt_id } => {
-            toggle_review_suspension(state, attempt_id, id.clone(), request_sha256.clone()).await
-        }
-        Request::ReviewAttemptStateV2 { attempt_id } => {
-            review_attempt_state_v2(state, attempt_id).await
-        }
-        Request::ReviewAttemptAcceptanceSetV2 {
-            operation_version,
-            operation_id,
-            attempt_id,
-            expected_attempt_revision,
-            accepted_success,
-        } => {
-            apply_review_attempt_operation_v2(
-                state,
-                operation_version,
-                operation_id,
-                attempt_id,
-                expected_attempt_revision,
-                ReviewAttemptMutation::AcceptedSuccess(accepted_success),
-            )
-            .await
-        }
-        Request::ReviewAttemptSuspensionSetV2 {
-            operation_version,
-            operation_id,
-            attempt_id,
-            expected_attempt_revision,
-            desired_suspended,
-        } => {
-            apply_review_attempt_operation_v2(
-                state,
-                operation_version,
-                operation_id,
-                attempt_id,
-                expected_attempt_revision,
-                ReviewAttemptMutation::Suspension(desired_suspended),
-            )
-            .await
-        }
-        Request::ReviewAttemptCommit { attempt_id } => {
-            commit_review_attempt(state, attempt_id).await
-        }
-        Request::AssetChunk {
-            logical_path,
-            offset,
-            limit,
-        } => asset_chunk(state, logical_path, offset, limit).await,
+
         Request::DeviceCreate { name, scopes } => create_device(state, name, scopes).await,
         Request::DeviceList {} => list_devices(state).await,
         Request::DeviceRevoke { device_id } => revoke_device(state, device_id).await,
@@ -338,363 +243,6 @@ fn bounded_success(id: String, result: ResponseResult) -> ResponseEnvelope {
             ProtocolError::new(ErrorCode::Internal, "response exceeds protocol limit"),
         ),
     }
-}
-
-async fn asset_chunk(
-    state: ServerState,
-    logical_path: String,
-    offset: u64,
-    limit: u32,
-) -> Result<ResponseResult, ProtocolError> {
-    let (head, bytes) = state
-        .store
-        .asset(logical_path.clone())
-        .await
-        .map_err(actor_error)?
-        .ok_or_else(asset_not_found)?;
-    let total_size = u64::try_from(bytes.len()).map_err(|_| internal_error())?;
-    let start = usize::try_from(offset).map_err(|_| invalid_asset_offset())?;
-    if start > bytes.len() {
-        return Err(invalid_asset_offset());
-    }
-    let limit = usize::try_from(limit).map_err(|_| invalid_asset_offset())?;
-    let end = start.saturating_add(limit).min(bytes.len());
-    let content_sha256 = head.blob_sha256.ok_or_else(internal_error)?;
-    Ok(ResponseResult::AssetChunk(AssetChunkView {
-        logical_path,
-        content_sha256,
-        total_size,
-        offset,
-        chunk_base64: STANDARD.encode(&bytes[start..end]),
-        eof: end == bytes.len(),
-    }))
-}
-
-async fn legacy_info(state: ServerState) -> Result<ResponseResult, ProtocolError> {
-    let info = state.store.legacy_info().await.map_err(actor_error)?;
-    Ok(ResponseResult::LegacyInfo(LegacyInfoView::from(info)))
-}
-
-async fn get_thema(state: ServerState, thema_id: String) -> Result<ResponseResult, ProtocolError> {
-    let query = QueryLegacyThema::new(thema_id).map_err(invalid_legacy_query)?;
-    let thema = state
-        .store
-        .get_legacy_thema(query.thema_id().clone())
-        .await
-        .map_err(actor_error)?
-        .ok_or_else(thema_not_found)?;
-    Ok(ResponseResult::Thema(ThemaView::from(thema)))
-}
-
-async fn due_themata(
-    state: ServerState,
-    day: u32,
-    limit: u16,
-) -> Result<ResponseResult, ProtocolError> {
-    let query = QueryDueThemata::new(day, limit).map_err(invalid_legacy_query)?;
-    let themata = state.store.due_themata(query).await.map_err(actor_error)?;
-    Ok(ResponseResult::DueThemata(
-        themata.into_iter().map(DueThemaView::from).collect(),
-    ))
-}
-
-async fn due_themata_page(
-    state: ServerState,
-    day: u32,
-    limit: u16,
-    after: Option<String>,
-) -> Result<ResponseResult, ProtocolError> {
-    let query = QueryDueThemataPage::new(day, limit, after).map_err(invalid_legacy_query)?;
-    let mut themata = state
-        .store
-        .due_themata_page(query)
-        .await
-        .map_err(actor_error)?;
-    let next = if themata.len() > usize::from(limit) {
-        themata.truncate(usize::from(limit));
-        Some(
-            DueCursor::after(themata.last().ok_or_else(internal_error)?)
-                .map_err(|_| internal_error())?
-                .encode(),
-        )
-    } else {
-        None
-    };
-    Ok(ResponseResult::DuePage(DuePageView::new(themata, next)))
-}
-
-async fn create_review_session(
-    state: ServerState,
-    source: ReviewSourceInput,
-    target_count: Option<u32>,
-) -> Result<ResponseResult, ProtocolError> {
-    let source = source.try_into().map_err(|_| invalid_review())?;
-    let session = state
-        .store
-        .create_review_session(source, target_count, None, review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewSession(LocalReviewSessionView::from(
-        session,
-    )))
-}
-
-async fn active_review_session(state: ServerState) -> Result<ResponseResult, ProtocolError> {
-    let session = state
-        .store
-        .active_review_session(None)
-        .await
-        .map_err(actor_error)?
-        .map(LocalReviewSessionView::from);
-    Ok(ResponseResult::ActiveReviewSession(
-        ActiveReviewSessionView { session },
-    ))
-}
-
-async fn resume_review_session(
-    state: ServerState,
-    session_id: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let session = state
-        .store
-        .resume_review_session(session_id, None)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewSession(LocalReviewSessionView::from(
-        session,
-    )))
-}
-
-async fn stop_review_session(
-    state: ServerState,
-    session_id: String,
-    abort: bool,
-) -> Result<ResponseResult, ProtocolError> {
-    let session = state
-        .store
-        .stop_review_session(session_id, None, abort, review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewSession(LocalReviewSessionView::from(
-        session,
-    )))
-}
-
-async fn begin_review_attempt(
-    state: ServerState,
-    session_id: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let attempt = state
-        .store
-        .begin_review_attempt(session_id, None, review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(Box::new(
-        LocalReviewAttemptView::from(attempt),
-    )))
-}
-
-async fn answer_review_attempt(
-    state: ServerState,
-    attempt_id: String,
-    response: ReviewAnswerInput,
-) -> Result<ResponseResult, ProtocolError> {
-    let attempt = state
-        .store
-        .grade_review_attempt(attempt_id, None, response.into(), review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(Box::new(
-        LocalReviewAttemptView::from(attempt),
-    )))
-}
-
-async fn override_review_attempt(
-    state: ServerState,
-    attempt_id: String,
-    request_id: String,
-    request_sha256: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let attempt = state
-        .store
-        .override_local_review_attempt(attempt_id, request_id, request_sha256, review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(Box::new(
-        LocalReviewAttemptView::from(attempt),
-    )))
-}
-
-async fn toggle_review_suspension(
-    state: ServerState,
-    attempt_id: String,
-    request_id: String,
-    request_sha256: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let attempt = state
-        .store
-        .toggle_local_attempt_suspension(attempt_id, request_id, request_sha256, review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttempt(Box::new(
-        LocalReviewAttemptView::from(attempt),
-    )))
-}
-
-async fn review_attempt_state_v2(
-    state: ServerState,
-    attempt_id: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let attempt = state
-        .store
-        .review_attempt_state(attempt_id, None)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewAttemptStateV2(Box::new(
-        LocalReviewAttemptStateV2::from(attempt),
-    )))
-}
-
-async fn apply_review_attempt_operation_v2(
-    state: ServerState,
-    operation_version: u32,
-    operation_id: String,
-    attempt_id: String,
-    expected_attempt_revision: u64,
-    mutation: ReviewAttemptMutation,
-) -> Result<ResponseResult, ProtocolError> {
-    let operation = ReviewAttemptOperation::new(
-        operation_version,
-        operation_id,
-        attempt_id,
-        expected_attempt_revision,
-        mutation,
-    )
-    .map_err(|_| invalid_review())?;
-    let result = state
-        .store
-        .apply_review_attempt_operation(
-            operation,
-            ReviewOperationAuthority::Local,
-            review_now_us()?,
-        )
-        .await
-        .map_err(attempt_operation_error)?;
-    desired_review_operation_result(result)
-}
-
-fn desired_review_operation_result(
-    result: ReviewAttemptOperationResult,
-) -> Result<ResponseResult, ProtocolError> {
-    match result.status {
-        ReviewAttemptOperationStatus::Accepted => Ok(ResponseResult::ReviewAttemptMutationV2(
-            Box::new(LocalReviewAttemptMutationV2::from(result)),
-        )),
-        ReviewAttemptOperationStatus::RevisionConflict => Err(ProtocolError::new(
-            ErrorCode::RevisionConflict,
-            "review attempt revision changed",
-        )),
-        ReviewAttemptOperationStatus::StaleAttempt => Err(ProtocolError::new(
-            ErrorCode::StaleAttempt,
-            "thema content or review state changed",
-        )),
-        ReviewAttemptOperationStatus::StateConflict => Err(ProtocolError::new(
-            ErrorCode::ReviewStateConflict,
-            "review attempt is not mutable",
-        )),
-    }
-}
-
-fn attempt_operation_error(error: ServiceError) -> ProtocolError {
-    match error {
-        ServiceError::Store(StoreError::IdempotencyConflict) => ProtocolError::new(
-            ErrorCode::IdempotencyConflict,
-            "operation identity was reused with different content",
-        ),
-        other => actor_error(other),
-    }
-}
-
-async fn commit_review_attempt(
-    state: ServerState,
-    attempt_id: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let event_id = state
-        .store
-        .commit_review_attempt(attempt_id, None, review_now_us()?)
-        .await
-        .map_err(actor_error)?;
-    Ok(ResponseResult::ReviewEvent(ReviewEventView { event_id }))
-}
-
-async fn import_document(
-    state: ServerState,
-    document_id: String,
-    org: String,
-    expected_revision: Option<u64>,
-) -> Result<ResponseResult, ProtocolError> {
-    let command =
-        ImportDocument::new(document_id, org, expected_revision).map_err(|_| invalid_document())?;
-    let prepared = tokio::task::spawn_blocking(move || command.prepare_server())
-        .await
-        .map_err(|_| internal_error())?
-        .map_err(|_| invalid_document())?;
-    let prepared = tokio::task::spawn_blocking(move || {
-        validate_response_size(&prepared.prepared)?;
-        Ok::<_, ProtocolError>(prepared)
-    })
-    .await
-    .map_err(|_| internal_error())??;
-    let summary = state.store.replace(prepared).await.map_err(actor_error)?;
-    Ok(ResponseResult::DocumentImported(import_result(summary)))
-}
-
-fn validate_response_size(prepared: &PreparedImport) -> Result<(), ProtocolError> {
-    let view = DocumentView::from_projection(&prepared.document_id, u64::MAX, &prepared.projection);
-    let response = ResponseEnvelope::success(
-        "x".repeat(crate::protocol::MAX_REQUEST_ID_LEN),
-        ResponseResult::Document(view),
-    );
-    let size = serde_json::to_vec(&response)
-        .map_err(|_| internal_error())?
-        .len();
-    if size > crate::protocol::MAX_FRAME_SIZE {
-        Err(ProtocolError::new(
-            ErrorCode::InvalidDocument,
-            "document projection exceeds protocol limit",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn import_result(summary: ImportSummary) -> ImportResult {
-    ImportResult {
-        document_id: summary.document_id.to_string(),
-        revision: summary.revision,
-        content_sha256: summary.content_sha256,
-        node_count: summary.node_count,
-        occurrence_count: summary.occurrence_count,
-        semantic_edge_count: summary.semantic_edge_count,
-    }
-}
-
-async fn get_document(
-    state: ServerState,
-    document_id: String,
-) -> Result<ResponseResult, ProtocolError> {
-    let query = QueryDocument::new(document_id).map_err(|_| invalid_document())?;
-    let stored = state
-        .store
-        .get(query.document_id().clone())
-        .await
-        .map_err(actor_error)?;
-    let stored = stored.ok_or_else(not_found)?;
-    Ok(ResponseResult::Document(DocumentView::from_projection(
-        stored.document_id(),
-        stored.revision(),
-        stored.projection(),
-    )))
 }
 
 async fn create_device(
@@ -829,15 +377,6 @@ fn now_us() -> Result<i64, ProtocolError> {
     i64::try_from(micros).map_err(|_| internal_error())
 }
 
-fn review_now_us() -> Result<u64, ProtocolError> {
-    u64::try_from(now_us()?).map_err(|_| internal_error())
-}
-
-fn request_sha256(request: &Request) -> Result<String, ProtocolError> {
-    let bytes = serde_json::to_vec(request).map_err(|_| internal_error())?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
 fn malformed_admin() -> ProtocolError {
     ProtocolError::new(ErrorCode::MalformedRequest, "invalid device operation")
 }
@@ -851,12 +390,6 @@ fn validation_response(id: String, error: MessageValidationError) -> ResponseEnv
         MessageValidationError::InvalidRequestId => {
             ProtocolError::new(ErrorCode::MalformedRequest, "invalid request ID")
         }
-        MessageValidationError::InvalidReviewRequest => {
-            ProtocolError::new(ErrorCode::MalformedRequest, "invalid review request")
-        }
-        MessageValidationError::InvalidAssetChunk => {
-            ProtocolError::new(ErrorCode::MalformedRequest, "invalid asset chunk request")
-        }
     };
     ResponseEnvelope::error(id, error)
 }
@@ -868,34 +401,6 @@ fn malformed_response(id: String) -> ResponseEnvelope {
     )
 }
 
-fn invalid_document() -> ProtocolError {
-    ProtocolError::new(ErrorCode::InvalidDocument, "invalid document")
-}
-
-fn not_found() -> ProtocolError {
-    ProtocolError::new(ErrorCode::NotFound, "document not found")
-}
-
-fn thema_not_found() -> ProtocolError {
-    ProtocolError::new(ErrorCode::NotFound, "thema not found")
-}
-
-fn asset_not_found() -> ProtocolError {
-    ProtocolError::new(ErrorCode::NotFound, "managed asset not found")
-}
-
-fn invalid_asset_offset() -> ProtocolError {
-    ProtocolError::new(ErrorCode::MalformedRequest, "invalid asset offset")
-}
-
-fn invalid_legacy_query(_error: LegacyQueryError) -> ProtocolError {
-    ProtocolError::new(ErrorCode::MalformedRequest, "invalid legacy query")
-}
-
-fn invalid_review() -> ProtocolError {
-    ProtocolError::new(ErrorCode::MalformedRequest, "invalid review request")
-}
-
 fn internal_error() -> ProtocolError {
     ProtocolError::new(ErrorCode::Internal, "internal daemon failure")
 }
@@ -903,10 +408,7 @@ fn internal_error() -> ProtocolError {
 fn actor_error(error: ServiceError) -> ProtocolError {
     match error {
         ServiceError::Busy => ProtocolError::new(ErrorCode::Busy, "daemon is busy"),
-        ServiceError::InvalidReviewReplay => ProtocolError::new(
-            ErrorCode::MalformedRequest,
-            "invalid review replay identity",
-        ),
+
         ServiceError::Application(error) => actor_application_error(error),
         ServiceError::Store(error) => actor_store_error(error),
         ServiceError::Stopped
@@ -1157,7 +659,7 @@ mod tests {
     };
     use crate::{
         application::ApplicationError,
-        protocol::{DueThemaView, ErrorCode, ResponseOutcome, ResponseResult},
+        protocol::{DeviceView, ErrorCode, ResponseOutcome, ResponseResult},
         service::ServiceError,
         store::StoreError,
     };
@@ -1203,14 +705,13 @@ mod tests {
     fn oversized_success_becomes_stable_protocol_error() {
         let response = bounded_success(
             "large-response".into(),
-            ResponseResult::DueThemata(vec![DueThemaView {
-                id: "thema".into(),
-                kind: "basic".into(),
-                keimenon: "x".repeat(crate::protocol::MAX_FRAME_SIZE),
-                hypothesis: Vec::new(),
-                answer: Vec::new(),
-                next_review_day: 20260714,
-                review_count: 0,
+            ResponseResult::Devices(vec![DeviceView {
+                device_id: "device".into(),
+                name: "x".repeat(crate::protocol::MAX_FRAME_SIZE),
+                scopes: Vec::new(),
+                created_at_us: 0,
+                last_used_at_us: None,
+                revoked_at_us: None,
             }]),
         );
         let ResponseOutcome::Failure { error } = response.outcome else {

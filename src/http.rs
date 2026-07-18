@@ -26,8 +26,9 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 
 use crate::{
     application::{
-        ApplicationError, DevicePrincipal, DeviceScope, MAX_OFFLINE_ASSET_BYTES,
-        PreparedDeviceDocumentLifecycleMutation, PreparedNote, ReviewAttemptMutation,
+        ApplicationError, DevicePrincipal, DeviceScope, DueCursor, ImportDocument, ImportSummary,
+        LegacyQueryError, MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation,
+        PreparedNote, QueryDocument, QueryDueThemataPage, QueryLegacyThema, ReviewAttemptMutation,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
         ReviewHistoryQuery, ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord,
         canonical_asset_path, prepare_asset, prepare_device_document_mutation,
@@ -37,28 +38,28 @@ use crate::{
     domain::DocumentId,
     is_canonical_sha256,
     protocol::{
-        MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
-        OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
-        OfflineReviewWireError, ReplicaWireError, active_review_pack_response, decode_cursor,
-        decode_snapshot_cursor,
+        DocumentView, DuePageView, ImportResult, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
+        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
+        OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
+        ThemaView, active_review_pack_response, decode_cursor, decode_snapshot_cursor,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
             ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DeviceIdentityV1,
-            DocumentHeadV1, DocumentMutationResultV1, DocumentRevisionPageV1,
-            DocumentRevisionSummaryV1, NodePageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
-            OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
-            OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
-            OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
-            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
-            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
-            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
-            ReviewHistoryPageV1, ReviewPackEnvelopeV2, ReviewQueueSummaryRequestV1,
-            ReviewQueueSummaryV1, ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
-            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-            ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
-            valid_bearer_token,
+            DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
+            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1,
+            OfflineAssetResultEnvelopeV1, OfflineContentOperationEnvelopeV1,
+            OfflineContentResultEnvelopeV1, OfflineReviewOperationEnvelopeV1,
+            OfflineReviewResultEnvelopeV2, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
+            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
+            ReviewClozeCheckV1, ReviewCommitResponseV1, ReviewHistoryPageV1, ReviewPackEnvelopeV2,
+            ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionModeV1,
+            ReviewSessionPageV1, ReviewSessionRequestV1, ReviewSessionStatusV1,
+            ReviewSessionSummaryV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
+            SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaReviewStateV1,
+            ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_response, offline_content_capabilities,
         offline_content_result_response, offline_result_response, replica_change_page,
@@ -164,6 +165,12 @@ where
 fn data_router() -> Router<HttpState> {
     Router::new()
         .route("/v1/dashboard", get(dashboard))
+        .route(
+            "/v1/documents/{id}",
+            get(get_document_projection).put(import_document_projection),
+        )
+        .route("/v1/legacy-themata/{id}", get(get_legacy_thema))
+        .route("/v1/legacy-review/due", get(legacy_due_page))
         .route("/v1/changes", get(changes))
         .route("/v1/sync/identity", get(device_identity))
         .route("/v1/sync/state", get(replica_state))
@@ -353,6 +360,107 @@ async fn dashboard(
     Ok(Json(
         DashboardV1::from_application(&summary).map_err(|_| ApiError::internal())?,
     ))
+}
+
+async fn import_document_projection(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<DocumentImportRequestV1>,
+) -> Result<Json<ImportResult>, ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    let prepared = ImportDocument::new(id, input.org, input.expected_revision)
+        .and_then(ImportDocument::prepare_server)
+        .map_err(ApiError::application)?;
+    let summary = state
+        .service
+        .replace(prepared)
+        .await
+        .map_err(ApiError::service)?;
+    announce(&state).await;
+    Ok(Json(import_result(summary)))
+}
+
+async fn get_document_projection(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+) -> Result<Json<DocumentView>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let query = QueryDocument::new(id).map_err(ApiError::application)?;
+    let document = state
+        .service
+        .get(query.document_id().clone())
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(DocumentView::from_projection(
+        document.document_id(),
+        document.revision(),
+        document.projection(),
+    )))
+}
+
+async fn get_legacy_thema(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+) -> Result<Json<ThemaView>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let query = QueryLegacyThema::new(id)
+        .map_err(|_error: LegacyQueryError| ApiError::bad_request("invalid thema ID"))?;
+    let thema = state
+        .service
+        .get_legacy_thema(query.thema_id().clone())
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(thema.into()))
+}
+
+#[derive(Deserialize)]
+struct LegacyDueQuery {
+    day: u32,
+    limit: Option<u16>,
+    after: Option<String>,
+}
+
+async fn legacy_due_page(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(input): Query<LegacyDueQuery>,
+) -> Result<Json<DuePageView>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    require(&principal, DeviceScope::Review)?;
+    let limit = input.limit.unwrap_or(100);
+    let query = QueryDueThemataPage::new(input.day, limit, input.after)
+        .map_err(|_| ApiError::bad_request("invalid due-page query"))?;
+    let due = state
+        .service
+        .due_themata_page(query)
+        .await
+        .map_err(ApiError::service)?;
+    let next = if due.len() == usize::from(limit) {
+        due.last()
+            .map(DueCursor::after)
+            .transpose()
+            .map_err(|_| ApiError::internal())?
+            .map(DueCursor::encode)
+    } else {
+        None
+    };
+    Ok(Json(DuePageView::new(due, next)))
+}
+
+fn import_result(summary: ImportSummary) -> ImportResult {
+    ImportResult {
+        document_id: summary.document_id.to_string(),
+        revision: summary.revision,
+        content_sha256: summary.content_sha256,
+        node_count: summary.node_count,
+        occurrence_count: summary.occurrence_count,
+        semantic_edge_count: summary.semantic_edge_count,
+    }
 }
 
 async fn changes(
@@ -2026,9 +2134,7 @@ impl ApiError {
                 "server is busy",
             ),
             ServiceError::AssetDigest => Self::bad_request("asset digest does not match content"),
-            ServiceError::InvalidReviewReplay => {
-                Self::bad_request("review replay identity is invalid")
-            }
+
             ServiceError::InvalidBlobMetadata => Self::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 ApiErrorCodeV1::InvalidBlobMetadata,
@@ -2286,6 +2392,9 @@ fn openapi_content_operation(path: &str, method: &str) -> Option<Value> {
             contract.error_statuses,
         ),
     );
+    if path == "/v1/legacy-review/due" {
+        operation["x-gnosis-required-scopes"] = json!(["read", "review"]);
+    }
     if let Some(body) = content_request_body(path, method, contract.request) {
         operation["requestBody"] = body;
     }
@@ -2328,6 +2437,36 @@ fn json_contract(
 
 fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract> {
     match (path, method) {
+        ("/v1/documents/{id}", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "DocumentView",
+            &["400", "401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/documents/{id}", "put") => Some(json_contract(
+            "content:write",
+            Some("DocumentImportRequestV1"),
+            "200",
+            "ImportResult",
+            &[
+                "400", "401", "403", "408", "412", "413", "422", "500", "503",
+            ],
+        )),
+        ("/v1/legacy-themata/{id}", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "ThemaView",
+            &["400", "401", "403", "404", "408", "500", "503"],
+        )),
+        ("/v1/legacy-review/due", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "DuePageView",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
         ("/v1/content/offline-operations", "post") => Some(json_contract(
             "content:write",
             Some("OfflineContentOperationEnvelopeV1"),
@@ -3049,6 +3188,10 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<NodeV1>();
     generator.subschema_for::<SettingsV1>();
     generator.subschema_for::<DashboardV1>();
+    generator.subschema_for::<DocumentView>();
+    generator.subschema_for::<ImportResult>();
+    generator.subschema_for::<ThemaView>();
+    generator.subschema_for::<DuePageView>();
     generator.subschema_for::<ReviewSessionPageV1>();
     generator.subschema_for::<ReviewSessionSummaryV1>();
     generator.subschema_for::<ReviewHistoryPageV1>();
@@ -3072,6 +3215,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
 
     let mut requests = openapi_schema_settings().for_deserialize().into_generator();
     requests.subschema_for::<NoteWriteRequestV1>();
+    requests.subschema_for::<DocumentImportRequestV1>();
     requests.subschema_for::<NoteRenameRequestV1>();
     requests.subschema_for::<ThemaWriteRequestV1>();
     requests.subschema_for::<UpdateSettingsRequestV1>();
@@ -3153,6 +3297,10 @@ fn openapi_error_response() -> Value {
 
 const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/dashboard", "get"),
+    ("/v1/documents/{id}", "get"),
+    ("/v1/documents/{id}", "put"),
+    ("/v1/legacy-themata/{id}", "get"),
+    ("/v1/legacy-review/due", "get"),
     ("/v1/changes", "get"),
     ("/v1/sync/identity", "get"),
     ("/v1/sync/state", "get"),
@@ -3226,7 +3374,7 @@ mod tests {
         body::{Body, to_bytes},
         http::{HeaderMap, Request, StatusCode},
     };
-    use rusqlite::Connection;
+
     use serde_json::{Value, json};
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt;
@@ -3278,13 +3426,7 @@ mod tests {
             "review response is invalid",
             None,
         );
-        assert_api_error(
-            ServiceError::InvalidReviewReplay,
-            StatusCode::BAD_REQUEST,
-            ApiErrorCodeV1::InvalidRequest,
-            "review replay identity is invalid",
-            None,
-        );
+
         assert_api_error(
             ServiceError::Application(ApplicationError::Conflict {
                 expected: 7,
@@ -5378,7 +5520,7 @@ mod tests {
             .unwrap();
         let session_id = session.session_id;
         let attempt = service
-            .begin_review_attempt(session_id.clone(), Some(device_id.to_owned()), attempt_time)
+            .begin_http_review_attempt(session_id.clone(), Some(device_id.to_owned()), attempt_time)
             .await
             .unwrap();
         (session_id, attempt.attempt_id)
@@ -6999,151 +7141,6 @@ mod tests {
         drop(app);
         drop(service);
         runtime.finish().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn unsafe_local_attempt_rejects_http_mutations_without_state_changes() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("gnosis.sqlite");
-        let runtime = ServiceRuntime::start(database.clone(), directory.path().join("blobs"), 8)
-            .await
-            .unwrap();
-        let service = runtime.handle();
-        let device = generate_device("reviewer".into(), vec!["review".into()]).unwrap();
-        let token = device.token.clone();
-        let device_id = device.device_id.clone();
-        service.create_device(device, 1).await.unwrap();
-        put_custom_review_thema(
-            &service,
-            "unsafe-local",
-            "basic",
-            "The answer is secret",
-            vec![],
-            vec!["secret".into()],
-            None,
-        )
-        .await;
-        let session = service
-            .create_review_session(
-                manual_source("unsafe-local"),
-                Some(1),
-                Some(device_id.clone()),
-                2,
-            )
-            .await
-            .unwrap();
-        let attempt = service
-            .begin_review_attempt(session.session_id.clone(), None, 3)
-            .await
-            .unwrap();
-        let before = service
-            .review_attempt_state(attempt.attempt_id.clone(), None)
-            .await
-            .unwrap();
-        let app = router(service.clone());
-
-        assert_unsafe_attempt_mutations_are_rejected(&app, &token, &attempt.attempt_id).await;
-
-        let after = service
-            .review_attempt_state(attempt.attempt_id, None)
-            .await
-            .unwrap();
-        assert_eq!(after, before);
-        assert_eq!(
-            service
-                .active_review_session(Some(device_id))
-                .await
-                .unwrap(),
-            Some(session)
-        );
-        drop(app);
-        drop(service);
-        runtime.finish().await.unwrap();
-        assert_no_committed_review_history(&database);
-    }
-
-    fn manual_source(thema_id: &str) -> ReviewSource {
-        ReviewSource {
-            kind: ReviewSourceKind::Manual,
-            tags: vec![],
-            exclude_tags: vec![],
-            topic_node_id: None,
-            topic_forward_depth: None,
-            topic_backward_depth: None,
-            manual_ids: vec![thema_id.into()],
-        }
-    }
-
-    async fn assert_unsafe_attempt_mutations_are_rejected(
-        app: &axum::Router,
-        token: &str,
-        attempt_id: &str,
-    ) {
-        let state = app
-            .clone()
-            .oneshot(authorized(
-                "GET",
-                &format!("/v1/review/attempts/{attempt_id}"),
-                token,
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        assert_invalid_review_presentation(state).await;
-        let requests = [
-            ("POST", "answer", json!({"kind":"text","value":"secret"})),
-            ("POST", "cloze-check", json!({"inputs":["secret"]})),
-            ("POST", "override", json!(null)),
-            ("POST", "suspension", json!(null)),
-            (
-                "PUT",
-                "suspension",
-                json!({"version":1,"operation_id":"unsafe-suspension",
-                    "expected_attempt_revision":0,"desired_suspended":true}),
-            ),
-            (
-                "PUT",
-                "accepted-success",
-                json!({"version":1,"operation_id":"unsafe-accepted",
-                    "expected_attempt_revision":0,"accepted_success":true}),
-            ),
-            ("POST", "commit", json!(null)),
-        ];
-        for (method, action, body) in requests {
-            let response = app
-                .clone()
-                .oneshot(authorized(
-                    method,
-                    &format!("/v1/review/attempts/{attempt_id}/{action}"),
-                    token,
-                    Body::from(serde_json::to_vec(&body).unwrap()),
-                ))
-                .await
-                .unwrap();
-            assert_invalid_review_presentation(response).await;
-        }
-    }
-
-    async fn assert_invalid_review_presentation(response: axum::response::Response) {
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response_json(response).await;
-        assert_eq!(body["error"]["code"], "invalid_request");
-        assert_eq!(
-            body["error"]["message"],
-            "review attempt presentation is invalid"
-        );
-    }
-
-    fn assert_no_committed_review_history(database: &std::path::Path) {
-        let connection = Connection::open(database).unwrap();
-        for (table, expected) in [("review_event", 0), ("review_state_revision", 1)] {
-            let count: u64 = connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(count, expected, "unexpected row in {table}");
-        }
     }
 
     #[test]

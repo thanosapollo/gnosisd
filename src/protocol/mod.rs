@@ -12,15 +12,10 @@ mod server;
 pub use client::{ClientError, request};
 pub(crate) use message::MessageValidationError;
 pub use message::{
-    ActiveReviewSessionView, AssetChunkView, BackupView, BackupsPrunedView, DeviceCreatedView,
-    DeviceView, DocumentView, DuePageView, DueThemaView, ErrorCode, ImportResult, LegacyInfoView,
-    LinkOccurrenceView, LocalFsrsConfigView, LocalPresentationView, LocalReviewAttemptMutationV2,
-    LocalReviewAttemptStateV2, LocalReviewAttemptView, LocalReviewSessionView,
-    LocalReviewStateView, LocalTransitionView, MAX_ASSET_CHUNK_BYTES, MAX_FRAME_SIZE,
-    MAX_REQUEST_ID_LEN, MAX_REVIEW_ID_LEN, NodeEdgeView, NodeView, PROTOCOL_VERSION, ProtocolError,
-    Request, RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewAnswerInput,
-    ReviewEventView, ReviewSourceInput, ReviewSourceKindInput, ReviewStateView, SystemInfo,
-    ThemaView,
+    BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, DocumentView, DuePageView,
+    DueThemaView, ErrorCode, ImportResult, LinkOccurrenceView, MAX_FRAME_SIZE, MAX_REQUEST_ID_LEN,
+    NodeEdgeView, NodeView, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
+    ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewStateView, SystemInfo, ThemaView,
 };
 #[cfg(test)]
 pub(crate) use offline_asset::offline_asset_result_json;
