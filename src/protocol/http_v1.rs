@@ -1184,12 +1184,23 @@ impl JsonSchema for ApiErrorBodyV1 {
 
 fn error_metadata_matches(code: ApiErrorCodeV1, meta: Option<&ApiErrorMetaV1>) -> bool {
     match code {
-        ApiErrorCodeV1::SnapshotRequired => matches!(meta, Some(ApiErrorMetaV1::Snapshot { .. })),
+        ApiErrorCodeV1::SnapshotRequired => matches!(
+            meta,
+            Some(ApiErrorMetaV1::Snapshot { snapshot_url })
+                if snapshot_url == "/v1/sync/snapshot"
+        ),
         ApiErrorCodeV1::RevisionConflict => matches!(meta, Some(ApiErrorMetaV1::Revision { .. })),
         ApiErrorCodeV1::DeviceSequenceGap => {
             matches!(meta, Some(ApiErrorMetaV1::DeviceSequence { .. }))
         }
-        ApiErrorCodeV1::BlobRequired => matches!(meta, Some(ApiErrorMetaV1::Blob { .. })),
+        ApiErrorCodeV1::BlobRequired => matches!(
+            meta,
+            Some(ApiErrorMetaV1::Blob {
+                content_sha256,
+                upload_url,
+            }) if crate::is_canonical_sha256(content_sha256)
+                && upload_url == &format!("/v1/sync/blobs/{content_sha256}")
+        ),
         _ => meta.is_none(),
     }
 }
@@ -1308,6 +1319,7 @@ mod error_schema {
     struct BlobErrorMetaSchemaV1 {
         #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
         content_sha256: String,
+        #[schemars(regex(pattern = "^/v1/sync/blobs/[0-9a-f]{64}$"))]
         upload_url: String,
     }
 }

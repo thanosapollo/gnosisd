@@ -7,7 +7,7 @@
 //! failure, or invalid response after dispatch has unknown delivery: callers
 //! must retain the durable outbox item and retry its same operation identity.
 
-use std::{fmt, net::IpAddr, time::Duration};
+use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
 
 use chrono::NaiveDate;
 use reqwest::{
@@ -279,7 +279,7 @@ impl HttpClient {
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
                 content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
-                revision: 1,
+                prior_revision: None,
             },
         )
         .await
@@ -292,6 +292,7 @@ impl HttpClient {
         expected_revision: u64,
         input: &NoteWriteRequestV1,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        validate_document_mutation_request(document_id, Some(expected_revision))?;
         require_operation_id(operation_id)?;
         let body = encode_document_mutation(input)?;
         let url = self.document_mutation_endpoint(document_id)?;
@@ -309,11 +310,9 @@ impl HttpClient {
             DocumentMutationExpectation {
                 document_id: Some(document_id.to_owned()),
                 active: true,
-                logical_path: None,
+                logical_path: Some(input.logical_path.clone()),
                 content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
-                revision: expected_revision
-                    .checked_add(1)
-                    .ok_or(HttpClientError::InvalidMutation)?,
+                prior_revision: Some(expected_revision),
             },
         )
         .await
@@ -326,6 +325,7 @@ impl HttpClient {
         expected_revision: u64,
         input: &NoteRenameRequestV1,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        validate_document_mutation_request(document_id, Some(expected_revision))?;
         require_operation_id(operation_id)?;
         let body = encode_document_mutation(input)?;
         let url = self.document_mutation_action_endpoint(document_id, "rename")?;
@@ -345,9 +345,7 @@ impl HttpClient {
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
                 content_sha256: None,
-                revision: expected_revision
-                    .checked_add(1)
-                    .ok_or(HttpClientError::InvalidMutation)?,
+                prior_revision: Some(expected_revision),
             },
         )
         .await
@@ -359,6 +357,7 @@ impl HttpClient {
         operation_id: &str,
         expected_revision: u64,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
+        validate_document_mutation_request(document_id, Some(expected_revision))?;
         require_operation_id(operation_id)?;
         let url = self.document_mutation_endpoint(document_id)?;
         let request = self
@@ -375,9 +374,7 @@ impl HttpClient {
                 active: false,
                 logical_path: None,
                 content_sha256: None,
-                revision: expected_revision
-                    .checked_add(1)
-                    .ok_or(HttpClientError::InvalidMutation)?,
+                prior_revision: Some(expected_revision),
             },
         )
         .await
@@ -414,7 +411,7 @@ impl HttpClient {
         operation_id: &str,
         input: &DocumentImportRequestV1,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
-        DocumentId::new(document_id).map_err(|_| HttpClientError::InvalidMutation)?;
+        validate_document_mutation_request(document_id, input.expected_revision)?;
         require_operation_id(operation_id)?;
         let url = self.resource_endpoint("v1/documents", document_id)?;
         let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
@@ -436,10 +433,7 @@ impl HttpClient {
                 active: true,
                 logical_path: None,
                 content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
-                revision: input
-                    .expected_revision
-                    .map_or(Some(1), |revision| revision.checked_add(1))
-                    .ok_or(HttpClientError::InvalidMutation)?,
+                prior_revision: input.expected_revision,
             },
         )
         .await
@@ -475,7 +469,7 @@ impl HttpClient {
         if year == 0
             || NaiveDate::from_ymd_opt(year, month, day_of_month).is_none()
             || !(1..=100).contains(&limit)
-            || after.is_some_and(str::is_empty)
+            || after.is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_DUE_CURSOR_BYTES)
         {
             return Err(HttpClientError::InvalidMutation);
         }
@@ -885,6 +879,8 @@ fn validate_document_view(
         || DocumentId::new(document.document_id.clone()).is_err()
         || !canonical_hex(&document.content_sha256, 64)
         || !canonical_hex(&document.compatibility_sha1, 40)
+        || !all_unique(&document.file_tags)
+        || document.nodes.iter().any(|node| !all_unique(&node.tags))
     {
         return Err(invalid_response());
     }
@@ -946,6 +942,11 @@ fn validate_document_view(
         return Err(invalid_response());
     }
     Ok(())
+}
+
+fn all_unique(values: &[String]) -> bool {
+    let mut seen = HashSet::with_capacity(values.len());
+    values.iter().all(|value| seen.insert(value.as_str()))
 }
 
 fn validate_due_page(page: &DuePageView, limit: u16) -> Result<(), HttpClientError> {
@@ -1039,6 +1040,17 @@ fn require_operation_id(operation_id: &str) -> Result<(), HttpClientError> {
     valid_operation_id(operation_id)
         .then_some(())
         .ok_or(HttpClientError::InvalidOperationId)
+}
+
+fn validate_document_mutation_request(
+    document_id: &str,
+    expected_revision: Option<u64>,
+) -> Result<(), HttpClientError> {
+    DocumentId::new(document_id).map_err(|_| HttpClientError::InvalidMutation)?;
+    expected_revision
+        .is_none_or(|revision| i64::try_from(revision).is_ok())
+        .then_some(())
+        .ok_or(HttpClientError::InvalidMutation)
 }
 
 fn encode_document_mutation(input: &impl Serialize) -> Result<Vec<u8>, HttpClientError> {
@@ -1255,7 +1267,7 @@ struct DocumentMutationExpectation {
     active: bool,
     logical_path: Option<String>,
     content_sha256: Option<String>,
-    revision: u64,
+    prior_revision: Option<u64>,
 }
 
 fn validate_document_mutation_result(
@@ -1269,11 +1281,11 @@ fn validate_document_mutation_result(
             operation_id,
             authoritative,
             cursor,
-            ..
+            changed,
         } => {
             *format_version == 1
                 && operation_id == expected_operation_id
-                && validate_document_head(authoritative, expectation)
+                && validate_document_head(authoritative, expectation, *changed)
                 && valid_result_cursor(cursor)
         }
         DocumentMutationResultV1::Rejected {
@@ -1292,7 +1304,14 @@ fn validate_document_mutation_result(
 fn validate_document_head(
     head: &crate::protocol::http_v1::DocumentHeadV1,
     expectation: &DocumentMutationExpectation,
+    changed: bool,
 ) -> bool {
+    let expected_revision = match (expectation.prior_revision, changed) {
+        (None, true) => Some(1),
+        (Some(revision), true) => revision.checked_add(1),
+        (Some(revision), false) => Some(revision),
+        (None, false) => None,
+    };
     expectation
         .document_id
         .as_deref()
@@ -1303,7 +1322,7 @@ fn validate_document_head(
             .logical_path
             .as_deref()
             .is_none_or(|expected| head.logical_path == expected)
-        && head.revision == expectation.revision
+        && expected_revision == Some(head.revision)
         && head.active == expectation.active
         && match (
             head.content_sha256.as_deref(),
@@ -1349,7 +1368,16 @@ fn validate_thema(thema: &ThemaV1, expected_id: &str) -> bool {
         thema.asset_paths.clone(),
         None,
     )
-    .is_ok_and(|prepared| prepared.content_sha256 == thema.content_sha256)
+    .is_ok_and(|prepared| {
+        prepared.content_sha256 == thema.content_sha256
+            && prepared.tags == thema.tags
+            && prepared
+                .node_ids
+                .iter()
+                .map(NodeId::as_str)
+                .eq(thema.node_ids.iter().map(String::as_str))
+            && prepared.asset_paths == thema.asset_paths
+    })
 }
 
 fn valid_result_cursor(cursor: &str) -> bool {
@@ -1723,7 +1751,7 @@ mod tests {
             active: true,
             logical_path: Some("note.org".into()),
             content_sha256: Some(digest.clone()),
-            revision: 1,
+            prior_revision: None,
         };
         let mut head = crate::protocol::http_v1::DocumentHeadV1 {
             document_id: "document".into(),
@@ -1732,7 +1760,7 @@ mod tests {
             content_sha256: Some(digest),
             active: true,
         };
-        assert!(validate_document_head(&head, &expectation));
+        assert!(validate_document_head(&head, &expectation, true));
         let mutation = DocumentMutationResultV1::Applied {
             format_version: 1,
             operation_id: "operation".into(),
@@ -1745,17 +1773,23 @@ mod tests {
             "operation",
             &expectation
         ));
-        head.logical_path = "../note.org".into();
-        assert!(!validate_document_head(&head, &expectation));
-        head.logical_path = "note.org".into();
+        assert!(!validate_document_head(&head, &expectation, false));
+        let update_expectation = DocumentMutationExpectation {
+            prior_revision: Some(1),
+            ..expectation
+        };
+        assert!(validate_document_head(&head, &update_expectation, false));
         head.revision = 2;
-        assert!(!validate_document_head(&head, &expectation));
+        assert!(validate_document_head(&head, &update_expectation, true));
+        head.logical_path = "../note.org".into();
+        assert!(!validate_document_head(&head, &update_expectation, true));
+        head.logical_path = "note.org".into();
         head.revision = 1;
         head.content_sha256 = Some("b".repeat(64));
-        assert!(!validate_document_head(&head, &expectation));
-        head.content_sha256 = expectation.content_sha256.clone();
+        assert!(!validate_document_head(&head, &update_expectation, false));
+        head.content_sha256 = update_expectation.content_sha256.clone();
         head.active = false;
-        assert!(!validate_document_head(&head, &expectation));
+        assert!(!validate_document_head(&head, &update_expectation, false));
 
         let content = thema_content(
             "basic",
@@ -1767,8 +1801,15 @@ mod tests {
             None,
         )
         .unwrap();
-        let prepared =
-            prepare_thema(Some("thema".into()), content, vec![], vec![], vec![], None).unwrap();
+        let prepared = prepare_thema(
+            Some("thema".into()),
+            content.clone(),
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
         let mut thema = ThemaV1 {
             thema_id: "thema".into(),
             revision: 1,
@@ -1791,6 +1832,19 @@ mod tests {
         thema.revision = 1;
         thema.asset_paths.push("../asset".into());
         assert!(!validate_thema(&thema, "thema"));
+        thema.asset_paths.clear();
+        let duplicate_tags = prepare_thema(
+            Some("thema".into()),
+            content,
+            vec!["tag".into(), "tag".into()],
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        thema.tags = vec!["tag".into(), "tag".into()];
+        thema.content_sha256 = duplicate_tags.content_sha256;
+        assert!(!validate_thema(&thema, "thema"));
     }
 
     #[test]
@@ -1809,6 +1863,9 @@ mod tests {
         for incomplete in [
             br#"{"error":{"code":"internal","message":"failure"}}"#.as_slice(),
             br#"{"error":{"code":"revision_conflict","message":"conflict","meta":{"expected_revision":1}}}"#.as_slice(),
+            br#"{"error":{"code":"snapshot_required","message":"snapshot","meta":{"snapshot_url":"/wrong"}}}"#.as_slice(),
+            br#"{"error":{"code":"blob_required","message":"blob","meta":{"content_sha256":"not-a-digest","upload_url":"/v1/sync/blobs/not-a-digest"}}}"#.as_slice(),
+            br#"{"error":{"code":"blob_required","message":"blob","meta":{"content_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","upload_url":"/wrong"}}}"#.as_slice(),
         ] {
             assert!(matches!(
                 server_error::<()>(StatusCode::INTERNAL_SERVER_ERROR, incomplete).unwrap_err(),
@@ -1872,6 +1929,62 @@ mod tests {
             client.due_page(101, 1, None).await,
             client.due_page(20_260_718, 0, None).await,
             client.due_page(20_260_718, 1, Some("")).await,
+            client
+                .due_page(20_260_718, 1, Some(&"c".repeat(MAX_DUE_CURSOR_BYTES + 1)))
+                .await,
+        ] {
+            let error = result.unwrap_err();
+            assert!(matches!(error, HttpClientError::InvalidMutation));
+            assert_eq!(error.delivery(), DeliveryStatus::NotSent);
+        }
+
+        assert!(matches!(
+            client
+                .due_page(20_260_718, 1, Some(&"c".repeat(MAX_DUE_CURSOR_BYTES)),)
+                .await,
+            Err(HttpClientError::Transport { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_document_mutations_are_not_sent() {
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
+        let note = NoteWriteRequestV1 {
+            logical_path: "note.org".into(),
+            org: "* Note".into(),
+        };
+        let rename = NoteRenameRequestV1 {
+            logical_path: "renamed.org".into(),
+        };
+        let invalid_id = "x".repeat(129);
+        for result in [
+            client
+                .replace_note(&invalid_id, "operation", 1, &note)
+                .await,
+            client
+                .rename_note(&invalid_id, "operation", 1, &rename)
+                .await,
+            client.tombstone_note(&invalid_id, "operation", 1).await,
+            client
+                .replace_note("document", "operation", u64::MAX, &note)
+                .await,
+            client
+                .rename_note("document", "operation", u64::MAX, &rename)
+                .await,
+            client
+                .tombstone_note("document", "operation", u64::MAX)
+                .await,
+            client
+                .import_document(
+                    "document",
+                    "operation",
+                    &DocumentImportRequestV1 {
+                        org: "* Note".into(),
+                        expected_revision: Some(u64::MAX),
+                    },
+                )
+                .await,
         ] {
             let error = result.unwrap_err();
             assert!(matches!(error, HttpClientError::InvalidMutation));

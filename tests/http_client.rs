@@ -1381,8 +1381,10 @@ async fn projection_clients_reject_non_strict_responses() {
         .as_object_mut()
         .unwrap()
         .remove("file_node_id");
+    let mut document_duplicate_tags = document.clone();
+    document_duplicate_tags["file_tags"] = json!(["tag", "tag"]);
     document["unexpected"] = json!(true);
-    for response in [document, document_missing] {
+    for response in [document, document_missing, document_duplicate_tags] {
         let raw = spawn_json_server(response).await;
         let client = HttpClient::new(&raw.base_url, token()).unwrap();
         assert!(matches!(
@@ -1912,6 +1914,23 @@ async fn client_replaces_documents_against_an_explicit_base_revision() {
         panic!("expected applied document mutation");
     };
     assert_eq!(authoritative.revision, 2);
+    let unchanged = client
+        .replace_note(
+            &authoritative.document_id,
+            "unchanged-document",
+            authoritative.revision,
+            &replacement,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unchanged,
+        DocumentMutationResultV1::Applied {
+            changed: false,
+            authoritative: ref head,
+            ..
+        } if head.revision == 2
+    ));
 
     let stale = client
         .replace_note(
@@ -1974,6 +1993,23 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
         panic!("expected applied rename");
     };
     assert_eq!(authoritative.logical_path, "renamed.org");
+    let unchanged_rename = client
+        .rename_note(
+            &authoritative.document_id,
+            "unchanged-rename",
+            authoritative.revision,
+            &rename,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unchanged_rename,
+        DocumentMutationResultV1::Applied {
+            changed: false,
+            authoritative: ref head,
+            ..
+        } if head.revision == authoritative.revision
+    ));
 
     let deleted = client
         .tombstone_note(
@@ -1996,6 +2032,22 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
         panic!("expected applied tombstone");
     };
     assert!(!authoritative.active);
+    let unchanged_tombstone = client
+        .tombstone_note(
+            &authoritative.document_id,
+            "unchanged-tombstone",
+            authoritative.revision,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unchanged_tombstone,
+        DocumentMutationResultV1::Applied {
+            changed: false,
+            authoritative: ref head,
+            ..
+        } if head.revision == authoritative.revision
+    ));
     daemon.stop().await;
 }
 
@@ -2685,6 +2737,25 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         .await
         .unwrap();
     assert_eq!(retry, imported);
+    let unchanged_import = client
+        .import_document(
+            "http-only-doc",
+            "unchanged-http-only-doc",
+            &DocumentImportRequestV1 {
+                org: input.org.clone(),
+                expected_revision: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        unchanged_import,
+        DocumentMutationResultV1::Applied {
+            changed: false,
+            authoritative: ref head,
+            ..
+        } if head.revision == 1
+    ));
     client
         .rename_note(
             "http-only-doc",
