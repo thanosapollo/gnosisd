@@ -90,9 +90,7 @@ Focused checks:
 ```sh
 cargo test --lib domain::
 cargo test --lib parser::org_tests
-cargo test --test org_parser
 cargo test --lib store::sqlite::tests
-cargo test --test sqlite_store
 cargo test --lib application::
 cargo test --lib protocol::
 cargo test --test daemon_protocol

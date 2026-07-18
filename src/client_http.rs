@@ -1545,6 +1545,7 @@ mod tests {
 
         for result in [
             client.due_page(0, 1, None).await,
+            client.due_page(101, 1, None).await,
             client.due_page(20_260_718, 0, None).await,
             client.due_page(20_260_718, 1, Some("bad")).await,
         ] {

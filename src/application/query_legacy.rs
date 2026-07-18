@@ -120,7 +120,7 @@ fn valid_day(day: u32) -> bool {
     let year = day / 10_000;
     let month = (day / 100) % 100;
     let day_of_month = day % 100;
-    if !(1..=12).contains(&month) {
+    if year == 0 || !(1..=12).contains(&month) {
         return false;
     }
     (1..=days_in_month(year, month)).contains(&day_of_month)
@@ -145,6 +145,8 @@ mod tests {
 
     #[test]
     fn validates_legacy_query_boundaries() {
+        assert!(QueryDueThemataPage::new(101, 1, None).is_err());
+        assert!(QueryDueThemataPage::new(10101, 1, None).is_ok());
         assert!(QueryDueThemataPage::new(20260229, 1, None).is_err());
         assert!(QueryDueThemataPage::new(20240229, 100, None).is_ok());
         assert_eq!(
