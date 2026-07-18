@@ -21,26 +21,25 @@ impl QueryLegacyThema {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DueCursor {
     reviewed: bool,
     next_review_day: u32,
-    thema_id: i64,
+    thema_id: String,
 }
 
 impl DueCursor {
     fn parse(value: &str) -> Result<Self, LegacyQueryError> {
-        let mut parts = value.split(':');
+        let mut parts = value.splitn(3, ':');
         let reviewed = match parts.next() {
             Some("0") => false,
             Some("1") => true,
             _ => return Err(LegacyQueryError::Cursor),
         };
         let next_review_day = parse_cursor_part(parts.next())?;
-        let thema_id = parse_cursor_part(parts.next())?;
-        if parts.next().is_some() || thema_id <= 0 {
-            return Err(LegacyQueryError::Cursor);
-        }
+        let thema_id = ThemaId::new(parts.next().ok_or(LegacyQueryError::Cursor)?)
+            .map_err(|_| LegacyQueryError::Cursor)?
+            .to_string();
         Ok(Self {
             reviewed,
             next_review_day,
@@ -48,16 +47,16 @@ impl DueCursor {
         })
     }
 
-    pub(crate) const fn reviewed(self) -> bool {
+    pub(crate) const fn reviewed(&self) -> bool {
         self.reviewed
     }
 
-    pub(crate) const fn next_review_day(self) -> u32 {
+    pub(crate) const fn next_review_day(&self) -> u32 {
         self.next_review_day
     }
 
-    pub(crate) const fn thema_id(self) -> i64 {
-        self.thema_id
+    pub(crate) fn thema_id(&self) -> &str {
+        &self.thema_id
     }
 
     pub(crate) fn encode(self) -> String {
@@ -69,16 +68,12 @@ impl DueCursor {
         )
     }
 
-    pub(crate) fn after(thema: &DueThema) -> Result<Self, LegacyQueryError> {
-        Ok(Self {
+    pub(crate) fn after(thema: &DueThema) -> Self {
+        Self {
             reviewed: thema.review_count > 0,
             next_review_day: thema.next_review_day,
-            thema_id: thema
-                .id
-                .as_str()
-                .parse()
-                .map_err(|_| LegacyQueryError::Cursor)?,
-        })
+            thema_id: thema.id.to_string(),
+        }
     }
 }
 
@@ -112,8 +107,8 @@ impl QueryDueThemataPage {
         self.limit
     }
 
-    pub(crate) const fn after(&self) -> Option<DueCursor> {
-        self.after
+    pub(crate) fn after(&self) -> Option<&DueCursor> {
+        self.after.as_ref()
     }
 }
 
@@ -188,7 +183,11 @@ mod tests {
         let cursor = next.after().unwrap();
         assert!(!cursor.reviewed());
         assert_eq!(cursor.next_review_day(), 20260713);
-        assert_eq!(cursor.thema_id(), 73_000_000_000_000);
+        assert_eq!(cursor.thema_id(), "73000000000000");
+
+        let opaque =
+            QueryDueThemataPage::new(20260714, 25, Some("1:20260714:opaque:thema".into())).unwrap();
+        assert_eq!(opaque.after().unwrap().thema_id(), "opaque:thema");
 
         let legacy = QueryDueThemataPage::new(20260714, 25, Some("0:0:1".into())).unwrap();
         assert_eq!(legacy.after().unwrap().next_review_day(), 0);

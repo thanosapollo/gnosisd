@@ -175,7 +175,7 @@ impl SqliteStore {
         &self,
         day: u32,
         limit: u16,
-        after: Option<(bool, u32, i64)>,
+        after: Option<(bool, u32, String)>,
     ) -> Result<Vec<DueThema>, StoreError> {
         load_due_legacy_themata(&self.connection, day, limit, after)
     }
@@ -3457,7 +3457,7 @@ fn load_due_legacy_themata(
     connection: &Connection,
     day: u32,
     limit: u16,
-    after: Option<(bool, u32, i64)>,
+    after: Option<(bool, u32, String)>,
 ) -> Result<Vec<DueThema>, StoreError> {
     let mut statement = connection
         .prepare(LEGACY_DUE_QUERY)
@@ -3498,9 +3498,9 @@ const LEGACY_DUE_QUERY: &str = "SELECT thema.thema_id, thema.kind, thema.keimeno
           OR (state.review_count > 0) > ?2 \
           OR ((state.review_count > 0) = ?2 AND state.next_review_day > ?3) \
           OR ((state.review_count > 0) = ?2 AND state.next_review_day = ?3 \
-              AND CAST(state.thema_id AS INTEGER) > ?4)) \
+              AND state.thema_id > ?4)) \
      ORDER BY (state.review_count > 0), state.next_review_day, \
-              CAST(state.thema_id AS INTEGER) \
+              state.thema_id \
      LIMIT ?5";
 
 fn due_thema_row(

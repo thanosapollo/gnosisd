@@ -2377,7 +2377,7 @@ fn run_due_page(
         (
             cursor.reviewed(),
             cursor.next_review_day(),
-            cursor.thema_id(),
+            cursor.thema_id().to_owned(),
         )
     });
     send(

@@ -2425,7 +2425,35 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
 
     let thema_id = create_review_thema(&daemon.base_url, &token).await;
     assert_eq!(client.legacy_thema(&thema_id).await.unwrap().id, thema_id);
-    client.legacy_due_page(20991231, 10, None).await.unwrap();
+    create_review_thema(&daemon.base_url, &token).await;
+    create_review_thema(&daemon.base_url, &token).await;
+    let due = client.legacy_due_page(20991231, 100, None).await.unwrap();
+    assert!(due.items.len() > 1);
+    assert!(due.items.iter().any(|item| item.id == thema_id));
+    assert!(due.next.is_none());
+
+    let exact = client
+        .legacy_due_page(20991231, due.items.len().try_into().unwrap(), None)
+        .await
+        .unwrap();
+    assert_eq!(exact.items, due.items);
+    assert!(exact.next.is_none());
+
+    let mut paged = Vec::new();
+    let mut after = None;
+    loop {
+        let page = client
+            .legacy_due_page(20991231, 1, after.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        paged.extend(page.items);
+        let Some(next) = page.next else {
+            break;
+        };
+        after = Some(next);
+    }
+    assert_eq!(paged, due.items);
 
     let unauthenticated = raw_http_client()
         .get(format!("{}/v1/documents/http-only-doc", daemon.base_url))
@@ -2563,6 +2591,35 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     daemon.stop().await;
 }
 
+#[tokio::test]
+async fn oversized_http_projection_is_rejected_before_commit() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+
+    let error = client
+        .import_document(
+            "oversized",
+            &DocumentImportRequestV1 {
+                org: deeply_nested_org(),
+                expected_revision: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    let HttpClientError::Server(error) = error else {
+        panic!("unexpected error: {error:?}");
+    };
+    assert_eq!(error.body().error.code(), ApiErrorCodeV1::InvalidContent);
+
+    let missing = client.document("oversized").await.unwrap_err();
+    let HttpClientError::Server(missing) = missing else {
+        panic!("unexpected error: {missing:?}");
+    };
+    assert_eq!(missing.body().error.code(), ApiErrorCodeV1::NotFound);
+    daemon.stop().await;
+}
+
 async fn create_device(socket: &Path) -> (String, String) {
     create_device_with_scopes(
         socket,
@@ -2629,6 +2686,18 @@ fn manual_source(thema_id: String) -> ReviewSourceInputV1 {
 fn write_token(path: &Path, token: &str) {
     fs::write(path, format!("{token}\n")).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn deeply_nested_org() -> String {
+    let mut org = String::from(":PROPERTIES:\n:ID: large-root\n:END:\n#+TITLE: Large\n");
+    for level in 1..=300 {
+        let title = format!("{level}-{}", "x".repeat(200));
+        org.push_str(&format!(
+            "{} {title}\n:PROPERTIES:\n:ID: large-{level}\n:END:\n",
+            "*".repeat(level)
+        ));
+    }
+    org
 }
 
 async fn run_cli(base_url: &str, token_path: &Path, args: &[&str]) -> Output {

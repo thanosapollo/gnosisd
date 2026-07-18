@@ -372,6 +372,19 @@ async fn import_document_projection(
     let prepared = ImportDocument::new(id, input.org, input.expected_revision)
         .and_then(ImportDocument::prepare_server)
         .map_err(ApiError::application)?;
+    let view = DocumentView::from_projection(
+        &prepared.prepared.document_id,
+        u64::MAX,
+        &prepared.prepared.projection,
+    );
+    let projection_size = serde_json::to_vec(&view)
+        .map_err(|_| ApiError::internal())?
+        .len();
+    if projection_size > crate::protocol::MAX_FRAME_SIZE {
+        return Err(ApiError::invalid_content(
+            "document projection is too large",
+        ));
+    }
     let summary = state
         .service
         .replace(prepared)
@@ -440,16 +453,19 @@ async fn legacy_due_page(
         .due_themata_page(query)
         .await
         .map_err(ApiError::service)?;
-    let next = if due.len() == usize::from(limit) {
-        due.last()
+    let page_len = usize::from(limit);
+    let has_more = due.len() > page_len;
+    let next = if has_more {
+        due.get(page_len - 1)
             .map(DueCursor::after)
-            .transpose()
-            .map_err(|_| ApiError::internal())?
             .map(DueCursor::encode)
     } else {
         None
     };
-    Ok(Json(DuePageView::new(due, next)))
+    Ok(Json(DuePageView::new(
+        due.into_iter().take(page_len).collect(),
+        next,
+    )))
 }
 
 fn import_result(summary: ImportSummary) -> ImportResult {
@@ -2808,6 +2824,13 @@ fn idempotency_key_parameter() -> Value {
 }
 
 fn content_query_parameters(path: &str) -> Vec<Value> {
+    if path == "/v1/legacy-review/due" {
+        return vec![
+            json!({"name":"day","in":"query","required":true,"schema":{"type":"integer","format":"uint32","minimum":0}}),
+            json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}}),
+            json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
+        ];
+    }
     let paged = matches!(
         path,
         "/v1/changes"
@@ -3539,6 +3562,24 @@ mod tests {
             assert!(operation["responses"].is_object(), "{method} {path}");
             assert_eq!(operation["security"][0]["bearerAuth"], json!([]));
         }
+    }
+
+    #[test]
+    fn openapi_types_legacy_due_query_exactly() {
+        let api = openapi_document();
+        let operation = &api["paths"]["/v1/legacy-review/due"]["get"];
+        assert_eq!(
+            operation["x-gnosis-required-scopes"],
+            json!(["read", "review"])
+        );
+        assert_eq!(
+            operation["parameters"],
+            json!([
+                {"name":"day","in":"query","required":true,"schema":{"type":"integer","format":"uint32","minimum":0}},
+                {"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}},
+                {"name":"after","in":"query","required":false,"schema":{"type":"string"}}
+            ])
+        );
     }
 
     #[test]
