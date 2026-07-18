@@ -515,18 +515,12 @@ async fn run(cli: Cli) -> Result<(), RunError> {
         }
         Command::GetThema { thema_id } => {
             let client = http_client(&cli.http_url, cli.token_file)?;
-            write_json(
-                &client
-                    .legacy_thema(&thema_id)
-                    .await
-                    .map_err(CliError::from)?,
-            )
-            .map_err(Into::into)
+            write_json(&client.thema(&thema_id).await.map_err(CliError::from)?).map_err(Into::into)
         }
         Command::DueThemata { day, limit } => {
             let client = http_client(&cli.http_url, cli.token_file)?;
             let page = client
-                .legacy_due_page(day, limit, None)
+                .due_page(day, limit, None)
                 .await
                 .map_err(CliError::from)?;
             write_json(&page.items).map_err(Into::into)
@@ -534,7 +528,7 @@ async fn run(cli: Cli) -> Result<(), RunError> {
         Command::DuePage { day, limit, after } => {
             let client = http_client(&cli.http_url, cli.token_file)?;
             let page = client
-                .legacy_due_page(day, limit, after.as_deref())
+                .due_page(day, limit, after.as_deref())
                 .await
                 .map_err(CliError::from)?;
             write_json(&page).map_err(Into::into)
@@ -1037,11 +1031,20 @@ fn utf8_path(path: PathBuf) -> Result<String, CliError> {
 }
 
 fn read_org() -> Result<String, CliError> {
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
+    read_org_from(io::stdin())
+}
+
+fn read_org_from(reader: impl Read) -> Result<String, CliError> {
+    let mut input = Vec::new();
+    reader
+        .take(CLIENT_INPUT_LIMIT + 1)
+        .read_to_end(&mut input)
         .map_err(CliError::ReadInput)?;
-    Ok(input)
+    if input.len() > CLIENT_INPUT_LIMIT as usize {
+        return Err(CliError::ClientInputTooLarge);
+    }
+    String::from_utf8(input)
+        .map_err(|error| CliError::ReadInput(io::Error::new(io::ErrorKind::InvalidData, error)))
 }
 
 fn read_client_input<T>() -> Result<T, CliError>
@@ -1103,11 +1106,23 @@ enum RunError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _};
+    use std::{fs, io::Cursor, os::unix::fs::PermissionsExt as _};
 
     use clap::Parser as _;
 
-    use super::{Cli, CliError, Command, correlation_id, read_device_token};
+    use super::{
+        CLIENT_INPUT_LIMIT, Cli, CliError, Command, correlation_id, read_device_token,
+        read_org_from,
+    };
+
+    #[test]
+    fn org_input_is_bounded() {
+        let input = vec![b'x'; CLIENT_INPUT_LIMIT as usize + 1];
+        assert!(matches!(
+            read_org_from(Cursor::new(input)),
+            Err(CliError::ClientInputTooLarge)
+        ));
+    }
 
     #[test]
     fn http_review_mutation_requires_durable_operation_identity() {

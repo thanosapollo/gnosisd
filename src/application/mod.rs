@@ -52,7 +52,7 @@ pub(crate) use offline_content::{
 };
 pub use query_document::QueryDocument;
 pub(crate) use query_legacy::DueCursor;
-pub use query_legacy::{LegacyQueryError, QueryDueThemataPage, QueryLegacyThema};
+pub(crate) use query_legacy::QueryDueThemataPage;
 pub(crate) use review::{
     AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
     FsrsModelSnapshot, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,

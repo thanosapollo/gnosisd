@@ -8,7 +8,7 @@ use crate::application::{
     ContentCounts, DashboardSummary, ReviewHistoryEvent, ReviewQueueCounts, ReviewQueueSummary,
     ReviewSessionSummary, ReviewTotals, ReviewWindow, ThemaReviewState,
 };
-use crate::domain::ClozeCheck;
+use crate::domain::{ClozeCheck, DocumentId, DocumentProjection, DueThema};
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -330,6 +330,179 @@ impl From<&ThemaReviewState> for ThemaReviewStateV1 {
         Self {
             thema_id: value.thema_id.clone(),
             state: ReviewStateV1::from(&value.state),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DueThemaView {
+    pub id: String,
+    pub kind: String,
+    pub keimenon: String,
+    pub hypothesis: Vec<Option<String>>,
+    pub answer: Vec<String>,
+    pub next_review_day: u32,
+    pub review_count: u64,
+}
+
+impl From<DueThema> for DueThemaView {
+    fn from(thema: DueThema) -> Self {
+        Self {
+            id: thema.id.to_string(),
+            kind: thema.kind,
+            keimenon: thema.keimenon,
+            hypothesis: thema.hypothesis,
+            answer: thema.answer,
+            next_review_day: thema.next_review_day,
+            review_count: thema.review_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DuePageView {
+    pub items: Vec<DueThemaView>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub next: Option<String>,
+}
+
+impl DuePageView {
+    pub(crate) fn new(items: Vec<DueThema>, next: Option<String>) -> Self {
+        Self {
+            items: items.into_iter().map(DueThemaView::from).collect(),
+            next,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportResult {
+    #[schemars(length(min = 1, max = 128))]
+    pub document_id: String,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    #[schemars(length(equal = 64))]
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+    pub node_count: usize,
+    pub occurrence_count: usize,
+    pub semantic_edge_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocumentView {
+    #[schemars(length(min = 1, max = 128))]
+    pub document_id: String,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    pub title: String,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub file_node_id: Option<String>,
+    pub file_tags: Vec<String>,
+    pub nodes: Vec<NodeView>,
+    pub link_occurrences: Vec<LinkOccurrenceView>,
+    pub semantic_edges: Vec<NodeEdgeView>,
+    #[schemars(length(equal = 40))]
+    #[schemars(regex(pattern = "^[0-9a-f]{40}$"))]
+    pub compatibility_sha1: String,
+    #[schemars(length(equal = 64))]
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
+}
+
+impl DocumentView {
+    pub(crate) fn from_projection(
+        document_id: &DocumentId,
+        revision: u64,
+        projection: &DocumentProjection,
+    ) -> Self {
+        Self {
+            document_id: document_id.to_string(),
+            revision,
+            title: projection.title().to_owned(),
+            file_node_id: projection.file_node_id().map(ToString::to_string),
+            file_tags: projection.file_tags().to_vec(),
+            nodes: projection.nodes().iter().map(NodeView::from).collect(),
+            link_occurrences: projection
+                .link_occurrences()
+                .iter()
+                .map(LinkOccurrenceView::from)
+                .collect(),
+            semantic_edges: projection
+                .semantic_edges()
+                .iter()
+                .map(NodeEdgeView::from)
+                .collect(),
+            compatibility_sha1: projection.compatibility_sha1().to_owned(),
+            content_sha256: projection.content_sha256().to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeView {
+    pub id: String,
+    pub title: String,
+    pub title_path: Vec<String>,
+    pub tags: Vec<String>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub parent_id: Option<String>,
+    pub level: u32,
+}
+
+impl From<&crate::domain::Node> for NodeView {
+    fn from(node: &crate::domain::Node) -> Self {
+        Self {
+            id: node.id().to_string(),
+            title: node.title().to_owned(),
+            title_path: node.title_path().parts().to_vec(),
+            tags: node.tags().to_vec(),
+            parent_id: node.parent_id().map(ToString::to_string),
+            level: node.level(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkOccurrenceView {
+    pub owner_id: String,
+    pub target_id: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+impl From<&crate::domain::LinkOccurrence> for LinkOccurrenceView {
+    fn from(occurrence: &crate::domain::LinkOccurrence) -> Self {
+        Self {
+            owner_id: occurrence.owner().to_string(),
+            target_id: occurrence.target().to_string(),
+            start_byte: occurrence.span().start(),
+            end_byte: occurrence.span().end(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeEdgeView {
+    pub source_id: String,
+    pub target_id: String,
+}
+
+impl From<&crate::domain::NodeEdge> for NodeEdgeView {
+    fn from(edge: &crate::domain::NodeEdge) -> Self {
+        Self {
+            source_id: edge.source().to_string(),
+            target_id: edge.target().to_string(),
         }
     }
 }

@@ -10,8 +10,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
-    DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LegacyReviewState,
-    LegacyThema, LinkOccurrence, Node, NodeEdge, NodeId, SourceSpan, ThemaId, TitlePath,
+    DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LinkOccurrence, Node,
+    NodeEdge, NodeId, SourceSpan, ThemaId, TitlePath,
 };
 use crate::{
     application::{
@@ -162,13 +162,6 @@ impl SqliteStore {
         document_id: &DocumentId,
     ) -> Result<Option<StoredDocument>, StoreError> {
         load_document(&self.connection, document_id)
-    }
-
-    pub(crate) fn get_legacy_thema(
-        &self,
-        thema_id: &ThemaId,
-    ) -> Result<Option<LegacyThema>, StoreError> {
-        load_legacy_thema(&self.connection, thema_id)
     }
 
     pub(crate) fn due_legacy_themata_page(
@@ -3287,160 +3280,6 @@ fn application_id(connection: &Connection) -> Result<u32, StoreError> {
         .map_err(StoreError::storage)
 }
 
-fn load_legacy_thema(
-    connection: &Connection,
-    thema_id: &ThemaId,
-) -> Result<Option<LegacyThema>, StoreError> {
-    let row = connection
-        .query_row(LEGACY_THEMA_QUERY, [thema_id.as_str()], legacy_thema_row)
-        .optional()
-        .map_err(StoreError::storage)?;
-    row.map(|row| materialize_legacy_thema(connection, row))
-        .transpose()
-}
-
-const LEGACY_THEMA_QUERY: &str = "SELECT thema.thema_id, thema.kind, thema.keimenon, \
-     thema.hypothesis_json, thema.answer_json, thema.source_guid, thema.archived_at_us, \
-     thema.parathema, thema.review_image, \
-     state.state_revision, state.review_count, state.last_reviewed_at_us, \
-     state.last_review_day, state.next_review_day, state.interval_days, \
-     state.total_successes, state.total_failures, state.suspended, \
-     state.stability, state.difficulty \
-     FROM thema \
-     JOIN review_state AS state ON state.thema_id = thema.thema_id \
-     WHERE thema.thema_id = ?1";
-
-struct LegacyThemaRow {
-    id: String,
-    kind: String,
-    keimenon: String,
-    hypothesis: String,
-    answer: String,
-    source_guid: Option<String>,
-    archived_at_us: Option<i64>,
-    parathema: Option<String>,
-    review_image: Option<String>,
-    review_state: LegacyReviewRow,
-}
-
-fn legacy_thema_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LegacyThemaRow> {
-    Ok(LegacyThemaRow {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        keimenon: row.get(2)?,
-        hypothesis: row.get(3)?,
-        answer: row.get(4)?,
-        source_guid: row.get(5)?,
-        archived_at_us: row.get(6)?,
-        parathema: row.get(7)?,
-        review_image: row.get(8)?,
-        review_state: LegacyReviewRow::from_row(row, 9)?,
-    })
-}
-
-struct LegacyReviewRow {
-    state_revision: i64,
-    review_count: i64,
-    last_reviewed_at_us: Option<i64>,
-    last_review_day: Option<i64>,
-    next_review_day: i64,
-    interval_days: Option<i64>,
-    total_successes: i64,
-    total_failures: i64,
-    suspended: i64,
-    stability: Option<f64>,
-    difficulty: Option<f64>,
-}
-
-impl LegacyReviewRow {
-    fn from_row(row: &rusqlite::Row<'_>, start: usize) -> rusqlite::Result<Self> {
-        Ok(Self {
-            state_revision: row.get(start)?,
-            review_count: row.get(start + 1)?,
-            last_reviewed_at_us: row.get(start + 2)?,
-            last_review_day: row.get(start + 3)?,
-            next_review_day: row.get(start + 4)?,
-            interval_days: row.get(start + 5)?,
-            total_successes: row.get(start + 6)?,
-            total_failures: row.get(start + 7)?,
-            suspended: row.get(start + 8)?,
-            stability: row.get(start + 9)?,
-            difficulty: row.get(start + 10)?,
-        })
-    }
-}
-
-fn materialize_legacy_thema(
-    connection: &Connection,
-    row: LegacyThemaRow,
-) -> Result<LegacyThema, StoreError> {
-    let id = ThemaId::new(row.id).map_err(|_| StoreError::CorruptData { field: "thema ID" })?;
-    Ok(LegacyThema {
-        tags: load_legacy_tags(connection, &id)?,
-        links: load_legacy_links(connection, &id)?,
-        review_state: materialize_legacy_review_state(row.review_state)?,
-        id,
-        kind: row.kind,
-        keimenon: row.keimenon,
-        hypothesis: serde_json::from_str(&row.hypothesis).map_err(|_| StoreError::CorruptData {
-            field: "thema hypothesis",
-        })?,
-        answer: serde_json::from_str(&row.answer).map_err(|_| StoreError::CorruptData {
-            field: "thema answer",
-        })?,
-        source_guid: row.source_guid,
-        archived_at_us: optional_u64(row.archived_at_us, "legacy archive timestamp")?,
-        parathema: row.parathema,
-        review_image: row.review_image,
-    })
-}
-
-fn materialize_legacy_review_state(row: LegacyReviewRow) -> Result<LegacyReviewState, StoreError> {
-    Ok(LegacyReviewState {
-        state_revision: to_u64(row.state_revision, "legacy state revision")?,
-        review_count: to_u64(row.review_count, "legacy review count")?,
-        last_reviewed_at_us: optional_u64(row.last_reviewed_at_us, "legacy review timestamp")?,
-        last_review_day: optional_u32(row.last_review_day, "legacy last review day")?,
-        next_review_day: to_u32(row.next_review_day, "legacy next review day")?,
-        interval_days: optional_u32(row.interval_days, "legacy interval")?,
-        total_successes: to_u64(row.total_successes, "total successes")?,
-        total_failures: to_u64(row.total_failures, "total failures")?,
-        suspended: row.suspended != 0,
-        stability: row.stability,
-        difficulty: row.difficulty,
-    })
-}
-
-fn load_legacy_tags(
-    connection: &Connection,
-    thema_id: &ThemaId,
-) -> Result<Vec<String>, StoreError> {
-    query_strings(
-        connection,
-        "SELECT tag FROM thema_tag WHERE thema_id = ?1 ORDER BY tag",
-        thema_id.as_str(),
-    )
-}
-
-fn load_legacy_links(
-    connection: &Connection,
-    thema_id: &ThemaId,
-) -> Result<Vec<ThemaId>, StoreError> {
-    query_strings(
-        connection,
-        "SELECT node_id FROM thema_node_link
-         WHERE thema_id = ?1 ORDER BY node_id",
-        thema_id.as_str(),
-    )?
-    .into_iter()
-    .map(|value| {
-        ThemaId::new(value).map_err(|_| StoreError::CorruptData {
-            field: "thema link",
-        })
-    })
-    .collect()
-}
-
 fn query_strings(
     connection: &Connection,
     query: &str,
@@ -3538,10 +3377,6 @@ fn materialize_due_thema(
 
 fn optional_u64(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
     value.map(|value| to_u64(value, field)).transpose()
-}
-
-fn optional_u32(value: Option<i64>, field: &'static str) -> Result<Option<u32>, StoreError> {
-    value.map(|value| to_u32(value, field)).transpose()
 }
 
 fn to_u64(value: i64, field: &'static str) -> Result<u64, StoreError> {

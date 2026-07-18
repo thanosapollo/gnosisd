@@ -28,7 +28,8 @@ pub use super::offline_review::{
     ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackItemV2, ReviewPackStatusV2, ReviewPackV2,
 };
 pub use client_views::{
-    ContentCountsV1, DashboardV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1,
+    ContentCountsV1, DashboardV1, DocumentView, DuePageView, DueThemaView, ImportResult,
+    LinkOccurrenceView, NodeEdgeView, NodeView, ReviewClozeCheckRequestV1, ReviewClozeCheckV1,
     ReviewHistoryEventV1, ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewQueueCountsV1,
     ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
     ReviewSessionPageV1, ReviewSessionSummaryV1, ReviewTotalsV1, ReviewWindowV1,

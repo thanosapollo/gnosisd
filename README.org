@@ -1,8 +1,8 @@
 #+title: Gnosis Core
 
-Gnosis Core is the source of truth for Gnosis knowledge and learning data. It
-serves the ~gnosis~ Emacs frontend, command-line, and future clients through a
-local administration protocol and an authenticated HTTP API.
+Gnosis Core is the source of truth for Gnosis knowledge and learning data.
+Ordinary clients use its authenticated HTTP API. Operators use the local
+administration protocol.
 
 * Ownership and trust boundary
 
@@ -183,9 +183,7 @@ Clients recover an attempt and its revision with
 ~GET /v1/review/attempts/{id}~. They set correctness or suspension through
 ~PUT /v1/review/attempts/{id}/accepted-success~ and
 ~PUT /v1/review/attempts/{id}/suspension~ using a durable operation ID and
-expected attempt revision. Exact retries return the retained result. The
-legacy ~POST~ override and suspension toggles remain available but must not be
-retried after an ambiguous transport failure.
+expected attempt revision. Exact retries return the retained result.
 
 The first HTTP attempt response hides raw answer-bearing content. Its captured
 presentation contains a server-materialized question and a closed response
@@ -198,8 +196,8 @@ proposed transition.
 ~client_http::HttpClient~ is the reference native transport. It disables
 redirects, proxies, and automatic retries; bounds every response; validates
 resource and operation identities; and treats a timeout or invalid mutation
-response as unknown delivery. New clients recover session state through the
-active-session and attempt-state resources instead of replaying legacy toggles.
+response as unknown delivery. Clients recover session state through the
+active-session and attempt-state resources.
 
 The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
 direct content resources, online review sessions and attempts, desired-state
@@ -275,40 +273,6 @@ scheduler configuration. Canonical settings also start with timezone
 ~Europe/Athens~ and day boundary ~0~. Settings are revisioned; existing sessions
 keep their captured settings when canonical settings change.
 
-* Emacs review dogfood
-
-The ~gnosis~ Emacs frontend can opt into server-authoritative online reviews
-without moving its other operations to core. Start ~gnosisd~ with the paths in
-[[Build and run]], then configure Emacs:
-
-#+begin_src emacs-lisp
-(setq gnosis-review-backend 'core)
-#+end_src
-
-The default remains ~legacy~. In core mode the established Emacs review UI
-creates or resumes the canonical daemon session. An existing active session
-prompts for explicit resume or abort. Basic, cloze, MCQ, and MC-cloze answers
-are submitted as structured responses. The daemon grades them and atomically
-commits scheduling state, override, suspension, session progress, daily totals,
-and the immutable event. A daemon or protocol failure stops the review; it
-never falls back to the embedded database.
-
-Managed review assets are read through bounded socket chunks. Emacs verifies
-the content digest before publishing a mode ~0600~ file below its private mode
-~0700~ cache. Daemon filesystem paths are not exposed.
-
-This is review dogfood, not a frontend cutover. Dashboard and history views,
-content authoring, edit, archive and delete, capture, import, note indexing,
-link maintenance, and some topic or tag prompts remain compatibility-backed.
-They do not become canonical because review mode uses core. Review-loop ~e~,
-~d~, and ~v~ fail before any local mutation until typed daemon operations exist.
-
-To leave the pilot, set ~gnosis-review-backend~ back to ~legacy~. Core review
-events are not mirrored into the legacy database, so compatibility history and
-dashboard data may be stale. Preserve both databases for inspection. Never
-copy the old database over the core database, reverse-migrate review events, or
-merge divergent state by timestamps.
-
 * Offline replicas
 
 An offline-capable client owns a real local SQLite replica. It contains
@@ -377,9 +341,8 @@ replacing the live server.
 
 This remains a single-user canonical server. Remote non-Tailnet transport,
 multi-server synchronization, Markdown, embeddings, and client filesystem
-watching remain out of scope. Client protocol alignment is active work. Full
-Emacs content-workflow migration and mobile UI development are separate client
-milestones.
+watching remain out of scope. Client protocol alignment and mobile UI work are
+separate milestones.
 
 Raspberry Pi installation and cutover are in
 [[file:docs/raspberry-pi.org][docs/raspberry-pi.org]].

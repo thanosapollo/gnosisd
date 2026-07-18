@@ -30,7 +30,7 @@ use crate::{
         MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
         MAX_OFFLINE_CONTENT_RESULT_BYTES, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
         MAX_OFFLINE_REVIEW_RESULT_BYTES, MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
-        ThemaView, decode_review_pack,
+        decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1, DeviceIdentityV1,
@@ -43,7 +43,7 @@ use crate::{
             ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
             ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaReviewStateV1,
-            valid_bearer_token,
+            ThemaV1, valid_bearer_token,
         },
     },
 };
@@ -348,6 +348,9 @@ impl HttpClient {
     ) -> Result<ImportResult, HttpClientError> {
         let url = self.resource_endpoint("v1/documents", document_id)?;
         let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
+        if body.len() > MAX_FRAME_SIZE {
+            return Err(HttpClientError::InvalidMutation);
+        }
         let result = execute_json_exact(
             self.client
                 .put(url)
@@ -369,23 +372,23 @@ impl HttpClient {
         Ok(document)
     }
 
-    pub async fn legacy_thema(&self, thema_id: &str) -> Result<ThemaView, HttpClientError> {
-        let url = self.resource_endpoint("v1/legacy-themata", thema_id)?;
-        let thema: ThemaView =
+    pub async fn thema(&self, thema_id: &str) -> Result<ThemaV1, HttpClientError> {
+        let url = self.resource_endpoint("v1/themata", thema_id)?;
+        let thema: ThemaV1 =
             execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
-        if thema.id != thema_id {
+        if thema.thema_id != thema_id {
             return Err(invalid_response());
         }
         Ok(thema)
     }
 
-    pub async fn legacy_due_page(
+    pub async fn due_page(
         &self,
         day: u32,
         limit: u16,
         after: Option<&str>,
     ) -> Result<DuePageView, HttpClientError> {
-        let mut url = self.endpoint("v1/legacy-review/due")?;
+        let mut url = self.endpoint("v1/review/due")?;
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("day", &day.to_string());
         pairs.append_pair("limit", &limit.to_string());
@@ -1499,6 +1502,23 @@ mod tests {
             let url = Url::parse(value).unwrap();
             assert!(validate_base_url(&url).is_err(), "accepted {value}");
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_document_import_is_not_sent() {
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
+        let input = DocumentImportRequestV1 {
+            org: "\\".repeat(MAX_FRAME_SIZE / 2 + 1),
+            expected_revision: None,
+        };
+
+        let error = client
+            .import_document("document", &input)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HttpClientError::InvalidMutation));
+        assert_eq!(error.delivery(), DeliveryStatus::NotSent);
     }
 
     #[tokio::test]

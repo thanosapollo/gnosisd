@@ -38,7 +38,7 @@ use crate::{
         validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
-    domain::{ClozeCheck, DocumentId, DueThema, LegacyThema, ThemaId},
+    domain::{ClozeCheck, DocumentId, DueThema},
     store::{
         DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
     },
@@ -86,18 +86,6 @@ impl ServiceHandle {
     ) -> Result<Option<StoredDocument>, ServiceError> {
         request(&self.sender, |response| StoreCommand::Get {
             document_id,
-            response,
-        })
-        .await?
-        .map_err(ServiceError::Store)
-    }
-
-    pub(crate) async fn get_legacy_thema(
-        &self,
-        thema_id: ThemaId,
-    ) -> Result<Option<LegacyThema>, ServiceError> {
-        request(&self.sender, |response| StoreCommand::GetLegacyThema {
-            thema_id,
             response,
         })
         .await?
@@ -1227,10 +1215,7 @@ enum StoreCommand {
         document_id: DocumentId,
         response: oneshot::Sender<StoreResult<Option<StoredDocument>>>,
     },
-    GetLegacyThema {
-        thema_id: ThemaId,
-        response: oneshot::Sender<StoreResult<Option<LegacyThema>>>,
-    },
+
     DueThemataPage {
         query: QueryDueThemataPage,
         response: oneshot::Sender<StoreResult<Vec<DueThema>>>,
@@ -1825,9 +1810,7 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             document_id,
             response,
         } => send(response, store.get_document(&document_id)),
-        StoreCommand::GetLegacyThema { thema_id, response } => {
-            send(response, store.get_legacy_thema(&thema_id))
-        }
+
         StoreCommand::DueThemataPage { query, response } => run_due_page(store, query, response),
         StoreCommand::ReplaceNote {
             prepared,

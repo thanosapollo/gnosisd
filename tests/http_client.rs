@@ -1340,7 +1340,7 @@ async fn authenticated_sync_identity_matches_the_token_owner() {
 }
 
 #[tokio::test]
-async fn legacy_projection_clients_reject_non_strict_responses() {
+async fn projection_clients_reject_non_strict_responses() {
     let mut import = json!({
         "document_id": "document",
         "revision": 1,
@@ -1399,30 +1399,20 @@ async fn legacy_projection_clients_reject_non_strict_responses() {
     }
 
     let mut thema = json!({
-        "id": "thema",
+        "thema_id": "thema",
+        "revision": 1,
         "kind": "basic",
         "keimenon": "Question",
         "hypothesis": [null],
         "answer": ["Answer"],
         "source_guid": null,
-        "archived_at_us": null,
         "parathema": null,
         "review_image": null,
         "tags": [],
-        "links": [],
-        "review_state": {
-            "state_revision": 0,
-            "review_count": 0,
-            "last_reviewed_at_us": null,
-            "last_review_day": null,
-            "next_review_day": 0,
-            "interval_days": null,
-            "total_successes": 0,
-            "total_failures": 0,
-            "suspended": false,
-            "stability": null,
-            "difficulty": null
-        }
+        "node_ids": [],
+        "asset_paths": [],
+        "content_sha256": "0".repeat(64),
+        "archived": false
     });
     let mut thema_missing = thema.clone();
     thema_missing.as_object_mut().unwrap().remove("source_guid");
@@ -1431,7 +1421,7 @@ async fn legacy_projection_clients_reject_non_strict_responses() {
         let raw = spawn_json_server(response).await;
         let client = HttpClient::new(&raw.base_url, token()).unwrap();
         assert!(matches!(
-            client.legacy_thema("thema").await,
+            client.thema("thema").await,
             Err(HttpClientError::InvalidResponse { .. })
         ));
         raw.task.await.unwrap();
@@ -1444,7 +1434,7 @@ async fn legacy_projection_clients_reject_non_strict_responses() {
         let raw = spawn_json_server(due).await;
         let client = HttpClient::new(&raw.base_url, token()).unwrap();
         assert!(matches!(
-            client.legacy_due_page(20260101, 10, None).await,
+            client.due_page(20260101, 10, None).await,
             Err(HttpClientError::InvalidResponse { .. })
         ));
         raw.task.await.unwrap();
@@ -1452,7 +1442,7 @@ async fn legacy_projection_clients_reject_non_strict_responses() {
 }
 
 #[tokio::test]
-async fn legacy_projection_clients_reject_semantic_mismatches() {
+async fn projection_clients_reject_semantic_mismatches() {
     let input = DocumentImportRequestV1 {
         org: "#+TITLE: Expected\n".into(),
         expected_revision: None,
@@ -1533,39 +1523,25 @@ async fn legacy_projection_clients_reject_semantic_mismatches() {
     }
 
     let thema = json!({
-        "id": "other",
+        "thema_id": "other",
+        "revision": 1,
         "kind": "basic",
-        "source_document_id": "document",
-        "source_node_id": "node",
-        "source_revision": 1,
-        "source_guid": null,
-        "source_keimenon_hash": "hash",
-        "archived": null,
-        "parathema": null,
         "keimenon": "Question",
         "hypothesis": [],
         "answer": ["Answer"],
+        "source_guid": null,
+        "parathema": null,
         "review_image": null,
-        "review_state": {
-            "state_revision": 0,
-            "last_reviewed_at_us": null,
-            "last_review_day": null,
-            "next_review_day": 1,
-            "review_count": 0,
-            "interval_days": null,
-            "ease_milli": 2500,
-            "consecutive_correct": 0,
-            "total_successes": 0,
-            "total_failures": 0,
-            "suspended": false,
-            "stability": null,
-            "difficulty": null
-        }
+        "tags": [],
+        "node_ids": [],
+        "asset_paths": [],
+        "content_sha256": "0".repeat(64),
+        "archived": false
     });
     let raw = spawn_json_server(thema).await;
     let client = HttpClient::new(&raw.base_url, token()).unwrap();
     assert!(matches!(
-        client.legacy_thema("thema").await,
+        client.thema("thema").await,
         Err(HttpClientError::InvalidResponse { .. })
     ));
     raw.task.await.unwrap();
@@ -1589,7 +1565,7 @@ async fn legacy_projection_clients_reject_semantic_mismatches() {
         let raw = spawn_json_server(response).await;
         let client = HttpClient::new(&raw.base_url, token()).unwrap();
         assert!(matches!(
-            client.legacy_due_page(20260101, 1, None).await,
+            client.due_page(20260101, 1, None).await,
             Err(HttpClientError::InvalidResponse { .. })
         ));
         raw.task.await.unwrap();
@@ -2691,16 +2667,16 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     assert_eq!(client.document("http-only-doc").await.unwrap().revision, 1);
 
     let thema_id = create_review_thema(&daemon.base_url, &token).await;
-    assert_eq!(client.legacy_thema(&thema_id).await.unwrap().id, thema_id);
+    assert_eq!(client.thema(&thema_id).await.unwrap().thema_id, thema_id);
     create_review_thema(&daemon.base_url, &token).await;
     create_review_thema(&daemon.base_url, &token).await;
-    let due = client.legacy_due_page(20991231, 100, None).await.unwrap();
+    let due = client.due_page(20991231, 100, None).await.unwrap();
     assert!(due.items.len() > 1);
     assert!(due.items.iter().any(|item| item.id == thema_id));
     assert!(due.next.is_none());
 
     let exact = client
-        .legacy_due_page(20991231, due.items.len().try_into().unwrap(), None)
+        .due_page(20991231, due.items.len().try_into().unwrap(), None)
         .await
         .unwrap();
     assert_eq!(exact.items, due.items);
@@ -2710,7 +2686,7 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     let mut after = None;
     loop {
         let page = client
-            .legacy_due_page(20991231, 1, after.as_deref())
+            .due_page(20991231, 1, after.as_deref())
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
@@ -2739,7 +2715,7 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         Err(HttpClientError::Server(error)) if error.status() == 403
     ));
     assert!(matches!(
-        read_only.legacy_due_page(20991231, 10, None).await,
+        read_only.due_page(20991231, 10, None).await,
         Err(HttpClientError::Server(error)) if error.status() == 403
     ));
 
@@ -2753,11 +2729,11 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         Err(HttpClientError::Server(error)) if error.status() == 403
     ));
     assert!(matches!(
-        review_only.legacy_thema(&thema_id).await,
+        review_only.thema(&thema_id).await,
         Err(HttpClientError::Server(error)) if error.status() == 403
     ));
     assert!(matches!(
-        review_only.legacy_due_page(20991231, 10, None).await,
+        review_only.due_page(20991231, 10, None).await,
         Err(HttpClientError::Server(error)) if error.status() == 403
     ));
 

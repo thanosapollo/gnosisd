@@ -10,12 +10,15 @@ mod replica;
 mod server;
 
 pub use client::{ClientError, request};
+pub use http_v1::{
+    DocumentView, DuePageView, DueThemaView, ImportResult, LinkOccurrenceView, NodeEdgeView,
+    NodeView,
+};
 pub(crate) use message::MessageValidationError;
 pub use message::{
-    BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, DocumentView, DuePageView,
-    DueThemaView, ErrorCode, ImportResult, LinkOccurrenceView, MAX_FRAME_SIZE, MAX_REQUEST_ID_LEN,
-    NodeEdgeView, NodeView, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, ResponseResult, ReviewStateView, SystemInfo, ThemaView,
+    BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, ErrorCode, MAX_FRAME_SIZE,
+    MAX_REQUEST_ID_LEN, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
+    ResponseEnvelope, ResponseOutcome, ResponseResult, SystemInfo,
 };
 #[cfg(test)]
 pub(crate) use offline_asset::offline_asset_result_json;

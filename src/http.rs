@@ -27,13 +27,13 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 use crate::{
     application::{
         ApplicationError, DevicePrincipal, DeviceScope, DueCursor, ImportDocument, ImportSummary,
-        LegacyQueryError, MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation,
-        PreparedNote, QueryDocument, QueryDueThemataPage, QueryLegacyThema, ReviewAttemptMutation,
-        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-        ReviewHistoryQuery, ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord,
-        canonical_asset_path, prepare_asset, prepare_device_document_mutation,
-        prepare_device_document_rename, prepare_device_document_tombstone, prepare_note,
-        prepare_thema, review_day_at, thema_content, validate_org_path,
+        MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation, PreparedNote,
+        QueryDocument, QueryDueThemataPage, ReviewAttemptMutation, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewHistoryQuery,
+        ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord, canonical_asset_path,
+        prepare_asset, prepare_device_document_mutation, prepare_device_document_rename,
+        prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
+        thema_content, validate_org_path,
     },
     domain::{DocumentId, DueThema},
     is_canonical_sha256,
@@ -41,8 +41,8 @@ use crate::{
         DocumentView, DuePageView, ImportResult, MAX_FRAME_SIZE,
         MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
         OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
-        OfflineReviewWireError, ReplicaWireError, ThemaView, active_review_pack_response,
-        decode_cursor, decode_snapshot_cursor,
+        OfflineReviewWireError, ReplicaWireError, active_review_pack_response, decode_cursor,
+        decode_snapshot_cursor,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
@@ -170,8 +170,7 @@ fn data_router() -> Router<HttpState> {
             "/v1/documents/{id}",
             get(get_document_projection).put(import_document_projection),
         )
-        .route("/v1/legacy-themata/{id}", get(get_legacy_thema))
-        .route("/v1/legacy-review/due", get(legacy_due_page))
+        .route("/v1/review/due", get(due_page))
         .route("/v1/changes", get(changes))
         .route("/v1/sync/identity", get(device_identity))
         .route("/v1/sync/state", get(replica_state))
@@ -434,34 +433,17 @@ async fn get_document_projection(
     .await
 }
 
-async fn get_legacy_thema(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    Path(id): Path<String>,
-) -> Result<Json<ThemaView>, ApiError> {
-    require(&principal, DeviceScope::Read)?;
-    let query = QueryLegacyThema::new(id)
-        .map_err(|_error: LegacyQueryError| ApiError::bad_request("invalid thema ID"))?;
-    let thema = state
-        .service
-        .get_legacy_thema(query.thema_id().clone())
-        .await
-        .map_err(ApiError::service)?
-        .ok_or_else(ApiError::not_found)?;
-    Ok(Json(thema.into()))
-}
-
 #[derive(Deserialize)]
-struct LegacyDueQuery {
+struct DueQuery {
     day: u32,
     limit: Option<u16>,
     after: Option<String>,
 }
 
-async fn legacy_due_page(
+async fn due_page(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-    Query(input): Query<LegacyDueQuery>,
+    Query(input): Query<DueQuery>,
 ) -> Result<Json<DuePageView>, ApiError> {
     require(&principal, DeviceScope::Read)?;
     require(&principal, DeviceScope::Review)?;
@@ -2462,7 +2444,7 @@ fn openapi_content_operation(path: &str, method: &str) -> Option<Value> {
             contract.error_statuses,
         ),
     );
-    if path == "/v1/legacy-review/due" {
+    if path == "/v1/review/due" {
         operation["x-gnosis-required-scopes"] = json!(["read", "review"]);
     }
     if let Some(body) = content_request_body(path, method, contract.request) {
@@ -2523,14 +2505,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
                 "400", "401", "403", "408", "412", "413", "422", "500", "503",
             ],
         )),
-        ("/v1/legacy-themata/{id}", "get") => Some(json_contract(
-            "read",
-            None,
-            "200",
-            "ThemaView",
-            &["400", "401", "403", "404", "408", "500", "503"],
-        )),
-        ("/v1/legacy-review/due", "get") => Some(json_contract(
+        ("/v1/review/due", "get") => Some(json_contract(
             "read",
             None,
             "200",
@@ -2878,7 +2853,7 @@ fn idempotency_key_parameter() -> Value {
 }
 
 fn content_query_parameters(path: &str) -> Vec<Value> {
-    if path == "/v1/legacy-review/due" {
+    if path == "/v1/review/due" {
         return vec![
             json!({"name":"day","in":"query","required":true,"schema":{"type":"integer","format":"uint32","minimum":0}}),
             json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}}),
@@ -3267,7 +3242,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<DashboardV1>();
     generator.subschema_for::<DocumentView>();
     generator.subschema_for::<ImportResult>();
-    generator.subschema_for::<ThemaView>();
+
     generator.subschema_for::<DuePageView>();
     generator.subschema_for::<ReviewSessionPageV1>();
     generator.subschema_for::<ReviewSessionSummaryV1>();
@@ -3376,8 +3351,8 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/dashboard", "get"),
     ("/v1/documents/{id}", "get"),
     ("/v1/documents/{id}", "put"),
-    ("/v1/legacy-themata/{id}", "get"),
-    ("/v1/legacy-review/due", "get"),
+    ("/v1/themata/{id}", "get"),
+    ("/v1/review/due", "get"),
     ("/v1/changes", "get"),
     ("/v1/sync/identity", "get"),
     ("/v1/sync/state", "get"),
@@ -3623,9 +3598,9 @@ mod tests {
     }
 
     #[test]
-    fn openapi_types_legacy_due_query_exactly() {
+    fn openapi_types_due_query_exactly() {
         let api = openapi_document();
-        let operation = &api["paths"]["/v1/legacy-review/due"]["get"];
+        let operation = &api["paths"]["/v1/review/due"]["get"];
         assert_eq!(
             operation["x-gnosis-required-scopes"],
             json!(["read", "review"])
@@ -3645,8 +3620,6 @@ mod tests {
             "NodeView",
             "LinkOccurrenceView",
             "NodeEdgeView",
-            "ThemaView",
-            "ReviewStateView",
             "DueThemaView",
             "DuePageView",
         ] {
@@ -3674,8 +3647,6 @@ mod tests {
         for (name, field) in [
             ("DocumentView", "file_node_id"),
             ("NodeView", "parent_id"),
-            ("ThemaView", "source_guid"),
-            ("ReviewStateView", "interval_days"),
             ("DuePageView", "next"),
         ] {
             assert!(
@@ -3692,6 +3663,15 @@ mod tests {
                 "200", "400", "401", "403", "404", "408", "422", "500", "503"
             ])
         );
+    }
+
+    #[test]
+    fn openapi_has_no_legacy_projection_aliases() {
+        let api = openapi_document();
+        assert!(api["paths"]["/v1/themata/{id}"].is_object());
+        assert!(api["paths"]["/v1/review/due"].is_object());
+        assert!(api["paths"]["/v1/legacy-themata/{id}"].is_null());
+        assert!(api["paths"]["/v1/legacy-review/due"].is_null());
     }
 
     #[test]
