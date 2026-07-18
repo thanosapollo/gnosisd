@@ -1340,6 +1340,118 @@ async fn authenticated_sync_identity_matches_the_token_owner() {
 }
 
 #[tokio::test]
+async fn legacy_projection_clients_reject_non_strict_responses() {
+    let mut import = json!({
+        "document_id": "document",
+        "revision": 1,
+        "content_sha256": "0".repeat(64),
+        "node_count": 0,
+        "occurrence_count": 0,
+        "semantic_edge_count": 0
+    });
+    let mut import_missing = import.clone();
+    import_missing.as_object_mut().unwrap().remove("revision");
+    import["unexpected"] = json!(true);
+    for response in [import, import_missing] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client
+                .import_document(
+                    "document",
+                    &DocumentImportRequestV1 {
+                        org: "#+TITLE: Document\n".into(),
+                        expected_revision: None,
+                    },
+                )
+                .await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+
+    let mut document = json!({
+        "document_id": "document",
+        "revision": 1,
+        "title": "Document",
+        "file_node_id": null,
+        "file_tags": [],
+        "nodes": [],
+        "link_occurrences": [],
+        "semantic_edges": [],
+        "compatibility_sha1": "0".repeat(40),
+        "content_sha256": "0".repeat(64)
+    });
+    let mut document_missing = document.clone();
+    document_missing
+        .as_object_mut()
+        .unwrap()
+        .remove("file_node_id");
+    document["unexpected"] = json!(true);
+    for response in [document, document_missing] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.document("document").await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+
+    let mut thema = json!({
+        "id": "thema",
+        "kind": "basic",
+        "keimenon": "Question",
+        "hypothesis": [null],
+        "answer": ["Answer"],
+        "source_guid": null,
+        "archived_at_us": null,
+        "parathema": null,
+        "review_image": null,
+        "tags": [],
+        "links": [],
+        "review_state": {
+            "state_revision": 0,
+            "review_count": 0,
+            "last_reviewed_at_us": null,
+            "last_review_day": null,
+            "next_review_day": 0,
+            "interval_days": null,
+            "total_successes": 0,
+            "total_failures": 0,
+            "suspended": false,
+            "stability": null,
+            "difficulty": null
+        }
+    });
+    let mut thema_missing = thema.clone();
+    thema_missing.as_object_mut().unwrap().remove("source_guid");
+    thema["unexpected"] = json!(true);
+    for response in [thema, thema_missing] {
+        let raw = spawn_json_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.legacy_thema("thema").await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+
+    for due in [
+        json!({"items": []}),
+        json!({"items": [], "next": null, "unexpected": true}),
+    ] {
+        let raw = spawn_json_server(due).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.legacy_due_page(20260101, 10, None).await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn device_identity_client_rejects_invalid_responses() {
     for body in [
         json!({"version": 2, "device_id": "device"}),
@@ -2411,6 +2523,16 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         create_device_with_scopes(&daemon.socket, vec!["review".into()]).await;
     let client =
         HttpClient::new(&daemon.base_url, SecretToken::new(token.clone()).unwrap()).unwrap();
+    let invalid_document = reqwest::Client::new()
+        .get(format!("{}/v1/documents/%20", daemon.base_url))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_document.status().as_u16(), 422);
+    let invalid_document: serde_json::Value =
+        serde_json::from_slice(&invalid_document.bytes().await.unwrap()).unwrap();
+    assert_eq!(invalid_document["error"]["code"], "invalid_content");
     let input = DocumentImportRequestV1 {
         org: include_str!("fixtures/org/no-file-id.org").to_owned(),
         expected_revision: None,

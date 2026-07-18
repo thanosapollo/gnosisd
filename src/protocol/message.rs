@@ -158,15 +158,24 @@ pub struct SystemInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ThemaView {
     pub id: String,
     pub kind: String,
     pub keimenon: String,
     pub hypothesis: Vec<Option<String>>,
     pub answer: Vec<String>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub source_guid: Option<String>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub archived_at_us: Option<u64>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub parathema: Option<String>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub review_image: Option<String>,
     pub tags: Vec<String>,
     pub links: Vec<String>,
@@ -193,17 +202,28 @@ impl From<LegacyThema> for ThemaView {
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewStateView {
     pub state_revision: u64,
     pub review_count: u64,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub last_reviewed_at_us: Option<u64>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub last_review_day: Option<u32>,
     pub next_review_day: u32,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub interval_days: Option<u32>,
     pub total_successes: u64,
     pub total_failures: u64,
     pub suspended: bool,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub stability: Option<f64>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub difficulty: Option<f64>,
 }
 
@@ -227,6 +247,7 @@ impl From<LegacyReviewState> for ReviewStateView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DueThemaView {
     pub id: String,
     pub kind: String,
@@ -252,8 +273,11 @@ impl From<DueThema> for DueThemaView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DuePageView {
     pub items: Vec<DueThemaView>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub next: Option<String>,
 }
 
@@ -267,6 +291,7 @@ impl DuePageView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportResult {
     pub document_id: String,
     pub revision: u64,
@@ -277,10 +302,13 @@ pub struct ImportResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DocumentView {
     pub document_id: String,
     pub revision: u64,
     pub title: String,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub file_node_id: Option<String>,
     pub file_tags: Vec<String>,
     pub nodes: Vec<NodeView>,
@@ -320,11 +348,14 @@ impl DocumentView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeView {
     pub id: String,
     pub title: String,
     pub title_path: Vec<String>,
     pub tags: Vec<String>,
+    #[serde(deserialize_with = "super::http_v1::deserialize_required_option")]
+    #[schemars(required)]
     pub parent_id: Option<String>,
     pub level: u32,
 }
@@ -343,6 +374,7 @@ impl From<&crate::domain::Node> for NodeView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LinkOccurrenceView {
     pub owner_id: String,
     pub target_id: String,
@@ -362,6 +394,7 @@ impl From<&crate::domain::LinkOccurrence> for LinkOccurrenceView {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeEdgeView {
     pub source_id: String,
     pub target_id: String,

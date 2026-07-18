@@ -2458,7 +2458,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             None,
             "200",
             "DocumentView",
-            &["400", "401", "403", "404", "408", "500", "503"],
+            &["400", "401", "403", "404", "408", "422", "500", "503"],
         )),
         ("/v1/documents/{id}", "put") => Some(json_contract(
             "content:write",
@@ -3578,6 +3578,41 @@ mod tests {
                 {"name":"day","in":"query","required":true,"schema":{"type":"integer","format":"uint32","minimum":0}},
                 {"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}},
                 {"name":"after","in":"query","required":false,"schema":{"type":"string"}}
+            ])
+        );
+        let schemas = &api["components"]["schemas"];
+        for name in [
+            "ImportResult",
+            "DocumentView",
+            "NodeView",
+            "LinkOccurrenceView",
+            "NodeEdgeView",
+            "ThemaView",
+            "ReviewStateView",
+            "DuePageView",
+            "DueThemaView",
+        ] {
+            assert_eq!(schemas[name]["additionalProperties"], false, "{name}");
+        }
+        for (name, field) in [
+            ("DocumentView", "file_node_id"),
+            ("NodeView", "parent_id"),
+            ("ThemaView", "source_guid"),
+            ("ReviewStateView", "interval_days"),
+            ("DuePageView", "next"),
+        ] {
+            assert!(
+                schemas[name]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(field)),
+                "{name}.{field}"
+            );
+        }
+        assert_eq!(
+            response_statuses(&api["paths"]["/v1/documents/{id}"]["get"]),
+            set(&[
+                "200", "400", "401", "403", "404", "408", "422", "500", "503"
             ])
         );
     }
