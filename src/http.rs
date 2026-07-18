@@ -369,22 +369,26 @@ async fn import_document_projection(
     ApiJson(input): ApiJson<DocumentImportRequestV1>,
 ) -> Result<Json<ImportResult>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
-    let prepared = ImportDocument::new(id, input.org, input.expected_revision)
-        .and_then(ImportDocument::prepare_server)
-        .map_err(ApiError::application)?;
-    let view = DocumentView::from_projection(
-        &prepared.prepared.document_id,
-        u64::MAX,
-        &prepared.prepared.projection,
-    );
-    let projection_size = serde_json::to_vec(&view)
-        .map_err(|_| ApiError::internal())?
-        .len();
-    if projection_size > crate::protocol::MAX_FRAME_SIZE {
-        return Err(ApiError::invalid_content(
-            "document projection is too large",
-        ));
-    }
+    let prepared = run_blocking(move || {
+        let prepared = ImportDocument::new(id, input.org, input.expected_revision)
+            .and_then(ImportDocument::prepare_server)
+            .map_err(ApiError::application)?;
+        let view = DocumentView::from_projection(
+            &prepared.prepared.document_id,
+            u64::MAX,
+            &prepared.prepared.projection,
+        );
+        let projection_size = serde_json::to_vec(&view)
+            .map_err(|_| ApiError::internal())?
+            .len();
+        if projection_size > crate::protocol::MAX_FRAME_SIZE {
+            return Err(ApiError::invalid_content(
+                "document projection is too large",
+            ));
+        }
+        Ok(prepared)
+    })
+    .await?;
     let summary = state
         .service
         .replace(prepared)
@@ -392,6 +396,16 @@ async fn import_document_projection(
         .map_err(ApiError::service)?;
     announce(&state).await;
     Ok(Json(import_result(summary)))
+}
+
+async fn run_blocking<T, F>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|_| ApiError::internal())?
 }
 
 async fn get_document_projection(
@@ -4856,6 +4870,39 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_import_preparation_does_not_stall_health() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let app = router(runtime.handle());
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, mut release_rx) = tokio::sync::mpsc::channel(1);
+        let preparation = tokio::spawn(super::run_blocking(move || {
+            started_tx.blocking_send(()).unwrap();
+            release_rx.blocking_recv().unwrap();
+            Ok(())
+        }));
+
+        started_rx.recv().await.unwrap();
+        let health = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.oneshot(Request::get("/health").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("health request stalled behind blocking preparation")
+        .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        release_tx.send(()).await.unwrap();
+        preparation.await.unwrap().unwrap();
     }
 
     #[tokio::test]
