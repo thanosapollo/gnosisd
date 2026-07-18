@@ -21,8 +21,9 @@ use thiserror::Error;
 
 use crate::{
     application::{
-        MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT,
-        canonical_asset_path, prepare_thema, thema_content, valid_operation_id, validate_org_path,
+        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES,
+        MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path, prepare_thema, thema_content,
+        valid_operation_id, validate_org_path,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
@@ -391,13 +392,25 @@ impl HttpClient {
             return Err(HttpClientError::InvalidReview);
         }
         let request = self.post_review_json("v1/review/sessions", input)?;
-        let session = execute_json_exact(
-            request,
-            MAX_OFFLINE_REVIEW_RESULT_BYTES,
-            StatusCode::CREATED,
-        )
-        .await?;
-        checked_online_session(session, None)
+        let session = checked_online_session(
+            execute_json_exact(
+                request,
+                MAX_OFFLINE_REVIEW_RESULT_BYTES,
+                StatusCode::CREATED,
+            )
+            .await?,
+            None,
+        )?;
+        if session.target_count
+            != Some(
+                input
+                    .target_count
+                    .unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT),
+            )
+        {
+            return Err(invalid_response());
+        }
+        Ok(session)
     }
 
     pub async fn dashboard(&self, days: Option<u16>) -> Result<DashboardV1, HttpClientError> {

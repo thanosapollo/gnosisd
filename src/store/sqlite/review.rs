@@ -1426,7 +1426,7 @@ fn select_manual(
     target_count: Option<u32>,
 ) -> Result<Vec<String>, StoreError> {
     let mut selected = Vec::new();
-    for id in ids {
+    for id in ids.iter().take(MAX_REVIEW_PACK_ITEMS) {
         let available: bool = connection
             .query_row(
                 "SELECT EXISTS(
