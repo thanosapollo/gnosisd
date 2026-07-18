@@ -2523,7 +2523,7 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         create_device_with_scopes(&daemon.socket, vec!["review".into()]).await;
     let client =
         HttpClient::new(&daemon.base_url, SecretToken::new(token.clone()).unwrap()).unwrap();
-    let invalid_document = reqwest::Client::new()
+    let invalid_document = raw_http_client()
         .get(format!("{}/v1/documents/%20", daemon.base_url))
         .bearer_auth(&token)
         .send()
