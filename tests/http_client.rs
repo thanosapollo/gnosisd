@@ -1341,16 +1341,9 @@ async fn authenticated_sync_identity_matches_the_token_owner() {
 
 #[tokio::test]
 async fn projection_clients_reject_non_strict_responses() {
-    let mut import = json!({
-        "document_id": "document",
-        "revision": 1,
-        "content_sha256": "0".repeat(64),
-        "node_count": 0,
-        "occurrence_count": 0,
-        "semantic_edge_count": 0
-    });
+    let mut import = document_mutation_json(1, "operation", "document");
     let mut import_missing = import.clone();
-    import_missing.as_object_mut().unwrap().remove("revision");
+    import_missing.as_object_mut().unwrap().remove("cursor");
     import["unexpected"] = json!(true);
     for response in [import, import_missing] {
         let raw = spawn_json_server(response).await;
@@ -1359,6 +1352,7 @@ async fn projection_clients_reject_non_strict_responses() {
             client
                 .import_document(
                     "document",
+                    "operation",
                     &DocumentImportRequestV1 {
                         org: "#+TITLE: Document\n".into(),
                         expected_revision: None,
@@ -1448,27 +1442,15 @@ async fn projection_clients_reject_semantic_mismatches() {
         expected_revision: None,
     };
     for response in [
-        json!({
-            "document_id": "other",
-            "revision": 1,
-            "content_sha256": format!("{:x}", Sha256::digest(input.org.as_bytes())),
-            "node_count": 0,
-            "occurrence_count": 0,
-            "semantic_edge_count": 0
-        }),
-        json!({
-            "document_id": "document",
-            "revision": 1,
-            "content_sha256": "0".repeat(64),
-            "node_count": 0,
-            "occurrence_count": 0,
-            "semantic_edge_count": 0
-        }),
+        document_mutation_json(1, "operation", "other"),
+        document_mutation_json(1, "other-operation", "document"),
     ] {
         let raw = spawn_json_server(response).await;
         let client = HttpClient::new(&raw.base_url, token()).unwrap();
         assert!(matches!(
-            client.import_document("document", &input).await,
+            client
+                .import_document("document", "operation", &input)
+                .await,
             Err(HttpClientError::InvalidResponse { .. })
         ));
         raw.task.await.unwrap();
@@ -1559,7 +1541,6 @@ async fn projection_clients_reject_semantic_mismatches() {
     };
     for response in [
         json!({"items": [item("b", 1), item("a", 1)], "next": null}),
-        json!({"items": [item("a", 1)], "next": "0:1:other"}),
         json!({"items": [item("a", 1), item("b", 1)], "next": null}),
     ] {
         let raw = spawn_json_server(response).await;
@@ -2660,10 +2641,33 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     };
 
     let imported = client
-        .import_document("http-only-doc", &input)
+        .import_document("http-only-doc", "import-http-only-doc", &input)
         .await
         .unwrap();
-    assert_eq!(imported.document_id, "http-only-doc");
+    assert!(matches!(
+        &imported,
+        DocumentMutationResultV1::Applied { authoritative, .. }
+            if authoritative.document_id == "http-only-doc"
+    ));
+    let retry = client
+        .import_document("http-only-doc", "import-http-only-doc", &input)
+        .await
+        .unwrap();
+    assert_eq!(retry, imported);
+    let changed_input = DocumentImportRequestV1 {
+        org: "#+TITLE: Changed\n".into(),
+        expected_revision: None,
+    };
+    assert!(matches!(
+        client
+            .import_document(
+                "http-only-doc",
+                "import-http-only-doc",
+                &changed_input,
+            )
+            .await,
+        Err(HttpClientError::Server(error)) if error.status() == 409
+    ));
     assert_eq!(client.document("http-only-doc").await.unwrap().revision, 1);
 
     let thema_id = create_review_thema(&daemon.base_url, &token).await;
@@ -2681,6 +2685,23 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         .unwrap();
     assert_eq!(exact.items, due.items);
     assert!(exact.next.is_none());
+
+    let first_page = client.due_page(20991231, 1, None).await.unwrap();
+    let cursor = first_page.next.as_deref().unwrap();
+    assert!(!cursor.contains(&first_page.items[0].id));
+    assert!(!cursor.contains(&first_page.items[0].next_review_day.to_string()));
+    let mut tampered = cursor.as_bytes().to_vec();
+    let middle = tampered.len() / 2;
+    tampered[middle] = if tampered[middle] == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered).unwrap();
+    let tampered_result = client.due_page(20991231, 1, Some(&tampered)).await;
+    assert!(
+        matches!(
+            &tampered_result,
+            Err(HttpClientError::Server(error)) if error.status() == 400
+        ),
+        "{tampered_result:?}"
+    );
 
     let mut paged = Vec::new();
     let mut after = None;
@@ -2711,7 +2732,9 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     )
     .unwrap();
     assert!(matches!(
-        read_only.import_document("forbidden-doc", &input).await,
+        read_only
+            .import_document("forbidden-doc", "forbidden-import", &input)
+            .await,
         Err(HttpClientError::Server(error)) if error.status() == 403
     ));
     assert!(matches!(
@@ -2747,7 +2770,14 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     let cli_import = run_cli_with_input(
         &daemon.base_url,
         &token_path,
-        &["import-org", "http-only-doc", "--if-revision", "1"],
+        &[
+            "import-org",
+            "http-only-doc",
+            "--operation-id",
+            "cli-import",
+            "--if-revision",
+            "1",
+        ],
         include_bytes!("fixtures/org/no-file-id.org"),
     )
     .await;
@@ -2791,7 +2821,12 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
     assert!(
         !run_cli_without_token_with_input(
             &daemon.base_url,
-            &["import-org", "unauthenticated-doc"],
+            &[
+                "import-org",
+                "unauthenticated-doc",
+                "--operation-id",
+                "unauthenticated-import",
+            ],
             include_bytes!("fixtures/org/no-file-id.org"),
         )
         .await
@@ -2802,7 +2837,12 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         !run_cli_with_input(
             &daemon.base_url,
             &read_only_token_path,
-            &["import-org", "forbidden-doc"],
+            &[
+                "import-org",
+                "forbidden-doc",
+                "--operation-id",
+                "forbidden-cli-import",
+            ],
             include_bytes!("fixtures/org/no-file-id.org"),
         )
         .await
@@ -2843,6 +2883,7 @@ async fn oversized_http_projection_is_rejected_before_commit() {
     let error = client
         .import_document(
             "oversized",
+            "oversized-import",
             &DocumentImportRequestV1 {
                 org: deeply_nested_org(),
                 expected_revision: None,

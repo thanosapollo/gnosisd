@@ -526,27 +526,21 @@ mod tests {
     fn document_mutation_replays_and_rejects_changed_key_reuse() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let device = add_device(&mut store, "first");
-        let first = operation(&device, "operation", "document", "note.org", "First", None);
+        let first = generated_operation(&device, "operation", "note.org", "First");
+        let first_document_id = first.prepared.document_id.to_string();
         let applied = store
             .apply_device_document_mutation(&first, Some(&blob(&first)), 2)
             .unwrap();
-        let retry = operation(&device, "operation", "other-id", "note.org", "First", None);
+        let retry = generated_operation(&device, "operation", "note.org", "First");
         let replay = store
             .apply_device_document_mutation(&retry, Some(&blob(&retry)), 3)
             .unwrap();
-        let changed = operation(
-            &device,
-            "operation",
-            "third-id",
-            "note.org",
-            "Changed",
-            None,
-        );
+        let changed = generated_operation(&device, "operation", "note.org", "Changed");
 
         assert!(!applied.replayed);
         assert!(replay.replayed);
         assert_eq!(replay.result, applied.result);
-        assert_applied_document(&applied.result, "document", 1, true);
+        assert_applied_document(&applied.result, &first_document_id, 1, true);
         assert!(matches!(
             store.apply_device_document_mutation(&changed, Some(&blob(&changed)), 4),
             Err(StoreError::IdempotencyConflict)
@@ -915,6 +909,22 @@ mod tests {
             logical_path.into(),
             format!("#+title: {title}\n"),
             expected_revision,
+        )
+        .unwrap();
+        prepare_device_document_mutation(1, operation_id.into(), device_id.into(), note).unwrap()
+    }
+
+    fn generated_operation(
+        device_id: &str,
+        operation_id: &str,
+        logical_path: &str,
+        title: &str,
+    ) -> PreparedDeviceDocumentMutation {
+        let note = prepare_note(
+            None,
+            logical_path.into(),
+            format!("#+title: {title}\n"),
+            None,
         )
         .unwrap();
         prepare_device_document_mutation(1, operation_id.into(), device_id.into(), note).unwrap()

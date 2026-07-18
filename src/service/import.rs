@@ -1,15 +1,18 @@
 use sha2::{Digest, Sha256};
 
+use crate::domain::DocumentId;
+
+#[cfg(test)]
 use crate::{
     application::{
         ApplicationError, ContentError, ImportSummary, PreparedNote, PreparedServerImport,
         path_key, summarize_import,
     },
     blob::BlobMeta,
-    domain::DocumentId,
     store::{SqliteStore, StoreError},
 };
 
+#[cfg(test)]
 pub(super) fn persist_server_import(
     store: &mut SqliteStore,
     server_import: &PreparedServerImport,
@@ -23,6 +26,7 @@ pub(super) fn persist_server_import(
         .unwrap_or_else(|| protocol_logical_path(&prepared.document_id));
     let note = PreparedNote {
         document_id: prepared.document_id.clone(),
+        explicit_document_id: true,
         path_key: path_key(&logical_path),
         logical_path,
         org: server_import.org.clone(),
@@ -37,11 +41,12 @@ pub(super) fn persist_server_import(
     Ok(summarize_import(prepared, stored.revision()))
 }
 
-fn protocol_logical_path(document_id: &DocumentId) -> String {
+pub(crate) fn protocol_logical_path(document_id: &DocumentId) -> String {
     let digest = Sha256::digest(document_id.as_str().as_bytes());
     format!("protocol/{digest:x}.org")
 }
 
+#[cfg(test)]
 fn map_store_error(error: StoreError) -> ApplicationError {
     match error {
         StoreError::Conflict { expected, actual } => {

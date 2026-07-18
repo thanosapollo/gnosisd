@@ -1,12 +1,18 @@
 use thiserror::Error;
 
+use crate::{domain::IdError, parser::org::OrgParseError};
+
+use super::content::ContentError;
+
+#[cfg(test)]
+use super::content::asset_paths_in_org;
+#[cfg(test)]
 use crate::{
-    domain::{DocumentId, DocumentProjection, IdError},
-    parser::org::{OrgParseError, parse_org},
+    domain::{DocumentId, DocumentProjection},
+    parser::org::parse_org,
 };
 
-use super::content::{ContentError, asset_paths_in_org};
-
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportDocument {
     document_id: DocumentId,
@@ -14,6 +20,7 @@ pub struct ImportDocument {
     expected_revision: Option<u64>,
 }
 
+#[cfg(test)]
 impl ImportDocument {
     pub fn new(
         document_id: impl Into<String>,
@@ -27,7 +34,6 @@ impl ImportDocument {
         })
     }
 
-    #[cfg(test)]
     pub fn prepare(self) -> Result<PreparedImport, ApplicationError> {
         Ok(self.prepare_server()?.prepared)
     }
@@ -48,6 +54,7 @@ impl ImportDocument {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedImport {
     pub document_id: DocumentId,
@@ -55,6 +62,7 @@ pub struct PreparedImport {
     pub expected_revision: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedServerImport {
     pub(crate) prepared: PreparedImport,
@@ -62,6 +70,7 @@ pub(crate) struct PreparedServerImport {
     pub(crate) asset_paths: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportSummary {
     pub document_id: DocumentId,
@@ -72,6 +81,7 @@ pub struct ImportSummary {
     pub semantic_edge_count: usize,
 }
 
+#[cfg(test)]
 pub fn summarize_import(prepared: &PreparedImport, revision: u64) -> ImportSummary {
     ImportSummary {
         document_id: prepared.document_id.clone(),
@@ -92,8 +102,10 @@ pub enum ApplicationError {
     #[error("invalid document content")]
     InvalidContent(#[from] ContentError),
     #[error("document revision conflict")]
+    #[allow(dead_code)]
     Conflict { expected: u64, actual: Option<u64> },
     #[error("document storage failed")]
+    #[allow(dead_code)]
     Storage,
 }
 

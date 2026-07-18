@@ -11,8 +11,7 @@ mod server;
 
 pub use client::{ClientError, request};
 pub use http_v1::{
-    DocumentView, DuePageView, DueThemaView, ImportResult, LinkOccurrenceView, NodeEdgeView,
-    NodeView,
+    DocumentView, DuePageView, DueThemaView, LinkOccurrenceView, NodeEdgeView, NodeView,
 };
 pub(crate) use message::MessageValidationError;
 pub use message::{

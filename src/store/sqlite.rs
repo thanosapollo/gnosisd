@@ -210,6 +210,7 @@ impl SqliteStore {
         Ok(stored)
     }
 
+    #[cfg(test)]
     pub(crate) fn document_logical_path(
         &self,
         document_id: &DocumentId,

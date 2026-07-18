@@ -26,23 +26,22 @@ use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer}
 
 use crate::{
     application::{
-        ApplicationError, DevicePrincipal, DeviceScope, DueCursor, ImportDocument, ImportSummary,
-        MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation, PreparedNote,
-        QueryDocument, QueryDueThemataPage, ReviewAttemptMutation, ReviewAttemptOperation,
-        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewHistoryQuery,
-        ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord, canonical_asset_path,
-        prepare_asset, prepare_device_document_mutation, prepare_device_document_rename,
+        ApplicationError, DevicePrincipal, DeviceScope, DueCursor, MAX_OFFLINE_ASSET_BYTES,
+        PreparedDeviceDocumentLifecycleMutation, PreparedNote, QueryDocument, QueryDueThemataPage,
+        ReviewAttemptMutation, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        ReviewAttemptOperationStatus, ReviewHistoryQuery, ReviewOperationAuthority,
+        ReviewSessionQuery, SettingsRecord, canonical_asset_path, prepare_asset,
+        prepare_device_document_mutation, prepare_device_document_rename,
         prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
         thema_content, validate_org_path,
     },
     domain::{DocumentId, DueThema},
     is_canonical_sha256,
     protocol::{
-        DocumentView, DuePageView, ImportResult, MAX_FRAME_SIZE,
-        MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
-        OfflineContentSubmission, OfflineContentWireError, OfflineReviewSubmission,
-        OfflineReviewWireError, ReplicaWireError, active_review_pack_response, decode_cursor,
-        decode_snapshot_cursor,
+        DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
+        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
+        OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
+        active_review_pack_response, decode_cursor, decode_snapshot_cursor,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
@@ -66,7 +65,7 @@ use crate::{
         offline_content_result_response, offline_result_response, replica_change_page,
         replica_snapshot_page, replica_state_response, review_pack_response,
     },
-    service::{ServiceError, ServiceHandle},
+    service::{ServiceError, ServiceHandle, protocol_logical_path},
     store::StoreError,
 };
 
@@ -366,18 +365,30 @@ async fn import_document_projection(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     ApiJson(input): ApiJson<DocumentImportRequestV1>,
-) -> Result<Json<ImportResult>, ApiError> {
+) -> Result<Json<DocumentMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
+    let operation_id = idempotency_key(&headers)?;
+    let document_id =
+        DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
+    let logical_path = state
+        .service
+        .note(document_id.clone())
+        .await
+        .map_err(ApiError::service)?
+        .map(|(head, _)| head.logical_path)
+        .unwrap_or_else(|| protocol_logical_path(&document_id));
     let prepared = run_blocking(move || {
-        let prepared = ImportDocument::new(id, input.org, input.expected_revision)
-            .and_then(ImportDocument::prepare_server)
-            .map_err(ApiError::application)?;
-        let view = DocumentView::from_projection(
-            &prepared.prepared.document_id,
-            u64::MAX,
-            &prepared.prepared.projection,
-        );
+        let prepared = prepare_note(
+            Some(document_id.to_string()),
+            logical_path,
+            input.org,
+            input.expected_revision,
+        )
+        .map_err(ApiError::invalid_content)?;
+        let view =
+            DocumentView::from_projection(&prepared.document_id, u64::MAX, &prepared.projection);
         let projection_size = serde_json::to_vec(&view)
             .map_err(|_| ApiError::internal())?
             .len();
@@ -389,13 +400,8 @@ async fn import_document_projection(
         Ok(prepared)
     })
     .await?;
-    let summary = state
-        .service
-        .replace(prepared)
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok(Json(import_result(summary)))
+    let result = apply_document_mutation(&state, principal, operation_id, prepared).await?;
+    Ok(Json(result))
 }
 
 async fn run_blocking<T, F>(operation: F) -> Result<T, ApiError>
@@ -448,25 +454,36 @@ async fn due_page(
     require(&principal, DeviceScope::Read)?;
     require(&principal, DeviceScope::Review)?;
     let limit = input.limit.unwrap_or(100);
-    let query = QueryDueThemataPage::new(input.day, limit, input.after)
+    let replica_state = state
+        .service
+        .replica_state(principal.device_id)
+        .await
+        .map_err(ApiError::service)?;
+    let cursor_key = replica_state.server_id;
+    let query = QueryDueThemataPage::new(input.day, limit, input.after, &cursor_key)
         .map_err(|_| ApiError::bad_request("invalid due-page query"))?;
     let due = state
         .service
         .due_themata_page(query)
         .await
         .map_err(ApiError::service)?;
-    run_blocking(move || bounded_due_page(due, usize::from(limit)))
+    run_blocking(move || bounded_due_page(due, usize::from(limit), input.day, cursor_key))
         .await
         .map(Json)
 }
 
-fn bounded_due_page(due: Vec<DueThema>, limit: usize) -> Result<DuePageView, ApiError> {
+fn bounded_due_page(
+    due: Vec<DueThema>,
+    limit: usize,
+    day: u32,
+    cursor_key: String,
+) -> Result<DuePageView, ApiError> {
     let max_items = due.len().min(limit);
     let mut low = 0;
     let mut high = max_items;
     while low < high {
         let count = low + (high - low).div_ceil(2);
-        let page = due_page_with_count(&due, count);
+        let page = due_page_with_count(&due, count, day, &cursor_key);
         if serde_json::to_vec(&page).is_ok_and(|bytes| bytes.len() <= MAX_FRAME_SIZE) {
             low = count;
         } else {
@@ -478,14 +495,14 @@ fn bounded_due_page(due: Vec<DueThema>, limit: usize) -> Result<DuePageView, Api
             "due item exceeds the projection response limit",
         ));
     }
-    Ok(due_page_with_count(&due, low))
+    Ok(due_page_with_count(&due, low, day, &cursor_key))
 }
 
-fn due_page_with_count(due: &[DueThema], count: usize) -> DuePageView {
+fn due_page_with_count(due: &[DueThema], count: usize, day: u32, cursor_key: &str) -> DuePageView {
     let next = if due.len() > count && count > 0 {
         due.get(count - 1)
             .map(DueCursor::after)
-            .map(DueCursor::encode)
+            .map(|cursor| cursor.encode(day, cursor_key))
     } else {
         None
     };
@@ -502,17 +519,6 @@ fn ensure_projection_response_budget(value: &impl Serialize) -> Result<(), ApiEr
         ));
     }
     Ok(())
-}
-
-fn import_result(summary: ImportSummary) -> ImportResult {
-    ImportResult {
-        document_id: summary.document_id.to_string(),
-        revision: summary.revision,
-        content_sha256: summary.content_sha256,
-        node_count: summary.node_count,
-        occurrence_count: summary.occurrence_count,
-        semantic_edge_count: summary.semantic_edge_count,
-    }
 }
 
 async fn changes(
@@ -2539,7 +2545,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "content:write",
             Some("DocumentImportRequestV1"),
             "200",
-            "ImportResult",
+            "DocumentMutationResultV1",
             &[
                 "400", "401", "403", "408", "412", "413", "422", "500", "503",
             ],
@@ -2871,7 +2877,8 @@ fn content_parameters(path: &str, method: &str) -> Vec<Value> {
 fn content_requires_idempotency(path: &str, method: &str) -> bool {
     matches!(
         (path, method),
-        ("/v1/document-mutations", "post")
+        ("/v1/documents/{id}", "put")
+            | ("/v1/document-mutations", "post")
             | ("/v1/document-mutations/{id}", "put" | "delete")
             | ("/v1/document-mutations/{id}/rename", "post")
     )
@@ -3280,8 +3287,6 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<SettingsV1>();
     generator.subschema_for::<DashboardV1>();
     generator.subschema_for::<DocumentView>();
-    generator.subschema_for::<ImportResult>();
-
     generator.subschema_for::<DuePageView>();
     generator.subschema_for::<ReviewSessionPageV1>();
     generator.subschema_for::<ReviewSessionSummaryV1>();
@@ -3652,7 +3657,6 @@ mod tests {
         );
         let schemas = &api["components"]["schemas"];
         for schema in [
-            "ImportResult",
             "DocumentView",
             "NodeView",
             "LinkOccurrenceView",
@@ -3665,18 +3669,7 @@ mod tests {
                 false
             );
         }
-        assert_eq!(
-            api["components"]["schemas"]["ImportResult"]["properties"]["revision"]["minimum"],
-            1
-        );
-        assert_eq!(
-            api["components"]["schemas"]["ImportResult"]["properties"]["content_sha256"]["minLength"],
-            64
-        );
-        assert_eq!(
-            api["components"]["schemas"]["ImportResult"]["properties"]["content_sha256"]["pattern"],
-            "^[0-9a-f]{64}$"
-        );
+
         assert_eq!(
             api["components"]["schemas"]["DocumentView"]["properties"]["compatibility_sha1"]["maxLength"],
             40
@@ -4984,11 +4977,30 @@ mod tests {
             next_review_day: 1,
             review_count: 0,
         };
-        let page = bounded_due_page(vec![due("a", 600_000), due("b", 600_000)], 2).unwrap();
+        let page = bounded_due_page(
+            vec![due("a", 600_000), due("b", 600_000)],
+            2,
+            20260718,
+            "server".into(),
+        )
+        .unwrap();
         assert_eq!(page.items.len(), 1);
-        assert_eq!(page.next.as_deref(), Some("0:1:a"));
+        assert!(
+            page.next
+                .as_deref()
+                .is_some_and(|cursor| !cursor.is_empty())
+        );
+        assert_ne!(page.next.as_deref(), Some("0:1:a"));
         assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_FRAME_SIZE);
-        assert!(bounded_due_page(vec![due("large", MAX_FRAME_SIZE)], 1).is_err());
+        assert!(
+            bounded_due_page(
+                vec![due("large", MAX_FRAME_SIZE)],
+                1,
+                20260718,
+                "server".into(),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

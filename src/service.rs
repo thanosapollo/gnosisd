@@ -6,8 +6,10 @@ use std::{
         mpsc::{self, SyncSender, TrySendError},
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(test)]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -18,17 +20,21 @@ mod import;
 
 pub(crate) use backup::BackupSummary;
 use backup::{BackupError, create_backup, prune_backups, validate_restore, verify_backup};
+#[cfg(test)]
 use import::persist_server_import;
+pub(crate) use import::protocol_logical_path;
+
+#[cfg(test)]
+use crate::application::{ImportSummary, PreparedServerImport};
 
 use crate::{
     application::{
         AnswerInput, ApplicationError, AssetHead, ContentChange, DashboardSummary, DevicePrincipal,
-        DeviceRecord, DocumentHead, DocumentRevision, ImportSummary, MAX_OFFLINE_ASSET_BYTES,
-        NewDevice, NodeRecord, OfflineAssetOperation, OfflineAssetResult,
-        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
-        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
-        PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation, PreparedNote,
-        PreparedServerImport, PreparedThema, QueryDueThemataPage, ReplicaChange, ReplicaState,
+        DeviceRecord, DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NewDevice,
+        NodeRecord, OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
+        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
+        PreparedAsset, PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
+        PreparedNote, PreparedThema, QueryDueThemataPage, ReplicaChange, ReplicaState,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
         ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
         ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
@@ -67,6 +73,7 @@ impl ServiceHandle {
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace(
         &self,
         prepared: PreparedServerImport,
@@ -1206,6 +1213,7 @@ enum StoreCommand {
     Ready {
         response: oneshot::Sender<StoreResult<()>>,
     },
+    #[cfg(test)]
     Replace {
         prepared: Box<PreparedServerImport>,
         created_at_us: i64,
@@ -1699,6 +1707,7 @@ fn reconcile_content_command(
     )
 }
 
+#[cfg(test)]
 fn replace_command(
     store: &mut SqliteStore,
     blobs: &BlobStore,
@@ -1798,6 +1807,7 @@ fn stage_blob_command(
 fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreCommand) {
     match command {
         StoreCommand::Ready { response } => send(response, store.settings().map(drop)),
+        #[cfg(test)]
         StoreCommand::Replace {
             prepared,
             created_at_us,
@@ -2425,6 +2435,7 @@ fn validate_blob_metadata(bytes: &[u8], media_type: &str) -> Result<(), ServiceE
     }
 }
 
+#[cfg(test)]
 fn system_time_us() -> Result<i64, ServiceError> {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -69,6 +69,8 @@ enum Command {
     SystemInfo,
     ImportOrg {
         document_id: String,
+        #[arg(long)]
+        operation_id: String,
         #[arg(long, value_name = "N")]
         if_revision: Option<u64>,
     },
@@ -501,8 +503,18 @@ async fn run(cli: Cli) -> Result<(), RunError> {
         }
         Command::ImportOrg {
             document_id,
+            operation_id,
             if_revision,
-        } => run_http_import(&cli.http_url, cli.token_file, document_id, if_revision).await,
+        } => {
+            run_http_import(
+                &cli.http_url,
+                cli.token_file,
+                document_id,
+                operation_id,
+                if_revision,
+            )
+            .await
+        }
         Command::GetDocument { document_id } => {
             let client = http_client(&cli.http_url, cli.token_file)?;
             write_json(
@@ -558,6 +570,7 @@ async fn run_http_import(
     base_url: &str,
     token_file: Option<PathBuf>,
     document_id: String,
+    operation_id: String,
     expected_revision: Option<u64>,
 ) -> Result<(), RunError> {
     let client = http_client(base_url, token_file)?;
@@ -566,7 +579,7 @@ async fn run_http_import(
         expected_revision,
     };
     let result = client
-        .import_document(&document_id, &input)
+        .import_document(&document_id, &operation_id, &input)
         .await
         .map_err(CliError::from)?;
     write_json(&result).map_err(Into::into)

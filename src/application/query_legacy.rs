@@ -1,8 +1,13 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::domain::{DueThema, ThemaId};
 
 pub const MAX_DUE_THEMATA: u16 = 100;
+const MAX_DUE_CURSOR_BYTES: usize = 256;
+const DUE_CURSOR_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DueCursor {
@@ -11,21 +16,43 @@ pub(crate) struct DueCursor {
     thema_id: String,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DueCursorPayload {
+    version: u32,
+    day: u32,
+    reviewed: bool,
+    next_review_day: u32,
+    thema_id: String,
+}
+
 impl DueCursor {
-    fn parse(value: &str) -> Result<Self, LegacyQueryError> {
-        let mut parts = value.splitn(3, ':');
-        let reviewed = match parts.next() {
-            Some("0") => false,
-            Some("1") => true,
-            _ => return Err(LegacyQueryError::Cursor),
-        };
-        let next_review_day = parse_cursor_part(parts.next())?;
-        let thema_id = ThemaId::new(parts.next().ok_or(LegacyQueryError::Cursor)?)
+    fn decode(value: &str, day: u32, key: &str) -> Result<Self, LegacyQueryError> {
+        if value.is_empty() || value.len() > MAX_DUE_CURSOR_BYTES {
+            return Err(LegacyQueryError::Cursor);
+        }
+        let token = BASE64_URL
+            .decode(value)
+            .map_err(|_| LegacyQueryError::Cursor)?;
+        let payload_len = token
+            .len()
+            .checked_sub(32)
+            .ok_or(LegacyQueryError::Cursor)?;
+        let (payload, digest) = token.split_at(payload_len);
+        if cursor_digest(key, payload).as_slice() != digest {
+            return Err(LegacyQueryError::Cursor);
+        }
+        let decoded: DueCursorPayload =
+            serde_json::from_slice(payload).map_err(|_| LegacyQueryError::Cursor)?;
+        if decoded.version != DUE_CURSOR_VERSION || decoded.day != day {
+            return Err(LegacyQueryError::Cursor);
+        }
+        let thema_id = ThemaId::new(decoded.thema_id)
             .map_err(|_| LegacyQueryError::Cursor)?
             .to_string();
         Ok(Self {
-            reviewed,
-            next_review_day,
+            reviewed: decoded.reviewed,
+            next_review_day: decoded.next_review_day,
             thema_id,
         })
     }
@@ -42,13 +69,20 @@ impl DueCursor {
         &self.thema_id
     }
 
-    pub(crate) fn encode(self) -> String {
-        format!(
-            "{}:{}:{}",
-            u8::from(self.reviewed),
-            self.next_review_day,
-            self.thema_id
-        )
+    pub(crate) fn encode(self, day: u32, key: &str) -> String {
+        let payload = serde_json::to_vec(&DueCursorPayload {
+            version: DUE_CURSOR_VERSION,
+            day,
+            reviewed: self.reviewed,
+            next_review_day: self.next_review_day,
+            thema_id: self.thema_id,
+        })
+        .expect("due cursor payload is serializable");
+        let digest = cursor_digest(key, &payload);
+        let mut token = Vec::with_capacity(payload.len() + digest.len());
+        token.extend_from_slice(&payload);
+        token.extend_from_slice(&digest);
+        BASE64_URL.encode(token)
     }
 
     pub(crate) fn after(thema: &DueThema) -> Self {
@@ -58,6 +92,14 @@ impl DueCursor {
             thema_id: thema.id.to_string(),
         }
     }
+}
+
+fn cursor_digest(key: &str, payload: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"gnosis-due-cursor-v1\0");
+    digest.update(key.as_bytes());
+    digest.update(payload);
+    digest.finalize().into()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -72,6 +114,7 @@ impl QueryDueThemataPage {
         day: u32,
         limit: u16,
         after: Option<String>,
+        cursor_key: &str,
     ) -> Result<Self, LegacyQueryError> {
         if !valid_day(day) {
             return Err(LegacyQueryError::Day);
@@ -82,7 +125,10 @@ impl QueryDueThemataPage {
         Ok(Self {
             day,
             limit,
-            after: after.as_deref().map(DueCursor::parse).transpose()?,
+            after: after
+                .as_deref()
+                .map(|value| DueCursor::decode(value, day, cursor_key))
+                .transpose()?,
         })
     }
 
@@ -107,13 +153,6 @@ pub(crate) enum LegacyQueryError {
     Limit,
     #[error("invalid due queue cursor")]
     Cursor,
-}
-
-fn parse_cursor_part<T: std::str::FromStr>(value: Option<&str>) -> Result<T, LegacyQueryError> {
-    value
-        .ok_or(LegacyQueryError::Cursor)?
-        .parse()
-        .map_err(|_| LegacyQueryError::Cursor)
 }
 
 fn valid_day(day: u32) -> bool {
@@ -141,39 +180,61 @@ const fn leap_year(year: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LegacyQueryError, QueryDueThemataPage};
+    use crate::domain::{DueThema, ThemaId};
+
+    use super::{DueCursor, LegacyQueryError, QueryDueThemataPage};
+
+    const KEY: &str = "server-identity";
 
     #[test]
     fn validates_legacy_query_boundaries() {
-        assert!(QueryDueThemataPage::new(101, 1, None).is_err());
-        assert!(QueryDueThemataPage::new(10101, 1, None).is_ok());
-        assert!(QueryDueThemataPage::new(20260229, 1, None).is_err());
-        assert!(QueryDueThemataPage::new(20240229, 100, None).is_ok());
+        assert!(QueryDueThemataPage::new(101, 1, None, KEY).is_err());
+        assert!(QueryDueThemataPage::new(10101, 1, None, KEY).is_ok());
+        assert!(QueryDueThemataPage::new(20260229, 1, None, KEY).is_err());
+        assert!(QueryDueThemataPage::new(20240229, 100, None, KEY).is_ok());
         assert_eq!(
-            QueryDueThemataPage::new(20260714, 101, None).unwrap_err(),
+            QueryDueThemataPage::new(20260714, 101, None, KEY).unwrap_err(),
             LegacyQueryError::Limit
         );
     }
 
     #[test]
     fn validates_due_page_cursors() {
-        let first = QueryDueThemataPage::new(20260714, 100, None).unwrap();
+        let first = QueryDueThemataPage::new(20260714, 100, None, KEY).unwrap();
         assert_eq!(first.after(), None);
 
-        let next = QueryDueThemataPage::new(20260714, 25, Some("0:20260713:73000000000000".into()))
-            .unwrap();
+        let source = DueThema {
+            id: ThemaId::new("thema-b").unwrap(),
+            kind: "basic".into(),
+            keimenon: "Question".into(),
+            hypothesis: Vec::new(),
+            answer: vec!["Answer".into()],
+            next_review_day: 20260713,
+            review_count: 0,
+        };
+        let token = DueCursor::after(&source).encode(20260714, KEY);
+        assert!(!token.contains("thema-b"));
+        assert!(!token.contains("20260713"));
+        let next = QueryDueThemataPage::new(20260714, 25, Some(token.clone()), KEY).unwrap();
         let cursor = next.after().unwrap();
         assert!(!cursor.reviewed());
         assert_eq!(cursor.next_review_day(), 20260713);
-        assert_eq!(cursor.thema_id(), "73000000000000");
+        assert_eq!(cursor.thema_id(), "thema-b");
 
-        let opaque =
-            QueryDueThemataPage::new(20260714, 25, Some("1:20260714:opaque:thema".into())).unwrap();
-        assert_eq!(opaque.after().unwrap().thema_id(), "opaque:thema");
+        assert!(QueryDueThemataPage::new(20260715, 25, Some(token.clone()), KEY).is_err());
+        assert!(QueryDueThemataPage::new(20260714, 25, Some(token), "another-server").is_err());
 
-        let legacy = QueryDueThemataPage::new(20260714, 25, Some("0:0:1".into())).unwrap();
-        assert_eq!(legacy.after().unwrap().next_review_day(), 0);
-
-        assert!(QueryDueThemataPage::new(20260714, 25, Some("bad".into())).is_err());
+        let mut tampered = DueCursor::after(&source).encode(20260714, KEY).into_bytes();
+        let last = tampered.last_mut().unwrap();
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        assert!(
+            QueryDueThemataPage::new(
+                20260714,
+                25,
+                Some(String::from_utf8(tampered).unwrap()),
+                KEY,
+            )
+            .is_err()
+        );
     }
 }

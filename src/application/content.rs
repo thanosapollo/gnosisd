@@ -24,6 +24,7 @@ static PLAIN_FILE_LINK: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparedNote {
     pub(crate) document_id: DocumentId,
+    pub(crate) explicit_document_id: bool,
     pub(crate) logical_path: String,
     pub(crate) path_key: String,
     pub(crate) org: String,
@@ -451,9 +452,11 @@ pub(crate) fn prepare_note(
     let projection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_org(&org)))
         .map_err(|_| ContentError::OrgParser)?
         .map_err(ContentError::Org)?;
+    let explicit_document_id = document_id.is_some();
     let document_id = document_id.unwrap_or_else(|| Uuid::now_v7().to_string());
     Ok(PreparedNote {
         document_id: DocumentId::new(document_id).map_err(|_| ContentError::DocumentId)?,
+        explicit_document_id,
         path_key: path_key(&logical_path),
         blob_sha256: format!("{:x}", Sha256::digest(org.as_bytes())),
         logical_path,

@@ -104,10 +104,9 @@ impl PreparedDeviceDocumentMutation {
             &self.prepared,
         )?;
         let kind = mutation_kind(&self.prepared);
-        let target = self
-            .prepared
-            .expected_revision
-            .map(|_| self.prepared.document_id.to_string());
+        let target = (self.prepared.explicit_document_id
+            || self.prepared.expected_revision.is_some())
+        .then(|| self.prepared.document_id.to_string());
         let request = document_request_json(self.identity.format_version, kind, &self.prepared)?;
         let digest = format!("{:x}", Sha256::digest(request.as_bytes()));
         if self.identity.mutation_kind == kind
@@ -288,8 +287,8 @@ pub(crate) fn prepare_device_document_mutation(
             device_id,
             mutation_kind,
             target_id: prepared
-                .expected_revision
-                .map(|_| prepared.document_id.to_string()),
+                .explicit_document_id
+                .then(|| prepared.document_id.to_string()),
             request_sha256,
             request_json,
         },
@@ -453,8 +452,8 @@ fn document_request_json(
         format_version,
         mutation_kind,
         document_id: prepared
-            .expected_revision
-            .map(|_| prepared.document_id.as_str()),
+            .explicit_document_id
+            .then_some(prepared.document_id.as_str()),
         logical_path: &prepared.logical_path,
         org: &prepared.org,
         blob_sha256: &prepared.blob_sha256,
@@ -507,18 +506,20 @@ mod tests {
     #[test]
     fn document_create_fingerprint_is_stable_and_excludes_generated_identity() {
         let org = "#+title: Stable\n";
+        let generated =
+            |org: &str| prepare_note(None, "note.org".into(), org.into(), None).unwrap();
         let first = prepare_device_document_mutation(
             1,
             "operation-a".into(),
             "device-a".into(),
-            note("first", org, None),
+            generated(org),
         )
         .unwrap();
         let second = prepare_device_document_mutation(
             1,
             "operation-b".into(),
             "device-b".into(),
-            note("second", org, None),
+            generated(org),
         )
         .unwrap();
         let digest = format!("{:x}", Sha256::digest(org.as_bytes()));
@@ -563,6 +564,25 @@ mod tests {
                 .identity
                 .request_json
                 .contains("\"expected_revision\":7")
+        );
+    }
+
+    #[test]
+    fn explicit_document_create_fingerprint_captures_target() {
+        let operation = prepare_device_document_mutation(
+            1,
+            "operation".into(),
+            "device".into(),
+            note("document", "#+title: Note\n", None),
+        )
+        .unwrap();
+
+        assert_eq!(operation.identity.target_id.as_deref(), Some("document"));
+        assert!(
+            operation
+                .identity
+                .request_json
+                .contains("\"document_id\":\"document\"")
         );
     }
 

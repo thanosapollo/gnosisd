@@ -24,13 +24,15 @@ pub(crate) use client_views::{
     ReviewQueueSummary, ReviewSessionQuery, ReviewSessionSummary, ReviewTotals, ReviewWindow,
     ThemaReviewState,
 };
+#[cfg(test)]
+pub(crate) use content::ContentError;
 pub(crate) use content::{
-    AssetHead, AssetRevision, ContentChange, ContentError, DocumentHead,
-    DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision, NodeRecord,
-    PreparedAsset, PreparedNote, PreparedThema, ProjectionEdge, ProjectionLinkOccurrence,
-    ProjectionNode, ThemaRecord, ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key,
-    prepare_asset, prepare_note, prepare_thema, retained_asset_paths_in_org, stored_thema_content,
-    thema_content, validate_asset_path, validate_offline_thema_assets, validate_org_path,
+    AssetHead, AssetRevision, ContentChange, DocumentHead, DocumentProjectionSnapshot,
+    DocumentReplicaRevision, DocumentRevision, NodeRecord, PreparedAsset, PreparedNote,
+    PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
+    ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset, prepare_note,
+    prepare_thema, retained_asset_paths_in_org, stored_thema_content, thema_content,
+    validate_asset_path, validate_offline_thema_assets, validate_org_path,
 };
 pub(crate) use device_mutation::{
     DeviceDocumentLifecycleMutation, DeviceMutationCursor, DeviceMutationIdentity,
@@ -39,7 +41,10 @@ pub(crate) use device_mutation::{
     prepare_device_document_mutation, prepare_device_document_rename,
     prepare_device_document_tombstone,
 };
-pub use import_document::{ApplicationError, ImportDocument, ImportSummary};
+pub use import_document::ApplicationError;
+#[cfg(test)]
+pub use import_document::{ImportDocument, ImportSummary};
+#[cfg(test)]
 pub(crate) use import_document::{PreparedServerImport, summarize_import};
 pub(crate) use offline_asset::{
     AssetReconciliationStatus, AuthoritativeAsset, MAX_OFFLINE_ASSET_BYTES,

@@ -20,16 +20,14 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::{
-    application::{
-        MAX_OFFLINE_ASSET_BYTES, QueryDueThemataPage, canonical_asset_path, valid_operation_id,
-    },
+    application::{MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, valid_operation_id},
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
     domain::DocumentId,
     is_canonical_sha256,
     protocol::{
-        DocumentView, DuePageView, ImportResult, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
+        DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
         MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
         MAX_OFFLINE_CONTENT_RESULT_BYTES, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
         MAX_OFFLINE_REVIEW_RESULT_BYTES, MAX_REPLICA_CURSOR_BYTES, MAX_REPLICA_PAGE_BYTES,
@@ -347,25 +345,23 @@ impl HttpClient {
     pub async fn import_document(
         &self,
         document_id: &str,
+        operation_id: &str,
         input: &DocumentImportRequestV1,
-    ) -> Result<ImportResult, HttpClientError> {
+    ) -> Result<DocumentMutationResultV1, HttpClientError> {
         DocumentId::new(document_id).map_err(|_| HttpClientError::InvalidMutation)?;
+        require_operation_id(operation_id)?;
         let url = self.resource_endpoint("v1/documents", document_id)?;
         let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
         if body.len() > MAX_FRAME_SIZE {
             return Err(HttpClientError::InvalidMutation);
         }
-        let result = execute_json_exact(
-            self.client
-                .put(url)
-                .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-                .body(body),
-            MAX_FRAME_SIZE,
-            StatusCode::OK,
-        )
-        .await?;
-        validate_import_result(&result, document_id, input)?;
-        Ok(result)
+        let request = self
+            .client
+            .put(url)
+            .header("Idempotency-Key", operation_id)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(body);
+        execute_document_mutation(request, operation_id, Some(document_id)).await
     }
 
     pub async fn document(&self, document_id: &str) -> Result<DocumentView, HttpClientError> {
@@ -392,8 +388,16 @@ impl HttpClient {
         limit: u16,
         after: Option<&str>,
     ) -> Result<DuePageView, HttpClientError> {
-        QueryDueThemataPage::new(day, limit, after.map(str::to_owned))
-            .map_err(|_| HttpClientError::InvalidMutation)?;
+        let year = i32::try_from(day / 10_000).map_err(|_| HttpClientError::InvalidMutation)?;
+        let month = (day / 100) % 100;
+        let day_of_month = day % 100;
+        if year == 0
+            || NaiveDate::from_ymd_opt(year, month, day_of_month).is_none()
+            || !(1..=100).contains(&limit)
+            || after.is_some_and(str::is_empty)
+        {
+            return Err(HttpClientError::InvalidMutation);
+        }
         let mut url = self.endpoint("v1/review/due")?;
         let mut pairs = url.query_pairs_mut();
         pairs.append_pair("day", &day.to_string());
@@ -786,21 +790,6 @@ fn append_cursor(url: &mut Url, cursor: &str) -> Result<(), HttpClientError> {
     Ok(())
 }
 
-fn validate_import_result(
-    result: &ImportResult,
-    document_id: &str,
-    input: &DocumentImportRequestV1,
-) -> Result<(), HttpClientError> {
-    let expected_digest = format!("{:x}", Sha256::digest(input.org.as_bytes()));
-    if result.document_id != document_id
-        || result.revision == 0
-        || result.content_sha256 != expected_digest
-    {
-        return Err(invalid_response());
-    }
-    Ok(())
-}
-
 fn validate_document_view(
     document: &DocumentView,
     document_id: &str,
@@ -848,16 +837,8 @@ fn validate_due_page(page: &DuePageView, limit: u16) -> Result<(), HttpClientErr
     {
         return Err(invalid_response());
     }
-    let expected_cursor = page.items.last().map(|item| {
-        format!(
-            "{}:{}:{}",
-            u8::from(item.review_count > 0),
-            item.next_review_day,
-            item.id
-        )
-    });
     match page.next.as_deref() {
-        Some(next) if expected_cursor.as_deref() == Some(next) => Ok(()),
+        Some(next) if !page.items.is_empty() && !next.is_empty() && next.len() <= 512 => Ok(()),
         None => Ok(()),
         _ => Err(invalid_response()),
     }
@@ -1520,7 +1501,7 @@ mod tests {
         };
 
         let error = client
-            .import_document("document", &input)
+            .import_document("document", "operation", &input)
             .await
             .unwrap_err();
         assert!(matches!(error, HttpClientError::InvalidMutation));
@@ -1537,7 +1518,7 @@ mod tests {
         };
 
         let import_error = client
-            .import_document(&"x".repeat(129), &input)
+            .import_document(&"x".repeat(129), "operation", &input)
             .await
             .unwrap_err();
         assert!(matches!(import_error, HttpClientError::InvalidMutation));
@@ -1547,7 +1528,7 @@ mod tests {
             client.due_page(0, 1, None).await,
             client.due_page(101, 1, None).await,
             client.due_page(20_260_718, 0, None).await,
-            client.due_page(20_260_718, 1, Some("bad")).await,
+            client.due_page(20_260_718, 1, Some("")).await,
         ] {
             let error = result.unwrap_err();
             assert!(matches!(error, HttpClientError::InvalidMutation));

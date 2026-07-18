@@ -380,21 +380,6 @@ impl DuePageView {
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ImportResult {
-    #[schemars(length(min = 1, max = 128))]
-    pub document_id: String,
-    #[schemars(range(min = 1))]
-    pub revision: u64,
-    #[schemars(length(equal = 64))]
-    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
-    pub content_sha256: String,
-    pub node_count: usize,
-    pub occurrence_count: usize,
-    pub semantic_edge_count: usize,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct DocumentView {
     #[schemars(length(min = 1, max = 128))]
     pub document_id: String,
