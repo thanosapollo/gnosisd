@@ -1,7 +1,7 @@
 use gnosis_core::protocol::http_v1::{
     ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
     AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
-    DocumentMutationResultV1, DocumentRevisionPageV1, NodePageV1, NoteRenameRequestV1,
+    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1, NoteRenameRequestV1,
     NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
     OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
@@ -283,6 +283,20 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         missing_state.as_object_mut().unwrap().remove(field);
         assert!(serde_json::from_value::<ReviewStateV1>(missing_state).is_err());
     }
+}
+
+#[test]
+fn due_projection_contains_only_schedule_metadata() {
+    let wire = json!({
+        "items":[{"id":"thema","next_review_day":20260719,"review_count":0}],
+        "next":null
+    });
+    let page: DuePageView = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(page).unwrap(), wire);
+
+    let mut answer_bearing = wire;
+    answer_bearing["items"][0]["answer"] = json!(["concealed"]);
+    assert!(serde_json::from_value::<DuePageView>(answer_bearing).is_err());
 }
 
 #[test]

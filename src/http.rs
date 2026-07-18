@@ -3733,6 +3733,22 @@ mod tests {
             ])
         );
         let schemas = &api["components"]["schemas"];
+        assert_eq!(
+            schemas["DueThemaView"]["required"],
+            json!(["id", "next_review_day", "review_count"])
+        );
+        assert_eq!(
+            schemas["DueThemaView"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            ["id", "next_review_day", "review_count"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
         for schema in [
             "DocumentView",
             "NodeView",
@@ -3933,6 +3949,10 @@ mod tests {
             sessions["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ReviewSessionRequestV1"
         );
+        let target_count =
+            &api["components"]["schemas"]["ReviewSessionRequestV1"]["properties"]["target_count"];
+        assert_eq!(target_count["minimum"], 1);
+        assert_eq!(target_count["maximum"], 500);
         assert_eq!(
             sessions["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ReviewSessionV1"
@@ -5067,23 +5087,9 @@ mod tests {
             "server".into(),
         )
         .unwrap();
-        assert_eq!(page.items.len(), 1);
-        assert!(
-            page.next
-                .as_deref()
-                .is_some_and(|cursor| !cursor.is_empty())
-        );
-        assert_ne!(page.next.as_deref(), Some("0:1:a"));
+        assert_eq!(page.items.len(), 2);
+        assert!(page.next.is_none());
         assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_FRAME_SIZE);
-        assert!(
-            bounded_due_page(
-                vec![due("large", MAX_FRAME_SIZE)],
-                1,
-                20260718,
-                "server".into(),
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -5949,6 +5955,90 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn online_review_sessions_conceal_due_content_and_enforce_target_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device =
+            generate_device("reviewer".into(), vec!["read".into(), "review".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        put_review_thema(&service, "Question", None, 2).await;
+        let app = router(service.clone());
+
+        let due = authenticated_json(&app, &token, "/v1/review/due?day=20260716").await;
+        assert_eq!(
+            due["items"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            ["id", "next_review_day", "review_count"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+
+        for index in 0..500 {
+            put_custom_review_thema(
+                &service,
+                &format!("thema-{index:03}"),
+                "basic",
+                "Question",
+                vec![None],
+                vec!["answer".into()],
+                None,
+            )
+            .await;
+        }
+
+        for (target_count, expected) in [(None, 100), (Some(500), 500)] {
+            let response = app
+                .clone()
+                .oneshot(authorized(
+                    "POST",
+                    "/v1/review/sessions",
+                    &token,
+                    Body::from(review_queue_session_body_with_target(target_count)),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let session = response_json(response).await;
+            assert_eq!(session["target_count"], expected);
+            assert_eq!(session["queue_length"], expected);
+            abort_http_review(&app, &token, session["session_id"].as_str().unwrap()).await;
+        }
+
+        for target_count in [0, 501] {
+            let rejected = app
+                .clone()
+                .oneshot(authorized(
+                    "POST",
+                    "/v1/review/sessions",
+                    &token,
+                    Body::from(review_queue_session_body_with_target(Some(target_count))),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+            let active = authenticated_json(&app, &token, "/v1/review/sessions/active").await;
+            assert_eq!(active["session"], Value::Null);
+        }
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
     async fn assert_case_folded_http_attempt(
         app: &axum::Router,
         token: &str,
@@ -6016,6 +6106,10 @@ mod tests {
     }
 
     fn review_session_body(thema_id: &str) -> Vec<u8> {
+        review_session_body_with_target(thema_id, None)
+    }
+
+    fn review_session_body_with_target(thema_id: &str, target_count: Option<u32>) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "source": {
                 "kind": "manual",
@@ -6026,7 +6120,26 @@ mod tests {
                 "topic_backward_depth": null,
                 "manual_ids": [thema_id]
             },
-            "target_count": null
+            "target_count": target_count
+        }))
+        .unwrap()
+    }
+
+    fn review_queue_session_body_with_target(target_count: Option<u32>) -> Vec<u8> {
+        let manual_ids = (0..500)
+            .map(|index| format!("thema-{index:03}"))
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&json!({
+            "source": {
+                "kind": "manual",
+                "tags": [],
+                "exclude_tags": [],
+                "topic_node_id": null,
+                "topic_forward_depth": null,
+                "topic_backward_depth": null,
+                "manual_ids": manual_ids
+            },
+            "target_count": target_count
         }))
         .unwrap()
     }

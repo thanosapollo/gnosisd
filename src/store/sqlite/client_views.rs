@@ -108,7 +108,7 @@ impl SqliteStore {
         let review_day = review_day_at(now_us, &settings.timezone, settings.day_boundary_hour)
             .map_err(StoreError::storage)?;
         let matched_count =
-            super::review::select_queue(&self.connection, source, review_day)?.len();
+            super::review::select_queue(&self.connection, source, review_day, None)?.len();
         Ok(ReviewQueueSummary {
             source: source.clone(),
             matched_count: u64::try_from(matched_count).map_err(StoreError::storage)?,

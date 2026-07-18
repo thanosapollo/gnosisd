@@ -21,8 +21,8 @@ use thiserror::Error;
 
 use crate::{
     application::{
-        MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_thema,
-        thema_content, valid_operation_id, validate_org_path,
+        MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT,
+        canonical_asset_path, prepare_thema, thema_content, valid_operation_id, validate_org_path,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
@@ -384,6 +384,12 @@ impl HttpClient {
         &self,
         input: &ReviewSessionRequestV1,
     ) -> Result<ReviewSessionV1, HttpClientError> {
+        if input
+            .target_count
+            .is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        {
+            return Err(HttpClientError::InvalidReview);
+        }
         let request = self.post_review_json("v1/review/sessions", input)?;
         let session = execute_json_exact(
             request,

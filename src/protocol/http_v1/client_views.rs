@@ -338,10 +338,6 @@ impl From<&ThemaReviewState> for ThemaReviewStateV1 {
 #[serde(deny_unknown_fields)]
 pub struct DueThemaView {
     pub id: String,
-    pub kind: String,
-    pub keimenon: String,
-    pub hypothesis: Vec<Option<String>>,
-    pub answer: Vec<String>,
     pub next_review_day: u32,
     pub review_count: u64,
 }
@@ -350,10 +346,6 @@ impl From<DueThema> for DueThemaView {
     fn from(thema: DueThema) -> Self {
         Self {
             id: thema.id.to_string(),
-            kind: thema.kind,
-            keimenon: thema.keimenon,
-            hypothesis: thema.hypothesis,
-            answer: thema.answer,
             next_review_day: thema.next_review_day,
             review_count: thema.review_count,
         }

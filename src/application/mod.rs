@@ -14,6 +14,8 @@ mod sync;
 pub(crate) const MAX_REVIEW_PACK_ID_CHARS: usize = 128;
 pub(crate) const MAX_REVIEW_PACK_ITEMS: usize = 500;
 pub(crate) const MAX_REVIEW_PACK_MEDIA_TYPE_CHARS: usize = 255;
+pub(crate) const DEFAULT_ONLINE_REVIEW_TARGET_COUNT: u32 = 100;
+pub(crate) const MAX_ONLINE_REVIEW_TARGET_COUNT: u32 = 500;
 
 pub(crate) use auth::{
     DevicePrincipal, DeviceRecord, DeviceScope, NewDevice, generate_device, parse_stored_scopes,

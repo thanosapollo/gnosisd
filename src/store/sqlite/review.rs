@@ -10,7 +10,8 @@ use super::{
 };
 use crate::{
     application::{
-        AnswerInput, FsrsConfigSnapshot, MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_BYTES,
+        AnswerInput, DEFAULT_ONLINE_REVIEW_TARGET_COUNT, FsrsConfigSnapshot,
+        MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, MAX_REVIEW_PACK_BYTES,
         MAX_REVIEW_PACK_ITEMS, OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult,
         PresentationSnapshot, RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation,
         ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
@@ -47,6 +48,11 @@ impl SqliteStore {
         owner_device_id: Option<&str>,
         started_at_us: u64,
     ) -> Result<ReviewSessionView, StoreError> {
+        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
+        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        {
+            return Err(StoreError::InvalidReviewState);
+        }
         require_no_active_session(&self.connection)?;
         let captured = captured_settings(&self.connection)?;
         let review_day = review_day_at(
@@ -55,10 +61,7 @@ impl SqliteStore {
             captured.day_boundary_hour,
         )
         .map_err(StoreError::storage)?;
-        let mut queue = select_queue(&self.connection, source, review_day)?;
-        if let Some(target) = target_count {
-            queue.truncate(target as usize);
-        }
+        let queue = select_queue(&self.connection, source, review_day, target_count)?;
         if queue.is_empty() {
             return Err(StoreError::NotFound);
         }
@@ -1189,10 +1192,7 @@ fn bounded_queue(
     target_count: Option<u32>,
     review_day: u32,
 ) -> Result<Vec<String>, StoreError> {
-    let mut queue = select_queue(connection, source, review_day)?;
-    if let Some(target) = target_count {
-        queue.truncate(target as usize);
-    }
+    let queue = select_queue(connection, source, review_day, target_count)?;
     if queue.is_empty() {
         Err(StoreError::NotFound)
     } else {
@@ -1402,9 +1402,11 @@ pub(super) fn select_queue(
     connection: &Connection,
     source: &ReviewSource,
     review_day: u32,
+    target_count: Option<u32>,
 ) -> Result<Vec<String>, StoreError> {
+    let limit = target_count.map_or(-1, i64::from);
     if source.kind == ReviewSourceKind::Manual {
-        return select_manual(connection, &source.manual_ids);
+        return select_manual(connection, &source.manual_ids, target_count);
     }
     if source.kind == ReviewSourceKind::Topic {
         return select_topic(
@@ -1412,12 +1414,17 @@ pub(super) fn select_queue(
             source.topic_node_id.as_deref().unwrap_or_default(),
             source.topic_forward_depth.unwrap_or_default(),
             source.topic_backward_depth.unwrap_or_default(),
+            limit,
         );
     }
-    select_filtered(connection, source, review_day)
+    select_filtered(connection, source, review_day, limit)
 }
 
-fn select_manual(connection: &Connection, ids: &[String]) -> Result<Vec<String>, StoreError> {
+fn select_manual(
+    connection: &Connection,
+    ids: &[String],
+    target_count: Option<u32>,
+) -> Result<Vec<String>, StoreError> {
     let mut selected = Vec::new();
     for id in ids {
         let available: bool = connection
@@ -1432,6 +1439,9 @@ fn select_manual(connection: &Connection, ids: &[String]) -> Result<Vec<String>,
             .map_err(StoreError::storage)?;
         if available && !selected.contains(id) {
             selected.push(id.clone());
+            if target_count.is_some_and(|count| selected.len() == count as usize) {
+                break;
+            }
         }
     }
     Ok(selected)
@@ -1442,6 +1452,7 @@ fn select_topic(
     node_id: &str,
     forward_depth: u32,
     backward_depth: u32,
+    limit: i64,
 ) -> Result<Vec<String>, StoreError> {
     let mut statement = connection
         .prepare(
@@ -1468,12 +1479,18 @@ fn select_topic(
          JOIN thema ON thema.thema_id = link.thema_id
          JOIN review_state AS state ON state.thema_id = thema.thema_id
          WHERE thema.archived_at_us IS NULL AND state.suspended = 0
-         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id",
+         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id
+         LIMIT ?4",
         )
         .map_err(StoreError::storage)?;
     statement
         .query_map(
-            params![node_id, i64::from(forward_depth), i64::from(backward_depth)],
+            params![
+                node_id,
+                i64::from(forward_depth),
+                i64::from(backward_depth),
+                limit
+            ],
             |row| row.get(0),
         )
         .map_err(StoreError::storage)?
@@ -1485,6 +1502,7 @@ fn select_filtered(
     connection: &Connection,
     source: &ReviewSource,
     review_day: u32,
+    limit: i64,
 ) -> Result<Vec<String>, StoreError> {
     let day_clause = match source.kind {
         ReviewSourceKind::Due | ReviewSourceKind::DueTag => "state.next_review_day <= ?1",
@@ -1507,13 +1525,15 @@ fn select_filtered(
                SELECT 1 FROM thema_tag
                WHERE thema_id = thema.thema_id AND tag IN (SELECT value FROM json_each(?3))
            )
-         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id"
+         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id
+         LIMIT ?4"
     );
     let mut statement = connection.prepare(&query).map_err(StoreError::storage)?;
     statement
-        .query_map(params![i64::from(review_day), include, exclude], |row| {
-            row.get(0)
-        })
+        .query_map(
+            params![i64::from(review_day), include, exclude, limit],
+            |row| row.get(0),
+        )
         .map_err(StoreError::storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::storage)
@@ -3918,8 +3938,30 @@ mod tests {
             manual_ids: vec![],
         };
         assert_eq!(
-            super::select_queue(&store.connection, &source, 20260715).unwrap(),
+            super::select_queue(&store.connection, &source, 20260715, None).unwrap(),
             ["keep"]
+        );
+    }
+
+    #[test]
+    fn filtered_review_selection_applies_target_in_sql() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for id in ["a", "b", "c"] {
+            add_thema(&mut store, id, "Question", None);
+        }
+        let source = ReviewSource {
+            kind: ReviewSourceKind::Tag,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: vec![],
+        };
+
+        assert_eq!(
+            super::select_queue(&store.connection, &source, 20260715, Some(2)).unwrap(),
+            ["a", "b"]
         );
     }
 

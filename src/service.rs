@@ -29,19 +29,20 @@ use crate::application::{ImportSummary, PreparedServerImport};
 
 use crate::{
     application::{
-        AnswerInput, ApplicationError, AssetHead, ContentChange, DashboardSummary, DevicePrincipal,
-        DeviceRecord, DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, NewDevice,
-        NodeRecord, OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
-        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
-        PreparedNote, PreparedThema, QueryDueThemataPage, ReplicaChange, ReplicaState,
-        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptState,
-        ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
-        ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
-        ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
-        SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
-        ThemaReviewState, prepare_offline_document, retained_asset_paths_in_org, token_digest,
-        validate_asset_path,
+        AnswerInput, ApplicationError, AssetHead, ContentChange,
+        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DevicePrincipal, DeviceRecord,
+        DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT,
+        NewDevice, NodeRecord, OfflineAssetOperation, OfflineAssetResult,
+        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
+        PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation, PreparedNote,
+        PreparedThema, QueryDueThemataPage, ReplicaChange, ReplicaState, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewError,
+        ReviewHistoryEvent, ReviewHistoryQuery, ReviewOperationAuthority, ReviewPackAsset,
+        ReviewPackView, ReviewQueueSummary, ReviewSessionQuery, ReviewSessionSummary,
+        ReviewSessionView, ReviewSource, SettingsError, SettingsInput, SettingsRecord,
+        SnapshotPage, SnapshotPosition, ThemaRecord, ThemaReviewState, prepare_offline_document,
+        retained_asset_paths_in_org, token_digest, validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{ClozeCheck, DocumentId, DueThema},
@@ -752,7 +753,9 @@ impl ServiceHandle {
         started_at_us: u64,
     ) -> Result<ReviewSessionView, ServiceError> {
         let source = source.validate().map_err(ServiceError::Review)?;
-        if target_count == Some(0) {
+        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
+        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        {
             return Err(ServiceError::Review(ReviewError::Target));
         }
         request(&self.sender, |response| StoreCommand::CreateReviewSession {

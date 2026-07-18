@@ -588,6 +588,7 @@ impl From<ReviewSourceKindV1> for ReviewSourceKind {
 #[serde(deny_unknown_fields)]
 pub struct ReviewSessionRequestV1 {
     pub source: ReviewSourceInputV1,
+    #[schemars(range(min = 1, max = 500))]
     pub target_count: Option<u32>,
 }
 
