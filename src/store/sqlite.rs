@@ -35,7 +35,7 @@ pub(crate) use mutation::DeviceMutationExecution;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -148,7 +148,6 @@ impl SqliteStore {
             .busy_timeout(Duration::from_secs(5))
             .map_err(StoreError::storage)?;
         initialize_schema(&connection)?;
-        validate_current_schema(&connection)?;
         Ok(Self { connection })
     }
 
@@ -3056,64 +3055,6 @@ fn user_schema_is_empty(connection: &Connection) -> Result<bool, StoreError> {
         .map_err(StoreError::storage)
 }
 
-fn validate_current_schema(connection: &Connection) -> Result<(), StoreError> {
-    let inconsistent = connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM sqlite_master
-                 WHERE name IN (
-                     'thema_legacy_id_unique', 'import_manifest',
-                     'import_table_count', 'import_path_rewrite'
-                 )
-                 UNION ALL
-                 SELECT 1 FROM pragma_table_info('thema') WHERE name = 'legacy_id'
-                 UNION ALL
-                 SELECT 1 FROM document
-                 WHERE active = 1 AND NOT EXISTS(
-                     SELECT 1 FROM document_revision AS revision
-                     WHERE revision.document_id = document.document_id
-                       AND revision.revision = document.revision
-                 )
-                 UNION ALL
-                 SELECT 1 FROM document
-                 WHERE active = 1 AND NOT EXISTS(
-                     SELECT 1 FROM document_projection_revision AS projection
-                     WHERE projection.document_id = document.document_id
-                       AND projection.revision = document.revision
-                 )
-                 UNION ALL
-                 SELECT 1 FROM thema
-                 WHERE NOT EXISTS(
-                     SELECT 1 FROM thema_revision AS revision
-                     WHERE revision.thema_id = thema.thema_id
-                       AND revision.revision = thema.revision
-                 )
-                 UNION ALL
-                 SELECT 1 FROM settings
-                 WHERE id = 1 AND NOT EXISTS(
-                     SELECT 1 FROM settings_revision AS revision
-                     WHERE revision.revision = settings.revision
-                 )
-                 UNION ALL
-                 SELECT 1 FROM review_state AS state
-                 WHERE NOT EXISTS(
-                     SELECT 1 FROM review_state_revision AS revision
-                     WHERE revision.thema_id = state.thema_id
-                       AND revision.state_revision = state.state_revision
-                 )
-             )",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(StoreError::storage)?;
-    if inconsistent {
-        return Err(StoreError::CorruptData {
-            field: "current schema history",
-        });
-    }
-    Ok(())
-}
-
 fn schema_version(connection: &Connection) -> Result<u32, StoreError> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -4269,28 +4210,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_historical_v1_without_the_current_identity() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE document(document_id TEXT PRIMARY KEY);
-                 PRAGMA user_version = 1;",
-            )
-            .unwrap();
-
-        let error = initialize_schema(&connection).unwrap_err();
-
-        assert!(matches!(
-            error,
-            StoreError::UnsupportedSchemaVersion {
-                found: 1,
-                supported: SCHEMA_VERSION
-            }
-        ));
-    }
-
-    #[test]
-    fn current_schema_is_v2_without_migration_history() {
+    fn current_schema_is_v1_without_migration_history() {
         let store = SqliteStore::open_in_memory().unwrap();
 
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
@@ -4323,28 +4243,6 @@ mod tests {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap());
-    }
-
-    #[test]
-    fn current_schema_remnants_and_missing_history_fail_closed() {
-        for mutation in [
-            "CREATE TABLE import_manifest(id INTEGER PRIMARY KEY) STRICT;",
-            "DELETE FROM settings_revision;",
-        ] {
-            let directory = tempdir().unwrap();
-            let path = directory.path().join("gnosis.db");
-            drop(SqliteStore::open(&path).unwrap());
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection.execute_batch(mutation).unwrap();
-            drop(connection);
-
-            assert!(matches!(
-                SqliteStore::open(&path),
-                Err(StoreError::CorruptData {
-                    field: "current schema history"
-                })
-            ));
-        }
     }
 
     fn schema_table_exists(connection: &rusqlite::Connection, table: &str) -> bool {
