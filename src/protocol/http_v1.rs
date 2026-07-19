@@ -504,7 +504,9 @@ pub struct ReviewSourceInputV1 {
     #[serde(default)]
     pub exclude_tags: Vec<String>,
     pub topic_node_id: Option<String>,
+    #[schemars(range(max = 32))]
     pub topic_forward_depth: Option<u32>,
+    #[schemars(range(max = 32))]
     pub topic_backward_depth: Option<u32>,
     #[serde(default)]
     #[schemars(length(max = 500))]
@@ -536,10 +538,13 @@ pub struct ReviewSourceV1 {
     pub topic_node_id: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
+    #[schemars(range(max = 32))]
     pub topic_forward_depth: Option<u32>,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(required)]
+    #[schemars(range(max = 32))]
     pub topic_backward_depth: Option<u32>,
+    #[schemars(length(max = 500))]
     pub manual_ids: Vec<String>,
 }
 
@@ -590,6 +595,7 @@ impl From<ReviewSourceKindV1> for ReviewSourceKind {
 pub struct ReviewSessionRequestV1 {
     pub source: ReviewSourceInputV1,
     #[schemars(range(min = 1, max = 500))]
+    #[schemars(extend("default" = 100))]
     pub target_count: Option<u32>,
 }
 

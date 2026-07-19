@@ -3953,10 +3953,15 @@ mod tests {
             &api["components"]["schemas"]["ReviewSessionRequestV1"]["properties"]["target_count"];
         assert_eq!(target_count["minimum"], 1);
         assert_eq!(target_count["maximum"], 500);
-        assert_eq!(
-            api["components"]["schemas"]["ReviewSourceInputV1"]["properties"]["manual_ids"]["maxItems"],
-            500
-        );
+        assert_eq!(target_count["default"], 100);
+        let source_input = &api["components"]["schemas"]["ReviewSourceInputV1"]["properties"];
+        assert_eq!(source_input["topic_forward_depth"]["maximum"], 32);
+        assert_eq!(source_input["topic_backward_depth"]["maximum"], 32);
+        assert_eq!(source_input["manual_ids"]["maxItems"], 500);
+        let source = &api["components"]["schemas"]["ReviewSourceV1"]["properties"];
+        assert_eq!(source["topic_forward_depth"]["maximum"], 32);
+        assert_eq!(source["topic_backward_depth"]["maximum"], 32);
+        assert_eq!(source["manual_ids"]["maxItems"], 500);
         assert_eq!(
             sessions["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ReviewSessionV1"
