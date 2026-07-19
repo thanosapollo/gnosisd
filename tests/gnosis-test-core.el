@@ -6,6 +6,8 @@
 (require 'ert)
 (require 'gnosis-core)
 
+(defvar gnosis-core--contract-cache)
+
 (defun gnosis-test-core--http-buffer (status body &optional content-type)
   "Return synthetic HTTP response buffer for STATUS and BODY.
 CONTENT-TYPE defaults to application/json."
@@ -19,6 +21,36 @@ CONTENT-TYPE defaults to application/json."
       (setq-local url-http-end-of-headers
                   (copy-marker (1- (- (point-max) (string-bytes body))))))
     buffer))
+
+(defun gnosis-test-core--contract ()
+  "Return a small live-contract fixture for typed request tests."
+  `(:openapi "3.1.0"
+    :info (:title "Gnosis API" :version "1.0.0")
+    :paths
+    (:/v1/widgets/{id}
+     (:put
+      (:operationId "put_widget"
+       :parameters
+       [(:in "path" :name "id" :required t :schema (:type "string"))
+        (:in "header" :name "If-Match" :required t
+         :schema (:type "string"))]
+       :requestBody
+       (:required t :content
+        (:application/json (:schema (:$ref "#/components/schemas/WidgetWrite"))))
+       :responses
+       (:200 (:description "Success" :content
+              (:application/json
+               (:schema (:$ref "#/components/schemas/Widget")))))
+       :security [(:bearerAuth [])]
+       :x-gnosis-required-scopes ["content:write"])))
+    :components
+    (:schemas
+     (:WidgetWrite
+      (:type "object" :additionalProperties ,gnosis-core--json-false
+       :required ["value"] :properties (:value (:type "string")))
+      :Widget
+      (:type "object" :additionalProperties ,gnosis-core--json-false
+       :required ["id"] :properties (:id (:type "string")))))))
 
 (ert-deftest gnosis-core-validates-service-authority ()
   (dolist (url '("http://127.0.0.1:7842" "http://localhost:7842"
@@ -39,6 +71,37 @@ CONTENT-TYPE defaults to application/json."
                        (concat (make-string 39 ?a) "φ")
                        (concat (make-string 39 ?a) " ")))
     (should-not (gnosis-core--valid-token-p token))))
+
+(ert-deftest gnosis-core-preserves-json-array-shape ()
+  (let ((value (gnosis-core--decode-json
+                "{\"empty\":[],\"items\":[\"one\"]}")))
+    (should (vectorp (plist-get value :empty)))
+    (should (equal ["one"] (plist-get value :items)))))
+
+(ert-deftest gnosis-core-encodes-opaque-path-and-query-values ()
+  (should (equal "opaque%2Fid%3Fx" (gnosis-core--path-segment "opaque/id?x")))
+  (should (equal "after=a%2Fb%3Fc&q=%C3%BC"
+                 (gnosis-core--query-string
+                  '(("after" . "a/b?c") ("q" . "ü"))))))
+
+(ert-deftest gnosis-core-generates-valid-distinct-operation-identities ()
+  (let ((first (gnosis-core-operation-id))
+        (second (gnosis-core-operation-id)))
+    (should (string-match-p
+             "\\`emacs:[A-Za-z0-9][A-Za-z0-9._:-]\\{0,127\\}\\'" first))
+    (should-not (equal first second))))
+
+(ert-deftest gnosis-core-builds-revision-and-idempotency-headers ()
+  (let ((identity (gnosis-core-operation-id)))
+    (should (equal '("If-Match" . "\"7\"")
+                   (gnosis-core--if-match-header 7)))
+    (should (equal (cons "Idempotency-Key" identity)
+                   (gnosis-core--idempotency-key-header identity))))
+  (dolist (value '(-1 1.5 "7"))
+    (should-error (gnosis-core--if-match-header value)
+                  :type 'gnosis-core-validation-error))
+  (should-error (gnosis-core--idempotency-key-header "bad identity")
+                :type 'gnosis-core-validation-error))
 
 (ert-deftest gnosis-core-resolves-function-secret-per-request ()
   (let ((calls 0))
@@ -85,6 +148,156 @@ CONTENT-TYPE defaults to application/json."
                      (gnosis-core--perform-request
                       "GET" "/v1/assets/test" nil 200 t t)))
       (should (equal "*/*" (cdr (assoc "Accept" headers)))))))
+
+(ert-deftest gnosis-core-adds-only-safe-caller-headers ()
+  (let (headers)
+    (cl-letf (((symbol-function 'gnosis-core--token)
+               (lambda () (make-string 40 ?x)))
+              ((symbol-function 'gnosis-core--retrieve-bounded)
+               (lambda (&rest _)
+                 (setq headers url-request-extra-headers)
+                 (gnosis-test-core--http-buffer 200 "{}"))))
+      (gnosis-core--perform-request
+       "PUT" "/v1/test" nil 200 nil t '(("If-Match" . "\"7\"")))
+      (should (equal "\"7\"" (cdr (assoc "If-Match" headers))))))
+  (dolist (headers '((("Authorization" . "replacement"))
+                     (("Accept" . "text/plain"))
+                     (("Host" . "attacker.example"))
+                     (("Content-Length" . "0"))
+                     (("If-Match" . "bad\nvalue"))
+                     (("Bad Header" . "value"))))
+    (should-error
+     (gnosis-core--perform-request "PUT" "/v1/test" nil 200 nil t headers)
+     :type 'gnosis-core-validation-error)))
+
+(ert-deftest gnosis-core-typed-request-follows-live-operation-contract ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        calls)
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest arguments)
+                 (setq calls arguments)
+                 '(:id "opaque/id"))))
+      (should (equal '(:id "opaque/id")
+                     (gnosis-core--typed-request
+                      "put_widget" '(("id" . "opaque/id")) nil
+                      '(:value "text") '(("If-Match" . "\"3\"")))))
+      (should (equal
+               '("PUT" "/v1/widgets/opaque%2Fid" (:value "text")
+                 200 nil nil t (("If-Match" . "\"3\"")))
+               calls)))))
+
+(ert-deftest gnosis-core-typed-request-rejects-contract-drift ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract))))
+    (should-error
+     (gnosis-core--typed-request
+      "put_widget" '(("id" . "widget")) nil '(:value "text") nil)
+     :type 'gnosis-core-protocol-error)
+    (should-error
+     (gnosis-core--typed-request
+      "put_widget" '(("id" . "widget")) nil '(:unknown "text")
+      '(("If-Match" . "\"3\"")))
+     :type 'gnosis-core-protocol-error)
+    (should-error
+     (gnosis-core--typed-request
+      "put_widget" '(("id" . "widget")) nil '(:value "text")
+      '(("If-Match" . "bad\nvalue")))
+     :type 'gnosis-core-validation-error)
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _) '(:id "widget" :extra t))))
+      (should-error
+       (gnosis-core--typed-request
+        "put_widget" '(("id" . "widget")) nil '(:value "text")
+        '(("If-Match" . "\"3\"")))
+       :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-typed-request-requires-bearer-scope-metadata ()
+  (dolist (key '(:security :x-gnosis-required-scopes))
+    (let* ((contract (gnosis-test-core--contract))
+           (operation (plist-get
+                       (plist-get (plist-get contract :paths)
+                                  :/v1/widgets/{id})
+                       :put))
+           (gnosis-core--contract-cache
+            (list :base "http://127.0.0.1:7842" :document contract)))
+      (setf (plist-get operation key) [])
+      (should-error
+       (gnosis-core--typed-request
+        "put_widget" '(("id" . "widget")) nil '(:value "text")
+        '(("If-Match" . "\"3\"")))
+       :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-typed-request-rejects-compound-authentication ()
+  (let* ((contract (gnosis-test-core--contract))
+         (operation (plist-get
+                     (plist-get (plist-get contract :paths)
+                                :/v1/widgets/{id})
+                     :put))
+         (gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842" :document contract)))
+    (setf (plist-get operation :security)
+          [(:bearerAuth [] :apiKeyAuth [])])
+    (should-error
+     (gnosis-core--typed-request
+      "put_widget" '(("id" . "widget")) nil '(:value "text")
+      '(("If-Match" . "\"3\"")))
+     :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-core-typed-request-validates-parameter-schemas ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract))))
+    (should-error
+     (gnosis-core--typed-request
+      "put_widget" '(("id" . 7)) nil '(:value "text")
+      '(("If-Match" . "\"3\"")))
+     :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-core-typed-request-rejects-incoherent-path-template ()
+  (let* ((contract (gnosis-test-core--contract))
+         (item (plist-get (plist-get contract :paths) :/v1/widgets/{id}))
+         (gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842"
+                :document (plist-put contract :paths
+                                     (list :/v1/widgets item)))))
+    (should-error
+     (gnosis-core--typed-request
+      "put_widget" '(("id" . "widget")) nil '(:value "text")
+      '(("If-Match" . "\"3\"")))
+     :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-core-validates-schema-composition-without-explicit-type ()
+  (let ((contract (gnosis-test-core--contract)))
+    (should (gnosis-core--schema-valid-p
+             "allowed" '(:enum ["allowed"]) contract))
+    (should (gnosis-core--schema-valid-p
+             "allowed" '(:not (:enum ["blocked"])) contract))
+    (should-not
+     (gnosis-core--schema-valid-p
+      '(:kind "allowed")
+      '(:type "object" :required ["id"]
+        :oneOf [(:type "object" :required ["kind"]
+                 :properties (:kind (:const "allowed")))])
+      contract))
+    (should-not (gnosis-core--schema-valid-p
+                 "blocked" '(:not (:enum ["blocked"])) contract))))
+
+(ert-deftest gnosis-core-refreshes-contract-when-authority-changes ()
+  (let ((gnosis-core--contract-cache nil)
+        (gnosis-core-base-url "https://one.example")
+        (calls 0))
+    (cl-letf (((symbol-function 'gnosis-core-openapi)
+               (lambda ()
+                 (cl-incf calls)
+                 (gnosis-test-core--contract))))
+      (should (eq (gnosis-core--contract) (gnosis-core--contract)))
+      (should (= calls 1))
+      (let ((gnosis-core-base-url "https://two.example"))
+        (gnosis-core--contract)
+        (should (= calls 2))))))
 
 (ert-deftest gnosis-core-openapi-request-is-public-and-retryable ()
   (let (calls)

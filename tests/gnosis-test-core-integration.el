@@ -7,12 +7,16 @@
 (require 'gnosis-core)
 
 (defvar gnosis-core--generated-openapi-operations)
+(defvar gnosis-core--generated-openapi-operation-count)
+(defvar gnosis-core--generated-openapi-path-count)
 
 (defun gnosis-test-core-integration--authenticated-get-paths ()
   "Return parameter-free authenticated GET paths from the generated contract."
   (load-file (getenv "GNOSIS_OPENAPI_GENERATED"))
-  (cl-loop for (_identity method path authenticated)
-           in gnosis-core--generated-openapi-operations
+  (cl-loop for operation in gnosis-core--generated-openapi-operations
+           for method = (plist-get (cdr operation) :method)
+           for path = (plist-get (cdr operation) :path)
+           for authenticated = (plist-get (cdr operation) :authenticated)
            when (and authenticated
                      (equal method "GET")
                      (not (string-match-p "{" path)))
@@ -57,9 +61,15 @@
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
   (load-file (getenv "GNOSIS_OPENAPI_GENERATED"))
+  (should (> gnosis-core--generated-openapi-path-count 10))
+  (should (= (length gnosis-core--generated-openapi-operations)
+             gnosis-core--generated-openapi-operation-count))
   (should (> (length gnosis-core--generated-openapi-operations) 10))
   (dolist (operation gnosis-core--generated-openapi-operations)
-    (pcase-let ((`(,identity ,method ,path ,authenticated) operation))
+    (let ((identity (car operation))
+          (method (plist-get (cdr operation) :method))
+          (path (plist-get (cdr operation) :path))
+          (authenticated (plist-get (cdr operation) :authenticated)))
       (should (stringp identity))
       (should (member method '("DELETE" "GET" "PATCH" "POST" "PUT")))
       (should (string-prefix-p "/v1/" path))

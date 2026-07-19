@@ -45,18 +45,94 @@
   "Return non-nil when OPERATION or INHERITED security is nonempty."
   (let* ((missing (make-symbol "missing"))
          (specific (gethash "security" operation missing))
-         (security (if (eq specific missing) inherited specific)))
-    (and (vectorp security) (> (length security) 0))))
+         (security (if (eq specific missing) inherited specific))
+         (authenticated
+          (and (vectorp security) (> (length security) 0)
+               (cl-loop for requirement across security
+                        thereis
+                        (and (hash-table-p requirement)
+                             (= (hash-table-count requirement) 1)
+                             (let ((scopes (gethash "bearerAuth" requirement
+                                                    missing)))
+                               (and (vectorp scopes)
+                                    (= (length scopes) 0))))))))
+    (when (and (vectorp security) (> (length security) 0)
+               (not authenticated))
+      (gnosis-openapi--invalid "Unsupported OpenAPI security scheme"))
+    authenticated))
+
+(defun gnosis-openapi--string-vector (table key label)
+  "Return string vector KEY from TABLE as a list, or reject with LABEL."
+  (let ((value (or (gethash key table) [])))
+    (unless (and (vectorp value)
+                 (cl-loop for item across value always (stringp item)))
+      (gnosis-openapi--invalid (format "Invalid OpenAPI %s" label)))
+    (sort (append value nil) #'string<)))
+
+(defun gnosis-openapi--schema-reference (container)
+  "Return application/json schema reference nested in CONTAINER."
+  (when-let* ((content (and (hash-table-p container)
+                            (gethash "content" container)))
+              (media (and (hash-table-p content)
+                          (gethash "application/json" content)))
+              (schema (and (hash-table-p media) (gethash "schema" media)))
+              (reference (and (hash-table-p schema) (gethash "$ref" schema))))
+    (unless (stringp reference)
+      (gnosis-openapi--invalid "Invalid OpenAPI schema reference"))
+    reference))
+
+(defun gnosis-openapi--required-headers (operation)
+  "Return required header names declared by OPERATION."
+  (let ((parameters (or (gethash "parameters" operation) [])))
+    (unless (vectorp parameters)
+      (gnosis-openapi--invalid "Invalid OpenAPI parameters"))
+    (sort
+     (cl-loop for parameter across parameters
+              when (and (hash-table-p parameter)
+                        (equal "header" (gethash "in" parameter))
+                        (eq t (gethash "required" parameter)))
+              collect (gnosis-openapi--required-string
+                       parameter "name" "header name"))
+     #'string<)))
+
+(defun gnosis-openapi--success (responses)
+  "Return sole success status and response schema from RESPONSES."
+  (let ((statuses
+         (sort
+          (cl-remove-if-not
+           (lambda (status) (string-match-p "\\`2[0-9][0-9]\\'" status))
+           (map-keys responses))
+          #'string<)))
+    (unless (= (length statuses) 1)
+      (gnosis-openapi--invalid "OpenAPI operation needs one success response"))
+    (let* ((status (car statuses))
+           (response (gethash status responses)))
+      (cons (string-to-number status)
+            (gnosis-openapi--schema-reference response)))))
 
 (defun gnosis-openapi--operation (path method value inherited)
   "Return manifest entry for PATH, METHOD, and operation VALUE."
-  (let ((identity (gnosis-openapi--required-string
-                   value "operationId" "operationId"))
-        (responses (and (hash-table-p value) (gethash "responses" value))))
+  (let* ((identity (gnosis-openapi--required-string
+                    value "operationId" "operationId"))
+         (responses (and (hash-table-p value) (gethash "responses" value)))
+         (authenticated (gnosis-openapi--authenticated-p value inherited))
+         (scopes (gnosis-openapi--string-vector
+                  value "x-gnosis-required-scopes" "required scopes")))
     (unless (and (hash-table-p responses) (> (hash-table-count responses) 0))
       (gnosis-openapi--invalid (format "Operation %s has no responses" identity)))
-    (list identity (upcase method) path
-          (and (gnosis-openapi--authenticated-p value inherited) t))))
+    (when (and authenticated (not scopes))
+      (gnosis-openapi--invalid "Authenticated operation needs required scopes"))
+    (let ((success (gnosis-openapi--success responses)))
+      (list identity
+            :method (upcase method)
+            :path path
+            :authenticated (and authenticated t)
+            :scopes scopes
+            :required-headers (gnosis-openapi--required-headers value)
+            :request-schema (gnosis-openapi--schema-reference
+                             (gethash "requestBody" value))
+            :response-status (car success)
+            :response-schema (cdr success)))))
 
 (defun gnosis-openapi--path-operations (path item inherited)
   "Return generated operations for PATH from path ITEM."
@@ -86,7 +162,7 @@
                        (string< (car left) (car right))))))
 
 (defun gnosis-openapi--contract (document)
-  "Return API version and operation manifest from DOCUMENT."
+  "Return API version, path count, and operation manifest from DOCUMENT."
   (unless (and (hash-table-p document)
                (equal "3.1.0" (gethash "openapi" document)))
     (gnosis-openapi--invalid "OpenAPI 3.1.0 is required"))
@@ -98,16 +174,21 @@
     (unless (and (equal title "Gnosis API")
                  (hash-table-p paths) (> (hash-table-count paths) 0))
       (gnosis-openapi--invalid "Invalid Gnosis OpenAPI metadata"))
-    (list version (gnosis-openapi--operations document))))
+    (list version (hash-table-count paths)
+          (gnosis-openapi--operations document))))
 
-(defun gnosis-openapi--write (output version operations)
-  "Write VERSION and OPERATIONS manifest to OUTPUT."
+(defun gnosis-openapi--write (output version path-count operations)
+  "Write VERSION, PATH-COUNT, and OPERATIONS manifest to OUTPUT."
   (make-directory (file-name-directory (expand-file-name output)) t)
   (with-temp-file output
     (insert ";;; gnosis-openapi-contract.el --- Generated Gnosis API manifest  -*- lexical-binding: t; -*-\n\n"
             ";; Generated from gnosisd /v1/openapi.json.  Do not edit.\n\n"
             "(defconst gnosis-core--generated-openapi-version\n  ")
     (prin1 version (current-buffer))
+    (insert ")\n\n(defconst gnosis-core--generated-openapi-path-count\n  ")
+    (prin1 path-count (current-buffer))
+    (insert ")\n\n(defconst gnosis-core--generated-openapi-operation-count\n  ")
+    (prin1 (length operations) (current-buffer))
     (insert ")\n\n(defconst gnosis-core--generated-openapi-operations\n  '")
     (prin1 operations (current-buffer))
     (insert ")\n\n(provide 'gnosis-openapi-contract)\n"
@@ -115,9 +196,9 @@
 
 (defun gnosis-openapi-generate (input output)
   "Generate a temporary contract manifest from INPUT at OUTPUT."
-  (pcase-let ((`(,version ,operations)
+  (pcase-let ((`(,version ,path-count ,operations)
                (gnosis-openapi--contract (gnosis-openapi--read input))))
-    (gnosis-openapi--write output version operations)
+    (gnosis-openapi--write output version path-count operations)
     output))
 
 (defun gnosis-openapi-generate-from-environment ()

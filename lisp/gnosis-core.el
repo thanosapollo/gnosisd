@@ -61,6 +61,18 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 (defconst gnosis-core--json-null (make-symbol "gnosis-json-null"))
 (defconst gnosis-core--json-false (make-symbol "gnosis-json-false"))
 
+(defconst gnosis-core--http-methods
+  '("delete" "get" "head" "options" "patch" "post" "put" "trace"))
+
+(defconst gnosis-core--reserved-request-headers
+  '("accept" "accept-encoding" "authorization" "connection"
+    "content-length" "content-type" "cookie" "expect" "host"
+    "proxy-authorization" "proxy-connection" "te" "trailer"
+    "transfer-encoding" "upgrade"))
+
+(defvar gnosis-core--contract-cache nil
+  "Cached live OpenAPI document and its validated service authority.")
+
 (define-error 'gnosis-core-error "Gnosis core error")
 (define-error 'gnosis-core-transport-error "Gnosis transport error" 'gnosis-core-error)
 (define-error 'gnosis-core-timeout "Gnosis request timed out" 'gnosis-core-transport-error)
@@ -138,10 +150,91 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
   (condition-case nil
       (json-parse-string
        (decode-coding-string bytes 'utf-8-unix)
-       :object-type 'plist :array-type 'list
+       :object-type 'plist :array-type 'array
        :null-object gnosis-core--json-null
        :false-object gnosis-core--json-false)
     (error (gnosis-core--invalid "Invalid JSON response"))))
+
+(defun gnosis-core--path-segment (value)
+  "Return opaque VALUE encoded as one URL path segment."
+  (unless (and (stringp value) (not (string-empty-p value)))
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis path value")))
+  (url-hexify-string value))
+
+(defun gnosis-core--query-value (value)
+  "Return VALUE encoded for an HTTP query parameter."
+  (url-hexify-string
+   (cond ((stringp value) value)
+         ((integerp value) (number-to-string value))
+         ((eq value t) "true")
+         ((eq value gnosis-core--json-false) "false")
+         (t (signal 'gnosis-core-validation-error
+                    '("Invalid Gnosis query value"))))))
+
+(defun gnosis-core--query-string (pairs)
+  "Return encoded HTTP query string from string-keyed PAIRS."
+  (mapconcat
+   (lambda (pair)
+     (unless (and (consp pair) (stringp (car pair))
+                  (not (string-empty-p (car pair))))
+       (signal 'gnosis-core-validation-error '("Invalid Gnosis query name")))
+     (concat (url-hexify-string (car pair)) "="
+             (gnosis-core--query-value (cdr pair))))
+   pairs "&"))
+
+(defun gnosis-core--operation-id-p (value)
+  "Return non-nil when VALUE is a valid operation identity."
+  (and (stringp value) (<= 1 (length value) 128)
+       (string-match-p "\\`[A-Za-z0-9][A-Za-z0-9._:-]*\\'" value)))
+
+(defun gnosis-core-operation-id ()
+  "Return a fresh operation identity suitable for a Gnosis mutation."
+  (concat
+   "emacs:"
+   (substring
+    (secure-hash
+     'sha256
+     (format "%S:%s:%s:%s" (current-time) (emacs-pid) (random) (user-uid)))
+    0 32)))
+
+(defun gnosis-core--if-match-header (revision)
+  "Return an If-Match header for nonnegative integer REVISION."
+  (unless (and (integerp revision) (>= revision 0))
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis revision")))
+  (cons "If-Match" (format "\"%d\"" revision)))
+
+(defun gnosis-core--idempotency-key-header (operation-id)
+  "Return an Idempotency-Key header for OPERATION-ID."
+  (unless (gnosis-core--operation-id-p operation-id)
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis operation identity")))
+  (cons "Idempotency-Key" operation-id))
+
+(defun gnosis-core--safe-request-headers (headers)
+  "Return validated caller-supplied HEADERS."
+  (unless (listp headers)
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis request headers")))
+  (let ((names
+         (mapcar
+          (lambda (header)
+            (unless (and (consp header) (stringp (car header)))
+              (signal 'gnosis-core-validation-error
+                      '("Invalid Gnosis request header")))
+            (downcase (car header)))
+          headers)))
+    (unless (= (length names) (length (delete-dups (copy-sequence names))))
+      (signal 'gnosis-core-validation-error '("Duplicate Gnosis request header")))
+    (mapcar
+     (lambda (header)
+       (pcase-let ((`(,name . ,value) header))
+         (unless (and (stringp name) (stringp value)
+                      (string-match-p "\\`[A-Za-z0-9-]+\\'" name)
+                      (<= 1 (length value) 512)
+                      (not (string-match-p "[\r\n]" value))
+                      (not (member (downcase name)
+                                   gnosis-core--reserved-request-headers)))
+           (signal 'gnosis-core-validation-error '("Unsafe Gnosis request header")))
+         (cons name value)))
+     headers)))
 
 (defun gnosis-core--header-content-type ()
   "Return current response Content-Type header value."
@@ -365,12 +458,14 @@ or `encoding' when content decoding is unsupported."
         (gnosis-core--cleanup-retrieval buffer process)))))
 
 (defun gnosis-core--perform-request
-    (method path body expected-status binary-p auth-p)
+    (method path body expected-status binary-p auth-p &optional headers)
   "Perform one METHOD request to PATH with BODY.
 EXPECTED-STATUS is the accepted status.  Return binary or decoded JSON as
-selected by BINARY-P.  Add authentication when AUTH-P is non-nil."
+selected by BINARY-P.  Add authentication when AUTH-P is non-nil and append
+validated caller-supplied HEADERS."
   (let* ((url (concat (gnosis-core--validated-base-url) path))
-         (locator (gnosis-core--locator-for-url url)))
+         (locator (gnosis-core--locator-for-url url))
+         (headers (gnosis-core--safe-request-headers headers)))
     (let ((url-proxy-locator locator)
           (url-debug (and (not auth-p) url-debug)))
       (let* ((url-request-method method)
@@ -380,6 +475,7 @@ selected by BINARY-P.  Add authentication when AUTH-P is non-nil."
                (and auth-p
                     `(("Authorization" .
                        ,(concat "Bearer " (gnosis-core--token)))))
+               headers
                (and body '(("Content-Type" . "application/json")))
                `(("Accept" . ,(if binary-p "*/*" "application/json"))
                  ("Accept-Encoding" . "identity"))))
@@ -415,11 +511,11 @@ selected by BINARY-P.  Add authentication when AUTH-P is non-nil."
            buffer (and (buffer-live-p buffer) (get-buffer-process buffer))))))))
 
 (defun gnosis-core--request
-    (method path &optional body expected-status binary-p retry-p auth-p)
+    (method path &optional body expected-status binary-p retry-p auth-p headers)
   "Request METHOD PATH with optional BODY and return the decoded response.
 EXPECTED-STATUS defaults to 200.  BINARY-P preserves bytes.  RETRY-P retries
 one transport failure using the exact request.  AUTH-P defaults to non-nil;
-`:none' disables authentication."
+`:none' disables authentication.  HEADERS are validated caller headers."
   (let ((attempts (if (and retry-p (equal method "GET")) 2 1))
         (authenticate (not (eq auth-p :none))))
     (catch 'result
@@ -428,7 +524,7 @@ one transport failure using the exact request.  AUTH-P defaults to non-nil;
             (throw 'result
                    (gnosis-core--perform-request
                     method path body (or expected-status 200)
-                    binary-p authenticate))
+                    binary-p authenticate headers))
           ((gnosis-core-unavailable gnosis-core-timeout)
            (when (= attempt (1- attempts)) (signal (car condition) (cdr condition)))))))))
 
@@ -468,6 +564,360 @@ one transport failure using the exact request.  AUTH-P defaults to non-nil;
                                "/" (string-remove-prefix
                                     ":" (symbol-name key)))
                               (proper-list-p item))))))
+
+(defun gnosis-core-refresh-contract ()
+  "Fetch and cache the live OpenAPI contract for the current authority."
+  (let ((base (gnosis-core--validated-base-url))
+        (document (gnosis-core-openapi)))
+    (setq gnosis-core--contract-cache
+          (list :base base :document document))
+    document))
+
+(defun gnosis-core--contract ()
+  "Return the live OpenAPI contract for the current authority."
+  (let ((base (gnosis-core--validated-base-url)))
+    (if (and (equal base (plist-get gnosis-core--contract-cache :base))
+             (plist-get gnosis-core--contract-cache :document))
+        (plist-get gnosis-core--contract-cache :document)
+      (gnosis-core-refresh-contract))))
+
+(defun gnosis-core--json-key (name)
+  "Return plist keyword for JSON object key NAME."
+  (intern (concat ":" name)))
+
+(defun gnosis-core--json-object-p (value)
+  "Return non-nil when VALUE has decoded JSON object shape."
+  (and (proper-list-p value)
+       (cl-evenp (length value))
+       (cl-loop for (key _item) on value by #'cddr
+                always (keywordp key))))
+
+(defun gnosis-core--schema-ref (contract reference)
+  "Resolve schema REFERENCE in CONTRACT or return nil."
+  (let ((prefix "#/components/schemas/"))
+    (and (stringp reference)
+         (string-prefix-p prefix reference)
+         (plist-get
+          (plist-get (plist-get contract :components) :schemas)
+          (gnosis-core--json-key (substring reference (length prefix)))))))
+
+(defun gnosis-core--schema-type-valid-p (value type)
+  "Return non-nil when VALUE has JSON schema TYPE."
+  (pcase type
+    ('nil t)
+    ("array" (vectorp value))
+    ("boolean" (memq value (list t gnosis-core--json-false)))
+    ("integer" (integerp value))
+    ("null" (eq value gnosis-core--json-null))
+    ("number" (numberp value))
+    ("object" (gnosis-core--json-object-p value))
+    ("string" (stringp value))
+    (_ nil)))
+
+(defun gnosis-core--schema-bounds-valid-p (value schema)
+  "Return non-nil when VALUE respects simple bounds in SCHEMA."
+  (and
+   (or (not (stringp value))
+       (and (or (not (plist-member schema :minLength))
+                (<= (plist-get schema :minLength) (length value)))
+            (or (not (plist-member schema :maxLength))
+                (<= (length value) (plist-get schema :maxLength)))))
+   (or (not (numberp value))
+       (and (or (not (plist-member schema :minimum))
+                (<= (plist-get schema :minimum) value))
+            (or (not (plist-member schema :maximum))
+                (<= value (plist-get schema :maximum)))))))
+
+(defun gnosis-core--schema-array-valid-p (value schema contract depth)
+  "Return non-nil when array VALUE satisfies SCHEMA in CONTRACT at DEPTH."
+  (let ((items (plist-get schema :items))
+        (length (length value)))
+    (and (or (not (plist-member schema :minItems))
+             (<= (plist-get schema :minItems) length))
+         (or (not (plist-member schema :maxItems))
+             (<= length (plist-get schema :maxItems)))
+         (or (not items)
+             (cl-loop for item across value
+                      always (gnosis-core--schema-valid-p
+                              item items contract (1+ depth)))))))
+
+(defun gnosis-core--schema-property-valid-p
+    (key value properties additional contract depth)
+  "Return non-nil when object KEY and VALUE satisfy PROPERTIES.
+ADDITIONAL defines unknown-key handling using CONTRACT at DEPTH."
+  (let* ((name (string-remove-prefix ":" (symbol-name key)))
+         (keyword (gnosis-core--json-key name)))
+    (cond ((plist-member properties keyword)
+           (gnosis-core--schema-valid-p
+            value (plist-get properties keyword) contract (1+ depth)))
+          ((eq additional gnosis-core--json-false) nil)
+          ((gnosis-core--json-object-p additional)
+           (gnosis-core--schema-valid-p value additional contract (1+ depth)))
+          (t t))))
+
+(defun gnosis-core--schema-object-valid-p (value schema contract depth)
+  "Return non-nil when object VALUE satisfies SCHEMA in CONTRACT at DEPTH."
+  (let ((required (plist-get schema :required))
+        (properties (plist-get schema :properties))
+        (additional (plist-get schema :additionalProperties)))
+    (and
+     (or (not required)
+         (cl-loop for name across required
+                  always (plist-member value (gnosis-core--json-key name))))
+     (cl-loop for (key item) on value by #'cddr
+              always (gnosis-core--schema-property-valid-p
+                      key item properties additional contract depth)))))
+
+(defun gnosis-core--schema-enum-valid-p (value schema)
+  "Return non-nil when VALUE satisfies const and enum rules in SCHEMA."
+  (and (or (not (plist-member schema :const))
+           (equal value (plist-get schema :const)))
+       (or (not (plist-member schema :enum))
+           (cl-find value (plist-get schema :enum) :test #'equal))))
+
+(defun gnosis-core--schema-composition-valid-p (value schemas mode contract depth)
+  "Validate VALUE against SCHEMAS using MODE and CONTRACT at DEPTH."
+  (let ((matches
+         (cl-loop for schema across schemas
+                  count (gnosis-core--schema-valid-p
+                         value schema contract (1+ depth)))))
+    (pcase mode
+      ('one (= matches 1))
+      ('any (> matches 0))
+      ('all (= matches (length schemas))))))
+
+(defun gnosis-core--schema-base-valid-p (value schema contract depth)
+  "Validate VALUE against non-composition SCHEMA rules in CONTRACT at DEPTH."
+  (let ((type (plist-get schema :type)))
+    (and (if (vectorp type)
+             (cl-loop for item across type
+                      thereis (gnosis-core--schema-type-valid-p value item))
+           (gnosis-core--schema-type-valid-p value type))
+         (gnosis-core--schema-enum-valid-p value schema)
+         (gnosis-core--schema-bounds-valid-p value schema)
+         (or (not (vectorp value))
+             (gnosis-core--schema-array-valid-p value schema contract depth))
+         (or (not (gnosis-core--json-object-p value))
+             (gnosis-core--schema-object-valid-p value schema contract depth)))))
+
+(defun gnosis-core--schema-valid-p (value schema contract &optional depth)
+  "Return non-nil when VALUE satisfies SCHEMA from CONTRACT at DEPTH."
+  (let ((depth (or depth 0)))
+    (condition-case nil
+        (and (< depth 64)
+             (gnosis-core--schema-base-valid-p value schema contract depth)
+             (or (not (plist-get schema :$ref))
+                 (when-let* ((resolved (gnosis-core--schema-ref
+                                        contract (plist-get schema :$ref))))
+                   (gnosis-core--schema-valid-p
+                    value resolved contract (1+ depth))))
+             (or (not (plist-get schema :oneOf))
+                 (gnosis-core--schema-composition-valid-p
+                  value (plist-get schema :oneOf) 'one contract depth))
+             (or (not (plist-get schema :anyOf))
+                 (gnosis-core--schema-composition-valid-p
+                  value (plist-get schema :anyOf) 'any contract depth))
+             (or (not (plist-get schema :allOf))
+                 (gnosis-core--schema-composition-valid-p
+                  value (plist-get schema :allOf) 'all contract depth))
+             (or (not (plist-member schema :not))
+                 (not (gnosis-core--schema-valid-p
+                       value (plist-get schema :not) contract (1+ depth)))))
+      (error nil))))
+
+(defun gnosis-core--operation-entry (identity)
+  "Return live contract entry for operation IDENTITY."
+  (let* ((contract (gnosis-core--contract))
+         (paths (plist-get contract :paths))
+         (matches
+          (cl-loop for (path-key item) on paths by #'cddr
+                   for path = (string-remove-prefix ":" (symbol-name path-key))
+                   append
+                   (cl-loop for method in gnosis-core--http-methods
+                            for operation = (plist-get item
+                                                       (gnosis-core--json-key method))
+                            when (equal identity (plist-get operation :operationId))
+                            collect (list :method (upcase method) :path path
+                                          :operation operation)))))
+    (unless (= (length matches) 1)
+      (gnosis-core--invalid "Gnosis operation is absent or ambiguous"))
+    (car matches)))
+
+(defun gnosis-core--bearer-requirement-p (requirement)
+  "Return non-nil when REQUIREMENT names only bearer authentication."
+  (and (gnosis-core--json-object-p requirement)
+       (= (length requirement) 2)
+       (vectorp (plist-get requirement :bearerAuth))
+       (= (length (plist-get requirement :bearerAuth)) 0)))
+
+(defun gnosis-core--operation-bearer-p (operation)
+  "Return non-nil when OPERATION requires bearer authentication."
+  (let ((security (plist-get operation :security)))
+    (and (vectorp security) (> (length security) 0)
+         (cl-loop for requirement across security
+                  thereis (gnosis-core--bearer-requirement-p requirement)))))
+
+(defun gnosis-core--operation-scopes-p (operation)
+  "Return non-nil when OPERATION declares nonempty string scopes."
+  (let ((scopes (plist-get operation :x-gnosis-required-scopes)))
+    (and (vectorp scopes) (> (length scopes) 0)
+         (cl-loop for scope across scopes
+                  always (and (stringp scope) (not (string-empty-p scope)))))))
+
+(defun gnosis-core--parameter-names (operation location &optional required)
+  "Return OPERATION parameter names at LOCATION.
+When REQUIRED is non-nil, return only required parameters."
+  (let ((parameters (or (plist-get operation :parameters) [])))
+    (unless (vectorp parameters)
+      (gnosis-core--invalid "Invalid Gnosis operation parameters"))
+    (cl-loop for parameter across parameters
+           when (and (equal location (plist-get parameter :in))
+                     (or (not required) (eq t (plist-get parameter :required))))
+             collect (plist-get parameter :name))))
+
+(defun gnosis-core--parameter (operation location name)
+  "Return OPERATION parameter at LOCATION named NAME."
+  (let ((fold-case (equal location "header")))
+    (cl-find-if
+     (lambda (parameter)
+       (and (equal location (plist-get parameter :in))
+            (if fold-case
+                (string-equal-ignore-case name (plist-get parameter :name))
+              (equal name (plist-get parameter :name)))))
+     (append (or (plist-get operation :parameters) []) nil))))
+
+(defun gnosis-core--validate-parameter-values
+    (pairs operation location contract)
+  "Validate PAIRS against OPERATION parameters at LOCATION in CONTRACT."
+  (dolist (pair pairs)
+    (unless (and (consp pair) (stringp (car pair)))
+      (gnosis-core--invalid "Invalid Gnosis parameter bindings"))
+    (let* ((parameter (gnosis-core--parameter operation location (car pair)))
+           (schema (and parameter (plist-get parameter :schema))))
+      (unless (and schema
+                   (gnosis-core--schema-valid-p
+                    (cdr pair) schema contract))
+        (gnosis-core--invalid "Invalid Gnosis parameter value")))))
+
+(defun gnosis-core--validate-binding-names
+    (provided allowed required label &optional fold-case)
+  "Validate PROVIDED names against ALLOWED and REQUIRED for LABEL.
+Compare names without case distinctions when FOLD-CASE is non-nil."
+  (unless (cl-every #'stringp (append provided allowed required))
+    (gnosis-core--invalid (format "Invalid Gnosis %s bindings" label)))
+  (let* ((normalize (if fold-case #'downcase #'identity))
+         (provided (mapcar normalize provided))
+         (allowed (mapcar normalize allowed))
+         (required (mapcar normalize required)))
+    (unless (and (= (length provided)
+                    (length (delete-dups (copy-sequence provided))))
+                 (cl-every (lambda (name) (member name allowed)) provided)
+                 (cl-every (lambda (name) (member name provided)) required))
+      (gnosis-core--invalid (format "Invalid Gnosis %s bindings" label)))))
+
+(defun gnosis-core--validate-operation-bindings
+    (operation template path-values query headers contract)
+  "Validate OPERATION bindings against TEMPLATE and CONTRACT.
+PATH-VALUES, QUERY, and HEADERS contain the supplied bindings."
+  (let ((path (mapcar #'car path-values))
+        (declared-path (gnosis-core--parameter-names operation "path"))
+        (query-names (mapcar #'car query))
+        (header-names (mapcar #'car headers)))
+    (unless (equal (sort (copy-sequence declared-path) #'string<)
+                   (sort (gnosis-core--path-parameter-names template) #'string<))
+      (gnosis-core--invalid "Invalid Gnosis path template"))
+    (gnosis-core--validate-binding-names
+     path declared-path
+     (gnosis-core--parameter-names operation "path" t) "path")
+    (gnosis-core--validate-binding-names
+     query-names (gnosis-core--parameter-names operation "query")
+     (gnosis-core--parameter-names operation "query" t) "query")
+    (gnosis-core--validate-binding-names
+     header-names (gnosis-core--parameter-names operation "header")
+     (gnosis-core--parameter-names operation "header" t) "header" t)
+    (gnosis-core--validate-parameter-values
+     path-values operation "path" contract)
+    (gnosis-core--validate-parameter-values query operation "query" contract)
+    (gnosis-core--validate-parameter-values
+     headers operation "header" contract)))
+
+(defun gnosis-core--path-parameter-names (template)
+  "Return parameter names present in OpenAPI path TEMPLATE."
+  (let ((position 0)
+        names)
+    (while (string-match "{\\([^}]+\\)}" template position)
+      (push (match-string 1 template) names)
+      (setq position (match-end 0)))
+    (nreverse names)))
+
+(defun gnosis-core--operation-path (template path-values query)
+  "Fill TEMPLATE from PATH-VALUES and append encoded QUERY."
+  (let ((path
+         (cl-reduce
+          (lambda (path pair)
+            (replace-regexp-in-string
+             (regexp-quote (format "{%s}" (car pair)))
+             (gnosis-core--path-segment (cdr pair)) path t t))
+          path-values :initial-value template)))
+    (when (string-match-p "{[^}]+}" path)
+      (gnosis-core--invalid "Incomplete Gnosis path bindings"))
+    (if query
+        (concat path "?" (gnosis-core--query-string query))
+      path)))
+
+(defun gnosis-core--operation-json-schema (container)
+  "Return application/json schema nested in OpenAPI CONTAINER."
+  (plist-get (plist-get (plist-get container :content) :application/json)
+             :schema))
+
+(defun gnosis-core--operation-success (operation)
+  "Return the sole success status and response schema for OPERATION."
+  (let ((matches
+         (cl-loop for (key response) on (plist-get operation :responses) by #'cddr
+                  for status = (string-remove-prefix ":" (symbol-name key))
+                  when (string-match-p "\\`2[0-9][0-9]\\'" status)
+                  collect (cons (string-to-number status)
+                                (gnosis-core--operation-json-schema response)))))
+    (unless (= (length matches) 1)
+      (gnosis-core--invalid "Gnosis operation has ambiguous success responses"))
+    (car matches)))
+
+(defun gnosis-core--typed-request
+    (identity &optional path-values query body headers)
+  "Execute live-contract operation IDENTITY.
+PATH-VALUES fill declared path parameters.  QUERY, BODY, and HEADERS supply
+the remaining declared request inputs."
+  (let* ((contract (gnosis-core--contract))
+         (entry (gnosis-core--operation-entry identity))
+         (operation (plist-get entry :operation))
+         (method (plist-get entry :method))
+         (template (plist-get entry :path))
+         (request-body (plist-get operation :requestBody))
+         (request-schema (gnosis-core--operation-json-schema request-body))
+         (success (gnosis-core--operation-success operation))
+         (headers (gnosis-core--safe-request-headers headers)))
+    (unless (and (string-prefix-p "/v1/" template)
+                 (gnosis-core--operation-bearer-p operation)
+                 (gnosis-core--operation-scopes-p operation))
+      (gnosis-core--invalid "Gnosis operation violates client doctrine"))
+    (gnosis-core--validate-operation-bindings
+     operation template path-values query headers contract)
+    (when (and (eq t (plist-get request-body :required)) (not body))
+      (gnosis-core--invalid "Gnosis operation requires a request body"))
+    (when (and body
+               (not (and request-schema
+                         (gnosis-core--schema-valid-p body request-schema contract))))
+      (gnosis-core--invalid "Invalid Gnosis request body"))
+    (let ((value
+           (gnosis-core--request
+            method
+            (gnosis-core--operation-path
+             template path-values query)
+            body (car success) nil (equal method "GET") t headers)))
+      (unless (and (cdr success)
+                   (gnosis-core--schema-valid-p value (cdr success) contract))
+        (gnosis-core--invalid "Invalid Gnosis operation response"))
+      value)))
 
 (defun gnosis-core-api-unavailable (operation)
   "Signal that generated bindings for OPERATION are not available."
