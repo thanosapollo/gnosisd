@@ -546,7 +546,10 @@ pub enum OfflineAssetResultV1 {
         operation_id: String,
         conflict_reason: OfflineAssetConflictReasonV1,
         #[serde(deserialize_with = "deserialize_required_option")]
-        #[schemars(required)]
+        #[schemars(
+            with = "crate::protocol::RequiredNullable<OfflineAssetProjectionV1>",
+            required
+        )]
         authoritative: Option<OfflineAssetProjectionV1>,
         #[schemars(length(min = 1, max = 512))]
         cursor: String,

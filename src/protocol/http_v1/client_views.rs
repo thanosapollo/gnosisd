@@ -20,7 +20,7 @@ pub struct DashboardV1 {
     pub queue: ReviewQueueCountsV1,
     pub content: ContentCountsV1,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<ReviewSessionV1>", required)]
     pub active_session: Option<ReviewSessionV1>,
 }
 
@@ -76,10 +76,10 @@ pub struct ReviewWindowV1 {
     pub totals: ReviewTotalsV1,
     pub average_per_calendar_day: f64,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<f64>", required)]
     pub average_per_active_day: Option<f64>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<f64>", required)]
     pub success_rate: Option<f64>,
 }
 
@@ -145,7 +145,7 @@ impl From<&ContentCounts> for ContentCountsV1 {
 pub struct ReviewSessionSummaryV1 {
     pub session: ReviewSessionV1,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub ended_at_us: Option<u64>,
     pub review_count: u64,
     pub new_count: u64,
@@ -176,7 +176,7 @@ pub struct ReviewSessionPageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<ReviewSessionSummaryV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next: Option<String>,
 }
 
@@ -214,7 +214,10 @@ pub struct ReviewHistoryEventV1 {
     pub accepted_success: bool,
     pub override_count: u64,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(
+        with = "crate::protocol::RequiredNullable<ReviewTransitionV1>",
+        required
+    )]
     pub transition: Option<ReviewTransitionV1>,
 }
 
@@ -240,7 +243,7 @@ pub struct ReviewHistoryPageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<ReviewHistoryEventV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next: Option<String>,
 }
 
@@ -357,7 +360,7 @@ impl From<DueThema> for DueThemaView {
 pub struct DuePageView {
     pub items: Vec<DueThemaView>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next: Option<String>,
 }
 
@@ -379,7 +382,7 @@ pub struct DocumentView {
     pub revision: u64,
     pub title: String,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub file_node_id: Option<String>,
     pub file_tags: Vec<String>,
     pub nodes: Vec<NodeView>,
@@ -430,7 +433,7 @@ pub struct NodeView {
     pub title_path: Vec<String>,
     pub tags: Vec<String>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub parent_id: Option<String>,
     pub level: u32,
 }

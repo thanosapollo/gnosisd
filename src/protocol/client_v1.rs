@@ -31,7 +31,7 @@ pub struct OfflineReviewAnswerRequestV1 {
     pub session_position: u32,
     pub response: OfflineAnswerV1,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
     pub accepted_success: Option<bool>,
     pub desired_suspended: bool,
     #[schemars(range(min = 1))]
@@ -68,7 +68,10 @@ pub struct ReviewPackCurrentV1 {
     #[schemars(extend("const" = 1))]
     pub version: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(
+        with = "crate::protocol::RequiredNullable<OfflineReviewQuestionV1>",
+        required
+    )]
     pub question: Option<OfflineReviewQuestionV1>,
 }
 
@@ -84,7 +87,10 @@ pub struct OfflineReviewAnswerReceiptV1 {
     #[schemars(range(min = 1))]
     pub device_sequence: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(
+        with = "crate::protocol::RequiredNullable<OfflineReviewQuestionV1>",
+        required
+    )]
     pub question: Option<OfflineReviewQuestionV1>,
 }
 
@@ -137,7 +143,7 @@ pub struct OfflineReviewAssetV1 {
 pub struct OfflineReviewResultPageRequestV1 {
     #[schemars(extend("const" = 1))]
     pub version: u32,
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     #[schemars(range(max = 9_223_372_036_854_775_807_u64))]
     pub after: Option<u64>,
     #[schemars(range(min = 1, max = 100))]
@@ -230,7 +236,7 @@ pub struct OfflineReviewResultPageV1 {
     pub version: u32,
     pub items: Vec<OfflineReviewResultV1>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub next_after: Option<u64>,
 }
 
@@ -266,10 +272,13 @@ pub struct ClientFailureV1 {
     pub code: ClientFailureCodeV1,
     pub delivery: ClientDeliveryV1,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub operation_id: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(
+        with = "crate::protocol::RequiredNullable<ApiErrorResponseV1>",
+        required
+    )]
     pub api_error: Option<ApiErrorResponseV1>,
 }
 

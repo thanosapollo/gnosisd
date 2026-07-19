@@ -673,7 +673,10 @@ pub enum OfflineContentResultV1 {
         operation_id: String,
         conflict_reason: OfflineContentConflictReasonV1,
         #[serde(deserialize_with = "deserialize_required_option")]
-        #[schemars(required)]
+        #[schemars(
+            with = "crate::protocol::RequiredNullable<OfflineContentDocumentV1>",
+            required
+        )]
         authoritative: Option<OfflineContentDocumentV1>,
         #[schemars(length(min = 1, max = 512))]
         cursor: String,
@@ -721,7 +724,7 @@ pub struct OfflineContentDocumentV1 {
     #[schemars(range(min = 1))]
     pub revision: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub content_sha256: Option<String>,
     pub active: bool,
 }
