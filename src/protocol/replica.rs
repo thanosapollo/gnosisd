@@ -579,7 +579,19 @@ fn thema_identity(value: &ThemaRevisionV1) -> Result<ProjectionIdentity, Replica
         None,
     )
     .map_err(|_| ReplicaWireError::Response)?;
-    if prepared.content_sha256 != value.content_sha256 {
+    if prepared.content_sha256 != value.content_sha256
+        || prepared.tags != value.tags
+        || prepared.concepts.len() != value.concepts.len()
+        || !prepared
+            .concepts
+            .iter()
+            .zip(&value.concepts)
+            .all(|(prepared, wire)| {
+                prepared.concept_id().as_str() == wire.node_id
+                    && prepared.relation() == wire.relation.into()
+            })
+        || prepared.asset_paths != value.asset_paths
+    {
         return Err(ReplicaWireError::Response);
     }
     Ok((

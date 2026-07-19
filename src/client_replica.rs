@@ -1963,6 +1963,20 @@ mod tests {
             replica.projection("thema", "thema").unwrap().unwrap(),
             before
         );
+        for malformed in [
+            duplicate_thema_concept_delta(&fixture, &cursor),
+            out_of_order_thema_concept_delta(&fixture, &cursor),
+        ] {
+            assert!(matches!(
+                replica.install_change_page(decode_response(malformed)),
+                Err(Error::ReplicaWire)
+            ));
+            assert_eq!(replica.status().unwrap().cursor, Some(cursor.clone()));
+            assert_eq!(
+                replica.projection("thema", "thema").unwrap().unwrap(),
+                before
+            );
+        }
         assert!(matches!(
             replica.install_change_page(decode_response(noncanonical_asset_delta(&cursor))),
             Err(Error::ReplicaWire)
@@ -3828,6 +3842,60 @@ mod tests {
     }
 
     fn valid_replica_fixture(mut fixture: Value) -> Value {
+        fixture["changes"]["items"][0]["projection"]["content_sha256"] = json!(
+            fixture_thema_digest(vec![("node".into(), ThemaConceptRelation::Supporting,)])
+        );
+        fixture
+    }
+
+    fn duplicate_thema_concept_delta(fixture: &Value, from: &str) -> Value {
+        let concept = fixture["changes"]["items"][0]["projection"]["concepts"][0].clone();
+        thema_delta(
+            fixture,
+            from,
+            &"6".repeat(32),
+            vec![concept.clone(), concept],
+            None,
+        )
+    }
+
+    fn out_of_order_thema_concept_delta(fixture: &Value, from: &str) -> Value {
+        let concepts = vec![
+            json!({"node_id": "z-node", "relation": "supporting"}),
+            json!({"node_id": "a-node", "relation": "primary"}),
+        ];
+        let digest = fixture_thema_digest(vec![
+            ("z-node".into(), ThemaConceptRelation::Supporting),
+            ("a-node".into(), ThemaConceptRelation::Primary),
+        ]);
+        thema_delta(fixture, from, &"7".repeat(32), concepts, Some(digest))
+    }
+
+    fn thema_delta(
+        fixture: &Value,
+        from: &str,
+        token: &str,
+        concepts: Vec<Value>,
+        digest: Option<String>,
+    ) -> Value {
+        let server = "0123456789abcdef0123456789abcdef";
+        let next = encode_cursor(server, 11, token).unwrap();
+        let mut thema = fixture["changes"]["items"][0].clone();
+        thema["cursor"] = json!(next.clone());
+        thema["projection"]["concepts"] = json!(concepts);
+        if let Some(digest) = digest {
+            thema["projection"]["content_sha256"] = json!(digest);
+        }
+        json!({
+            "version": 1,
+            "from": from,
+            "next": next,
+            "has_more": false,
+            "items": [thema]
+        })
+    }
+
+    fn fixture_thema_digest(concepts: Vec<(String, ThemaConceptRelation)>) -> String {
         let content = thema_content(
             "basic",
             "Question".into(),
@@ -3842,14 +3910,12 @@ mod tests {
             Some("thema".into()),
             content,
             vec!["tag".into()],
-            vec![("node".into(), ThemaConceptRelation::Supporting)],
+            concepts,
             vec![],
             None,
         )
         .unwrap();
-        fixture["changes"]["items"][0]["projection"]["content_sha256"] =
-            json!(prepared.content_sha256);
-        fixture
+        prepared.content_sha256
     }
 
     fn older_asset_delta(from: &str) -> Value {
