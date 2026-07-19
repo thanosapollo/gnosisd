@@ -79,6 +79,9 @@ impl BlobStore {
         match fs::remove_file(&path) {
             Ok(()) => {
                 sync_directory(parent)?;
+                if fs::read_dir(parent)?.next().is_none() {
+                    fs::remove_dir(parent)?;
+                }
                 sync_directory(&self.root)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),

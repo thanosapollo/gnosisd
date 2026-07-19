@@ -1620,6 +1620,15 @@ fn thema_matches_input(thema: &ThemaV1, input: &ThemaWriteRequestV1) -> bool {
         ThemaKindV1::Mcq => "mcq",
         ThemaKindV1::McCloze => "mc-cloze",
     };
+    let mut tags = input.tags.clone();
+    tags.sort();
+    tags.dedup();
+    let mut concepts = input.concepts.clone();
+    concepts.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+    concepts.dedup();
+    let mut asset_paths = input.asset_paths.clone();
+    asset_paths.sort();
+    asset_paths.dedup();
     kind == input.kind
         && thema.keimenon == input.keimenon
         && thema.hypothesis == input.hypothesis
@@ -1627,9 +1636,9 @@ fn thema_matches_input(thema: &ThemaV1, input: &ThemaWriteRequestV1) -> bool {
         && thema.source_guid == input.source_guid
         && thema.parathema == input.parathema
         && thema.review_image == input.review_image
-        && thema.tags == input.tags
-        && thema.concepts == input.concepts
-        && thema.asset_paths == input.asset_paths
+        && thema.tags == tags
+        && thema.concepts == concepts
+        && thema.asset_paths == asset_paths
         && is_canonical_sha256(&thema.content_sha256)
 }
 
@@ -2282,7 +2291,7 @@ mod tests {
             source_guid: None,
             parathema: None,
             review_image: None,
-            tags: vec![],
+            tags: vec!["zeta".into(), "alpha".into(), "zeta".into()],
             concepts: vec![],
             asset_paths: vec![],
         };
@@ -2298,7 +2307,7 @@ mod tests {
                 "source_guid": null,
                 "parathema": null,
                 "review_image": null,
-                "tags": [],
+                "tags": ["alpha", "zeta"],
                 "concepts": [],
                 "asset_paths": [],
                 "content_sha256": "b".repeat(64),

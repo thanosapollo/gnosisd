@@ -134,14 +134,18 @@ pub(crate) struct SqliteStore {
     connection: Connection,
 }
 
-pub(super) fn put_asset_in(
-    transaction: &Transaction<'_>,
+pub(super) enum AssetWriteDecision {
+    Unchanged(AssetHead),
+    Write,
+}
+
+pub(super) fn asset_write_decision(
+    connection: &Connection,
     prepared: &PreparedAsset,
     blob: &BlobMeta,
-    created_at_us: i64,
-    author_device_id: Option<&str>,
-) -> Result<(AssetHead, bool), StoreError> {
-    let collides: bool = transaction
+    require_matching_blob_metadata: bool,
+) -> Result<AssetWriteDecision, StoreError> {
+    let collides: bool = connection
         .query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM managed_asset
@@ -156,7 +160,7 @@ pub(super) fn put_asset_in(
             reason: "asset path collides by case",
         });
     }
-    let current: Option<(String, i64, bool)> = transaction
+    let current: Option<(String, i64, bool)> = connection
         .query_row(
             "SELECT blob_sha256, revision, active
              FROM managed_asset WHERE asset_path = ?1",
@@ -169,15 +173,54 @@ pub(super) fn put_asset_in(
         prepared.expected_revision,
         current.as_ref().map(|(_, revision, _)| *revision),
     )?;
+    let stored_blob: Option<(i64, String)> = connection
+        .query_row(
+            "SELECT size_bytes, media_type FROM blob WHERE content_sha256 = ?1",
+            [&blob.sha256],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    if require_matching_blob_metadata
+        && stored_blob.is_some_and(|(size, media_type)| {
+            u64::try_from(size).ok() != Some(blob.size_bytes) || media_type != blob.media_type
+        })
+    {
+        return Err(StoreError::BlobMetadata);
+    }
     if current
         .as_ref()
         .is_some_and(|(digest, _, active)| digest == &blob.sha256 && *active)
     {
-        return Ok((
-            load_asset_head(transaction, &prepared.logical_path)?.ok_or(StoreError::NotFound)?,
-            false,
+        return Ok(AssetWriteDecision::Unchanged(
+            load_asset_head(connection, &prepared.logical_path)?.ok_or(StoreError::NotFound)?,
         ));
     }
+    Ok(AssetWriteDecision::Write)
+}
+
+pub(super) fn put_asset_in(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedAsset,
+    blob: &BlobMeta,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+    require_matching_blob_metadata: bool,
+) -> Result<(AssetHead, bool), StoreError> {
+    if let AssetWriteDecision::Unchanged(head) =
+        asset_write_decision(transaction, prepared, blob, require_matching_blob_metadata)?
+    {
+        return Ok((head, false));
+    }
+    let current: Option<(String, i64, bool)> = transaction
+        .query_row(
+            "SELECT blob_sha256, revision, active
+             FROM managed_asset WHERE asset_path = ?1",
+            [&prepared.logical_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
     let revision = next_number(current.as_ref().map(|(_, revision, _)| *revision))?;
     insert_blob(transaction, blob, created_at_us)?;
     transaction
@@ -557,6 +600,7 @@ impl SqliteStore {
             blob,
             created_at_us,
             author_device_id,
+            false,
         )?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(head.revision)

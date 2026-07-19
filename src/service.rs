@@ -1822,6 +1822,9 @@ fn apply_device_desired_state_mutation_command(
     asset_bytes: Option<&[u8]>,
     created_at_us: i64,
 ) -> Result<DeviceMutationExecution, ServiceError> {
+    let needs_blob = store
+        .device_desired_state_mutation_needs_blob(operation)
+        .map_err(ServiceError::Store)?;
     let mut new_blob_digest = None;
     match (&operation.mutation, asset_bytes) {
         (
@@ -1838,16 +1841,18 @@ fn apply_device_desired_state_mutation_command(
             if actual_digest != *digest || actual_size != *size_bytes {
                 return Err(ServiceError::Corrupt);
             }
-            let existed = blobs.contains(digest)?;
-            let blob = blobs.put(bytes, media_type)?;
-            if blob.sha256 != actual_digest || blob.size_bytes != actual_size {
-                if !existed {
-                    blobs.discard(&blob.sha256)?;
+            if needs_blob {
+                let existed = blobs.contains(digest)?;
+                let blob = blobs.put(bytes, media_type)?;
+                if blob.sha256 != actual_digest || blob.size_bytes != actual_size {
+                    if !existed {
+                        blobs.discard(&blob.sha256)?;
+                    }
+                    return Err(ServiceError::Corrupt);
                 }
-                return Err(ServiceError::Corrupt);
-            }
-            if !existed {
-                new_blob_digest = Some(blob.sha256);
+                if !existed {
+                    new_blob_digest = Some(blob.sha256);
+                }
             }
         }
         (DeviceDesiredStateMutation::PutAsset { .. }, None) | (_, Some(_)) => {
@@ -2706,6 +2711,7 @@ mod tests {
             DeviceMutationResult::Rejected { .. }
         ));
         assert!(!blob_path.join(&digest[..2]).join(&digest).exists());
+        assert!(!blob_path.join(&digest[..2]).exists());
         assert!(
             blob_path
                 .join(&first_digest[..2])
@@ -2726,6 +2732,7 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(execution.result, replay.result);
         assert!(!blob_path.join(&digest[..2]).join(&digest).exists());
+        assert!(!blob_path.join(&digest[..2]).exists());
         drop(service);
         runtime.finish().await.unwrap();
     }

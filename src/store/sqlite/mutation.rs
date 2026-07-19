@@ -2,10 +2,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use sha2::{Digest, Sha256};
 
 use super::{
-    NoteWriteDecision, SqliteStore, StoreError, current_content_cursor, load_document_head,
-    note_write_decision, put_asset_in, put_thema_in, rename_document_in, replace_note_in,
-    replica_cursor_token, server_id, set_thema_archived_in, tombstone_asset_in,
-    tombstone_document_in, update_settings_in,
+    AssetWriteDecision, NoteWriteDecision, SqliteStore, StoreError, asset_write_decision,
+    current_content_cursor, load_document_head, note_write_decision, put_asset_in, put_thema_in,
+    rename_document_in, replace_note_in, replica_cursor_token, server_id, set_thema_archived_in,
+    tombstone_asset_in, tombstone_document_in, update_settings_in,
 };
 use crate::{
     application::{
@@ -141,6 +141,38 @@ impl SqliteStore {
             replayed: false,
         })
     }
+
+    pub(crate) fn device_desired_state_mutation_needs_blob(
+        &self,
+        operation: &PreparedDeviceDesiredStateMutation,
+    ) -> Result<bool, StoreError> {
+        operation.validate().map_err(|_| StoreError::CorruptData {
+            field: "device desired-state mutation",
+        })?;
+        if replayed_device_mutation(&self.connection, &operation.identity)?.is_some() {
+            return Ok(false);
+        }
+        let DeviceDesiredStateMutation::PutAsset {
+            prepared,
+            digest,
+            size_bytes,
+            media_type,
+        } = &operation.mutation
+        else {
+            return Ok(false);
+        };
+        let blob = BlobMeta {
+            sha256: digest.clone(),
+            size_bytes: *size_bytes,
+            media_type: media_type.clone(),
+        };
+        match asset_write_decision(&self.connection, prepared, &blob, true) {
+            Ok(AssetWriteDecision::Write) => Ok(true),
+            Ok(AssetWriteDecision::Unchanged(_)) => Ok(false),
+            Err(error) if desired_state_rejection(&error).is_some() => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn apply_desired_state_mutation(
@@ -162,7 +194,7 @@ fn apply_desired_state_mutation(
                 media_type: media_type.clone(),
             };
             let (head, changed) =
-                put_asset_in(transaction, prepared, &blob, created_at_us, author)?;
+                put_asset_in(transaction, prepared, &blob, created_at_us, author, true)?;
             Ok((changed, DeviceMutationProjection::Asset(head)))
         }
         DeviceDesiredStateMutation::TombstoneAsset {
@@ -239,7 +271,9 @@ fn desired_state_rejection(error: &StoreError) -> Option<DeviceMutationRejection
         }
         StoreError::NotFound => Some(DeviceMutationRejection::NotFound),
         StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
-        StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
+        StoreError::BlobMetadata | StoreError::InvalidProjection { .. } => {
+            Some(DeviceMutationRejection::InvalidContent)
+        }
         _ => None,
     }
 }
@@ -850,6 +884,48 @@ mod tests {
             ));
         }
         assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+    }
+
+    #[test]
+    fn desired_state_asset_rejects_existing_blob_metadata_mismatch() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "asset-metadata");
+        let digest = format!("{:x}", Sha256::digest(b"asset"));
+        let logical_path = format!("assets/{digest}/a.png");
+        let operation = |operation_id: &str, media_type: &str| {
+            prepare_device_desired_state_mutation(
+                1,
+                operation_id.into(),
+                device.clone(),
+                DeviceDesiredStateMutation::PutAsset {
+                    prepared: prepare_asset(logical_path.clone(), "a.png".into(), None).unwrap(),
+                    digest: digest.clone(),
+                    size_bytes: 5,
+                    media_type: media_type.into(),
+                },
+            )
+            .unwrap()
+        };
+        store
+            .apply_device_desired_state_mutation(&operation("first", "image/png"), 1)
+            .unwrap();
+
+        let result = store
+            .apply_device_desired_state_mutation(&operation("second", "image/jpeg"), 2)
+            .unwrap();
+
+        assert!(matches!(
+            result.result,
+            DeviceMutationResult::Rejected {
+                rejection: DeviceMutationRejection::InvalidContent,
+                ..
+            }
+        ));
+        assert_eq!(
+            store.asset_head(&logical_path).unwrap().unwrap().media_type,
+            Some("image/png".into())
+        );
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 2);
     }
 
     #[test]
