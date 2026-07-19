@@ -3,8 +3,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 
 use gnosis_core::protocol::{
-    DaemonConfig, DaemonServer, PROTOCOL_VERSION, Request, RequestEnvelope, ResponseEnvelope,
-    ResponseOutcome, ResponseResult,
+    DaemonConfig, DaemonServer, ErrorCode, MAX_REPAIR_BATCH_SIZE, PROTOCOL_VERSION, RepairView,
+    Request, RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -65,6 +65,33 @@ async fn unix_socket_serves_operator_commands_and_secures_files() {
         listed.outcome,
         ResponseOutcome::Success { result }
             if matches!(*result, ResponseResult::Devices(ref devices) if devices.len() == 1)
+    ));
+
+    let repair = request(
+        &socket,
+        "repair",
+        Request::Repair {
+            batch_size: MAX_REPAIR_BATCH_SIZE,
+        },
+    )
+    .await;
+    match repair.outcome {
+        ResponseOutcome::Success { result } => assert_eq!(
+            *result,
+            ResponseResult::Repair(RepairView {
+                document_revisions_repaired: 0,
+                blobs_verified: 0,
+                max_batch_observed: 0,
+            })
+        ),
+        ResponseOutcome::Failure { error } => panic!("admin.repair failed: {error:?}"),
+    }
+
+    let invalid = request(&socket, "repair-invalid", Request::Repair { batch_size: 0 }).await;
+    assert!(matches!(
+        invalid.outcome,
+        ResponseOutcome::Failure { error }
+            if error.code == ErrorCode::MalformedRequest
     ));
 
     shutdown_tx.send(()).unwrap();

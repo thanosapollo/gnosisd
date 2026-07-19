@@ -177,6 +177,10 @@ impl ReviewPackCommand {
 
 #[derive(Debug, Subcommand)]
 enum AdminCommand {
+    Repair {
+        #[arg(long, default_value_t = 100, value_name = "N")]
+        batch_size: u16,
+    },
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
@@ -999,6 +1003,7 @@ fn correlation_id() -> String {
 
 fn admin_request(command: AdminCommand) -> Result<Request, CliError> {
     match command {
+        AdminCommand::Repair { batch_size } => Ok(Request::Repair { batch_size }),
         AdminCommand::Backup { command } => match command {
             BackupCommand::Create {
                 destination,
@@ -1083,6 +1088,7 @@ fn write_result(result: &ResponseResult) -> Result<(), CliError> {
         ResponseResult::Device(value) => write_json(value),
         ResponseResult::Backup(value) => write_json(value),
         ResponseResult::BackupsPruned(value) => write_json(value),
+        ResponseResult::Repair(value) => write_json(value),
     }
 }
 

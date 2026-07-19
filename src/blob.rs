@@ -1,5 +1,4 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -100,6 +99,31 @@ impl BlobStore {
         verify_file(&self.blob_path(digest)?, digest, size)
     }
 
+    pub(crate) fn cleanup_orphans(
+        &self,
+        mut is_referenced: impl FnMut(&str) -> Result<bool, BlobError>,
+    ) -> Result<u64, BlobError> {
+        let mut removed = 0_u64;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_str().ok_or(BlobError::Corrupt)?;
+            if name.starts_with(".tmp-") {
+                if entry.file_type()?.is_file() {
+                    fs::remove_file(path)?;
+                    removed += 1;
+                }
+                continue;
+            }
+            removed += cleanup_orphan_prefix(&path, name, &mut is_referenced)?;
+        }
+        if removed > 0 {
+            sync_directory(&self.root)?;
+        }
+        Ok(removed)
+    }
+
     pub(crate) fn copy_to(&self, digest: &str, size: u64, root: &Path) -> Result<(), BlobError> {
         let source = self.blob_path(digest)?;
         self.verify(digest, size)?;
@@ -111,29 +135,6 @@ impl BlobStore {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
         File::open(&target)?.sync_all()?;
         sync_directory(parent)?;
-        Ok(())
-    }
-
-    pub(crate) fn recover(&self, expected: &[(String, u64)]) -> Result<(), BlobError> {
-        let expected = expected.iter().cloned().collect::<BTreeMap<_, _>>();
-        let mut found = BTreeSet::new();
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let name = entry.file_name();
-            let name = name.to_str().ok_or(BlobError::Corrupt)?;
-            if name.starts_with(".tmp-") && entry.file_type()?.is_file() {
-                fs::remove_file(path)?;
-                continue;
-            }
-            recover_prefix(&path, name, &expected, &mut found)?;
-        }
-        for (digest, size) in expected {
-            if !found.contains(&digest) {
-                return Err(BlobError::Corrupt);
-            }
-            self.verify(&digest, size)?;
-        }
         Ok(())
     }
 
@@ -160,12 +161,11 @@ fn sync_directory(path: &Path) -> Result<(), BlobError> {
     Ok(())
 }
 
-fn recover_prefix(
+fn cleanup_orphan_prefix(
     path: &Path,
     prefix: &str,
-    expected: &BTreeMap<String, u64>,
-    found: &mut BTreeSet<String>,
-) -> Result<(), BlobError> {
+    is_referenced: &mut impl FnMut(&str) -> Result<bool, BlobError>,
+) -> Result<u64, BlobError> {
     let metadata = fs::symlink_metadata(path)?;
     if prefix.len() != 2
         || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -173,6 +173,7 @@ fn recover_prefix(
     {
         return Err(BlobError::Corrupt);
     }
+    let mut removed = 0_u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let digest = entry
@@ -184,16 +185,16 @@ fn recover_prefix(
         if &digest[..2] != prefix || !entry.file_type()?.is_file() {
             return Err(BlobError::Corrupt);
         }
-        if expected.contains_key(&digest) {
-            found.insert(digest);
-        } else {
+        if !is_referenced(&digest)? {
             fs::remove_file(entry.path())?;
+            removed += 1;
         }
     }
-    if fs::read_dir(path)?.next().is_none() {
+    if removed > 0 && fs::read_dir(path)?.next().is_none() {
+        sync_directory(path)?;
         fs::remove_dir(path)?;
     }
-    Ok(())
+    Ok(removed)
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), BlobError> {
@@ -282,14 +283,19 @@ mod tests {
     }
 
     #[test]
-    fn startup_recovery_removes_unreferenced_and_interrupted_blobs() {
+    fn cleanup_orphans_removes_unreferenced_and_temp_files() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("blobs");
         let store = BlobStore::open(&root).unwrap();
-        let blob = store.put(b"orphan", "text/plain").unwrap();
+        let keep = store.put(b"keep", "text/plain").unwrap();
+        let orphan = store.put(b"orphan", "text/plain").unwrap();
         std::fs::write(root.join(".tmp-interrupted"), b"partial").unwrap();
-        store.recover(&[]).unwrap();
-        assert!(!root.join(&blob.sha256[..2]).exists());
+        let removed = store
+            .cleanup_orphans(|digest| Ok(digest == keep.sha256))
+            .unwrap();
+        assert_eq!(removed, 2);
+        assert!(root.join(&keep.sha256[..2]).join(&keep.sha256).exists());
+        assert!(!root.join(&orphan.sha256[..2]).exists());
         assert!(!root.join(".tmp-interrupted").exists());
     }
 }

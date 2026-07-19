@@ -19,8 +19,8 @@ use crate::{
     application::{ApplicationError, generate_device},
     protocol::{
         BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, ErrorCode,
-        MessageValidationError, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
-        ResponseEnvelope, ResponseResult, SystemInfo, frame,
+        MessageValidationError, PROTOCOL_VERSION, ProtocolError, RepairView, Request,
+        RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo, frame,
     },
     service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError},
     store::StoreError,
@@ -227,6 +227,7 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
             path,
             temporary_directory,
         } => validate_restore(state, path, temporary_directory).await,
+        Request::Repair { batch_size } => repair(state, batch_size).await,
     };
     match result {
         Ok(result) => bounded_success(id, result),
@@ -349,6 +350,15 @@ async fn validate_restore(
     Ok(ResponseResult::Backup(backup_view(summary)))
 }
 
+async fn repair(state: ServerState, batch_size: u16) -> Result<ResponseResult, ProtocolError> {
+    let summary = state.store.repair(batch_size).await.map_err(actor_error)?;
+    Ok(ResponseResult::Repair(RepairView {
+        document_revisions_repaired: summary.document_revisions_repaired,
+        blobs_verified: summary.blobs_verified,
+        max_batch_observed: summary.max_batch_observed,
+    }))
+}
+
 fn backup_view(summary: crate::service::BackupSummary) -> BackupView {
     BackupView {
         path: summary.path.to_string_lossy().into_owned(),
@@ -390,6 +400,9 @@ fn validation_response(id: String, error: MessageValidationError) -> ResponseEnv
         MessageValidationError::InvalidRequestId => {
             ProtocolError::new(ErrorCode::MalformedRequest, "invalid request ID")
         }
+        MessageValidationError::InvalidRepairBatchSize => {
+            ProtocolError::new(ErrorCode::MalformedRequest, "invalid repair batch size")
+        }
     };
     ResponseEnvelope::error(id, error)
 }
@@ -415,6 +428,7 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         | ServiceError::Corrupt
         | ServiceError::AssetDigest
         | ServiceError::InvalidBlobMetadata
+        | ServiceError::InvalidRepairBatchSize
         | ServiceError::Blob(_)
         | ServiceError::Review(_)
         | ServiceError::Settings(_)

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    io,
     path::PathBuf,
     sync::{
         Arc,
@@ -48,10 +48,18 @@ use crate::{
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{ClozeCheck, DocumentId, DueThema},
+    protocol::MAX_REPAIR_BATCH_SIZE,
     store::{
         DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
     },
 };
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RepairSummary {
+    pub(crate) document_revisions_repaired: u64,
+    pub(crate) blobs_verified: u64,
+    pub(crate) max_batch_observed: u16,
+}
 
 #[derive(Clone)]
 pub(crate) struct ServiceHandle {
@@ -65,6 +73,18 @@ impl ServiceHandle {
         request(&self.sender, |response| StoreCommand::Ready { response })
             .await?
             .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn repair(&self, batch_size: u16) -> Result<RepairSummary, ServiceError> {
+        if batch_size == 0 || batch_size > MAX_REPAIR_BATCH_SIZE {
+            return Err(ServiceError::InvalidRepairBatchSize);
+        }
+        request(&self.sender, |response| StoreCommand::Repair {
+            batch_size,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
     }
 
     #[cfg(test)]
@@ -1253,6 +1273,10 @@ enum StoreCommand {
     Ready {
         response: oneshot::Sender<StoreResult<()>>,
     },
+    Repair {
+        batch_size: u16,
+        response: oneshot::Sender<StoreResult<RepairSummary>>,
+    },
     #[cfg(test)]
     Replace {
         prepared: Box<PreparedServerImport>,
@@ -1656,19 +1680,7 @@ fn store_actor(
             return;
         }
     };
-    let recovery = store
-        .clear_staged_blobs()
-        .and_then(|()| store.referenced_blobs())
-        .and_then(|expected| {
-            blobs
-                .recover(&expected)
-                .map_err(|error| StoreError::Storage(Box::new(error)))
-        });
-    if let Err(error) = recovery {
-        let _ = ready.send(Err(error));
-        return;
-    }
-    if let Err(error) = rebuild_document_asset_index(&mut store, &blobs) {
+    if let Err(error) = store.clear_staged_blobs() {
         let _ = ready.send(Err(error));
         return;
     }
@@ -1680,35 +1692,81 @@ fn store_actor(
     }
 }
 
-fn rebuild_document_asset_index(
+fn repair_canonical_state(
     store: &mut SqliteStore,
     blobs: &BlobStore,
-) -> Result<(), StoreError> {
-    let mut parsed: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut associations = Vec::new();
-    for source in store.document_asset_sources()? {
-        let asset_paths = match parsed.get(&source.blob_sha256) {
-            Some(asset_paths) => asset_paths.clone(),
-            None => {
-                let bytes = blobs
-                    .read(&source.blob_sha256)
-                    .map_err(|error| StoreError::Storage(Box::new(error)))?;
-                let org = String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
-                    field: "document blob UTF-8",
-                })?;
-                let asset_paths = retained_asset_paths_in_org(&org);
-                parsed.insert(source.blob_sha256.clone(), asset_paths.clone());
-                asset_paths
-            }
-        };
-        associations.push(DocumentAssetAssociation {
-            document_id: source.document_id,
-            revision: source.revision,
-            asset_paths,
-            active_head: source.active_head,
-        });
+    batch_size: u16,
+) -> Result<RepairSummary, StoreError> {
+    let mut summary = RepairSummary {
+        document_revisions_repaired: 0,
+        blobs_verified: 0,
+        max_batch_observed: 0,
+    };
+    let mut document_cursor: Option<(String, u64)> = None;
+    loop {
+        let sources = store.document_asset_sources_page(
+            document_cursor
+                .as_ref()
+                .map(|(document_id, revision)| (document_id.as_str(), *revision)),
+            batch_size,
+        )?;
+        summary.max_batch_observed = summary
+            .max_batch_observed
+            .max(u16::try_from(sources.len()).unwrap_or(u16::MAX));
+        if sources.is_empty() {
+            break;
+        }
+        let mut associations = Vec::with_capacity(sources.len());
+        for source in &sources {
+            let bytes = blobs
+                .read(&source.blob_sha256)
+                .map_err(|error| StoreError::Storage(Box::new(error)))?;
+            let org = String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
+                field: "document blob UTF-8",
+            })?;
+            associations.push(DocumentAssetAssociation {
+                document_id: source.document_id.clone(),
+                revision: source.revision,
+                asset_paths: retained_asset_paths_in_org(&org),
+                active_head: source.active_head,
+            });
+        }
+        store.repair_document_assets(&associations)?;
+        summary.document_revisions_repaired += sources.len() as u64;
+        document_cursor = sources
+            .last()
+            .map(|source| (source.document_id.clone(), source.revision));
     }
-    store.rebuild_document_assets(&associations)
+
+    let mut blob_cursor = None;
+    loop {
+        let page = store.referenced_blobs_page(blob_cursor.as_deref(), batch_size)?;
+        summary.max_batch_observed = summary
+            .max_batch_observed
+            .max(u16::try_from(page.len()).unwrap_or(u16::MAX));
+        if page.is_empty() {
+            break;
+        }
+        for (digest, size) in &page {
+            blobs
+                .verify(digest, *size)
+                .map_err(|error| StoreError::Storage(Box::new(error)))?;
+        }
+        summary.blobs_verified += page.len() as u64;
+        blob_cursor = page.last().map(|(digest, _)| digest.clone());
+    }
+
+    let store_ref: &SqliteStore = store;
+    blobs
+        .cleanup_orphans(|digest| {
+            store_ref.is_blob_referenced(digest).map_err(|error| {
+                BlobError::Io(io::Error::other(format!(
+                    "referenced blob lookup failed: {error}"
+                )))
+            })
+        })
+        .map_err(|error| StoreError::Storage(Box::new(error)))?;
+    Ok(summary)
 }
 
 struct ContentCommand<'a> {
@@ -1953,6 +2011,10 @@ fn stage_blob_command(
 fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreCommand) {
     match command {
         StoreCommand::Ready { response } => send(response, store.settings().map(drop)),
+        StoreCommand::Repair {
+            batch_size,
+            response,
+        } => send(response, repair_canonical_state(store, blobs, batch_size)),
         #[cfg(test)]
         StoreCommand::Replace {
             prepared,
@@ -2570,6 +2632,8 @@ pub(crate) enum ServiceError {
     Busy,
     #[error("store service stopped")]
     Stopped,
+    #[error("repair batch size is invalid")]
+    InvalidRepairBatchSize,
     #[error("stored content is corrupt")]
     Corrupt,
     #[error("asset digest does not match its canonical path")]

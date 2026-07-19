@@ -16,8 +16,8 @@ pub use http_v1::{
 pub(crate) use message::MessageValidationError;
 pub use message::{
     BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, ErrorCode, MAX_FRAME_SIZE,
-    MAX_REQUEST_ID_LEN, PROTOCOL_VERSION, ProtocolError, Request, RequestEnvelope,
-    ResponseEnvelope, ResponseOutcome, ResponseResult, SystemInfo,
+    MAX_REPAIR_BATCH_SIZE, MAX_REQUEST_ID_LEN, PROTOCOL_VERSION, ProtocolError, RepairView,
+    Request, RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult, SystemInfo,
 };
 #[cfg(test)]
 pub(crate) use offline_asset::offline_asset_result_json;

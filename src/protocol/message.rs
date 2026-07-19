@@ -4,6 +4,7 @@ use thiserror::Error;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_REQUEST_ID_LEN: usize = 128;
+pub const MAX_REPAIR_BATCH_SIZE: u16 = 1_000;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -49,11 +50,20 @@ pub enum Request {
         path: String,
         temporary_directory: String,
     },
+    #[serde(rename = "admin.repair")]
+    Repair { batch_size: u16 },
 }
 
 impl Request {
     fn validate(&self) -> Result<(), MessageValidationError> {
-        Ok(())
+        match self {
+            Self::Repair { batch_size }
+                if *batch_size == 0 || *batch_size > MAX_REPAIR_BATCH_SIZE =>
+            {
+                Err(MessageValidationError::InvalidRepairBatchSize)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -101,6 +111,14 @@ pub enum ResponseResult {
     Device(DeviceView),
     Backup(BackupView),
     BackupsPruned(BackupsPrunedView),
+    Repair(RepairView),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RepairView {
+    pub document_revisions_repaired: u64,
+    pub blobs_verified: u64,
+    pub max_batch_observed: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -191,6 +209,8 @@ pub enum MessageValidationError {
     UnsupportedVersion(u16),
     #[error("request ID must contain 1 to {MAX_REQUEST_ID_LEN} bytes")]
     InvalidRequestId,
+    #[error("repair batch size must contain 1 to {MAX_REPAIR_BATCH_SIZE} items")]
+    InvalidRepairBatchSize,
 }
 
 #[cfg(test)]

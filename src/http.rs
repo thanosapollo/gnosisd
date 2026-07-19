@@ -2264,6 +2264,7 @@ impl ApiError {
             ServiceError::Settings(_) => Self::invalid_content("settings"),
             ServiceError::Stopped
             | ServiceError::Corrupt
+            | ServiceError::InvalidRepairBatchSize
             | ServiceError::Blob(_)
             | ServiceError::Backup(_) => Self::internal(),
         }
