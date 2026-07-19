@@ -512,7 +512,7 @@ pub struct ReviewSourceInputV1 {
 }
 
 impl ReviewSourceInputV1 {
-    fn into_application(self) -> ReviewSource {
+    pub(crate) fn into_application(self) -> ReviewSource {
         ReviewSource {
             kind: self.kind.into(),
             tags: self.tags,

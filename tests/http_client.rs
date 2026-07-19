@@ -1461,6 +1461,20 @@ async fn review_session_client_enforces_request_and_normalized_response_targets(
         assert_eq!(error.delivery(), DeliveryStatus::NotSent);
     }
 
+    let oversized_source = ReviewSourceInputV1 {
+        manual_ids: (0..=500).map(|index| format!("thema-{index}")).collect(),
+        ..source.clone()
+    };
+    let error = unavailable
+        .create_review_session(&ReviewSessionRequestV1 {
+            source: oversized_source,
+            target_count: Some(1),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, HttpClientError::InvalidReview));
+    assert_eq!(error.delivery(), DeliveryStatus::NotSent);
+
     for target_count in [Some(10), None, Some(9)] {
         let raw = spawn_json_response(
             "201 Created",

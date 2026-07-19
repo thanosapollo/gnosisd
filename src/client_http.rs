@@ -385,9 +385,10 @@ impl HttpClient {
         &self,
         input: &ReviewSessionRequestV1,
     ) -> Result<ReviewSessionV1, HttpClientError> {
-        if input
-            .target_count
-            .is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        if input.source.clone().into_application().validate().is_err()
+            || input
+                .target_count
+                .is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
         {
             return Err(HttpClientError::InvalidReview);
         }
