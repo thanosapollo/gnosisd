@@ -454,6 +454,7 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::DeviceSequence { .. }
         | StoreError::ReplicaCursor
         | StoreError::ReplicaServer
+        | StoreError::InvalidCursor
         | StoreError::BlobRequired { .. }
         | StoreError::BlobMetadata
         | StoreError::PathChange

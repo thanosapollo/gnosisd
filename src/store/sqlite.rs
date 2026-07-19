@@ -18,10 +18,11 @@ use crate::{
     application::{
         AssetHead, AssetRevision, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead,
         DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision, NewDevice,
-        NodeRecord, PreparedAsset, PreparedNote, PreparedThema, ReplicaChange, ReplicaProjection,
-        ReplicaState, ReviewStateRevision, SettingsInput, SettingsRecord, SettingsRevision,
-        SnapshotPage, SnapshotPosition, ThemaRecord, ThemaRevision, parse_stored_scopes, path_key,
-        stored_scopes, stored_thema_content, validate_org_path,
+        NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote, PreparedThema,
+        ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsInput,
+        SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition, ThemaRecord,
+        ThemaRevision, parse_stored_scopes, path_key, stored_scopes, stored_thema_content,
+        validate_org_path,
     },
     blob::BlobMeta,
 };
@@ -62,6 +63,8 @@ pub(crate) enum StoreError {
     DeviceSequence { expected: u64 },
     #[error("replica cursor is outside the retained server feed")]
     ReplicaCursor,
+    #[error("page cursor is not part of the requested collection")]
+    InvalidCursor,
     #[error("replica snapshot belongs to another server")]
     ReplicaServer,
     #[error("operation requires a staged blob")]
@@ -1183,6 +1186,69 @@ impl SqliteStore {
 
     pub(crate) fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
         load_node(&self.connection, node_id)
+    }
+
+    pub(crate) fn node_themata(
+        &self,
+        node_id: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<Vec<NodeThemaAssociation>, StoreError> {
+        let node_exists: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM node WHERE node_id = ?1
+                     UNION ALL SELECT 1 FROM retired_node WHERE node_id = ?1
+                 )",
+                params![node_id],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::storage)?;
+        if !node_exists {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(after) = after {
+            let associated: bool = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM thema_concept
+                         WHERE concept_id = ?1 AND thema_id = ?2
+                     )",
+                    params![node_id, after],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::storage)?;
+            if !associated {
+                return Err(StoreError::InvalidCursor);
+            }
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT thema_id, relation FROM thema_concept
+                 WHERE concept_id = ?1 AND thema_id > coalesce(?2, '')
+                 ORDER BY thema_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        statement
+            .query_map(params![node_id, after, i64::from(limit)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(StoreError::storage)?
+            .map(|row| {
+                let (thema_id, relation) = row.map_err(StoreError::storage)?;
+                Ok(NodeThemaAssociation {
+                    thema_id,
+                    relation: ThemaConceptRelation::parse(&relation).ok_or(
+                        StoreError::CorruptData {
+                            field: "thema concept relation",
+                        },
+                    )?,
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn search_nodes(
@@ -3131,7 +3197,6 @@ fn materialize_current_node(
     let (id, document_id, path, title, title_path, level, active) = row;
     Ok(NodeRecord {
         tags: query_node_tags(connection, &document_id, &id)?,
-        thema_ids: linked_themata(connection, &id)?,
         node_id: id,
         document_id,
         logical_path: path,
@@ -3167,7 +3232,6 @@ fn load_retired_node(
         .map_err(StoreError::storage)?
         .map(|(id, document_id, path, title, title_path, tags, level)| {
             Ok(NodeRecord {
-                thema_ids: linked_themata(connection, &id)?,
                 node_id: id,
                 document_id,
                 logical_path: path,
@@ -3196,14 +3260,6 @@ fn query_node_tags(
         .map_err(StoreError::storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::storage)
-}
-
-fn linked_themata(connection: &Connection, node_id: &str) -> Result<Vec<String>, StoreError> {
-    query_strings(
-        connection,
-        "SELECT thema_id FROM thema_concept WHERE concept_id = ?1 ORDER BY thema_id",
-        node_id,
-    )
 }
 
 type DeviceRow = (String, String, String, i64, Option<i64>, Option<i64>);
@@ -4228,8 +4284,8 @@ mod tests {
         initialize_schema, replace_rows, retire_removed_nodes, schema_version,
     };
     use crate::application::{
-        PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind, SettingsInput,
-        generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
+        NodeThemaAssociation, PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind,
+        SettingsInput, generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
@@ -4401,6 +4457,69 @@ mod tests {
             )
             .unwrap_err();
         assert!(relation.to_string().contains("CHECK constraint failed"));
+    }
+
+    #[test]
+    fn node_themata_pages_relations_and_rejects_stale_cursors() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let document_id = DocumentId::new("concept-document").unwrap();
+        store
+            .replace_document(&document_id, &concept_projection(), None)
+            .unwrap();
+        let expected = (0..1_201)
+            .map(|index| format!("thema-{index:04}"))
+            .collect::<Vec<_>>();
+        for (index, thema_id) in expected.iter().enumerate() {
+            let relation = match index % 3 {
+                0 => "primary",
+                1 => "supporting",
+                _ => "reference",
+            };
+            store
+                .connection
+                .execute("INSERT INTO thema (thema_id) VALUES (?1)", [thema_id])
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO thema_concept (thema_id, concept_id, relation)
+                     VALUES (?1, 'primary', ?2)",
+                    rusqlite::params![thema_id, relation],
+                )
+                .unwrap();
+        }
+
+        let mut associations = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store.node_themata("primary", 97, after.as_deref()).unwrap();
+            assert!(page.len() <= 97);
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|item| item.thema_id.clone());
+            associations.extend(page);
+        }
+        assert_eq!(
+            associations
+                .iter()
+                .map(|item| item.thema_id.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(associations[0].relation, ThemaConceptRelation::Primary);
+        assert_eq!(associations[1].relation, ThemaConceptRelation::Supporting);
+        assert_eq!(associations[2].relation, ThemaConceptRelation::Reference);
+
+        let stale = associations[500].thema_id.clone();
+        store
+            .connection
+            .execute("DELETE FROM thema WHERE thema_id = ?1", [&stale])
+            .unwrap();
+        assert!(matches!(
+            store.node_themata("primary", 97, Some(&stale)),
+            Err(StoreError::InvalidCursor)
+        ));
     }
 
     #[test]
@@ -4931,7 +5050,13 @@ mod tests {
         transaction.commit().unwrap();
         let retired = store.get_node("supporting").unwrap().unwrap();
         assert!(!retired.active);
-        assert_eq!(retired.thema_ids, ["thema"]);
+        assert_eq!(
+            store.node_themata("supporting", 10, None).unwrap(),
+            [NodeThemaAssociation {
+                thema_id: "thema".into(),
+                relation: ThemaConceptRelation::Supporting,
+            }]
+        );
 
         let second = prepare_thema(
             Some("thema".into()),
@@ -4954,10 +5079,8 @@ mod tests {
         store.put_thema(&second, 20260715, 3, None).unwrap();
         assert!(
             store
-                .get_node("supporting")
+                .node_themata("supporting", 10, None)
                 .unwrap()
-                .unwrap()
-                .thema_ids
                 .is_empty()
         );
 

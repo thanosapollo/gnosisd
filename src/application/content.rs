@@ -227,7 +227,12 @@ pub(crate) struct NodeRecord {
     pub(crate) tags: Vec<String>,
     pub(crate) level: u32,
     pub(crate) active: bool,
-    pub(crate) thema_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NodeThemaAssociation {
+    pub(crate) thema_id: String,
+    pub(crate) relation: ThemaConceptRelation,
 }
 
 pub(crate) fn prepare_thema(

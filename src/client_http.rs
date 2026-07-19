@@ -30,7 +30,7 @@ use crate::{
     },
     domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
-        SourceSpan, TitlePath,
+        SourceSpan, ThemaId, TitlePath,
     },
     is_canonical_sha256,
     protocol::{
@@ -43,10 +43,11 @@ use crate::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1,
             DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DeviceIdentityV1,
-            DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1, NoteRenameRequestV1,
-            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
-            ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
-            ReviewAttemptV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
+            DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1,
+            NodeThemaAssociationPageV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
+            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
             ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
             ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
             ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
@@ -590,6 +591,33 @@ impl HttpClient {
         execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
     }
 
+    pub async fn node_themata(
+        &self,
+        node_id: &NodeId,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<NodeThemaAssociationPageV1, HttpClientError> {
+        if !(1..=500).contains(&limit) {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        if let Some(after) = after {
+            ThemaId::new(after.to_owned()).map_err(|_| HttpClientError::InvalidCursor)?;
+        }
+        let mut url = self.endpoint("v1/nodes/")?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .pop_if_empty()
+            .push(node_id.as_str())
+            .push("themata");
+        url.query_pairs_mut()
+            .append_pair("limit", &limit.to_string());
+        if let Some(after) = after {
+            url.query_pairs_mut().append_pair("after", after);
+        }
+        let page = execute_json(self.client.get(url), MAX_FRAME_SIZE).await?;
+        checked_node_themata_page(page, limit, after)
+    }
+
     pub async fn import_document(
         &self,
         document_id: &str,
@@ -1104,6 +1132,32 @@ fn append_cursor(url: &mut Url, cursor: &str) -> Result<(), HttpClientError> {
     }
     url.query_pairs_mut().append_pair("cursor", cursor);
     Ok(())
+}
+
+fn checked_node_themata_page(
+    page: NodeThemaAssociationPageV1,
+    limit: u16,
+    after: Option<&str>,
+) -> Result<NodeThemaAssociationPageV1, HttpClientError> {
+    if page.items.len() > usize::from(limit)
+        || page
+            .items
+            .iter()
+            .any(|item| ThemaId::new(item.thema_id.clone()).is_err())
+        || page
+            .items
+            .windows(2)
+            .any(|items| items[0].thema_id >= items[1].thema_id)
+        || after.is_some_and(|after| {
+            page.items
+                .first()
+                .is_some_and(|item| item.thema_id.as_str() <= after)
+        })
+        || page.next.as_deref() != page.items.last().map(|item| item.thema_id.as_str())
+    {
+        return Err(invalid_response());
+    }
+    Ok(page)
 }
 
 fn validate_document_view(
@@ -2141,6 +2195,28 @@ mod tests {
         },
         service::ServiceRuntime,
     };
+
+    #[test]
+    fn node_themata_validator_enforces_order_cursor_and_page_size() {
+        let page: NodeThemaAssociationPageV1 = serde_json::from_value(serde_json::json!({
+            "items": [
+                {"thema_id": "thema-a", "relation": "primary"},
+                {"thema_id": "thema-b", "relation": "supporting"}
+            ],
+            "next": "thema-b"
+        }))
+        .unwrap();
+        assert!(checked_node_themata_page(page.clone(), 2, None).is_ok());
+        assert!(checked_node_themata_page(page.clone(), 1, None).is_err());
+        assert!(checked_node_themata_page(page.clone(), 2, Some("thema-a")).is_err());
+
+        let mut wrong_next = page.clone();
+        wrong_next.next = Some("thema-a".into());
+        assert!(checked_node_themata_page(wrong_next, 2, None).is_err());
+        let mut unordered = page;
+        unordered.items.reverse();
+        assert!(checked_node_themata_page(unordered, 2, None).is_err());
+    }
 
     #[test]
     fn response_validators_reject_semantically_invalid_content() {

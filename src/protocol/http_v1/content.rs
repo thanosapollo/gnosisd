@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use super::{DocumentOperationV1, FsrsConfigV1, ThemaKindV1};
 use crate::application::{
     AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
-    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, SettingsInput,
-    SettingsRecord, ThemaMutationProjection, ThemaRecord,
+    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, NodeThemaAssociation,
+    SettingsInput, SettingsRecord, ThemaMutationProjection, ThemaRecord,
 };
 use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
@@ -591,7 +591,6 @@ pub struct NodeV1 {
     pub tags: Vec<String>,
     pub level: u32,
     pub active: bool,
-    pub thema_ids: Vec<String>,
 }
 
 impl NodeV1 {
@@ -605,7 +604,44 @@ impl NodeV1 {
             tags: value.tags.clone(),
             level: value.level,
             active: value.active,
-            thema_ids: value.thema_ids.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeThemaAssociationV1 {
+    pub thema_id: String,
+    pub relation: ThemaConceptRelationV1,
+}
+
+impl NodeThemaAssociationV1 {
+    fn from_application(value: &NodeThemaAssociation) -> Self {
+        Self {
+            thema_id: value.thema_id.clone(),
+            relation: value.relation.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeThemaAssociationPageV1 {
+    #[schemars(length(max = 500))]
+    pub items: Vec<NodeThemaAssociationV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(required)]
+    pub next: Option<String>,
+}
+
+impl NodeThemaAssociationPageV1 {
+    pub(crate) fn from_application(items: &[NodeThemaAssociation]) -> Self {
+        Self {
+            items: items
+                .iter()
+                .map(NodeThemaAssociationV1::from_application)
+                .collect(),
+            next: items.last().map(|item| item.thema_id.clone()),
         }
     }
 }

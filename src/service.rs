@@ -33,9 +33,10 @@ use crate::{
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
         DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
         MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord,
-        OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
-        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
+        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
+        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
+        PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
         PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
         ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
         ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
@@ -578,6 +579,22 @@ impl ServiceHandle {
     pub(crate) async fn node(&self, node_id: String) -> Result<Option<NodeRecord>, ServiceError> {
         request(&self.sender, |response| StoreCommand::GetNode {
             node_id,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn node_themata(
+        &self,
+        node_id: String,
+        limit: u16,
+        after: Option<String>,
+    ) -> Result<Vec<NodeThemaAssociation>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::NodeThemata {
+            node_id,
+            limit,
+            after,
             response,
         })
         .await?
@@ -1407,6 +1424,12 @@ enum StoreCommand {
         node_id: String,
         response: oneshot::Sender<StoreResult<Option<NodeRecord>>>,
     },
+    NodeThemata {
+        node_id: String,
+        limit: u16,
+        after: Option<String>,
+        response: oneshot::Sender<StoreResult<Vec<NodeThemaAssociation>>>,
+    },
     SearchNodes {
         query: String,
         limit: u16,
@@ -2196,6 +2219,15 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             store.search_themata(&query, limit, after.as_deref()),
         ),
         StoreCommand::GetNode { node_id, response } => send(response, store.get_node(&node_id)),
+        StoreCommand::NodeThemata {
+            node_id,
+            limit,
+            after,
+            response,
+        } => send(
+            response,
+            store.node_themata(&node_id, limit, after.as_deref()),
+        ),
         StoreCommand::SearchNodes {
             query,
             limit,

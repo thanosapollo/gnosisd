@@ -37,7 +37,7 @@ use crate::{
         prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
         thema_content, validate_org_path,
     },
-    domain::{DocumentId, DueThema, ThemaId},
+    domain::{DocumentId, DueThema, NodeId, ThemaId},
     is_canonical_sha256,
     protocol::{
         DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
@@ -49,19 +49,20 @@ use crate::{
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
             ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DesiredStateMutationResultV1,
             DeviceIdentityV1, DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
-            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1,
-            OfflineAssetResultEnvelopeV1, OfflineContentOperationEnvelopeV1,
-            OfflineContentResultEnvelopeV1, OfflineReviewOperationEnvelopeV1,
-            OfflineReviewResultEnvelopeV2, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
-            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
-            ReviewClozeCheckV1, ReviewCommitResponseV1, ReviewHistoryPageV1, ReviewPackEnvelopeV2,
-            ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionModeV1,
-            ReviewSessionPageV1, ReviewSessionRequestV1, ReviewSessionStatusV1,
-            ReviewSessionSummaryV1, ReviewSessionV1, SetAcceptedSuccessRequestV1,
-            SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1, ThemaReviewStateV1,
-            ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
+            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1,
+            NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
+            OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
+            OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
+            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
+            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
+            ReviewHistoryPageV1, ReviewPackEnvelopeV2, ReviewQueueSummaryRequestV1,
+            ReviewQueueSummaryV1, ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
+            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
+            ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+            valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_response, offline_content_capabilities,
         offline_content_result_response, offline_result_response, replica_change_page,
@@ -211,6 +212,7 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/themata/{id}/unarchive", post(unarchive_thema))
         .route("/v1/nodes", get(search_nodes))
         .route("/v1/nodes/{id}", get(get_node))
+        .route("/v1/nodes/{id}/themata", get(node_themata))
         .route("/v1/nodes/{id}/inbound", get(inbound_nodes))
         .route("/v1/nodes/{id}/outbound", get(outbound_nodes))
         .route(
@@ -1333,6 +1335,32 @@ async fn get_node(
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(NodeV1::from_application(&node)))
 }
+async fn node_themata(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<NodeThemaAssociationPageV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    NodeId::new(id.clone()).map_err(|_| ApiError::bad_request("invalid node ID"))?;
+    if let Some(after) = query.after.as_deref() {
+        ThemaId::new(after.to_owned()).map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    }
+    let items = state
+        .service
+        .node_themata(id, page_limit(query.limit)?, query.after)
+        .await
+        .map_err(ApiError::service)?;
+    run_blocking(move || {
+        bounded_projection_page(
+            &items,
+            |page| Ok(NodeThemaAssociationPageV1::from_application(page)),
+            "node thema association exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
+}
 async fn search_nodes(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -2273,6 +2301,7 @@ impl ApiError {
                 }),
             },
             StoreError::ReplicaCursor | StoreError::ReplicaServer => Self::snapshot_required(),
+            StoreError::InvalidCursor => Self::bad_request("invalid cursor"),
             StoreError::BlobRequired { digest } => Self {
                 status: StatusCode::CONFLICT,
                 code: ApiErrorCodeV1::BlobRequired,
@@ -2719,6 +2748,13 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "NodeV1",
             &["401", "403", "404", "408", "500", "503"],
         )),
+        ("/v1/nodes/{id}/themata", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "NodeThemaAssociationPageV1",
+            &["400", "401", "403", "404", "408", "500", "503"],
+        )),
         ("/v1/nodes/{id}/inbound", "get") | ("/v1/nodes/{id}/outbound", "get") => {
             Some(json_contract(
                 "read",
@@ -2882,6 +2918,7 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
             | "/v1/notes/{id}/revisions"
             | "/v1/themata"
             | "/v1/nodes"
+            | "/v1/nodes/{id}/themata"
             | "/v1/nodes/{id}/inbound"
             | "/v1/nodes/{id}/outbound"
     );
@@ -3242,6 +3279,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ThemaV1>();
     generator.subschema_for::<NodePageV1>();
     generator.subschema_for::<NodeV1>();
+    generator.subschema_for::<NodeThemaAssociationPageV1>();
     generator.subschema_for::<SettingsV1>();
     generator.subschema_for::<DashboardV1>();
     generator.subschema_for::<DocumentView>();
@@ -3388,6 +3426,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/themata/{id}/unarchive", "post"),
     ("/v1/nodes", "get"),
     ("/v1/nodes/{id}", "get"),
+    ("/v1/nodes/{id}/themata", "get"),
     ("/v1/nodes/{id}/inbound", "get"),
     ("/v1/nodes/{id}/outbound", "get"),
     ("/v1/review/sessions", "get"),
@@ -3625,6 +3664,21 @@ mod tests {
                 "#/components/schemas/ThemaConceptV1"
             );
         }
+        assert!(
+            !schemas["NodeV1"]["properties"]
+                .as_object()
+                .unwrap()
+                .contains_key("thema_ids")
+        );
+        assert_eq!(
+            schemas["NodeThemaAssociationV1"]["required"],
+            json!(["thema_id", "relation"])
+        );
+        assert_eq!(
+            api["paths"]["/v1/nodes/{id}/themata"]["get"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/NodeThemaAssociationPageV1"
+        );
     }
 
     #[test]
@@ -5069,6 +5123,17 @@ mod tests {
             .unwrap();
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
+        let missing_node_themata_auth = app
+            .clone()
+            .oneshot(
+                Request::get("/v1/nodes/missing/themata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_node_themata_auth.status(), StatusCode::UNAUTHORIZED);
+
         let allowed = app
             .clone()
             .oneshot(authorized("GET", "/v1/settings", &token, Body::empty()))
@@ -5103,6 +5168,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_graph.status(), StatusCode::NOT_FOUND);
+
+        let missing_node_themata = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/missing/themata",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_node_themata.status(), StatusCode::NOT_FOUND);
+
+        let malformed_node_themata_cursor = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/missing/themata?after=%20",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            malformed_node_themata_cursor.status(),
+            StatusCode::BAD_REQUEST
+        );
 
         let settings = serde_json::to_vec(&json!({
             "timezone": "UTC",

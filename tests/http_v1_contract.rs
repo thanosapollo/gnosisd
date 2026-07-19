@@ -1,8 +1,9 @@
 use gnosis_core::protocol::http_v1::{
     ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
     AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
-    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1, NoteRenameRequestV1,
-    NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
+    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1,
+    NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+    OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
     OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
@@ -655,9 +656,25 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
     assert_round_trip::<NodePageV1>(json!({
         "items":[{"node_id":"node","document_id":"document",
             "logical_path":"notes/example.org","title":"Node","title_path":["Parent"],
-            "tags":[],"level":2,"active":true,"thema_ids":["thema"]}],
+            "tags":[],"level":2,"active":true}],
         "next":"node"
     }));
+    assert_round_trip::<NodeThemaAssociationPageV1>(json!({
+        "items":[
+            {"thema_id":"thema-a","relation":"primary"},
+            {"thema_id":"thema-b","relation":"supporting"},
+            {"thema_id":"thema-c","relation":"reference"}
+        ],
+        "next":"thema-c"
+    }));
+    assert!(
+        serde_json::from_value::<NodeV1>(json!({
+            "node_id":"node","document_id":"document","logical_path":"notes/example.org",
+            "title":"Node","title_path":["Parent"],"tags":[],"level":2,"active":true,
+            "thema_ids":["thema"]
+        }))
+        .is_err()
+    );
     assert_reencodes::<SettingsV1>(settings_wire(true));
 }
 
