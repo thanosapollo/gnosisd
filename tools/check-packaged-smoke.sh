@@ -93,18 +93,20 @@ auth="Authorization: Bearer $token"
 
 stage content
 note=$(curl --fail-with-body --silent --show-error \
-    -H "$auth" -H 'Content-Type: application/json' \
+    -H "$auth" -H 'Idempotency-Key: smoke-create-document' \
+    -H 'Content-Type: application/json' \
     -d '{"logical_path":"smoke.org","org":"#+TITLE: Smoke\n* Node\n:PROPERTIES:\n:ID: smoke-node\n:END:\n"}' \
-    "$api/notes")
-document_id=$(printf %s "$note" | jq -er .document_id)
+    "$api/document-mutations")
+document_id=$(printf %s "$note" | jq -er .authoritative.document_id)
 curl --fail-with-body --silent --show-error -H "$auth" \
     "$api/nodes/smoke-node" | jq -e '.node_id == "smoke-node"' >/dev/null
 
 thema=$(curl --fail-with-body --silent --show-error \
-    -H "$auth" -H 'Content-Type: application/json' \
+    -H "$auth" -H 'Idempotency-Key: smoke-create-thema' \
+    -H 'Content-Type: application/json' \
     -d '{"kind":"basic","keimenon":"Ready?","hypothesis":[],"answer":["yes"],"tags":["smoke"],"concepts":[{"node_id":"smoke-node","relation":"primary"}],"asset_paths":[]}' \
     "$api/themata")
-thema_id=$(printf %s "$thema" | jq -er .thema_id)
+thema_id=$(printf %s "$thema" | jq -er .authoritative.value.thema_id)
 
 stage review
 session=$(curl --fail-with-body --silent --show-error \
@@ -133,11 +135,15 @@ curl --fail-with-body --silent --show-error -H "$auth" -X POST \
     "$api/review/attempts/$attempt_id/commit" | jq -e '.event_id | length > 0' >/dev/null
 
 stage cleanup-content
-curl --fail-with-body --silent --show-error -H "$auth" -H 'If-Match: "1"' \
-    -X POST "$api/themata/$thema_id/archive" | jq -e '.archived == true' >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" \
+    -H 'Idempotency-Key: smoke-archive-thema' -H 'If-Match: "1"' \
+    -X POST "$api/themata/$thema_id/archive" \
+    | jq -e '.authoritative.value.archived == true' >/dev/null
 stage cleanup-note
-curl --fail-with-body --silent --show-error -H "$auth" -H 'If-Match: "1"' \
-    -X DELETE "$api/notes/$document_id" | jq -e '.active == false' >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" \
+    -H 'Idempotency-Key: smoke-delete-document' -H 'If-Match: "1"' \
+    -X DELETE "$api/document-mutations/$document_id" \
+    | jq -e '.authoritative.active == false' >/dev/null
 
 stage backup
 backup_json=$($gnosis --socket "$socket" admin backup create --directory "$backups")
