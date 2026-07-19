@@ -48,10 +48,12 @@ impl SqliteStore {
         owner_device_id: Option<&str>,
         started_at_us: u64,
     ) -> Result<ReviewSessionView, StoreError> {
+        source
+            .clone()
+            .validate()
+            .map_err(|_| StoreError::InvalidReviewState)?;
         let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
         if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
-            || source.kind == ReviewSourceKind::Manual
-                && source.manual_ids.len() > MAX_REVIEW_PACK_ITEMS
         {
             return Err(StoreError::InvalidReviewState);
         }
@@ -102,14 +104,15 @@ impl SqliteStore {
         device_id: &str,
         issued_at_us: u64,
     ) -> Result<ReviewPackView, StoreError> {
+        source
+            .clone()
+            .validate()
+            .map_err(|_| StoreError::InvalidReviewState)?;
         if format_version != 1 {
             return Err(StoreError::InvalidReviewState);
         }
         let target_count = Some(target_count.unwrap_or(100));
-        if !target_count.is_some_and(|count| (1..=MAX_REVIEW_PACK_ITEMS as u32).contains(&count))
-            || source.kind == ReviewSourceKind::Manual
-                && source.manual_ids.len() > MAX_REVIEW_PACK_ITEMS
-        {
+        if !target_count.is_some_and(|count| (1..=MAX_REVIEW_PACK_ITEMS as u32).contains(&count)) {
             return Err(StoreError::InvalidReviewState);
         }
         require_review_device(&self.connection, device_id)?;
