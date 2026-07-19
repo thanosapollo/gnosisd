@@ -2840,6 +2840,165 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_defers_bounded_association_repair_and_repair_commits_each_page() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_path = directory.path().join("blobs");
+        let runtime = ServiceRuntime::start(database.clone(), blob_path.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+
+        let mut asset_paths = Vec::new();
+        for (created_at_us, name, bytes) in [
+            (1, "active.png", b"active asset".to_vec()),
+            (2, "history.png", b"history asset".to_vec()),
+        ] {
+            let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+            let path = canonical_asset_path(&digest, name).unwrap();
+            service
+                .put_asset(
+                    prepare_asset(path.clone(), name.into(), None).unwrap(),
+                    bytes,
+                    "image/png".into(),
+                    created_at_us,
+                    None,
+                )
+                .await
+                .unwrap();
+            asset_paths.push(path);
+        }
+
+        let active_org = format!("#+title: Active\n[[file:{}]]\n", asset_paths[0]);
+        service
+            .replace_note(
+                prepare_note(
+                    Some("a-active".into()),
+                    "active.org".into(),
+                    active_org,
+                    None,
+                )
+                .unwrap(),
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        let history_org = format!("#+title: History\n[[file:{}]]\n", asset_paths[1]);
+        let history_note = prepare_note(
+            Some("z-tombstone".into()),
+            "history.org".into(),
+            history_org.clone(),
+            None,
+        )
+        .unwrap();
+        let history_digest = history_note.blob_sha256.clone();
+        service.replace_note(history_note, 4, None).await.unwrap();
+        service
+            .tombstone_note(
+                crate::domain::DocumentId::new("z-tombstone").unwrap(),
+                1,
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute("DELETE FROM document_revision_asset", [])
+            .unwrap();
+        connection
+            .execute("DELETE FROM document_asset", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO document_asset(document_id, asset_path) VALUES ('z-tombstone', ?1)",
+                [asset_paths[1].as_str()],
+            )
+            .unwrap();
+        drop(connection);
+        let history_blob = blob_path.join(&history_digest[..2]).join(&history_digest);
+        std::fs::write(&history_blob, b"corrupt").unwrap();
+
+        let runtime = ServiceRuntime::start(database.clone(), blob_path, 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        service.ready().await.unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let stale_current: Vec<(String, String)> = connection
+            .prepare("SELECT document_id, asset_path FROM document_asset ORDER BY document_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            stale_current,
+            vec![("z-tombstone".into(), asset_paths[1].clone())]
+        );
+        drop(connection);
+
+        assert!(service.repair(1).await.is_err());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let partial_current: Vec<(String, String)> = connection
+            .prepare("SELECT document_id, asset_path FROM document_asset ORDER BY document_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            partial_current,
+            vec![("a-active".into(), asset_paths[0].clone())]
+        );
+        let partial_history: u64 = connection
+            .query_row("SELECT count(*) FROM document_revision_asset", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(partial_history, 1);
+        drop(connection);
+
+        std::fs::write(&history_blob, history_org).unwrap();
+        let summary = service.repair(1).await.unwrap();
+        assert_eq!(summary.document_revisions_repaired, 3);
+        assert_eq!(summary.max_batch_observed, 1);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let current: Vec<(String, String)> = connection
+            .prepare("SELECT document_id, asset_path FROM document_asset ORDER BY document_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(current, vec![("a-active".into(), asset_paths[0].clone())]);
+        let history: Vec<(String, u64, String)> = connection
+            .prepare(
+                "SELECT document_id, revision, asset_path FROM document_revision_asset
+                 ORDER BY document_id, revision, asset_path",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            history,
+            vec![
+                ("a-active".into(), 1, asset_paths[0].clone()),
+                ("z-tombstone".into(), 1, asset_paths[1].clone()),
+            ]
+        );
+        drop(connection);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_desired_asset_does_not_publish_a_blob() {
         let directory = tempfile::tempdir().unwrap();
         let blob_path = directory.path().join("blobs");
