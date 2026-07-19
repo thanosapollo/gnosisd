@@ -444,6 +444,24 @@ CONTENT-TYPE defaults to application/json."
     ["value"] '(:type "object" :properties (:value (:type "string")))
     (gnosis-test-core--contract))))
 
+(ert-deftest gnosis-core-shared-response-check-allows-normalized-objects ()
+  (should
+   (gnosis-core--shared-response-fields-valid-p
+    '(:source (:kind "due"))
+    '(:type "object"
+      :properties
+      (:source (:type "object" :required ["kind" "tags"]
+                :properties (:kind (:type "string")
+                             :tags (:type "array")))))
+    (gnosis-test-core--contract))))
+
+(ert-deftest gnosis-core-schema-shape-rejects-reference-cycles ()
+  (let ((contract '(:components (:schemas (:Loop (:$ref
+                                                   "#/components/schemas/Loop"))))))
+    (should-not
+     (gnosis-core--schema-shape-valid-p
+      "value" '(:$ref "#/components/schemas/Loop") contract))))
+
 (ert-deftest gnosis-core-mutation-does-not-hide-uncertain-outcome ()
   (let ((gnosis-core--contract-cache
          (list :base "http://127.0.0.1:7842"

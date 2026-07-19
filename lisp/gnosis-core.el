@@ -883,6 +883,33 @@ PATH-VALUES, QUERY, and HEADERS contain the supplied bindings."
            schema)))
     (and resolved (plist-get resolved :properties))))
 
+(defun gnosis-core--schema-shape-valid-p (value schema contract &optional depth)
+  "Check VALUE shape against SCHEMA in CONTRACT at optional DEPTH."
+  (let ((depth (or depth 0)))
+    (and
+     (< depth 64)
+     (cond
+      ((plist-get schema :$ref)
+       (when-let* ((resolved
+                    (gnosis-core--schema-ref contract (plist-get schema :$ref))))
+         (gnosis-core--schema-shape-valid-p
+          value resolved contract (1+ depth))))
+      ((or (plist-get schema :oneOf) (plist-get schema :anyOf))
+       (cl-loop for branch across (or (plist-get schema :oneOf)
+                                      (plist-get schema :anyOf))
+                thereis (gnosis-core--schema-shape-valid-p
+                         value branch contract (1+ depth))))
+      ((plist-get schema :allOf)
+       (cl-loop for branch across (plist-get schema :allOf)
+                always (gnosis-core--schema-shape-valid-p
+                        value branch contract (1+ depth))))
+      (t
+       (let ((type (plist-get schema :type)))
+         (if (vectorp type)
+             (cl-loop for branch across type
+                      thereis (gnosis-core--schema-type-valid-p value branch))
+           (gnosis-core--schema-type-valid-p value type))))))))
+
 (defun gnosis-core--shared-response-fields-valid-p
     (body response-schema contract)
   "Check BODY against matching RESPONSE-SCHEMA fields using CONTRACT."
@@ -895,7 +922,7 @@ PATH-VALUES, QUERY, and HEADERS contain the supplied bindings."
                  for schema = (and (plist-member properties key)
                                    (plist-get properties key))
                  always (or (not schema)
-                            (gnosis-core--schema-valid-p
+                            (gnosis-core--schema-shape-valid-p
                              value schema contract))))))
 
 (defun gnosis-core--operation-success (operation)
