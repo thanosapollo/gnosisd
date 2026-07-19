@@ -88,6 +88,7 @@ pub(crate) enum DeviceDesiredStateMutation {
     PutAsset {
         prepared: PreparedAsset,
         digest: String,
+        body_sha256: String,
         size_bytes: u64,
         media_type: String,
     },
@@ -546,6 +547,7 @@ fn desired_state_request_json(
         DeviceDesiredStateMutation::PutAsset {
             prepared,
             digest,
+            body_sha256,
             size_bytes,
             media_type,
         } => serde_json::json!({
@@ -555,6 +557,7 @@ fn desired_state_request_json(
             "original_name": prepared.original_name,
             "expected_revision": prepared.expected_revision,
             "digest": digest,
+            "body_sha256": body_sha256,
             "size_bytes": size_bytes,
             "media_type": media_type,
         }),

@@ -155,6 +155,7 @@ impl SqliteStore {
         let DeviceDesiredStateMutation::PutAsset {
             prepared,
             digest,
+            body_sha256: _,
             size_bytes,
             media_type,
         } = &operation.mutation
@@ -185,6 +186,7 @@ fn apply_desired_state_mutation(
         DeviceDesiredStateMutation::PutAsset {
             prepared,
             digest,
+            body_sha256: _,
             size_bytes,
             media_type,
         } => {
@@ -737,6 +739,7 @@ mod tests {
                 )
                 .unwrap(),
                 digest: asset_digest.clone(),
+                body_sha256: asset_digest.clone(),
                 size_bytes: 5,
                 media_type: "image/png".into(),
             },
@@ -833,7 +836,8 @@ mod tests {
                     None,
                 )
                 .unwrap(),
-                digest: asset_digest,
+                digest: asset_digest.clone(),
+                body_sha256: asset_digest,
                 size_bytes: 5,
                 media_type: "image/jpeg".into(),
             },
@@ -992,6 +996,7 @@ mod tests {
                     )
                     .unwrap(),
                     digest: digest.clone(),
+                    body_sha256: digest.clone(),
                     size_bytes: 5,
                     media_type: media_type.into(),
                 },

@@ -1830,6 +1830,7 @@ fn apply_device_desired_state_mutation_command(
         (
             DeviceDesiredStateMutation::PutAsset {
                 digest,
+                body_sha256,
                 size_bytes,
                 media_type,
                 ..
@@ -1838,7 +1839,10 @@ fn apply_device_desired_state_mutation_command(
         ) => {
             let actual_digest = format!("{:x}", Sha256::digest(bytes));
             let actual_size = bytes.len() as u64;
-            if actual_digest != *digest {
+            if actual_digest != *body_sha256 {
+                return Err(ServiceError::Corrupt);
+            }
+            if body_sha256 != digest {
                 return Err(ServiceError::AssetDigest);
             }
             if actual_size != *size_bytes {
@@ -2679,6 +2683,7 @@ mod tests {
             DeviceDesiredStateMutation::PutAsset {
                 prepared: prepare_asset(asset_path.clone(), "image.png".into(), None).unwrap(),
                 digest: first_digest.clone(),
+                body_sha256: first_digest.clone(),
                 size_bytes: first_bytes.len() as u64,
                 media_type: "image/png".into(),
             },
@@ -2698,6 +2703,7 @@ mod tests {
             DeviceDesiredStateMutation::PutAsset {
                 prepared: prepare_asset(asset_path, "image.png".into(), Some(99)).unwrap(),
                 digest: digest.clone(),
+                body_sha256: digest.clone(),
                 size_bytes: bytes.len() as u64,
                 media_type: "image/png".into(),
             },

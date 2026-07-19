@@ -950,6 +950,7 @@ async fn put_asset(
         .to_owned();
     let operation_id = idempotency_key(&headers)?;
     let size_bytes = u64::try_from(body.len()).map_err(|_| ApiError::internal())?;
+    let body_sha256 = format!("{:x}", Sha256::digest(&body));
     apply_desired_state_mutation(
         &state,
         principal,
@@ -957,6 +958,7 @@ async fn put_asset(
         DeviceDesiredStateMutation::PutAsset {
             prepared,
             digest,
+            body_sha256,
             size_bytes,
             media_type: media,
         },
@@ -5381,6 +5383,62 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "unexpected {table} row");
         }
+    }
+
+    #[tokio::test]
+    async fn asset_key_reuse_with_different_bytes_conflicts_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blobs = directory.path().join("blobs");
+        let device = generate_device("asset-replay".into(), vec!["content:write".into()]).unwrap();
+        let token = device.token.clone();
+        let accepted = b"accepted";
+        let digest = format!("{:x}", Sha256::digest(accepted));
+        let path = format!("/v1/assets/{digest}/image.png");
+
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        service.create_device(device, 1).await.unwrap();
+        let mut request = authorized_with_type(
+            "PUT",
+            &path,
+            &token,
+            "image/png",
+            Body::from(accepted.to_vec()),
+        );
+        request.headers_mut().insert(
+            "Idempotency-Key",
+            axum::http::HeaderValue::from_static("asset-replay"),
+        );
+        let response = router(service.clone()).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let runtime = ServiceRuntime::start(database, blobs, 8).await.unwrap();
+        let service = runtime.handle();
+        let mut request = authorized_with_type(
+            "PUT",
+            &path,
+            &token,
+            "image/png",
+            Body::from(b"rejected".to_vec()),
+        );
+        request.headers_mut().insert(
+            "Idempotency-Key",
+            axum::http::HeaderValue::from_static("asset-replay"),
+        );
+        let response = router(service.clone()).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "idempotency_conflict"
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
     }
 
     #[tokio::test]
