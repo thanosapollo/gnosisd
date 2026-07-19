@@ -41,16 +41,16 @@ use crate::{
         decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1, DesiredStateMutationResultV1,
-            DeviceIdentityV1, DocumentImportRequestV1, DocumentMutationResultV1,
-            NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
-            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
-            ReviewClozeCheckV1, ReviewCommitResponseV1, ReviewHistoryPageV1,
-            ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2,
-            ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
-            ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
-            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1,
+            DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DeviceIdentityV1,
+            DocumentImportRequestV1, DocumentMutationResultV1, NoteRenameRequestV1,
+            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
+            ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
+            ReviewAttemptV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
+            ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
+            ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
+            ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
+            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaKindV1,
             ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
             valid_bearer_token,
@@ -403,12 +403,28 @@ impl HttpClient {
             .client
             .put(self.asset_endpoint(digest, name)?)
             .header("Idempotency-Key", operation_id)
-            .header(CONTENT_TYPE, media_type)
+            .header(CONTENT_TYPE, media_type.clone())
             .body(bytes.to_vec());
         if let Some(revision) = expected_revision {
             request = request.header("If-Match", revision);
         }
-        execute_desired_state_mutation(request, operation_id).await
+        execute_desired_state_mutation(
+            request,
+            operation_id,
+            DesiredMutationExpectation::Asset {
+                logical_path: format!("assets/{digest}/{name}"),
+                digest: Some(digest.to_owned()),
+                media_type: Some(
+                    media_type
+                        .to_str()
+                        .map_err(|_| HttpClientError::InvalidUpload)?
+                        .to_owned(),
+                ),
+                active: true,
+                expected_revision,
+            },
+        )
+        .await
     }
 
     pub async fn tombstone_asset(
@@ -425,7 +441,18 @@ impl HttpClient {
             .delete(self.asset_endpoint(digest, name)?)
             .header("Idempotency-Key", operation_id)
             .header("If-Match", expected_revision);
-        execute_desired_state_mutation(request, operation_id).await
+        execute_desired_state_mutation(
+            request,
+            operation_id,
+            DesiredMutationExpectation::Asset {
+                logical_path: format!("assets/{digest}/{name}"),
+                digest: None,
+                media_type: None,
+                active: false,
+                expected_revision: Some(expected_revision),
+            },
+        )
+        .await
     }
 
     pub async fn create_thema(
@@ -439,6 +466,12 @@ impl HttpClient {
             operation_id,
             None,
             input,
+            DesiredMutationExpectation::Thema {
+                thema_id: None,
+                input: Some(input.clone()),
+                archived: Some(false),
+                expected_revision: None,
+            },
         )
         .await
     }
@@ -456,6 +489,12 @@ impl HttpClient {
             operation_id,
             Some(expected_revision),
             input,
+            DesiredMutationExpectation::Thema {
+                thema_id: Some(thema_id.to_owned()),
+                input: Some(input.clone()),
+                archived: None,
+                expected_revision: Some(expected_revision),
+            },
         )
         .await
     }
@@ -474,7 +513,17 @@ impl HttpClient {
             .post(self.thema_endpoint(thema_id, Some(suffix))?)
             .header("Idempotency-Key", operation_id)
             .header("If-Match", expected_revision);
-        execute_desired_state_mutation(request, operation_id).await
+        execute_desired_state_mutation(
+            request,
+            operation_id,
+            DesiredMutationExpectation::Thema {
+                thema_id: Some(thema_id.to_owned()),
+                input: None,
+                archived: Some(archived),
+                expected_revision: Some(expected_revision),
+            },
+        )
+        .await
     }
 
     pub async fn update_settings(
@@ -489,6 +538,10 @@ impl HttpClient {
             operation_id,
             Some(expected_revision),
             input,
+            DesiredMutationExpectation::Settings {
+                input: input.clone(),
+                expected_revision,
+            },
         )
         .await
     }
@@ -894,6 +947,7 @@ impl HttpClient {
         operation_id: &str,
         expected_revision: Option<u64>,
         input: &impl Serialize,
+        expectation: DesiredMutationExpectation,
     ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
         require_operation_id(operation_id)?;
         let mut request = self
@@ -908,7 +962,7 @@ impl HttpClient {
             }
             request = request.header("If-Match", revision);
         }
-        execute_desired_state_mutation(request, operation_id).await
+        execute_desired_state_mutation(request, operation_id, expectation).await
     }
 
     fn post_review_json(
@@ -1444,20 +1498,47 @@ async fn execute_document_mutation(
         .ok_or_else(invalid_response)
 }
 
+enum DesiredMutationExpectation {
+    Asset {
+        logical_path: String,
+        digest: Option<String>,
+        media_type: Option<String>,
+        active: bool,
+        expected_revision: Option<u64>,
+    },
+    Thema {
+        thema_id: Option<String>,
+        input: Option<ThemaWriteRequestV1>,
+        archived: Option<bool>,
+        expected_revision: Option<u64>,
+    },
+    Settings {
+        input: UpdateSettingsRequestV1,
+        expected_revision: u64,
+    },
+}
+
 async fn execute_desired_state_mutation(
     request: RequestBuilder,
     operation_id: &str,
+    expectation: DesiredMutationExpectation,
 ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
     let result: DesiredStateMutationResultV1 =
-        execute_json_exact(request, MAX_OFFLINE_CONTENT_RESULT_BYTES, StatusCode::OK).await?;
+        execute_json_exact(request, MAX_FRAME_SIZE, StatusCode::OK).await?;
     let valid = match &result {
         DesiredStateMutationResultV1::Applied {
             format_version,
             operation_id: actual,
+            changed,
+            authoritative,
             cursor,
-            ..
+        } => {
+            *format_version == 1
+                && actual == operation_id
+                && valid_result_cursor(cursor)
+                && valid_desired_projection(authoritative, *changed, &expectation)
         }
-        | DesiredStateMutationResultV1::Rejected {
+        DesiredStateMutationResultV1::Rejected {
             format_version,
             operation_id: actual,
             cursor,
@@ -1465,6 +1546,91 @@ async fn execute_desired_state_mutation(
         } => *format_version == 1 && actual == operation_id && valid_result_cursor(cursor),
     };
     valid.then_some(result).ok_or_else(invalid_response)
+}
+
+fn valid_desired_projection(
+    projection: &DesiredStateMutationProjectionV1,
+    changed: bool,
+    expectation: &DesiredMutationExpectation,
+) -> bool {
+    match (projection, expectation) {
+        (
+            DesiredStateMutationProjectionV1::Asset(asset),
+            DesiredMutationExpectation::Asset {
+                logical_path,
+                digest,
+                media_type,
+                active,
+                expected_revision,
+            },
+        ) => {
+            asset.logical_path == *logical_path
+                && asset.content_sha256 == *digest
+                && asset.media_type == *media_type
+                && asset.active == *active
+                && valid_mutation_revision(asset.revision, *expected_revision, changed)
+        }
+        (
+            DesiredStateMutationProjectionV1::Thema(thema),
+            DesiredMutationExpectation::Thema {
+                thema_id,
+                input,
+                archived,
+                expected_revision,
+            },
+        ) => {
+            thema_id
+                .as_ref()
+                .is_none_or(|expected| thema.thema_id == *expected)
+                && input
+                    .as_ref()
+                    .is_none_or(|expected| thema_matches_input(thema, expected))
+                && archived.is_none_or(|expected| thema.archived == expected)
+                && valid_mutation_revision(thema.revision, *expected_revision, changed)
+        }
+        (
+            DesiredStateMutationProjectionV1::Settings(settings),
+            DesiredMutationExpectation::Settings {
+                input,
+                expected_revision,
+            },
+        ) => {
+            settings.timezone == input.timezone
+                && settings.day_boundary_hour == input.day_boundary_hour
+                && settings.scheduler.desired_retention == input.desired_retention
+                && valid_mutation_revision(settings.revision, Some(*expected_revision), changed)
+        }
+        _ => false,
+    }
+}
+
+fn valid_mutation_revision(revision: u64, expected_revision: Option<u64>, changed: bool) -> bool {
+    match (expected_revision, changed) {
+        (None, true) => revision == 1,
+        (None, false) => false,
+        (Some(expected), false) => revision == expected,
+        (Some(expected), true) => expected.checked_add(1) == Some(revision),
+    }
+}
+
+fn thema_matches_input(thema: &ThemaV1, input: &ThemaWriteRequestV1) -> bool {
+    let kind = match thema.kind {
+        ThemaKindV1::Basic => "basic",
+        ThemaKindV1::Cloze => "cloze",
+        ThemaKindV1::Mcq => "mcq",
+        ThemaKindV1::McCloze => "mc-cloze",
+    };
+    kind == input.kind
+        && thema.keimenon == input.keimenon
+        && thema.hypothesis == input.hypothesis
+        && thema.answer == input.answer
+        && thema.source_guid == input.source_guid
+        && thema.parathema == input.parathema
+        && thema.review_image == input.review_image
+        && thema.tags == input.tags
+        && thema.concepts == input.concepts
+        && thema.asset_paths == input.asset_paths
+        && is_canonical_sha256(&thema.content_sha256)
 }
 
 struct DocumentMutationExpectation {
@@ -2085,6 +2251,100 @@ mod tests {
                 HttpClientError::InvalidResponse { .. }
             ));
         }
+    }
+
+    #[test]
+    fn desired_state_validators_bind_kind_identity_state_and_revision() {
+        let digest = "a".repeat(64);
+        let asset =
+            DesiredStateMutationProjectionV1::Asset(crate::protocol::http_v1::AssetHeadV1 {
+                logical_path: format!("assets/{digest}/a.png"),
+                revision: 1,
+                content_sha256: Some(digest.clone()),
+                media_type: Some("image/png".into()),
+                active: true,
+            });
+        let asset_expectation = DesiredMutationExpectation::Asset {
+            logical_path: format!("assets/{digest}/a.png"),
+            digest: Some(digest),
+            media_type: Some("image/png".into()),
+            active: true,
+            expected_revision: None,
+        };
+        assert!(valid_desired_projection(&asset, true, &asset_expectation));
+        assert!(!valid_desired_projection(&asset, false, &asset_expectation));
+
+        let thema_input = ThemaWriteRequestV1 {
+            kind: "basic".into(),
+            keimenon: "Question".into(),
+            hypothesis: vec![],
+            answer: vec!["Answer".into()],
+            source_guid: None,
+            parathema: None,
+            review_image: None,
+            tags: vec![],
+            concepts: vec![],
+            asset_paths: vec![],
+        };
+        let thema: DesiredStateMutationProjectionV1 = serde_json::from_value(serde_json::json!({
+            "kind": "thema",
+            "value": {
+                "thema_id": "thema",
+                "revision": 2,
+                "kind": "basic",
+                "keimenon": "Question",
+                "hypothesis": [],
+                "answer": ["Answer"],
+                "source_guid": null,
+                "parathema": null,
+                "review_image": null,
+                "tags": [],
+                "concepts": [],
+                "asset_paths": [],
+                "content_sha256": "b".repeat(64),
+                "archived": false
+            }
+        }))
+        .unwrap();
+        let thema_expectation = DesiredMutationExpectation::Thema {
+            thema_id: Some("thema".into()),
+            input: Some(thema_input),
+            archived: None,
+            expected_revision: Some(1),
+        };
+        assert!(valid_desired_projection(&thema, true, &thema_expectation));
+        assert!(!valid_desired_projection(&asset, true, &thema_expectation));
+
+        let settings: DesiredStateMutationProjectionV1 =
+            serde_json::from_value(serde_json::json!({
+                "kind": "settings",
+                "value": {
+                    "revision": 2,
+                    "timezone": "UTC",
+                    "day_boundary_hour": 4,
+                    "scheduler": {
+                        "algorithm": "fsrs",
+                        "model": "fsrs6",
+                        "implementation": "fsrs-6.6.1",
+                        "desired_retention": 0.9,
+                        "parameters": vec![0.0; 21]
+                    }
+                }
+            }))
+            .unwrap();
+        let settings_expectation = DesiredMutationExpectation::Settings {
+            input: UpdateSettingsRequestV1 {
+                timezone: "UTC".into(),
+                day_boundary_hour: 4,
+                desired_retention: 0.9,
+            },
+            expected_revision: 1,
+        };
+        assert!(valid_desired_projection(
+            &settings,
+            true,
+            &settings_expectation
+        ));
     }
 
     #[test]

@@ -514,6 +514,12 @@ pub(crate) fn prepare_device_desired_state_mutation(
     mutation: DeviceDesiredStateMutation,
 ) -> Result<PreparedDeviceDesiredStateMutation, DeviceMutationError> {
     validate_common_identity(format_version, &operation_id, &device_id)?;
+    if let DeviceDesiredStateMutation::ReplaceSettings { input, .. } = &mutation {
+        input
+            .clone()
+            .validate()
+            .map_err(|_| DeviceMutationError::InvalidSettings)?;
+    }
     let mutation_kind = mutation.kind();
     let target_id = mutation.target_id();
     let request_json = desired_state_request_json(format_version, &mutation)?;
@@ -773,6 +779,8 @@ pub(crate) enum DeviceMutationError {
     Identity,
     #[error("device mutation could not be encoded")]
     Encoding,
+    #[error("device mutation settings are invalid")]
+    InvalidSettings,
     #[error("stored device mutation result is invalid")]
     Result,
 }

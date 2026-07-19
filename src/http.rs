@@ -823,7 +823,12 @@ async fn apply_desired_state_mutation(
 ) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     let operation =
         prepare_device_desired_state_mutation(1, operation_id, principal.device_id, mutation)
-            .map_err(|_| ApiError::bad_request("invalid Idempotency-Key"))?;
+            .map_err(|error| match error {
+                crate::application::DeviceMutationError::InvalidSettings => {
+                    ApiError::invalid_content("invalid settings")
+                }
+                _ => ApiError::bad_request("invalid device mutation"),
+            })?;
     let execution = state
         .service
         .apply_device_desired_state_mutation(operation, asset_bytes, now_us_i64()?)
@@ -1167,20 +1172,30 @@ fn prepared_thema(
 
 fn ensure_thema_response_budget(input: &ThemaWriteRequestV1) -> Result<(), ApiError> {
     let upper_bound = serde_json::to_vec(&json!({
-        "thema_id": "x".repeat(128),
-        "revision": u64::MAX,
-        "kind": input.kind,
-        "keimenon": input.keimenon,
-        "hypothesis": input.hypothesis,
-        "answer": input.answer,
-        "source_guid": input.source_guid,
-        "parathema": input.parathema,
-        "review_image": input.review_image,
-        "tags": input.tags,
-        "concepts": input.concepts,
-        "asset_paths": input.asset_paths,
-        "content_sha256": "0".repeat(64),
-        "archived": true
+        "status": "applied",
+        "format_version": 1,
+        "operation_id": "x".repeat(128),
+        "changed": true,
+        "authoritative": {
+            "kind": "thema",
+            "value": {
+                "thema_id": "x".repeat(128),
+                "revision": u64::MAX,
+                "kind": input.kind,
+                "keimenon": input.keimenon,
+                "hypothesis": input.hypothesis,
+                "answer": input.answer,
+                "source_guid": input.source_guid,
+                "parathema": input.parathema,
+                "review_image": input.review_image,
+                "tags": input.tags,
+                "concepts": input.concepts,
+                "asset_paths": input.asset_paths,
+                "content_sha256": "0".repeat(64),
+                "archived": true
+            }
+        },
+        "cursor": "x".repeat(512)
     }))
     .map_err(|_| ApiError::internal())?
     .len();
@@ -5137,6 +5152,51 @@ mod tests {
         drop(app);
         drop(service);
         runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_settings_mutations_are_rejected_before_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("settings".into(), vec!["settings:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+
+        for (operation_id, timezone, retention) in [
+            ("invalid-timezone", "Mars/Olympus", 0.9),
+            ("invalid-retention", "UTC", 1.0),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized_mutation(
+                    "PUT",
+                    "/v1/settings",
+                    &token,
+                    operation_id,
+                    Some("1"),
+                    Body::from(
+                        serde_json::to_vec(&json!({
+                            "timezone": timezone,
+                            "day_boundary_hour": 4,
+                            "desired_retention": retention
+                        }))
+                        .unwrap(),
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        assert_eq!(service.settings().await.unwrap().revision, 1);
     }
 
     #[tokio::test]

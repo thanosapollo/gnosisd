@@ -680,7 +680,9 @@ mod tests {
 
     #[test]
     fn desired_state_mutations_replay_assets_themata_and_settings() {
-        let mut store = SqliteStore::open_in_memory().unwrap();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gnosis.sqlite");
+        let mut store = SqliteStore::open(&path).unwrap();
         let device = add_device(&mut store, "desired");
         let asset_digest = format!("{:x}", Sha256::digest(b"asset"));
 
@@ -695,20 +697,15 @@ mod tests {
                     None,
                 )
                 .unwrap(),
-                digest: asset_digest,
+                digest: asset_digest.clone(),
                 size_bytes: 5,
                 media_type: "image/png".into(),
             },
         )
         .unwrap();
-        let first = store
+        let first_asset = store
             .apply_device_desired_state_mutation(&asset, 1)
             .unwrap();
-        let replay = store
-            .apply_device_desired_state_mutation(&asset, 2)
-            .unwrap();
-        assert!(replay.replayed);
-        assert_eq!(first.result, replay.result);
 
         let thema = prepare_device_desired_state_mutation(
             1,
@@ -737,7 +734,7 @@ mod tests {
             },
         )
         .unwrap();
-        let first = store
+        let first_thema = store
             .apply_device_desired_state_mutation(&thema, 3)
             .unwrap();
         let mut thema_retry = thema.clone();
@@ -748,16 +745,11 @@ mod tests {
             unreachable!()
         };
         *initial_review_day += 1;
-        let replay = store
-            .apply_device_desired_state_mutation(&thema_retry, 4)
-            .unwrap();
-        assert!(replay.replayed);
-        assert_eq!(first.result, replay.result);
 
         let settings = prepare_device_desired_state_mutation(
             1,
             "settings-op".into(),
-            device,
+            device.clone(),
             DeviceDesiredStateMutation::ReplaceSettings {
                 input: SettingsInput {
                     timezone: "UTC".into(),
@@ -770,14 +762,93 @@ mod tests {
             },
         )
         .unwrap();
-        let first = store
+        let first_settings = store
             .apply_device_desired_state_mutation(&settings, 5)
             .unwrap();
+        drop(store);
+
+        let mut store = SqliteStore::open(path).unwrap();
         let replay = store
-            .apply_device_desired_state_mutation(&settings, 6)
+            .apply_device_desired_state_mutation(&asset, 6)
             .unwrap();
         assert!(replay.replayed);
-        assert_eq!(first.result, replay.result);
+        assert_eq!(first_asset.result, replay.result);
+        let replay = store
+            .apply_device_desired_state_mutation(&thema_retry, 7)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first_thema.result, replay.result);
+        let replay = store
+            .apply_device_desired_state_mutation(&settings, 8)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first_settings.result, replay.result);
+        let changed_asset = prepare_device_desired_state_mutation(
+            1,
+            "asset-op".into(),
+            device.clone(),
+            DeviceDesiredStateMutation::PutAsset {
+                prepared: prepare_asset(
+                    format!("assets/{asset_digest}/a.png"),
+                    "a.png".into(),
+                    None,
+                )
+                .unwrap(),
+                digest: asset_digest,
+                size_bytes: 5,
+                media_type: "image/jpeg".into(),
+            },
+        )
+        .unwrap();
+        let changed_thema = prepare_device_desired_state_mutation(
+            1,
+            "thema-op".into(),
+            device.clone(),
+            DeviceDesiredStateMutation::PutThema {
+                prepared: prepare_thema(
+                    Some("thema".into()),
+                    thema_content(
+                        "basic",
+                        "Changed".into(),
+                        vec![],
+                        vec!["Answer".into()],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+                initial_review_day: 20260719,
+            },
+        )
+        .unwrap();
+        let changed_settings = prepare_device_desired_state_mutation(
+            1,
+            "settings-op".into(),
+            device,
+            DeviceDesiredStateMutation::ReplaceSettings {
+                input: SettingsInput {
+                    timezone: "Europe/Athens".into(),
+                    day_boundary_hour: 4,
+                    desired_retention: 0.9,
+                }
+                .validate()
+                .unwrap(),
+                expected_revision: 1,
+            },
+        )
+        .unwrap();
+        for changed in [&changed_asset, &changed_thema, &changed_settings] {
+            assert!(matches!(
+                store.apply_device_desired_state_mutation(changed, 9),
+                Err(StoreError::IdempotencyConflict)
+            ));
+        }
         assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
     }
 

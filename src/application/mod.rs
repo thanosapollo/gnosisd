@@ -38,8 +38,8 @@ pub(crate) use content::{
 };
 pub(crate) use device_mutation::{
     DeviceDesiredStateMutation, DeviceDocumentLifecycleMutation, DeviceMutationCursor,
-    DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection, DeviceMutationRejection,
-    DeviceMutationResult, PreparedDeviceDesiredStateMutation,
+    DeviceMutationError, DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
+    DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDesiredStateMutation,
     PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
     ThemaMutationProjection, prepare_device_desired_state_mutation,
     prepare_device_document_mutation, prepare_device_document_rename,

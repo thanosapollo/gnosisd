@@ -2653,10 +2653,10 @@ mod tests {
     async fn rejected_desired_asset_does_not_publish_a_blob() {
         let directory = tempfile::tempdir().unwrap();
         let blob_path = directory.path().join("blobs");
-        let runtime =
-            ServiceRuntime::start(directory.path().join("gnosis.sqlite"), blob_path.clone(), 8)
-                .await
-                .unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let runtime = ServiceRuntime::start(database.clone(), blob_path.clone(), 8)
+            .await
+            .unwrap();
         let service = runtime.handle();
         let device = generate_device("Device".into(), vec!["content:write".into()]).unwrap();
         let device_id = device.device_id.clone();
@@ -2697,7 +2697,7 @@ mod tests {
         .unwrap();
 
         let execution = service
-            .apply_device_desired_state_mutation(operation, Some(bytes), 3)
+            .apply_device_desired_state_mutation(operation.clone(), Some(bytes.clone()), 3)
             .await
             .unwrap();
 
@@ -2705,13 +2705,27 @@ mod tests {
             execution.result,
             DeviceMutationResult::Rejected { .. }
         ));
-        assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+        assert!(!blob_path.join(&digest[..2]).join(&digest).exists());
         assert!(
             blob_path
                 .join(&first_digest[..2])
                 .join(first_digest)
                 .exists()
         );
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let runtime = ServiceRuntime::start(database, blob_path.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let replay = service
+            .apply_device_desired_state_mutation(operation, Some(bytes), 4)
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(execution.result, replay.result);
+        assert!(!blob_path.join(&digest[..2]).join(&digest).exists());
         drop(service);
         runtime.finish().await.unwrap();
     }
