@@ -3405,7 +3405,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drains_an_accepted_backup_job() {
+    async fn shutdown_drains_an_accepted_backup_after_response_is_dropped() {
         let directory = tempfile::tempdir().unwrap();
         let backup = directory.path().join("backup");
         let runtime = ServiceRuntime::start(
@@ -3449,6 +3449,7 @@ mod tests {
         .await
         .expect("store actor accepted readiness after backup dispatch")
         .unwrap();
+        drop(backup_result);
         drop(service);
 
         let mut finish = tokio::spawn(runtime.finish());
@@ -3459,7 +3460,6 @@ mod tests {
         );
         release.send(()).unwrap();
         finish.await.unwrap().unwrap();
-        backup_result.await.unwrap().unwrap();
         assert!(super::verify_backup(&backup).is_ok());
     }
 
