@@ -1461,40 +1461,47 @@ async fn review_session_client_enforces_request_and_normalized_response_targets(
         assert_eq!(error.delivery(), DeliveryStatus::NotSent);
     }
 
-    for target_count in [None, Some(9)] {
-        let raw = spawn_json_server(json!({
-            "session_id": "session",
-            "mode": "online",
-            "source": {
-                "kind": "manual",
-                "tags": [],
-                "exclude_tags": [],
-                "topic_node_id": null,
-                "topic_forward_depth": null,
-                "topic_backward_depth": null,
-                "manual_ids": ["thema"]
-            },
-            "target_count": target_count,
-            "status": "active",
-            "current_position": 0,
-            "queue_length": 1,
-            "started_at_us": 1
-        }))
+    for target_count in [Some(10), None, Some(9)] {
+        let raw = spawn_json_response(
+            "201 Created",
+            json!({
+                "session_id": "session",
+                "mode": "online",
+                "source": {
+                    "kind": "manual",
+                    "tags": [],
+                    "exclude_tags": [],
+                    "topic_node_id": null,
+                    "topic_forward_depth": null,
+                    "topic_backward_depth": null,
+                    "manual_ids": ["thema"]
+                },
+                "target_count": target_count,
+                "status": "active",
+                "current_position": 0,
+                "queue_length": 1,
+                "started_at_us": 1,
+                "owner_device_id": null
+            }),
+        )
         .await;
         let client = HttpClient::new(&raw.base_url, token()).unwrap();
-        let error = client
+        let result = client
             .create_review_session(&ReviewSessionRequestV1 {
                 source: source.clone(),
                 target_count: Some(10),
             })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            HttpClientError::InvalidResponse {
-                delivery: DeliveryStatus::Unknown
-            }
-        ));
+            .await;
+        if target_count == Some(10) {
+            assert_eq!(result.unwrap().target_count, Some(10));
+        } else {
+            assert!(matches!(
+                result.unwrap_err(),
+                HttpClientError::InvalidResponse {
+                    delivery: DeliveryStatus::Unknown
+                }
+            ));
+        }
         raw.task.await.unwrap();
     }
 }
