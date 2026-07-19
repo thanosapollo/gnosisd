@@ -2723,6 +2723,7 @@ mod tests {
         review_day_at, thema_content,
     };
     use crate::blob::BlobMeta;
+    use crate::store::StoreError;
 
     fn add_thema_with_tags(
         store: &mut SqliteStore,
@@ -3962,6 +3963,39 @@ mod tests {
         assert_eq!(
             super::select_queue(&store.connection, &source, 20260715, Some(2)).unwrap(),
             ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn session_store_normalizes_and_rejects_targets_before_state_access() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "bounded", "Question", None);
+        let source = manual_source("bounded");
+
+        for target_count in [Some(0), Some(501)] {
+            assert!(matches!(
+                store.create_review_session(&source, target_count, None, 1),
+                Err(StoreError::InvalidReviewState)
+            ));
+            assert_eq!(store.active_review_session(None).unwrap(), None);
+        }
+
+        let session = store.create_review_session(&source, None, None, 1).unwrap();
+        assert_eq!(session.target_count, Some(100));
+
+        for target_count in [Some(0), Some(501)] {
+            assert!(matches!(
+                store.create_review_session(&source, target_count, None, 1),
+                Err(StoreError::InvalidReviewState)
+            ));
+        }
+        assert_eq!(
+            store
+                .active_review_session(None)
+                .unwrap()
+                .unwrap()
+                .session_id,
+            session.session_id
         );
     }
 
