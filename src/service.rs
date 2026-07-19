@@ -1838,7 +1838,10 @@ fn apply_device_desired_state_mutation_command(
         ) => {
             let actual_digest = format!("{:x}", Sha256::digest(bytes));
             let actual_size = bytes.len() as u64;
-            if actual_digest != *digest || actual_size != *size_bytes {
+            if actual_digest != *digest {
+                return Err(ServiceError::AssetDigest);
+            }
+            if actual_size != *size_bytes {
                 return Err(ServiceError::Corrupt);
             }
             if needs_blob {

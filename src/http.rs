@@ -5323,6 +5323,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asset_digest_mismatch_is_repeatable_and_writes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let runtime = ServiceRuntime::start(database.clone(), directory.path().join("blobs"), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("asset-digest".into(), vec!["content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+        let digest = format!("{:x}", Sha256::digest(b"expected"));
+        let path = format!("/v1/assets/{digest}/image.png");
+        let request = || {
+            let mut request = authorized_with_type(
+                "PUT",
+                &path,
+                &token,
+                "image/png",
+                Body::from(b"different".to_vec()),
+            );
+            request.headers_mut().insert(
+                "Idempotency-Key",
+                axum::http::HeaderValue::from_static("asset-digest-mismatch"),
+            );
+            request
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+        let first = response_json(first).await;
+        assert_eq!(first["error"]["code"], "invalid_request");
+        assert_eq!(
+            first["error"]["message"],
+            "asset digest does not match content"
+        );
+        let replay = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response_json(replay).await, first);
+        assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        for table in [
+            "blob",
+            "managed_asset",
+            "content_change",
+            "device_mutation_receipt",
+        ] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "unexpected {table} row");
+        }
+    }
+
+    #[tokio::test]
     async fn durable_thema_create_conflict_is_retained_across_restart() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("gnosis.sqlite");
