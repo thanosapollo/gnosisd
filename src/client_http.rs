@@ -1614,6 +1614,9 @@ fn valid_mutation_revision(revision: u64, expected_revision: Option<u64>, change
 }
 
 fn thema_matches_input(thema: &ThemaV1, input: &ThemaWriteRequestV1) -> bool {
+    if !validate_thema(thema, &thema.thema_id) {
+        return false;
+    }
     let kind = match thema.kind {
         ThemaKindV1::Basic => "basic",
         ThemaKindV1::Cloze => "cloze",
@@ -2295,34 +2298,72 @@ mod tests {
             concepts: vec![],
             asset_paths: vec![],
         };
-        let thema: DesiredStateMutationProjectionV1 = serde_json::from_value(serde_json::json!({
-            "kind": "thema",
-            "value": {
-                "thema_id": "thema",
-                "revision": 2,
-                "kind": "basic",
-                "keimenon": "Question",
-                "hypothesis": [],
-                "answer": ["Answer"],
-                "source_guid": null,
-                "parathema": null,
-                "review_image": null,
-                "tags": ["alpha", "zeta"],
-                "concepts": [],
-                "asset_paths": [],
-                "content_sha256": "b".repeat(64),
-                "archived": false
-            }
-        }))
+        let prepared = prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                "Question".into(),
+                vec![],
+                vec!["Answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            thema_input.tags.clone(),
+            vec![],
+            vec![],
+            None,
+        )
         .unwrap();
+        let mut thema: DesiredStateMutationProjectionV1 =
+            serde_json::from_value(serde_json::json!({
+                "kind": "thema",
+                "value": {
+                    "thema_id": "thema",
+                    "revision": 2,
+                    "kind": "basic",
+                    "keimenon": "Question",
+                    "hypothesis": [],
+                    "answer": ["Answer"],
+                    "source_guid": null,
+                    "parathema": null,
+                    "review_image": null,
+                    "tags": ["alpha", "zeta"],
+                    "concepts": [],
+                    "asset_paths": [],
+                    "content_sha256": prepared.content_sha256,
+                    "archived": false
+                }
+            }))
+            .unwrap();
         let thema_expectation = DesiredMutationExpectation::Thema {
             thema_id: Some("thema".into()),
-            input: Some(thema_input),
+            input: Some(thema_input.clone()),
             archived: None,
             expected_revision: Some(1),
         };
         assert!(valid_desired_projection(&thema, true, &thema_expectation));
         assert!(!valid_desired_projection(&asset, true, &thema_expectation));
+        let valid_digest = match &mut thema {
+            DesiredStateMutationProjectionV1::Thema(thema) => {
+                std::mem::replace(&mut thema.content_sha256, "b".repeat(64))
+            }
+            _ => unreachable!(),
+        };
+        assert!(!valid_desired_projection(&thema, true, &thema_expectation));
+        let DesiredStateMutationProjectionV1::Thema(thema_value) = &mut thema else {
+            unreachable!();
+        };
+        thema_value.content_sha256 = valid_digest;
+        thema_value.thema_id = "../thema".into();
+        let create_expectation = DesiredMutationExpectation::Thema {
+            thema_id: None,
+            input: Some(thema_input),
+            archived: None,
+            expected_revision: None,
+        };
+        assert!(!valid_desired_projection(&thema, true, &create_expectation));
 
         let settings: DesiredStateMutationProjectionV1 =
             serde_json::from_value(serde_json::json!({

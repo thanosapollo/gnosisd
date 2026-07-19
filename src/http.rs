@@ -2539,7 +2539,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DocumentMutationResultV1",
             &[
-                "400", "401", "403", "408", "409", "412", "413", "422", "500", "503",
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
             ],
         )),
         ("/v1/review/due", "get") => Some(json_contract(
@@ -4417,6 +4417,17 @@ mod tests {
     fn openapi_types_content_resources_exactly() {
         let api = openapi_document();
         let contracts = [
+            expected_json_contract(
+                "/v1/documents/{id}",
+                "put",
+                "content:write",
+                Some("DocumentImportRequestV1"),
+                "200",
+                "DocumentMutationResultV1",
+                &[
+                    "200", "400", "401", "403", "408", "409", "413", "422", "500", "503",
+                ],
+            ),
             expected_json_contract(
                 "/v1/changes",
                 "get",
