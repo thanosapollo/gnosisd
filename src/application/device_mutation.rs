@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::{PreparedNote, valid_operation_id, validate_org_path};
+use super::{
+    AssetHead, PreparedAsset, PreparedNote, PreparedThema, SettingsInput, SettingsRecord,
+    ThemaRecord, valid_operation_id, validate_org_path,
+};
 use crate::domain::DocumentId;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -15,6 +18,20 @@ pub(crate) enum DeviceMutationKind {
     Rename,
     #[serde(rename = "document_tombstone")]
     Tombstone,
+    #[serde(rename = "asset_create")]
+    AssetCreate,
+    #[serde(rename = "asset_replace")]
+    AssetReplace,
+    #[serde(rename = "asset_tombstone")]
+    AssetTombstone,
+    #[serde(rename = "thema_create")]
+    ThemaCreate,
+    #[serde(rename = "thema_replace")]
+    ThemaReplace,
+    #[serde(rename = "thema_archive_set")]
+    ThemaArchiveSet,
+    #[serde(rename = "settings_replace")]
+    SettingsReplace,
 }
 
 impl DeviceMutationKind {
@@ -24,6 +41,13 @@ impl DeviceMutationKind {
             Self::Replace => "document_replace",
             Self::Rename => "document_rename",
             Self::Tombstone => "document_tombstone",
+            Self::AssetCreate => "asset_create",
+            Self::AssetReplace => "asset_replace",
+            Self::AssetTombstone => "asset_tombstone",
+            Self::ThemaCreate => "thema_create",
+            Self::ThemaReplace => "thema_replace",
+            Self::ThemaArchiveSet => "thema_archive_set",
+            Self::SettingsReplace => "settings_replace",
         }
     }
 }
@@ -51,6 +75,90 @@ pub(crate) struct PreparedDeviceDocumentLifecycleMutation {
     pub(crate) document_id: DocumentId,
     pub(crate) expected_revision: u64,
     pub(crate) mutation: DeviceDocumentLifecycleMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreparedDeviceDesiredStateMutation {
+    pub(crate) identity: DeviceMutationIdentity,
+    pub(crate) mutation: DeviceDesiredStateMutation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DeviceDesiredStateMutation {
+    PutAsset {
+        prepared: PreparedAsset,
+        digest: String,
+        size_bytes: u64,
+        media_type: String,
+    },
+    TombstoneAsset {
+        asset_path: String,
+        expected_revision: u64,
+    },
+    PutThema {
+        prepared: PreparedThema,
+        initial_review_day: u32,
+    },
+    SetThemaArchived {
+        thema_id: String,
+        expected_revision: u64,
+        archived: bool,
+    },
+    ReplaceSettings {
+        input: SettingsInput,
+        expected_revision: u64,
+    },
+}
+
+impl DeviceDesiredStateMutation {
+    pub(crate) const fn kind(&self) -> DeviceMutationKind {
+        match self {
+            Self::PutAsset { prepared, .. } if prepared.expected_revision.is_some() => {
+                DeviceMutationKind::AssetReplace
+            }
+            Self::PutAsset { .. } => DeviceMutationKind::AssetCreate,
+            Self::TombstoneAsset { .. } => DeviceMutationKind::AssetTombstone,
+            Self::PutThema { prepared, .. } if prepared.expected_revision.is_some() => {
+                DeviceMutationKind::ThemaReplace
+            }
+            Self::PutThema { .. } => DeviceMutationKind::ThemaCreate,
+            Self::SetThemaArchived { .. } => DeviceMutationKind::ThemaArchiveSet,
+            Self::ReplaceSettings { .. } => DeviceMutationKind::SettingsReplace,
+        }
+    }
+
+    pub(crate) fn target_id(&self) -> String {
+        match self {
+            Self::PutAsset { prepared, .. } => prepared.logical_path.clone(),
+            Self::TombstoneAsset { asset_path, .. } => asset_path.clone(),
+            Self::PutThema { prepared, .. } => prepared.thema_id.to_string(),
+            Self::SetThemaArchived { thema_id, .. } => thema_id.clone(),
+            Self::ReplaceSettings { .. } => "canonical".to_owned(),
+        }
+    }
+}
+
+impl PreparedDeviceDesiredStateMutation {
+    pub(crate) fn validate(&self) -> Result<(), DeviceMutationError> {
+        validate_common_identity(
+            self.identity.format_version,
+            &self.identity.operation_id,
+            &self.identity.device_id,
+        )?;
+        let kind = self.mutation.kind();
+        let target = self.mutation.target_id();
+        let request = desired_state_request_json(self.identity.format_version, &self.mutation)?;
+        let digest = format!("{:x}", Sha256::digest(request.as_bytes()));
+        if self.identity.mutation_kind == kind
+            && self.identity.target_id.as_deref() == Some(target.as_str())
+            && self.identity.request_json == request
+            && self.identity.request_sha256 == digest
+        {
+            Ok(())
+        } else {
+            Err(DeviceMutationError::Identity)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,10 +237,62 @@ pub(crate) struct DeviceMutationCursor {
     pub(crate) token: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub(crate) enum DeviceMutationProjection {
     Document(super::DocumentHead),
+    Asset(AssetHead),
+    Thema(ThemaMutationProjection),
+    Settings(SettingsRecord),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ThemaMutationProjection {
+    pub(crate) thema_id: String,
+    pub(crate) revision: u64,
+    pub(crate) kind: String,
+    pub(crate) keimenon: String,
+    pub(crate) hypothesis: Vec<Option<String>>,
+    pub(crate) answer: Vec<String>,
+    pub(crate) source_guid: Option<String>,
+    pub(crate) parathema: Option<String>,
+    pub(crate) review_image: Option<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) concepts: Vec<(String, String)>,
+    pub(crate) asset_paths: Vec<String>,
+    pub(crate) content_sha256: String,
+    pub(crate) archived: bool,
+}
+
+impl From<&ThemaRecord> for ThemaMutationProjection {
+    fn from(value: &ThemaRecord) -> Self {
+        Self {
+            thema_id: value.thema_id.clone(),
+            revision: value.revision,
+            kind: value.content.kind.as_str().to_owned(),
+            keimenon: value.content.keimenon.clone(),
+            hypothesis: value.content.hypothesis.clone(),
+            answer: value.content.answer.clone(),
+            source_guid: value.content.source_guid.clone(),
+            parathema: value.content.parathema.clone(),
+            review_image: value.content.review_image.clone(),
+            tags: value.tags.clone(),
+            concepts: value
+                .concepts
+                .iter()
+                .map(|concept| {
+                    (
+                        concept.concept_id().to_string(),
+                        concept.relation().as_str().to_owned(),
+                    )
+                })
+                .collect(),
+            asset_paths: value.asset_paths.clone(),
+            content_sha256: value.content_sha256.clone(),
+            archived: value.archived,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -148,8 +308,12 @@ pub(crate) enum DeviceMutationRejection {
     RenameRequired,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retained mutation receipts keep projections inline for one stable serialized shape"
+)]
 pub(crate) enum DeviceMutationResult {
     Applied {
         format_version: u32,
@@ -238,13 +402,23 @@ impl DeviceMutationResult {
 
     fn projection_matches(&self, identity: &DeviceMutationIdentity) -> bool {
         match self {
-            Self::Applied {
-                authoritative: DeviceMutationProjection::Document(document),
-                ..
-            } => identity
-                .target_id
-                .as_deref()
-                .is_none_or(|target| target == document.document_id),
+            Self::Applied { authoritative, .. } => match authoritative {
+                DeviceMutationProjection::Document(document) => identity
+                    .target_id
+                    .as_deref()
+                    .is_none_or(|target| target == document.document_id),
+                DeviceMutationProjection::Asset(asset) => identity
+                    .target_id
+                    .as_deref()
+                    .is_some_and(|target| target == asset.logical_path),
+                DeviceMutationProjection::Thema(thema) => identity
+                    .target_id
+                    .as_deref()
+                    .is_some_and(|target| target == thema.thema_id),
+                DeviceMutationProjection::Settings(_) => {
+                    identity.target_id.as_deref() == Some("canonical")
+                }
+            },
             Self::Rejected { .. } => true,
         }
     }
@@ -333,6 +507,106 @@ pub(crate) fn prepare_device_document_tombstone(
     )
 }
 
+pub(crate) fn prepare_device_desired_state_mutation(
+    format_version: u32,
+    operation_id: String,
+    device_id: String,
+    mutation: DeviceDesiredStateMutation,
+) -> Result<PreparedDeviceDesiredStateMutation, DeviceMutationError> {
+    validate_common_identity(format_version, &operation_id, &device_id)?;
+    let mutation_kind = mutation.kind();
+    let target_id = mutation.target_id();
+    let request_json = desired_state_request_json(format_version, &mutation)?;
+    let request_sha256 = format!("{:x}", Sha256::digest(request_json.as_bytes()));
+    Ok(PreparedDeviceDesiredStateMutation {
+        identity: DeviceMutationIdentity {
+            format_version,
+            operation_id,
+            device_id,
+            mutation_kind,
+            target_id: Some(target_id),
+            request_sha256,
+            request_json,
+        },
+        mutation,
+    })
+}
+
+fn desired_state_request_json(
+    format_version: u32,
+    mutation: &DeviceDesiredStateMutation,
+) -> Result<String, DeviceMutationError> {
+    let payload = match mutation {
+        DeviceDesiredStateMutation::PutAsset {
+            prepared,
+            digest,
+            size_bytes,
+            media_type,
+        } => serde_json::json!({
+            "format_version": format_version,
+            "mutation_kind": mutation.kind(),
+            "logical_path": prepared.logical_path,
+            "original_name": prepared.original_name,
+            "expected_revision": prepared.expected_revision,
+            "digest": digest,
+            "size_bytes": size_bytes,
+            "media_type": media_type,
+        }),
+        DeviceDesiredStateMutation::TombstoneAsset {
+            asset_path,
+            expected_revision,
+        } => serde_json::json!({
+            "format_version": format_version,
+            "mutation_kind": mutation.kind(),
+            "asset_path": asset_path,
+            "expected_revision": expected_revision,
+        }),
+        DeviceDesiredStateMutation::PutThema { prepared, .. } => serde_json::json!({
+            "format_version": format_version,
+            "mutation_kind": mutation.kind(),
+            "thema_id": prepared.thema_id.as_str(),
+            "kind": prepared.content.kind.as_str(),
+            "keimenon": prepared.content.keimenon,
+            "hypothesis": prepared.content.hypothesis,
+            "answer": prepared.content.answer,
+            "source_guid": prepared.content.source_guid,
+            "parathema": prepared.content.parathema,
+            "review_image": prepared.content.review_image,
+            "tags": prepared.tags,
+            "concepts": prepared.concepts.iter().map(|concept| serde_json::json!({
+                "concept_id": concept.concept_id().as_str(),
+                "relation": concept.relation().as_str(),
+            })).collect::<Vec<_>>(),
+            "asset_paths": prepared.asset_paths,
+            "content_sha256": prepared.content_sha256,
+            "expected_revision": prepared.expected_revision,
+        }),
+        DeviceDesiredStateMutation::SetThemaArchived {
+            thema_id,
+            expected_revision,
+            archived,
+        } => serde_json::json!({
+            "format_version": format_version,
+            "mutation_kind": mutation.kind(),
+            "thema_id": thema_id,
+            "expected_revision": expected_revision,
+            "archived": archived,
+        }),
+        DeviceDesiredStateMutation::ReplaceSettings {
+            input,
+            expected_revision,
+        } => serde_json::json!({
+            "format_version": format_version,
+            "mutation_kind": mutation.kind(),
+            "timezone": input.timezone,
+            "day_boundary_hour": input.day_boundary_hour,
+            "desired_retention": input.desired_retention,
+            "expected_revision": expected_revision,
+        }),
+    };
+    serde_json::to_string(&payload).map_err(|_| DeviceMutationError::Identity)
+}
+
 fn lifecycle_operation(
     format_version: u32,
     operation_id: String,
@@ -406,12 +680,24 @@ fn validate_lifecycle_identity(
     device_id: &str,
     expected_revision: u64,
 ) -> Result<(), DeviceMutationError> {
+    validate_common_identity(format_version, operation_id, device_id)?;
+    if i64::try_from(expected_revision).is_err() {
+        Err(DeviceMutationError::Identity)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_common_identity(
+    format_version: u32,
+    operation_id: &str,
+    device_id: &str,
+) -> Result<(), DeviceMutationError> {
     if format_version == 1
         && valid_operation_id(operation_id)
         && !device_id.is_empty()
         && device_id.len() <= 128
         && !device_id.contains('\0')
-        && i64::try_from(expected_revision).is_ok()
     {
         Ok(())
     } else {

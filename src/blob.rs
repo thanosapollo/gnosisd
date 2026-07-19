@@ -65,7 +65,6 @@ impl BlobStore {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, digest: &str) -> Result<bool, BlobError> {
         match fs::metadata(self.blob_path(digest)?) {
             Ok(metadata) => Ok(metadata.is_file()),
@@ -74,7 +73,6 @@ impl BlobStore {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn discard(&self, digest: &str) -> Result<(), BlobError> {
         let path = self.blob_path(digest)?;
         let parent = path.parent().ok_or(BlobError::InvalidDigest)?;

@@ -37,9 +37,11 @@ pub(crate) use content::{
     validate_asset_path, validate_offline_thema_assets, validate_org_path,
 };
 pub(crate) use device_mutation::{
-    DeviceDocumentLifecycleMutation, DeviceMutationCursor, DeviceMutationIdentity,
-    DeviceMutationKind, DeviceMutationProjection, DeviceMutationRejection, DeviceMutationResult,
+    DeviceDesiredStateMutation, DeviceDocumentLifecycleMutation, DeviceMutationCursor,
+    DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection, DeviceMutationRejection,
+    DeviceMutationResult, PreparedDeviceDesiredStateMutation,
     PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
+    ThemaMutationProjection, prepare_device_desired_state_mutation,
     prepare_device_document_mutation, prepare_device_document_rename,
     prepare_device_document_tombstone,
 };

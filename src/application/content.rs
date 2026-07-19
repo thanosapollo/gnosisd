@@ -175,7 +175,8 @@ pub(crate) struct DocumentReplicaRevision {
     pub(crate) projection: Option<DocumentProjectionSnapshot>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AssetHead {
     pub(crate) logical_path: String,
     pub(crate) revision: u64,

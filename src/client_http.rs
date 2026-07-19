@@ -41,17 +41,19 @@ use crate::{
         decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1, DeviceIdentityV1,
-            DocumentImportRequestV1, DocumentMutationResultV1, NoteRenameRequestV1,
-            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
-            ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
-            ReviewAttemptV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
-            ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
-            ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
-            ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
-            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1, DesiredStateMutationResultV1,
+            DeviceIdentityV1, DocumentImportRequestV1, DocumentMutationResultV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
+            ReplicaStateV1, ReviewAnswerV1, ReviewAttemptOperationResponseV1,
+            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
+            ReviewClozeCheckV1, ReviewCommitResponseV1, ReviewHistoryPageV1,
+            ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2,
+            ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
+            ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
+            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaKindV1,
-            ThemaReviewStateV1, ThemaV1, valid_bearer_token,
+            ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+            valid_bearer_token,
         },
     },
 };
@@ -377,6 +379,116 @@ impl HttpClient {
                 content_sha256: None,
                 prior_revision: Some(expected_revision),
             },
+        )
+        .await
+    }
+
+    pub async fn put_asset(
+        &self,
+        digest: &str,
+        name: &str,
+        operation_id: &str,
+        expected_revision: Option<u64>,
+        media_type: &str,
+        bytes: &[u8],
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        require_digest(digest)?;
+        require_operation_id(operation_id)?;
+        if format!("{:x}", Sha256::digest(bytes)) != digest {
+            return Err(HttpClientError::InvalidUpload);
+        }
+        let media_type =
+            HeaderValue::from_str(media_type).map_err(|_| HttpClientError::InvalidUpload)?;
+        let mut request = self
+            .client
+            .put(self.asset_endpoint(digest, name)?)
+            .header("Idempotency-Key", operation_id)
+            .header(CONTENT_TYPE, media_type)
+            .body(bytes.to_vec());
+        if let Some(revision) = expected_revision {
+            request = request.header("If-Match", revision);
+        }
+        execute_desired_state_mutation(request, operation_id).await
+    }
+
+    pub async fn tombstone_asset(
+        &self,
+        digest: &str,
+        name: &str,
+        operation_id: &str,
+        expected_revision: u64,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        require_digest(digest)?;
+        require_operation_id(operation_id)?;
+        let request = self
+            .client
+            .delete(self.asset_endpoint(digest, name)?)
+            .header("Idempotency-Key", operation_id)
+            .header("If-Match", expected_revision);
+        execute_desired_state_mutation(request, operation_id).await
+    }
+
+    pub async fn create_thema(
+        &self,
+        operation_id: &str,
+        input: &ThemaWriteRequestV1,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        self.send_desired_state_json(
+            self.endpoint("v1/themata")?,
+            reqwest::Method::POST,
+            operation_id,
+            None,
+            input,
+        )
+        .await
+    }
+
+    pub async fn replace_thema(
+        &self,
+        thema_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+        input: &ThemaWriteRequestV1,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        self.send_desired_state_json(
+            self.thema_endpoint(thema_id, None)?,
+            reqwest::Method::PUT,
+            operation_id,
+            Some(expected_revision),
+            input,
+        )
+        .await
+    }
+
+    pub async fn set_thema_archived(
+        &self,
+        thema_id: &str,
+        operation_id: &str,
+        expected_revision: u64,
+        archived: bool,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        let suffix = if archived { "archive" } else { "unarchive" };
+        let request = self
+            .client
+            .post(self.thema_endpoint(thema_id, Some(suffix))?)
+            .header("Idempotency-Key", operation_id)
+            .header("If-Match", expected_revision);
+        execute_desired_state_mutation(request, operation_id).await
+    }
+
+    pub async fn update_settings(
+        &self,
+        operation_id: &str,
+        expected_revision: u64,
+        input: &UpdateSettingsRequestV1,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        self.send_desired_state_json(
+            self.endpoint("v1/settings")?,
+            reqwest::Method::PUT,
+            operation_id,
+            Some(expected_revision),
+            input,
         )
         .await
     }
@@ -747,6 +859,56 @@ impl HttpClient {
             .map_err(|_| HttpClientError::InvalidBaseUrl)?
             .push(action);
         Ok(url)
+    }
+
+    fn asset_endpoint(&self, digest: &str, name: &str) -> Result<Url, HttpClientError> {
+        let mut url = self.endpoint("v1/assets/")?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .pop_if_empty()
+            .push(digest)
+            .push(name);
+        Ok(url)
+    }
+
+    fn thema_endpoint(&self, thema_id: &str, action: Option<&str>) -> Result<Url, HttpClientError> {
+        if thema_id.is_empty() {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let mut url = self.endpoint("v1/themata/")?;
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?;
+        segments.pop_if_empty().push(thema_id);
+        if let Some(action) = action {
+            segments.push(action);
+        }
+        drop(segments);
+        Ok(url)
+    }
+
+    async fn send_desired_state_json(
+        &self,
+        url: Url,
+        method: reqwest::Method,
+        operation_id: &str,
+        expected_revision: Option<u64>,
+        input: &impl Serialize,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        let mut request = self
+            .client
+            .request(method, url)
+            .header("Idempotency-Key", operation_id)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(encode_document_mutation(input)?);
+        if let Some(revision) = expected_revision {
+            if revision == 0 {
+                return Err(HttpClientError::InvalidMutation);
+            }
+            request = request.header("If-Match", revision);
+        }
+        execute_desired_state_mutation(request, operation_id).await
     }
 
     fn post_review_json(
@@ -1280,6 +1442,29 @@ async fn execute_document_mutation(
     validate_document_mutation_result(&result, operation_id, &expectation)
         .then_some(result)
         .ok_or_else(invalid_response)
+}
+
+async fn execute_desired_state_mutation(
+    request: RequestBuilder,
+    operation_id: &str,
+) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+    let result: DesiredStateMutationResultV1 =
+        execute_json_exact(request, MAX_OFFLINE_CONTENT_RESULT_BYTES, StatusCode::OK).await?;
+    let valid = match &result {
+        DesiredStateMutationResultV1::Applied {
+            format_version,
+            operation_id: actual,
+            cursor,
+            ..
+        }
+        | DesiredStateMutationResultV1::Rejected {
+            format_version,
+            operation_id: actual,
+            cursor,
+            ..
+        } => *format_version == 1 && actual == operation_id && valid_result_cursor(cursor),
+    };
+    valid.then_some(result).ok_or_else(invalid_response)
 }
 
 struct DocumentMutationExpectation {

@@ -20,18 +20,20 @@ use chrono::NaiveDate;
 use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::broadcast;
 use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 
 use crate::{
     application::{
-        ApplicationError, DevicePrincipal, DeviceScope, DueCursor, MAX_DUE_CURSOR_BYTES,
-        MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation, PreparedNote,
-        QueryDocument, QueryDueThemataPage, ReviewAttemptMutation, ReviewAttemptOperation,
-        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewHistoryQuery,
-        ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord, canonical_asset_path,
-        prepare_asset, prepare_device_document_mutation, prepare_device_document_rename,
+        ApplicationError, DeviceDesiredStateMutation, DevicePrincipal, DeviceScope, DueCursor,
+        MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES, PreparedDeviceDocumentLifecycleMutation,
+        PreparedNote, QueryDocument, QueryDueThemataPage, ReviewAttemptMutation,
+        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
+        ReviewHistoryQuery, ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord,
+        canonical_asset_path, prepare_asset, prepare_device_desired_state_mutation,
+        prepare_device_document_mutation, prepare_device_document_rename,
         prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
         thema_content, validate_org_path,
     },
@@ -45,8 +47,8 @@ use crate::{
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
-            ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DeviceIdentityV1,
-            DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
+            ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DesiredStateMutationResultV1,
+            DeviceIdentityV1, DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
             DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1, NodeV1,
             NoteRenameRequestV1, NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1,
             OfflineAssetResultEnvelopeV1, OfflineContentOperationEnvelopeV1,
@@ -180,11 +182,7 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/sync/snapshot", get(replica_snapshot))
         .route("/v1/events", get(events))
         .route("/v1/settings", get(get_settings).put(update_settings))
-        .route("/v1/notes", post(create_note))
-        .route(
-            "/v1/notes/{id}",
-            get(get_note).put(update_note).delete(delete_note),
-        )
+        .route("/v1/notes/{id}", get(get_note))
         .route("/v1/document-mutations", post(create_document_mutation))
         .route(
             "/v1/document-mutations/{id}",
@@ -194,7 +192,6 @@ fn data_router() -> Router<HttpState> {
             "/v1/document-mutations/{id}/rename",
             post(rename_document_mutation),
         )
-        .route("/v1/notes/{id}/rename", post(rename_note))
         .route("/v1/notes/{id}/revisions", get(note_revisions))
         .route("/v1/notes/{id}/revisions/{revision}", get(note_revision))
         .route(
@@ -251,10 +248,9 @@ fn data_router() -> Router<HttpState> {
             "/v1/review/attempts/{id}/accepted-success",
             axum::routing::put(set_accepted_success),
         )
-        .route("/v1/review/attempts/{id}/override", post(override_attempt))
         .route(
             "/v1/review/attempts/{id}/suspension",
-            post(toggle_suspension).put(set_suspension),
+            axum::routing::put(set_suspension),
         )
         .route("/v1/review/attempts/{id}/commit", post(commit_attempt))
 }
@@ -707,46 +703,6 @@ async fn events(
     Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
-async fn create_note(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    ApiJson(input): ApiJson<NoteWriteRequestV1>,
-) -> Result<(StatusCode, Json<DocumentHeadV1>), ApiError> {
-    require(&principal, DeviceScope::ContentWrite)?;
-    let prepared = prepare_note(None, input.logical_path, input.org, None)
-        .map_err(ApiError::invalid_content)?;
-    let head = state
-        .service
-        .replace_note(prepared, now_us_i64()?, Some(principal.device_id))
-        .await
-        .map_err(note_write_error)?;
-    announce(&state).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(DocumentHeadV1::from_application(&head)),
-    ))
-}
-
-async fn update_note(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    ApiJson(input): ApiJson<NoteWriteRequestV1>,
-) -> Result<Json<DocumentHeadV1>, ApiError> {
-    require(&principal, DeviceScope::ContentWrite)?;
-    let revision = if_match(&headers)?;
-    let prepared = prepare_note(Some(id), input.logical_path, input.org, Some(revision))
-        .map_err(ApiError::invalid_content)?;
-    let head = state
-        .service
-        .replace_note(prepared, now_us_i64()?, Some(principal.device_id))
-        .await
-        .map_err(|error| conflict_with(error, revision))?;
-    announce(&state).await;
-    Ok(Json(DocumentHeadV1::from_application(&head)))
-}
-
 async fn create_document_mutation(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -858,6 +814,29 @@ async fn apply_document_mutation(
     DocumentMutationResultV1::from_application(&execution.result).map_err(|_| ApiError::internal())
 }
 
+async fn apply_desired_state_mutation(
+    state: &HttpState,
+    principal: DevicePrincipal,
+    operation_id: String,
+    mutation: DeviceDesiredStateMutation,
+    asset_bytes: Option<Vec<u8>>,
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
+    let operation =
+        prepare_device_desired_state_mutation(1, operation_id, principal.device_id, mutation)
+            .map_err(|_| ApiError::bad_request("invalid Idempotency-Key"))?;
+    let execution = state
+        .service
+        .apply_device_desired_state_mutation(operation, asset_bytes, now_us_i64()?)
+        .await
+        .map_err(ApiError::service)?;
+    if !execution.replayed && execution.result.changed() {
+        announce(state).await;
+    }
+    let result = DesiredStateMutationResultV1::from_application(&execution.result)
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(result))
+}
+
 async fn get_note(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -882,52 +861,6 @@ async fn get_note(
             .map_err(|_| ApiError::internal())?,
     );
     Ok(response)
-}
-
-async fn rename_note(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    ApiJson(input): ApiJson<NoteRenameRequestV1>,
-) -> Result<Json<DocumentHeadV1>, ApiError> {
-    require(&principal, DeviceScope::ContentWrite)?;
-    let id = DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
-    let head = state
-        .service
-        .rename_note(
-            id,
-            input.logical_path,
-            if_match(&headers)?,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok(Json(DocumentHeadV1::from_application(&head)))
-}
-
-async fn delete_note(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<DocumentHeadV1>, ApiError> {
-    require(&principal, DeviceScope::ContentWrite)?;
-    let id = DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
-    let head = state
-        .service
-        .tombstone_note(
-            id,
-            if_match(&headers)?,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok(Json(DocumentHeadV1::from_application(&head)))
 }
 
 async fn note_revisions(
@@ -1000,7 +933,7 @@ async fn put_asset(
     Path((digest, name)): Path<(String, String)>,
     headers: HeaderMap,
     ApiBytes(body): ApiBytes,
-) -> Result<(StatusCode, Json<AssetHeadV1>), ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let path = canonical_asset_path(&digest, &name).map_err(ApiError::invalid_content)?;
     let expected = optional_if_match(&headers)?;
@@ -1010,22 +943,21 @@ async fn put_asset(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    let head = state
-        .service
-        .put_asset(
+    let operation_id = idempotency_key(&headers)?;
+    let size_bytes = u64::try_from(body.len()).map_err(|_| ApiError::internal())?;
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        operation_id,
+        DeviceDesiredStateMutation::PutAsset {
             prepared,
-            body.to_vec(),
-            media,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok((
-        StatusCode::CREATED,
-        Json(AssetHeadV1::from_application(&head)),
-    ))
+            digest,
+            size_bytes,
+            media_type: media,
+        },
+        Some(body.to_vec()),
+    )
+    .await
 }
 
 async fn stage_blob(
@@ -1127,44 +1059,56 @@ async fn delete_asset(
     Extension(principal): Extension<DevicePrincipal>,
     Path((digest, name)): Path<(String, String)>,
     headers: HeaderMap,
-) -> Result<Json<AssetHeadV1>, ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let path = canonical_asset_path(&digest, &name).map_err(ApiError::invalid_content)?;
-    let head = state
-        .service
-        .tombstone_asset(
-            path,
-            if_match(&headers)?,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok(Json(AssetHeadV1::from_application(&head)))
+    let operation_id = idempotency_key(&headers)?;
+    let expected_revision = if_match(&headers)?;
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        operation_id,
+        DeviceDesiredStateMutation::TombstoneAsset {
+            asset_path: path,
+            expected_revision,
+        },
+        None,
+    )
+    .await
 }
 
 async fn create_thema(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
+    headers: HeaderMap,
     ApiJson(input): ApiJson<ThemaWriteRequestV1>,
-) -> Result<(StatusCode, Json<ThemaV1>), ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     ensure_thema_response_budget(&input)?;
-    let prepared = prepared_thema(None, input, None)?;
+    let operation_id = idempotency_key(&headers)?;
+    let thema_id = durable_created_thema_id(&principal.device_id, &operation_id);
+    let prepared = prepared_thema(Some(thema_id), input, None)?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
-    let record = state
-        .service
-        .put_thema(
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        operation_id,
+        DeviceDesiredStateMutation::PutThema {
             prepared,
-            settings_review_day(&settings)?,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok((StatusCode::CREATED, bounded_thema(&record)?))
+            initial_review_day: settings_review_day(&settings)?,
+        },
+        None,
+    )
+    .await
+}
+
+fn durable_created_thema_id(device_id: &str, operation_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"gnosis-thema-v1\0");
+    digest.update(device_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(operation_id.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 async fn update_thema(
@@ -1173,23 +1117,22 @@ async fn update_thema(
     Path(id): Path<String>,
     headers: HeaderMap,
     ApiJson(input): ApiJson<ThemaWriteRequestV1>,
-) -> Result<Json<ThemaV1>, ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     ensure_thema_response_budget(&input)?;
     let prepared = prepared_thema(Some(id), input, Some(if_match(&headers)?))?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
-    let record = state
-        .service
-        .put_thema(
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        idempotency_key(&headers)?,
+        DeviceDesiredStateMutation::PutThema {
             prepared,
-            settings_review_day(&settings)?,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    bounded_thema(&record)
+            initial_review_day: settings_review_day(&settings)?,
+        },
+        None,
+    )
+    .await
 }
 
 fn prepared_thema(
@@ -1308,7 +1251,7 @@ async fn archive_thema(
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
     headers: HeaderMap,
-) -> Result<Json<ThemaV1>, ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     set_archive(state, principal, path, headers, true).await
 }
 async fn unarchive_thema(
@@ -1316,7 +1259,7 @@ async fn unarchive_thema(
     principal: Extension<DevicePrincipal>,
     path: Path<String>,
     headers: HeaderMap,
-) -> Result<Json<ThemaV1>, ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     set_archive(state, principal, path, headers, false).await
 }
 
@@ -1340,21 +1283,22 @@ async fn set_archive(
     Path(id): Path<String>,
     headers: HeaderMap,
     archived: bool,
-) -> Result<Json<ThemaV1>, ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
-    let record = state
-        .service
-        .archive_thema(
-            id,
-            if_match(&headers)?,
+    let operation_id = idempotency_key(&headers)?;
+    let expected_revision = if_match(&headers)?;
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        operation_id,
+        DeviceDesiredStateMutation::SetThemaArchived {
+            thema_id: id,
+            expected_revision,
             archived,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    bounded_thema(&record)
+        },
+        None,
+    )
+    .await
 }
 
 async fn get_node(
@@ -1719,38 +1663,6 @@ async fn set_accepted_success(
     )
     .await
 }
-async fn override_attempt(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    Path(id): Path<String>,
-) -> Result<Json<ReviewAttemptV1>, ApiError> {
-    require(&principal, DeviceScope::Review)?;
-    require_safe_http_attempt(&state, &id).await?;
-    let attempt = state
-        .service
-        .override_review_attempt(id, online_review_actor())
-        .await
-        .map_err(ApiError::service)?;
-    Ok(Json(
-        ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?,
-    ))
-}
-async fn toggle_suspension(
-    State(state): State<HttpState>,
-    Extension(principal): Extension<DevicePrincipal>,
-    Path(id): Path<String>,
-) -> Result<Json<ReviewAttemptV1>, ApiError> {
-    require(&principal, DeviceScope::Review)?;
-    require_safe_http_attempt(&state, &id).await?;
-    let attempt = state
-        .service
-        .toggle_attempt_suspension(id, online_review_actor())
-        .await
-        .map_err(ApiError::service)?;
-    Ok(Json(
-        ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?,
-    ))
-}
 async fn set_suspension(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -2085,20 +1997,21 @@ async fn update_settings(
     Extension(principal): Extension<DevicePrincipal>,
     headers: HeaderMap,
     ApiJson(input): ApiJson<UpdateSettingsRequestV1>,
-) -> Result<Json<SettingsV1>, ApiError> {
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::SettingsWrite)?;
-    let settings = state
-        .service
-        .update_settings(
-            input.into_application(),
-            if_match(&headers)?,
-            now_us_i64()?,
-            Some(principal.device_id),
-        )
-        .await
-        .map_err(ApiError::service)?;
-    announce(&state).await;
-    Ok(Json(SettingsV1::from_application(&settings)))
+    let operation_id = idempotency_key(&headers)?;
+    let expected_revision = if_match(&headers)?;
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        operation_id,
+        DeviceDesiredStateMutation::ReplaceSettings {
+            input: input.into_application(),
+            expected_revision,
+        },
+        None,
+    )
+    .await
 }
 
 fn now_us() -> Result<u64, ApiError> {
@@ -2120,24 +2033,6 @@ fn settings_review_day(settings: &SettingsRecord) -> Result<u32, ApiError> {
 async fn announce(state: &HttpState) {
     if let Ok(cursor) = state.service.latest_content_cursor().await {
         let _ = state.cursors.send(cursor);
-    }
-}
-
-fn conflict_with(error: ServiceError, expected: u64) -> ApiError {
-    match error {
-        ServiceError::Store(StoreError::Conflict { actual, .. }) => {
-            ApiError::conflict(expected, actual)
-        }
-        other => note_write_error(other),
-    }
-}
-
-fn note_write_error(error: ServiceError) -> ApiError {
-    match error {
-        ServiceError::Store(StoreError::NotFound) => {
-            ApiError::invalid_content("inactive document asset")
-        }
-        other => ApiError::service(other),
     }
 }
 
@@ -2673,27 +2568,12 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "settings:write",
             Some("UpdateSettingsRequestV1"),
             "200",
-            "SettingsV1",
+            "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
+                "400", "401", "403", "408", "409", "412", "413", "422", "428", "500", "503",
             ],
         )),
-        ("/v1/notes", "post") => Some(json_contract(
-            "content:write",
-            Some("NoteWriteRequestV1"),
-            "201",
-            "DocumentHeadV1",
-            &["401", "403", "408", "412", "413", "422", "500", "503"],
-        )),
-        ("/v1/notes/{id}", "put") => Some(json_contract(
-            "content:write",
-            Some("NoteWriteRequestV1"),
-            "200",
-            "DocumentHeadV1",
-            &[
-                "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
-            ],
-        )),
+
         ("/v1/document-mutations", "post") => Some(json_contract(
             "content:write",
             Some("NoteWriteRequestV1"),
@@ -2728,24 +2608,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
                 "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
             ],
         )),
-        ("/v1/notes/{id}", "delete") => Some(json_contract(
-            "content:write",
-            None,
-            "200",
-            "DocumentHeadV1",
-            &[
-                "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
-            ],
-        )),
-        ("/v1/notes/{id}/rename", "post") => Some(json_contract(
-            "content:write",
-            Some("NoteRenameRequestV1"),
-            "200",
-            "DocumentHeadV1",
-            &[
-                "400", "401", "403", "404", "408", "412", "413", "422", "428", "500", "503",
-            ],
-        )),
+
         ("/v1/notes/{id}/revisions", "get") => Some(json_contract(
             "read",
             None,
@@ -2765,8 +2628,8 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
         ("/v1/assets/{digest}/{name}", "put") => Some(json_contract(
             "content:write",
             None,
-            "201",
-            "AssetHeadV1",
+            "200",
+            "DesiredStateMutationResultV1",
             &[
                 "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
             ],
@@ -2775,9 +2638,9 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "content:write",
             None,
             "200",
-            "AssetHeadV1",
+            "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                "400", "401", "403", "404", "408", "409", "412", "422", "428", "500", "503",
             ],
         )),
         ("/v1/themata", "get") => Some(json_contract(
@@ -2790,9 +2653,11 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
         ("/v1/themata", "post") => Some(json_contract(
             "content:write",
             Some("ThemaWriteRequestV1"),
-            "201",
-            "ThemaV1",
-            &["401", "403", "404", "408", "413", "422", "500", "503"],
+            "200",
+            "DesiredStateMutationResultV1",
+            &[
+                "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
         )),
         ("/v1/themata/{id}", "get") => Some(json_contract(
             "read",
@@ -2805,9 +2670,9 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "content:write",
             Some("ThemaWriteRequestV1"),
             "200",
-            "ThemaV1",
+            "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "404", "408", "412", "413", "422", "428", "500", "503",
+                "400", "401", "403", "404", "408", "409", "412", "413", "422", "428", "500", "503",
             ],
         )),
         ("/v1/themata/{id}/archive", "post") | ("/v1/themata/{id}/unarchive", "post") => {
@@ -2815,9 +2680,9 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
                 "content:write",
                 None,
                 "200",
-                "ThemaV1",
+                "DesiredStateMutationResultV1",
                 &[
-                    "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                    "400", "401", "403", "404", "408", "409", "412", "422", "428", "500", "503",
                 ],
             ))
         }
@@ -2961,6 +2826,12 @@ fn content_requires_idempotency(path: &str, method: &str) -> bool {
             | ("/v1/document-mutations", "post")
             | ("/v1/document-mutations/{id}", "put" | "delete")
             | ("/v1/document-mutations/{id}/rename", "post")
+            | ("/v1/assets/{digest}/{name}", "put" | "delete")
+            | ("/v1/themata", "post")
+            | ("/v1/themata/{id}", "put")
+            | ("/v1/themata/{id}/archive", "post")
+            | ("/v1/themata/{id}/unarchive", "post")
+            | ("/v1/settings", "put")
     )
 }
 
@@ -3163,20 +3034,7 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
                 "400", "401", "403", "404", "408", "412", "413", "422", "500", "503",
             ],
         )),
-        ("/v1/review/attempts/{id}/override", "post") => Some(json_contract(
-            "review",
-            None,
-            "200",
-            "ReviewAttemptV1",
-            &["400", "401", "403", "404", "408", "412", "500", "503"],
-        )),
-        ("/v1/review/attempts/{id}/suspension", "post") => Some(json_contract(
-            "review",
-            None,
-            "200",
-            "ReviewAttemptV1",
-            &["400", "401", "403", "404", "408", "500", "503"],
-        )),
+
         ("/v1/review/attempts/{id}/commit", "post") => Some(json_contract(
             "review",
             None,
@@ -3356,6 +3214,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ContentChangePageV1>();
     generator.subschema_for::<DocumentHeadV1>();
     generator.subschema_for::<DocumentMutationResultV1>();
+    generator.subschema_for::<DesiredStateMutationResultV1>();
     generator.subschema_for::<DocumentRevisionPageV1>();
     generator.subschema_for::<DocumentRevisionSummaryV1>();
     generator.subschema_for::<AssetHeadV1>();
@@ -3488,15 +3347,11 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/events", "get"),
     ("/v1/settings", "get"),
     ("/v1/settings", "put"),
-    ("/v1/notes", "post"),
     ("/v1/notes/{id}", "get"),
-    ("/v1/notes/{id}", "put"),
-    ("/v1/notes/{id}", "delete"),
     ("/v1/document-mutations", "post"),
     ("/v1/document-mutations/{id}", "put"),
     ("/v1/document-mutations/{id}", "delete"),
     ("/v1/document-mutations/{id}/rename", "post"),
-    ("/v1/notes/{id}/rename", "post"),
     ("/v1/notes/{id}/revisions", "get"),
     ("/v1/notes/{id}/revisions/{revision}", "get"),
     ("/v1/assets/{digest}/{name}", "get"),
@@ -3536,8 +3391,6 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/review/attempts/{id}/answer", "post"),
     ("/v1/review/attempts/{id}/cloze-check", "post"),
     ("/v1/review/attempts/{id}/accepted-success", "put"),
-    ("/v1/review/attempts/{id}/override", "post"),
-    ("/v1/review/attempts/{id}/suspension", "post"),
     ("/v1/review/attempts/{id}/suspension", "put"),
     ("/v1/review/attempts/{id}/commit", "post"),
 ];
@@ -3557,8 +3410,8 @@ mod tests {
 
     use super::{
         ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page,
-        bounded_projection_page, ensure_thema_response_budget, openapi_document, optional_if_match,
-        router,
+        bounded_projection_page, durable_created_thema_id, ensure_thema_response_budget,
+        openapi_document, optional_if_match, router,
     };
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
@@ -3617,6 +3470,18 @@ mod tests {
                 expected_revision: 7,
                 current_revision: Some(9),
             }),
+        );
+    }
+
+    #[test]
+    fn created_thema_ids_are_stable_and_device_scoped() {
+        assert_eq!(
+            durable_created_thema_id("device", "operation"),
+            durable_created_thema_id("device", "operation")
+        );
+        assert_ne!(
+            durable_created_thema_id("device-a", "operation"),
+            durable_created_thema_id("device-b", "operation")
         );
     }
 
@@ -4016,8 +3881,9 @@ mod tests {
         );
         assert!(answer["responses"]["412"].is_object());
         assert!(
-            api["paths"]["/v1/review/attempts/{id}/override"]["post"]["responses"]["412"]
-                .is_object()
+            api["paths"]
+                .get("/v1/review/attempts/{id}/override")
+                .is_none()
         );
         let commit = &api["paths"]["/v1/review/attempts/{id}/commit"]["post"];
         assert_eq!(
@@ -4048,7 +3914,7 @@ mod tests {
         );
 
         let suspension = &api["paths"]["/v1/review/attempts/{id}/suspension"];
-        assert!(suspension["post"].is_object());
+        assert!(suspension.get("post").is_none());
         assert_eq!(
             suspension["put"]["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/SetSuspensionRequestV1"
@@ -4219,16 +4085,7 @@ mod tests {
                 "200", "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
             ],
         );
-        assert_response_statuses(
-            &paths["/v1/review/attempts/{id}/override"]["post"],
-            &[
-                "200", "400", "401", "403", "404", "408", "412", "500", "503",
-            ],
-        );
-        assert_response_statuses(
-            &paths["/v1/review/attempts/{id}/suspension"]["post"],
-            &["200", "400", "401", "403", "404", "408", "500", "503"],
-        );
+        assert!(paths.get("/v1/review/attempts/{id}/override").is_none());
         assert_response_statuses(
             &paths["/v1/review/attempts/{id}/commit"]["post"],
             &[
@@ -4567,31 +4424,10 @@ mod tests {
                 "settings:write",
                 Some("UpdateSettingsRequestV1"),
                 "200",
-                "SettingsV1",
+                "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
-                ],
-            ),
-            expected_json_contract(
-                "/v1/notes",
-                "post",
-                "content:write",
-                Some("NoteWriteRequestV1"),
-                "201",
-                "DocumentHeadV1",
-                &[
-                    "201", "401", "403", "408", "412", "413", "422", "500", "503",
-                ],
-            ),
-            expected_json_contract(
-                "/v1/notes/{id}",
-                "put",
-                "content:write",
-                Some("NoteWriteRequestV1"),
-                "200",
-                "DocumentHeadV1",
-                &[
-                    "200", "400", "401", "403", "408", "412", "413", "422", "428", "500", "503",
+                    "200", "400", "401", "403", "408", "409", "412", "413", "422", "428", "500",
+                    "503",
                 ],
             ),
             expected_json_contract(
@@ -4639,29 +4475,6 @@ mod tests {
                 ],
             ),
             expected_json_contract(
-                "/v1/notes/{id}",
-                "delete",
-                "content:write",
-                None,
-                "200",
-                "DocumentHeadV1",
-                &[
-                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
-                ],
-            ),
-            expected_json_contract(
-                "/v1/notes/{id}/rename",
-                "post",
-                "content:write",
-                Some("NoteRenameRequestV1"),
-                "200",
-                "DocumentHeadV1",
-                &[
-                    "200", "400", "401", "403", "404", "408", "412", "413", "422", "428", "500",
-                    "503",
-                ],
-            ),
-            expected_json_contract(
                 "/v1/notes/{id}/revisions",
                 "get",
                 "read",
@@ -4686,10 +4499,10 @@ mod tests {
                 "put",
                 "content:write",
                 None,
-                "201",
-                "AssetHeadV1",
+                "200",
+                "DesiredStateMutationResultV1",
                 &[
-                    "201", "400", "401", "403", "404", "408", "409", "412", "413", "422", "500",
+                    "200", "400", "401", "403", "404", "408", "409", "412", "413", "422", "500",
                     "503",
                 ],
             ),
@@ -4699,9 +4512,10 @@ mod tests {
                 "content:write",
                 None,
                 "200",
-                "AssetHeadV1",
+                "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                    "200", "400", "401", "403", "404", "408", "409", "412", "422", "428", "500",
+                    "503",
                 ],
             ),
             expected_json_contract(
@@ -4718,10 +4532,10 @@ mod tests {
                 "post",
                 "content:write",
                 Some("ThemaWriteRequestV1"),
-                "201",
-                "ThemaV1",
+                "200",
+                "DesiredStateMutationResultV1",
                 &[
-                    "201", "401", "403", "404", "408", "413", "422", "500", "503",
+                    "200", "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4739,10 +4553,10 @@ mod tests {
                 "content:write",
                 Some("ThemaWriteRequestV1"),
                 "200",
-                "ThemaV1",
+                "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "412", "413", "422", "428", "500",
-                    "503",
+                    "200", "400", "401", "403", "404", "408", "409", "412", "413", "422", "428",
+                    "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4751,9 +4565,10 @@ mod tests {
                 "content:write",
                 None,
                 "200",
-                "ThemaV1",
+                "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                    "200", "400", "401", "403", "404", "408", "409", "412", "422", "428", "500",
+                    "503",
                 ],
             ),
             expected_json_contract(
@@ -4762,9 +4577,10 @@ mod tests {
                 "content:write",
                 None,
                 "200",
-                "ThemaV1",
+                "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "412", "422", "428", "500", "503",
+                    "200", "400", "401", "403", "404", "408", "409", "412", "422", "428", "500",
+                    "503",
                 ],
             ),
             expected_json_contract(
@@ -4836,14 +4652,28 @@ mod tests {
             "post",
             "If-Match",
         );
-        assert_required_header(&api, "/v1/notes/{id}", "put", "If-Match");
-        assert_required_header(&api, "/v1/notes/{id}", "delete", "If-Match");
-        assert_required_header(&api, "/v1/notes/{id}/rename", "post", "If-Match");
         assert_optional_header(&api, "/v1/assets/{digest}/{name}", "put", "If-Match");
+        assert_required_header(&api, "/v1/assets/{digest}/{name}", "put", "Idempotency-Key");
         assert_required_header(&api, "/v1/assets/{digest}/{name}", "delete", "If-Match");
+        assert_required_header(
+            &api,
+            "/v1/assets/{digest}/{name}",
+            "delete",
+            "Idempotency-Key",
+        );
+        assert_required_header(&api, "/v1/themata", "post", "Idempotency-Key");
         assert_required_header(&api, "/v1/themata/{id}", "put", "If-Match");
+        assert_required_header(&api, "/v1/themata/{id}", "put", "Idempotency-Key");
         assert_required_header(&api, "/v1/themata/{id}/archive", "post", "If-Match");
+        assert_required_header(&api, "/v1/themata/{id}/archive", "post", "Idempotency-Key");
         assert_required_header(&api, "/v1/themata/{id}/unarchive", "post", "If-Match");
+        assert_required_header(
+            &api,
+            "/v1/themata/{id}/unarchive",
+            "post",
+            "Idempotency-Key",
+        );
+        assert_required_header(&api, "/v1/settings", "put", "Idempotency-Key");
         assert_eq!(
             operation_parameter(&api["paths"]["/v1/settings"]["put"], "If-Match")["schema"]["pattern"],
             "^(?:[0-9]+|\"[0-9]+\")$"
@@ -5278,8 +5108,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(oversized.headers()["content-type"], "application/json");
+        assert_eq!(oversized.status(), StatusCode::NOT_FOUND);
 
         let malformed_query = app
             .clone()
@@ -5330,18 +5159,48 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(bytes));
         let path = format!("/v1/assets/{digest}/image.png");
 
-        let created = app
-            .clone()
-            .oneshot(authorized_with_type(
-                "PUT",
-                &path,
-                &token,
-                "image/png",
-                Body::from(bytes.to_vec()),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(created.status(), StatusCode::CREATED);
+        let mut request = authorized_with_type(
+            "PUT",
+            &path,
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        request.headers_mut().insert(
+            "Idempotency-Key",
+            axum::http::HeaderValue::from_static("asset-create"),
+        );
+        let created = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created_body = response_json(created).await;
+        let mut replay_request = authorized_with_type(
+            "PUT",
+            &path,
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        replay_request.headers_mut().insert(
+            "Idempotency-Key",
+            axum::http::HeaderValue::from_static("asset-create"),
+        );
+        let replay = app.clone().oneshot(replay_request).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await, created_body);
+
+        let mut reused_request = authorized_with_type(
+            "PUT",
+            &format!("/v1/assets/{digest}/image-2.png"),
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        reused_request.headers_mut().insert(
+            "Idempotency-Key",
+            axum::http::HeaderValue::from_static("asset-create"),
+        );
+        let reused = app.clone().oneshot(reused_request).await.unwrap();
+        assert_eq!(reused.status(), StatusCode::CONFLICT);
 
         let fetched = app
             .clone()
@@ -5612,8 +5471,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(stale_toggle.status(), StatusCode::OK);
-        assert_eq!(response_json(stale_toggle).await["desired_suspended"], true);
+        assert_eq!(stale_toggle.status(), StatusCode::METHOD_NOT_ALLOWED);
         service
             .stop_review_session(session_id, Some(device_id.clone()), true, 6)
             .await
@@ -5639,7 +5497,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(stale_override.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale_override.status(), StatusCode::NOT_FOUND);
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -6521,7 +6379,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_note_writes_preserve_the_frozen_v1_contract() {
+    async fn legacy_note_write_routes_are_removed() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
             directory.path().join("gnosis.sqlite"),
@@ -6546,42 +6404,33 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(create.status(), StatusCode::CREATED);
-        let created = response_json(create).await;
-        assert_eq!(created["revision"], 1);
-        assert!(created.get("status").is_none());
-        let document_id = created["document_id"].as_str().unwrap();
-        let path = format!("/v1/notes/{document_id}");
+        assert_eq!(create.status(), StatusCode::NOT_FOUND);
+        let path = "/v1/notes/document";
 
         let update = app
             .clone()
             .oneshot(authorized_if_match(
                 "PUT",
-                &path,
+                path,
                 &token,
                 "1",
                 Body::from(note_body("note.org", "Updated")),
             ))
             .await
             .unwrap();
-        assert_eq!(update.status(), StatusCode::OK);
-        assert_eq!(response_json(update).await["revision"], 2);
+        assert_eq!(update.status(), StatusCode::METHOD_NOT_ALLOWED);
 
         let stale = app
             .oneshot(authorized_if_match(
                 "PUT",
-                &path,
+                path,
                 &token,
                 "1",
                 Body::from(note_body("note.org", "Stale")),
             ))
             .await
             .unwrap();
-        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
-        assert_eq!(
-            response_json(stale).await["error"]["code"],
-            "revision_conflict"
-        );
+        assert_eq!(stale.status(), StatusCode::METHOD_NOT_ALLOWED);
         drop(service);
         runtime.finish().await.unwrap();
     }
@@ -7184,7 +7033,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(service.latest_content_cursor().await.unwrap(), before);
 
         drop(app);

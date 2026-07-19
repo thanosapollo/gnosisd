@@ -134,6 +134,324 @@ pub(crate) struct SqliteStore {
     connection: Connection,
 }
 
+pub(super) fn put_asset_in(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedAsset,
+    blob: &BlobMeta,
+    created_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(AssetHead, bool), StoreError> {
+    let collides: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM managed_asset
+                 WHERE path_key = ?1 AND asset_path <> ?2
+             )",
+            params![prepared.path_key, prepared.logical_path],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)?;
+    if collides {
+        return Err(StoreError::InvalidProjection {
+            reason: "asset path collides by case",
+        });
+    }
+    let current: Option<(String, i64, bool)> = transaction
+        .query_row(
+            "SELECT blob_sha256, revision, active
+             FROM managed_asset WHERE asset_path = ?1",
+            [&prepared.logical_path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    check_expected_number(
+        prepared.expected_revision,
+        current.as_ref().map(|(_, revision, _)| *revision),
+    )?;
+    if current
+        .as_ref()
+        .is_some_and(|(digest, _, active)| digest == &blob.sha256 && *active)
+    {
+        return Ok((
+            load_asset_head(transaction, &prepared.logical_path)?.ok_or(StoreError::NotFound)?,
+            false,
+        ));
+    }
+    let revision = next_number(current.as_ref().map(|(_, revision, _)| *revision))?;
+    insert_blob(transaction, blob, created_at_us)?;
+    transaction
+        .execute(
+            "INSERT INTO managed_asset(
+                 asset_path, path_key, blob_sha256, original_name, revision,
+                 active, created_at_us, updated_at_us
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)
+             ON CONFLICT(asset_path) DO UPDATE SET
+                 path_key = excluded.path_key,
+                 blob_sha256 = excluded.blob_sha256,
+                 original_name = excluded.original_name,
+                 revision = excluded.revision,
+                 active = 1,
+                 updated_at_us = excluded.updated_at_us",
+            params![
+                prepared.logical_path,
+                prepared.path_key,
+                blob.sha256,
+                prepared.original_name,
+                u64_to_i64(revision, "asset revision")?,
+                created_at_us
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO asset_revision(
+                 asset_path, revision, blob_sha256, operation, created_at_us,
+                 author_device_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                prepared.logical_path,
+                u64_to_i64(revision, "asset revision")?,
+                blob.sha256,
+                if current.is_some() {
+                    "update"
+                } else {
+                    "create"
+                },
+                created_at_us,
+                author_device_id
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    insert_content_change(
+        transaction,
+        "asset",
+        &prepared.logical_path,
+        revision,
+        if current.is_some() {
+            "update"
+        } else {
+            "create"
+        },
+        created_at_us,
+    )?;
+    Ok((
+        load_asset_head(transaction, &prepared.logical_path)?.ok_or(StoreError::NotFound)?,
+        true,
+    ))
+}
+
+pub(super) fn tombstone_asset_in(
+    transaction: &Transaction<'_>,
+    asset_path: &str,
+    expected_revision: u64,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<AssetHead, StoreError> {
+    let current = load_asset_head(transaction, asset_path)?
+        .filter(|asset| asset.active)
+        .ok_or(StoreError::NotFound)?;
+    check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+    require_asset_unreferenced(transaction, asset_path)?;
+    let revision = current
+        .revision
+        .checked_add(1)
+        .ok_or(StoreError::CorruptData {
+            field: "asset revision",
+        })?;
+    transaction
+        .execute(
+            "UPDATE managed_asset SET active = 0, revision = ?2, updated_at_us = ?3
+             WHERE asset_path = ?1",
+            params![
+                asset_path,
+                u64_to_i64(revision, "asset revision")?,
+                updated_at_us
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO asset_revision(
+                 asset_path, revision, blob_sha256, operation, created_at_us, author_device_id
+             ) VALUES (?1, ?2, NULL, 'tombstone', ?3, ?4)",
+            params![
+                asset_path,
+                u64_to_i64(revision, "asset revision")?,
+                updated_at_us,
+                author_device_id
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    insert_content_change(
+        transaction,
+        "asset",
+        asset_path,
+        revision,
+        "tombstone",
+        updated_at_us,
+    )?;
+    Ok(AssetHead {
+        revision,
+        blob_sha256: None,
+        media_type: None,
+        active: false,
+        ..current
+    })
+}
+
+pub(super) fn update_settings_in(
+    transaction: &Transaction<'_>,
+    input: &SettingsInput,
+    expected_revision: u64,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<SettingsRecord, StoreError> {
+    let current = transaction
+        .query_row("SELECT revision FROM settings WHERE id = 1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(StoreError::storage)?;
+    check_expected_number(Some(expected_revision), Some(current))?;
+    let revision = next_number(Some(current))?;
+    let scheduler = input.scheduler();
+    transaction
+        .execute(
+            "UPDATE settings SET revision = ?1, timezone = ?2,
+                 day_boundary_hour = ?3, scheduler_json = ?4, updated_at_us = ?5
+             WHERE id = 1",
+            params![
+                u64_to_i64(revision, "settings revision")?,
+                input.timezone,
+                i64::from(input.day_boundary_hour),
+                serde_json::to_string(&scheduler).map_err(StoreError::storage)?,
+                updated_at_us,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    let settings = load_settings(transaction)?;
+    insert_settings_history(
+        transaction,
+        &settings,
+        "update",
+        updated_at_us,
+        author_device_id,
+    )?;
+    insert_content_change(
+        transaction,
+        "settings",
+        "canonical",
+        revision,
+        "update",
+        updated_at_us,
+    )?;
+    Ok(settings)
+}
+
+pub(super) fn put_thema_in(
+    transaction: &Transaction<'_>,
+    prepared: &PreparedThema,
+    initial_review_day: u32,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<(ThemaRecord, bool), StoreError> {
+    let current = thema_revision(transaction, prepared.thema_id.as_str())?;
+    check_expected_number(prepared.expected_revision, current)?;
+    validate_thema_associations(transaction, prepared)?;
+    if thema_is_unchanged(transaction, prepared)? {
+        return Ok((
+            load_thema(transaction, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)?,
+            false,
+        ));
+    }
+    let revision = next_number(current)?;
+    upsert_thema_row(transaction, prepared, revision, updated_at_us)?;
+    replace_thema_associations(transaction, prepared)?;
+    insert_initial_review_state(transaction, prepared, initial_review_day)?;
+    let record =
+        load_thema(transaction, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)?;
+    insert_thema_history(
+        transaction,
+        &record,
+        if current.is_some() {
+            "update"
+        } else {
+            "create"
+        },
+        updated_at_us,
+        author_device_id,
+    )?;
+    insert_initial_review_state_history(transaction, prepared, updated_at_us)?;
+    insert_content_change(
+        transaction,
+        "thema",
+        prepared.thema_id.as_str(),
+        revision,
+        if current.is_some() {
+            "update"
+        } else {
+            "create"
+        },
+        updated_at_us,
+    )?;
+    if current.is_none() {
+        insert_content_change(
+            transaction,
+            "review",
+            prepared.thema_id.as_str(),
+            0,
+            "snapshot",
+            updated_at_us,
+        )?;
+    }
+    Ok((record, true))
+}
+
+pub(super) fn set_thema_archived_in(
+    transaction: &Transaction<'_>,
+    thema_id: &str,
+    expected_revision: u64,
+    archived: bool,
+    updated_at_us: i64,
+    author_device_id: Option<&str>,
+) -> Result<ThemaRecord, StoreError> {
+    let current = thema_revision(transaction, thema_id)?.ok_or(StoreError::NotFound)?;
+    check_expected_number(Some(expected_revision), Some(current))?;
+    if !archived {
+        require_thema_assets_active(transaction, thema_id)?;
+    }
+    let revision = next_number(Some(current))?;
+    transaction
+        .execute(
+            "UPDATE thema SET revision = ?2, archived_at_us = ?3, updated_at_us = ?4
+             WHERE thema_id = ?1",
+            params![
+                thema_id,
+                u64_to_i64(revision, "thema revision")?,
+                archived.then_some(updated_at_us),
+                updated_at_us
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    let record = load_thema(transaction, thema_id)?.ok_or(StoreError::NotFound)?;
+    insert_thema_history(
+        transaction,
+        &record,
+        if archived { "archive" } else { "unarchive" },
+        updated_at_us,
+        author_device_id,
+    )?;
+    insert_content_change(
+        transaction,
+        "thema",
+        thema_id,
+        revision,
+        if archived { "archive" } else { "unarchive" },
+        updated_at_us,
+    )?;
+    Ok(record)
+}
+
 impl SqliteStore {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -232,108 +550,16 @@ impl SqliteStore {
         created_at_us: i64,
         author_device_id: Option<&str>,
     ) -> Result<u64, StoreError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(StoreError::storage)?;
-        let collides: bool = transaction
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM managed_asset
-                     WHERE path_key = ?1 AND asset_path <> ?2
-                 )",
-                params![prepared.path_key, prepared.logical_path],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::storage)?;
-        if collides {
-            return Err(StoreError::InvalidProjection {
-                reason: "asset path collides by case",
-            });
-        }
-        let current: Option<(String, i64, bool)> = transaction
-            .query_row(
-                "SELECT blob_sha256, revision, active
-                 FROM managed_asset WHERE asset_path = ?1",
-                [&prepared.logical_path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()
-            .map_err(StoreError::storage)?;
-        check_expected_number(
-            prepared.expected_revision,
-            current.as_ref().map(|(_, revision, _)| *revision),
-        )?;
-        if current
-            .as_ref()
-            .is_some_and(|(digest, _, active)| digest == &blob.sha256 && *active)
-        {
-            transaction.commit().map_err(StoreError::storage)?;
-            return current
-                .and_then(|(_, revision, _)| u64::try_from(revision).ok())
-                .ok_or(StoreError::CorruptData {
-                    field: "asset revision",
-                });
-        }
-        let revision = next_number(current.as_ref().map(|(_, revision, _)| *revision))?;
-        insert_blob(&transaction, blob, created_at_us)?;
-        transaction
-            .execute(
-                "INSERT INTO managed_asset(
-                     asset_path, path_key, blob_sha256, original_name, revision,
-                     active, created_at_us, updated_at_us
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)
-                 ON CONFLICT(asset_path) DO UPDATE SET
-                     path_key = excluded.path_key,
-                     blob_sha256 = excluded.blob_sha256,
-                     original_name = excluded.original_name,
-                     revision = excluded.revision,
-                     active = 1,
-                     updated_at_us = excluded.updated_at_us",
-                params![
-                    prepared.logical_path,
-                    prepared.path_key,
-                    blob.sha256,
-                    prepared.original_name,
-                    u64_to_i64(revision, "asset revision")?,
-                    created_at_us
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        transaction
-            .execute(
-                "INSERT INTO asset_revision(
-                     asset_path, revision, blob_sha256, operation, created_at_us,
-                     author_device_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    prepared.logical_path,
-                    u64_to_i64(revision, "asset revision")?,
-                    blob.sha256,
-                    if current.is_some() {
-                        "update"
-                    } else {
-                        "create"
-                    },
-                    created_at_us,
-                    author_device_id
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        insert_content_change(
+        let transaction = self.write_transaction()?;
+        let (head, _) = put_asset_in(
             &transaction,
-            "asset",
-            &prepared.logical_path,
-            revision,
-            if current.is_some() {
-                "update"
-            } else {
-                "create"
-            },
+            prepared,
+            blob,
             created_at_us,
+            author_device_id,
         )?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(revision)
+        Ok(head.revision)
     }
 
     pub(crate) fn stage_blob(
@@ -505,57 +731,15 @@ impl SqliteStore {
         author_device_id: Option<&str>,
     ) -> Result<AssetHead, StoreError> {
         let transaction = self.write_transaction()?;
-        let current = load_asset_head(&transaction, asset_path)?
-            .filter(|asset| asset.active)
-            .ok_or(StoreError::NotFound)?;
-        check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
-        require_asset_unreferenced(&transaction, asset_path)?;
-        let revision = current
-            .revision
-            .checked_add(1)
-            .ok_or(StoreError::CorruptData {
-                field: "asset revision",
-            })?;
-        transaction
-            .execute(
-                "UPDATE managed_asset SET active = 0, revision = ?2, updated_at_us = ?3
-             WHERE asset_path = ?1",
-                params![
-                    asset_path,
-                    u64_to_i64(revision, "asset revision")?,
-                    updated_at_us
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        transaction
-            .execute(
-                "INSERT INTO asset_revision(
-                 asset_path, revision, blob_sha256, operation, created_at_us, author_device_id
-             ) VALUES (?1, ?2, NULL, 'tombstone', ?3, ?4)",
-                params![
-                    asset_path,
-                    u64_to_i64(revision, "asset revision")?,
-                    updated_at_us,
-                    author_device_id
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        insert_content_change(
+        let head = tombstone_asset_in(
             &transaction,
-            "asset",
             asset_path,
-            revision,
-            "tombstone",
+            expected_revision,
             updated_at_us,
+            author_device_id,
         )?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(AssetHead {
-            revision,
-            blob_sha256: None,
-            media_type: None,
-            active: false,
-            ..current
-        })
+        Ok(head)
     }
 
     pub(crate) fn content_changes(
@@ -785,6 +969,16 @@ impl SqliteStore {
         load_blob_rows(&self.connection)
     }
 
+    pub(crate) fn has_blob_record(&self, digest: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blob WHERE content_sha256 = ?1)",
+                [digest],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::storage)
+    }
+
     pub(crate) fn document_asset_sources(&self) -> Result<Vec<DocumentAssetSource>, StoreError> {
         load_document_asset_sources(&self.connection)
     }
@@ -837,46 +1031,15 @@ impl SqliteStore {
         author_device_id: Option<&str>,
     ) -> Result<SettingsRecord, StoreError> {
         let transaction = self.write_transaction()?;
-        let current = transaction
-            .query_row("SELECT revision FROM settings WHERE id = 1", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .map_err(StoreError::storage)?;
-        check_expected_number(Some(expected_revision), Some(current))?;
-        let revision = next_number(Some(current))?;
-        let scheduler = input.scheduler();
-        transaction
-            .execute(
-                "UPDATE settings SET revision = ?1, timezone = ?2,
-                     day_boundary_hour = ?3, scheduler_json = ?4, updated_at_us = ?5
-                 WHERE id = 1",
-                params![
-                    u64_to_i64(revision, "settings revision")?,
-                    input.timezone,
-                    i64::from(input.day_boundary_hour),
-                    serde_json::to_string(&scheduler).map_err(StoreError::storage)?,
-                    updated_at_us,
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        let settings = load_settings(&transaction)?;
-        insert_settings_history(
+        let settings = update_settings_in(
             &transaction,
-            &settings,
-            "update",
+            input,
+            expected_revision,
             updated_at_us,
             author_device_id,
         )?;
-        insert_content_change(
-            &transaction,
-            "settings",
-            "canonical",
-            revision,
-            "update",
-            updated_at_us,
-        )?;
         transaction.commit().map_err(StoreError::storage)?;
-        load_settings(&self.connection)
+        Ok(settings)
     }
 
     pub(crate) fn put_thema(
@@ -887,56 +1050,15 @@ impl SqliteStore {
         author_device_id: Option<&str>,
     ) -> Result<ThemaRecord, StoreError> {
         let transaction = self.write_transaction()?;
-        let current = thema_revision(&transaction, prepared.thema_id.as_str())?;
-        check_expected_number(prepared.expected_revision, current)?;
-        validate_thema_associations(&transaction, prepared)?;
-        if thema_is_unchanged(&transaction, prepared)? {
-            transaction.commit().map_err(StoreError::storage)?;
-            return load_thema(&self.connection, prepared.thema_id.as_str())?
-                .ok_or(StoreError::NotFound);
-        }
-        let revision = next_number(current)?;
-        upsert_thema_row(&transaction, prepared, revision, updated_at_us)?;
-        replace_thema_associations(&transaction, prepared)?;
-        insert_initial_review_state(&transaction, prepared, initial_review_day)?;
-        let record =
-            load_thema(&transaction, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)?;
-        insert_thema_history(
+        let (record, _) = put_thema_in(
             &transaction,
-            &record,
-            if current.is_some() {
-                "update"
-            } else {
-                "create"
-            },
+            prepared,
+            initial_review_day,
             updated_at_us,
             author_device_id,
         )?;
-        insert_initial_review_state_history(&transaction, prepared, updated_at_us)?;
-        insert_content_change(
-            &transaction,
-            "thema",
-            prepared.thema_id.as_str(),
-            revision,
-            if current.is_some() {
-                "update"
-            } else {
-                "create"
-            },
-            updated_at_us,
-        )?;
-        if current.is_none() {
-            insert_content_change(
-                &transaction,
-                "review",
-                prepared.thema_id.as_str(),
-                0,
-                "snapshot",
-                updated_at_us,
-            )?;
-        }
         transaction.commit().map_err(StoreError::storage)?;
-        load_thema(&self.connection, prepared.thema_id.as_str())?.ok_or(StoreError::NotFound)
+        Ok(record)
     }
 
     pub(crate) fn get_thema(&self, thema_id: &str) -> Result<Option<ThemaRecord>, StoreError> {
@@ -952,42 +1074,16 @@ impl SqliteStore {
         author_device_id: Option<&str>,
     ) -> Result<ThemaRecord, StoreError> {
         let transaction = self.write_transaction()?;
-        let current = thema_revision(&transaction, thema_id)?.ok_or(StoreError::NotFound)?;
-        check_expected_number(Some(expected_revision), Some(current))?;
-        if !archived {
-            require_thema_assets_active(&transaction, thema_id)?;
-        }
-        let revision = next_number(Some(current))?;
-        transaction
-            .execute(
-                "UPDATE thema SET revision = ?2, archived_at_us = ?3, updated_at_us = ?4
-             WHERE thema_id = ?1",
-                params![
-                    thema_id,
-                    u64_to_i64(revision, "thema revision")?,
-                    archived.then_some(updated_at_us),
-                    updated_at_us
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        let record = load_thema(&transaction, thema_id)?.ok_or(StoreError::NotFound)?;
-        insert_thema_history(
+        let record = set_thema_archived_in(
             &transaction,
-            &record,
-            if archived { "archive" } else { "unarchive" },
+            thema_id,
+            expected_revision,
+            archived,
             updated_at_us,
             author_device_id,
         )?;
-        insert_content_change(
-            &transaction,
-            "thema",
-            thema_id,
-            revision,
-            if archived { "archive" } else { "unarchive" },
-            updated_at_us,
-        )?;
         transaction.commit().map_err(StoreError::storage)?;
-        load_thema(&self.connection, thema_id)?.ok_or(StoreError::NotFound)
+        Ok(record)
     }
 
     pub(crate) fn search_themata(

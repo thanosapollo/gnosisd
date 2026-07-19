@@ -5,7 +5,7 @@ use super::{DocumentOperationV1, FsrsConfigV1, ThemaKindV1};
 use crate::application::{
     AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
     DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, SettingsInput,
-    SettingsRecord, ThemaRecord,
+    SettingsRecord, ThemaMutationProjection, ThemaRecord,
 };
 use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
@@ -200,7 +200,98 @@ impl DocumentMutationResultV1 {
                 rejection: mutation_rejection(rejection),
                 cursor: mutation_cursor(cursor)?,
             }),
+            DeviceMutationResult::Applied { .. } => Err(ContentWireError),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum DesiredStateMutationProjectionV1 {
+    Asset(AssetHeadV1),
+    Thema(ThemaV1),
+    Settings(SettingsV1),
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "wire projection remains inline so runtime DTO and OpenAPI expose one shape"
+)]
+pub enum DesiredStateMutationResultV1 {
+    Applied {
+        #[schemars(extend("const" = 1))]
+        format_version: u32,
+        #[schemars(
+            length(min = 1, max = 128),
+            regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+        )]
+        operation_id: String,
+        changed: bool,
+        authoritative: DesiredStateMutationProjectionV1,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+    Rejected {
+        #[schemars(extend("const" = 1))]
+        format_version: u32,
+        #[schemars(
+            length(min = 1, max = 128),
+            regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+        )]
+        operation_id: String,
+        rejection: DocumentMutationRejectionV1,
+        #[schemars(length(min = 1, max = 512))]
+        cursor: String,
+    },
+}
+
+impl DesiredStateMutationResultV1 {
+    pub(crate) fn from_application(value: &DeviceMutationResult) -> Result<Self, ContentWireError> {
+        match value {
+            DeviceMutationResult::Applied {
+                format_version,
+                operation_id,
+                changed,
+                authoritative,
+                cursor,
+            } => Ok(Self::Applied {
+                format_version: *format_version,
+                operation_id: operation_id.clone(),
+                changed: *changed,
+                authoritative: desired_state_projection(authoritative)?,
+                cursor: mutation_cursor(cursor)?,
+            }),
+            DeviceMutationResult::Rejected {
+                format_version,
+                operation_id,
+                rejection,
+                cursor,
+            } => Ok(Self::Rejected {
+                format_version: *format_version,
+                operation_id: operation_id.clone(),
+                rejection: mutation_rejection(rejection),
+                cursor: mutation_cursor(cursor)?,
+            }),
+        }
+    }
+}
+
+fn desired_state_projection(
+    value: &DeviceMutationProjection,
+) -> Result<DesiredStateMutationProjectionV1, ContentWireError> {
+    match value {
+        DeviceMutationProjection::Asset(asset) => Ok(DesiredStateMutationProjectionV1::Asset(
+            AssetHeadV1::from_application(asset),
+        )),
+        DeviceMutationProjection::Thema(thema) => Ok(DesiredStateMutationProjectionV1::Thema(
+            ThemaV1::from_mutation_projection(thema)?,
+        )),
+        DeviceMutationProjection::Settings(settings) => Ok(
+            DesiredStateMutationProjectionV1::Settings(SettingsV1::from_application(settings)),
+        ),
+        DeviceMutationProjection::Document(_) => Err(ContentWireError),
     }
 }
 
@@ -381,6 +472,48 @@ impl ThemaV1 {
             content_sha256: value.content_sha256.clone(),
             archived: value.archived,
         }
+    }
+
+    fn from_mutation_projection(value: &ThemaMutationProjection) -> Result<Self, ContentWireError> {
+        let kind = match value.kind.as_str() {
+            "basic" => ThemaKindV1::Basic,
+            "cloze" => ThemaKindV1::Cloze,
+            "mcq" => ThemaKindV1::Mcq,
+            "mc-cloze" => ThemaKindV1::McCloze,
+            _ => return Err(ContentWireError),
+        };
+        let concepts = value
+            .concepts
+            .iter()
+            .map(|(node_id, relation)| {
+                let relation = match relation.as_str() {
+                    "primary" => ThemaConceptRelationV1::Primary,
+                    "supporting" => ThemaConceptRelationV1::Supporting,
+                    "reference" => ThemaConceptRelationV1::Reference,
+                    _ => return Err(ContentWireError),
+                };
+                Ok(ThemaConceptV1 {
+                    node_id: node_id.clone(),
+                    relation,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            thema_id: value.thema_id.clone(),
+            revision: value.revision,
+            kind,
+            keimenon: value.keimenon.clone(),
+            hypothesis: value.hypothesis.clone(),
+            answer: value.answer.clone(),
+            source_guid: value.source_guid.clone(),
+            parathema: value.parathema.clone(),
+            review_image: value.review_image.clone(),
+            tags: value.tags.clone(),
+            concepts,
+            asset_paths: value.asset_paths.clone(),
+            content_sha256: value.content_sha256.clone(),
+            archived: value.archived,
+        })
     }
 }
 

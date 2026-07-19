@@ -3,15 +3,17 @@ use sha2::{Digest, Sha256};
 
 use super::{
     NoteWriteDecision, SqliteStore, StoreError, current_content_cursor, load_document_head,
-    note_write_decision, rename_document_in, replace_note_in, replica_cursor_token, server_id,
-    tombstone_document_in,
+    note_write_decision, put_asset_in, put_thema_in, rename_document_in, replace_note_in,
+    replica_cursor_token, server_id, set_thema_archived_in, tombstone_asset_in,
+    tombstone_document_in, update_settings_in,
 };
 use crate::{
     application::{
-        DeviceDocumentLifecycleMutation, DeviceMutationCursor, DeviceMutationIdentity,
-        DeviceMutationKind, DeviceMutationProjection, DeviceMutationRejection,
-        DeviceMutationResult, PreparedDeviceDocumentLifecycleMutation,
-        PreparedDeviceDocumentMutation,
+        DeviceDesiredStateMutation, DeviceDocumentLifecycleMutation, DeviceMutationCursor,
+        DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
+        DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDesiredStateMutation,
+        PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
+        ThemaMutationProjection,
     },
     blob::BlobMeta,
 };
@@ -19,7 +21,7 @@ use crate::{
 const REPLAY_SQL: &str = "SELECT request_sha256, request_json, result_kind, result_json
      FROM device_mutation_receipt WHERE device_id = ?1 AND operation_id = ?2";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeviceMutationExecution {
     pub(crate) result: DeviceMutationResult,
     pub(crate) replayed: bool,
@@ -87,6 +89,158 @@ impl SqliteStore {
             result,
             replayed: false,
         })
+    }
+
+    pub(crate) fn apply_device_desired_state_mutation(
+        &mut self,
+        operation: &PreparedDeviceDesiredStateMutation,
+        created_at_us: i64,
+    ) -> Result<DeviceMutationExecution, StoreError> {
+        operation.validate().map_err(|_| StoreError::CorruptData {
+            field: "device desired-state mutation",
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::storage)?;
+        if let Some(replay) = replayed_device_mutation(&transaction, &operation.identity)? {
+            transaction.commit().map_err(StoreError::storage)?;
+            return Ok(replay);
+        }
+        transaction
+            .execute_batch("SAVEPOINT device_mutation_apply")
+            .map_err(StoreError::storage)?;
+        let result = match apply_desired_state_mutation(&transaction, operation, created_at_us) {
+            Ok((changed, authoritative)) => {
+                transaction
+                    .execute_batch("RELEASE device_mutation_apply")
+                    .map_err(StoreError::storage)?;
+                DeviceMutationResult::applied(
+                    &operation.identity,
+                    changed,
+                    authoritative,
+                    mutation_cursor(&transaction)?,
+                )
+            }
+            Err(error) => {
+                let Some(rejection) = desired_state_rejection(&error) else {
+                    return Err(error);
+                };
+                transaction
+                    .execute_batch(
+                        "ROLLBACK TO device_mutation_apply; RELEASE device_mutation_apply",
+                    )
+                    .map_err(StoreError::storage)?;
+                rejected_result(&transaction, &operation.identity, rejection)?
+            }
+        };
+        insert_receipt(&transaction, &operation.identity, &result, created_at_us)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(DeviceMutationExecution {
+            result,
+            replayed: false,
+        })
+    }
+}
+
+fn apply_desired_state_mutation(
+    transaction: &Transaction<'_>,
+    operation: &PreparedDeviceDesiredStateMutation,
+    created_at_us: i64,
+) -> Result<(bool, DeviceMutationProjection), StoreError> {
+    let author = Some(operation.identity.device_id.as_str());
+    match &operation.mutation {
+        DeviceDesiredStateMutation::PutAsset {
+            prepared,
+            digest,
+            size_bytes,
+            media_type,
+        } => {
+            let blob = BlobMeta {
+                sha256: digest.clone(),
+                size_bytes: *size_bytes,
+                media_type: media_type.clone(),
+            };
+            let (head, changed) =
+                put_asset_in(transaction, prepared, &blob, created_at_us, author)?;
+            Ok((changed, DeviceMutationProjection::Asset(head)))
+        }
+        DeviceDesiredStateMutation::TombstoneAsset {
+            asset_path,
+            expected_revision,
+        } => Ok((
+            true,
+            DeviceMutationProjection::Asset(tombstone_asset_in(
+                transaction,
+                asset_path,
+                *expected_revision,
+                created_at_us,
+                author,
+            )?),
+        )),
+        DeviceDesiredStateMutation::PutThema {
+            prepared,
+            initial_review_day,
+        } => {
+            let (record, changed) = put_thema_in(
+                transaction,
+                prepared,
+                *initial_review_day,
+                created_at_us,
+                author,
+            )?;
+            Ok((
+                changed,
+                DeviceMutationProjection::Thema(thema_projection(record)),
+            ))
+        }
+        DeviceDesiredStateMutation::SetThemaArchived {
+            thema_id,
+            expected_revision,
+            archived,
+        } => Ok((
+            true,
+            DeviceMutationProjection::Thema(thema_projection(set_thema_archived_in(
+                transaction,
+                thema_id.as_str(),
+                *expected_revision,
+                *archived,
+                created_at_us,
+                author,
+            )?)),
+        )),
+        DeviceDesiredStateMutation::ReplaceSettings {
+            input,
+            expected_revision,
+        } => Ok((
+            true,
+            DeviceMutationProjection::Settings(update_settings_in(
+                transaction,
+                input,
+                *expected_revision,
+                created_at_us,
+                author,
+            )?),
+        )),
+    }
+}
+
+fn thema_projection(record: crate::application::ThemaRecord) -> ThemaMutationProjection {
+    ThemaMutationProjection::from(&record)
+}
+
+fn desired_state_rejection(error: &StoreError) -> Option<DeviceMutationRejection> {
+    match error {
+        StoreError::Conflict { expected, actual } => {
+            Some(DeviceMutationRejection::RevisionConflict {
+                expected: Some(*expected),
+                actual: *actual,
+            })
+        }
+        StoreError::NotFound => Some(DeviceMutationRejection::NotFound),
+        StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
+        StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
+        _ => None,
     }
 }
 
@@ -514,13 +668,118 @@ mod tests {
     use super::super::{SqliteStore, StoreError};
     use crate::{
         application::{
-            DeviceMutationProjection, DeviceMutationRejection, DeviceMutationResult,
-            PreparedDeviceDocumentMutation, generate_device, prepare_device_document_mutation,
+            DeviceDesiredStateMutation, DeviceMutationProjection, DeviceMutationRejection,
+            DeviceMutationResult, PreparedDeviceDocumentMutation, SettingsInput, generate_device,
+            prepare_asset, prepare_device_desired_state_mutation, prepare_device_document_mutation,
             prepare_device_document_rename, prepare_device_document_tombstone, prepare_note,
+            prepare_thema, thema_content,
         },
         blob::BlobMeta,
         domain::DocumentId,
     };
+
+    #[test]
+    fn desired_state_mutations_replay_assets_themata_and_settings() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "desired");
+        let asset_digest = format!("{:x}", Sha256::digest(b"asset"));
+
+        let asset = prepare_device_desired_state_mutation(
+            1,
+            "asset-op".into(),
+            device.clone(),
+            DeviceDesiredStateMutation::PutAsset {
+                prepared: prepare_asset(
+                    format!("assets/{asset_digest}/a.png"),
+                    "a.png".into(),
+                    None,
+                )
+                .unwrap(),
+                digest: asset_digest,
+                size_bytes: 5,
+                media_type: "image/png".into(),
+            },
+        )
+        .unwrap();
+        let first = store
+            .apply_device_desired_state_mutation(&asset, 1)
+            .unwrap();
+        let replay = store
+            .apply_device_desired_state_mutation(&asset, 2)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first.result, replay.result);
+
+        let thema = prepare_device_desired_state_mutation(
+            1,
+            "thema-op".into(),
+            device.clone(),
+            DeviceDesiredStateMutation::PutThema {
+                prepared: prepare_thema(
+                    Some("thema".into()),
+                    thema_content(
+                        "basic",
+                        "Question".into(),
+                        vec![],
+                        vec!["Answer".into()],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+                initial_review_day: 20260719,
+            },
+        )
+        .unwrap();
+        let first = store
+            .apply_device_desired_state_mutation(&thema, 3)
+            .unwrap();
+        let mut thema_retry = thema.clone();
+        let DeviceDesiredStateMutation::PutThema {
+            initial_review_day, ..
+        } = &mut thema_retry.mutation
+        else {
+            unreachable!()
+        };
+        *initial_review_day += 1;
+        let replay = store
+            .apply_device_desired_state_mutation(&thema_retry, 4)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first.result, replay.result);
+
+        let settings = prepare_device_desired_state_mutation(
+            1,
+            "settings-op".into(),
+            device,
+            DeviceDesiredStateMutation::ReplaceSettings {
+                input: SettingsInput {
+                    timezone: "UTC".into(),
+                    day_boundary_hour: 4,
+                    desired_retention: 0.9,
+                }
+                .validate()
+                .unwrap(),
+                expected_revision: 1,
+            },
+        )
+        .unwrap();
+        let first = store
+            .apply_device_desired_state_mutation(&settings, 5)
+            .unwrap();
+        let replay = store
+            .apply_device_desired_state_mutation(&settings, 6)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first.result, replay.result);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+    }
 
     #[test]
     fn document_mutation_replays_and_rejects_changed_key_reuse() {
@@ -696,7 +955,9 @@ mod tests {
         let DeviceMutationResult::Applied { authoritative, .. } = &first.result else {
             panic!("expected applied tombstone");
         };
-        let DeviceMutationProjection::Document(head) = authoritative;
+        let DeviceMutationProjection::Document(head) = authoritative else {
+            panic!("expected document projection")
+        };
         assert_eq!(head.revision, 2);
         assert!(!head.active);
         assert_eq!(row_count(&store, "document_revision"), 2);

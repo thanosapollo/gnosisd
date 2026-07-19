@@ -5,6 +5,7 @@ use std::{
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -3298,12 +3299,13 @@ async fn put_review_asset_with_media(
     let response = raw_http_client()
         .put(format!("{base_url}/v1/assets/{digest}/image.png"))
         .bearer_auth(token)
+        .header("idempotency-key", next_operation_id("test-asset"))
         .header("content-type", media_type)
         .body(bytes.to_vec())
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     path
 }
 
@@ -3337,17 +3339,26 @@ async fn create_review_thema_from(
     let response = raw_http_client()
         .post(format!("{base_url}/v1/themata"))
         .bearer_auth(token)
+        .header("idempotency-key", next_operation_id("test-thema"))
         .header("content-type", "application/json")
         .body(serde_json::to_vec(input).unwrap())
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     serde_json::from_slice::<serde_json::Value>(&response.bytes().await.unwrap())
-        .unwrap()["thema_id"]
+        .unwrap()["authoritative"]["value"]["thema_id"]
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn next_operation_id(prefix: &str) -> String {
+    static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "{prefix}-{}",
+        NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn raw_http_client() -> reqwest::Client {

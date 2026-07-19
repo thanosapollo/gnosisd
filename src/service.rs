@@ -30,19 +30,20 @@ use crate::application::{ImportSummary, PreparedServerImport};
 use crate::{
     application::{
         AnswerInput, ApplicationError, AssetHead, ContentChange,
-        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DevicePrincipal, DeviceRecord,
-        DocumentHead, DocumentRevision, MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT,
-        NewDevice, NodeRecord, OfflineAssetOperation, OfflineAssetResult,
-        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
-        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
-        PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation, PreparedNote,
-        PreparedThema, QueryDueThemataPage, ReplicaChange, ReplicaState, ReviewAttemptOperation,
-        ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewError,
-        ReviewHistoryEvent, ReviewHistoryQuery, ReviewOperationAuthority, ReviewPackAsset,
-        ReviewPackView, ReviewQueueSummary, ReviewSessionQuery, ReviewSessionSummary,
-        ReviewSessionView, ReviewSource, SettingsError, SettingsInput, SettingsRecord,
-        SnapshotPage, SnapshotPosition, ThemaRecord, ThemaReviewState, prepare_offline_document,
-        retained_asset_paths_in_org, token_digest, validate_asset_path,
+        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
+        DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
+        MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord,
+        OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
+        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
+        PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
+        PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
+        ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
+        ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
+        ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
+        ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
+        SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
+        ThemaReviewState, prepare_offline_document, retained_asset_paths_in_org, token_digest,
+        validate_asset_path,
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{ClozeCheck, DocumentId, DueThema},
@@ -57,6 +58,7 @@ pub(crate) struct ServiceHandle {
     blobs: Arc<BlobStore>,
 }
 
+#[allow(dead_code)]
 impl ServiceHandle {
     pub(crate) async fn ready(&self) -> Result<(), ServiceError> {
         request(&self.sender, |response| StoreCommand::Ready { response })
@@ -150,6 +152,23 @@ impl ServiceHandle {
         request(&self.sender, |response| {
             StoreCommand::ApplyDeviceDocumentLifecycleMutation {
                 operation: Box::new(operation),
+                created_at_us,
+                response,
+            }
+        })
+        .await?
+    }
+
+    pub(crate) async fn apply_device_desired_state_mutation(
+        &self,
+        operation: PreparedDeviceDesiredStateMutation,
+        asset_bytes: Option<Vec<u8>>,
+        created_at_us: i64,
+    ) -> Result<DeviceMutationExecution, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ApplyDeviceDesiredStateMutation {
+                operation: Box::new(operation),
+                asset_bytes,
                 created_at_us,
                 response,
             }
@@ -1212,6 +1231,7 @@ enum PreparedContentOperation {
     Conflict(OfflineContentConflictReason),
 }
 
+#[allow(dead_code)]
 enum StoreCommand {
     Ready {
         response: oneshot::Sender<StoreResult<()>>,
@@ -1244,6 +1264,12 @@ enum StoreCommand {
     },
     ApplyDeviceDocumentLifecycleMutation {
         operation: Box<PreparedDeviceDocumentLifecycleMutation>,
+        created_at_us: i64,
+        response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
+    },
+    ApplyDeviceDesiredStateMutation {
+        operation: Box<PreparedDeviceDesiredStateMutation>,
+        asset_bytes: Option<Vec<u8>>,
         created_at_us: i64,
         response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
     },
@@ -1757,12 +1783,94 @@ fn apply_device_document_mutation_command(
     let needs_blob = store
         .device_document_mutation_needs_blob(operation)
         .map_err(ServiceError::Store)?;
-    let blob = needs_blob
-        .then(|| blobs.put(operation.prepared.org.as_bytes(), "text/org; charset=utf-8"))
-        .transpose()?;
-    store
-        .apply_device_document_mutation(operation, blob.as_ref(), created_at_us)
-        .map_err(ServiceError::Store)
+    let blob = if needs_blob {
+        let digest = &operation.prepared.blob_sha256;
+        let existed = blobs.contains(digest)?;
+        Some((
+            blobs.put(operation.prepared.org.as_bytes(), "text/org; charset=utf-8")?,
+            !existed,
+        ))
+    } else {
+        None
+    };
+    let result = store
+        .apply_device_document_mutation(
+            operation,
+            blob.as_ref().map(|(blob, _)| blob),
+            created_at_us,
+        )
+        .map_err(ServiceError::Store);
+    let discard_blob = match &result {
+        Ok(execution) => matches!(&execution.result, DeviceMutationResult::Rejected { .. }),
+        Err(_) => true,
+    };
+    if discard_blob
+        && let Some((blob, true)) = &blob
+        && !store
+            .has_blob_record(&blob.sha256)
+            .map_err(ServiceError::Store)?
+    {
+        blobs.discard(&blob.sha256)?;
+    }
+    result
+}
+
+fn apply_device_desired_state_mutation_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    operation: &PreparedDeviceDesiredStateMutation,
+    asset_bytes: Option<&[u8]>,
+    created_at_us: i64,
+) -> Result<DeviceMutationExecution, ServiceError> {
+    let mut new_blob_digest = None;
+    match (&operation.mutation, asset_bytes) {
+        (
+            DeviceDesiredStateMutation::PutAsset {
+                digest,
+                size_bytes,
+                media_type,
+                ..
+            },
+            Some(bytes),
+        ) => {
+            let actual_digest = format!("{:x}", Sha256::digest(bytes));
+            let actual_size = bytes.len() as u64;
+            if actual_digest != *digest || actual_size != *size_bytes {
+                return Err(ServiceError::Corrupt);
+            }
+            let existed = blobs.contains(digest)?;
+            let blob = blobs.put(bytes, media_type)?;
+            if blob.sha256 != actual_digest || blob.size_bytes != actual_size {
+                if !existed {
+                    blobs.discard(&blob.sha256)?;
+                }
+                return Err(ServiceError::Corrupt);
+            }
+            if !existed {
+                new_blob_digest = Some(blob.sha256);
+            }
+        }
+        (DeviceDesiredStateMutation::PutAsset { .. }, None) | (_, Some(_)) => {
+            return Err(ServiceError::Corrupt);
+        }
+        (_, None) => {}
+    }
+    let result = store
+        .apply_device_desired_state_mutation(operation, created_at_us)
+        .map_err(ServiceError::Store);
+    let discard_blob = match &result {
+        Ok(execution) => matches!(&execution.result, DeviceMutationResult::Rejected { .. }),
+        Err(_) => true,
+    };
+    if discard_blob
+        && let Some(digest) = new_blob_digest
+        && !store
+            .has_blob_record(&digest)
+            .map_err(ServiceError::Store)?
+    {
+        blobs.discard(&digest)?;
+    }
+    result
 }
 
 struct AssetWrite<'a> {
@@ -1857,6 +1965,21 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
             store
                 .apply_device_document_lifecycle_mutation(&operation, created_at_us)
                 .map_err(ServiceError::Store),
+        ),
+        StoreCommand::ApplyDeviceDesiredStateMutation {
+            operation,
+            asset_bytes,
+            created_at_us,
+            response,
+        } => send(
+            response,
+            apply_device_desired_state_mutation_command(
+                store,
+                blobs,
+                &operation,
+                asset_bytes.as_deref(),
+                created_at_us,
+            ),
         ),
         StoreCommand::DocumentHead {
             document_id,
@@ -2396,6 +2519,7 @@ fn send<T>(sender: oneshot::Sender<T>, value: T) {
     let _ = sender.send(value);
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum ServiceError {
     #[error("store queue is full")]
@@ -2471,9 +2595,10 @@ mod tests {
 
     use super::{ServiceError, ServiceHandle, ServiceRuntime, StoreCommand, store_actor};
     use crate::application::{
-        AssetReconciliationStatus, ImportDocument, OfflineAssetConflictReason,
-        OfflineAssetOperation, ReplicaProjection, SettingsInput, canonical_asset_path,
-        generate_device, prepare_asset, prepare_device_document_mutation, prepare_note,
+        AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
+        ImportDocument, OfflineAssetConflictReason, OfflineAssetOperation, ReplicaProjection,
+        SettingsInput, canonical_asset_path, generate_device, prepare_asset,
+        prepare_device_desired_state_mutation, prepare_device_document_mutation, prepare_note,
         prepare_thema, thema_content,
     };
     use crate::blob::BlobStore;
@@ -2522,6 +2647,73 @@ mod tests {
 
         assert!(matches!(result, Err(ServiceError::Busy)));
         assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_desired_asset_does_not_publish_a_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob_path = directory.path().join("blobs");
+        let runtime =
+            ServiceRuntime::start(directory.path().join("gnosis.sqlite"), blob_path.clone(), 8)
+                .await
+                .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("Device".into(), vec!["content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let first_bytes = b"accepted asset".to_vec();
+        let first_digest = format!("{:x}", sha2::Sha256::digest(&first_bytes));
+        let asset_path = canonical_asset_path(&first_digest, "image.png").unwrap();
+        let first = prepare_device_desired_state_mutation(
+            1,
+            "accepted-asset".into(),
+            device_id.clone(),
+            DeviceDesiredStateMutation::PutAsset {
+                prepared: prepare_asset(asset_path.clone(), "image.png".into(), None).unwrap(),
+                digest: first_digest.clone(),
+                size_bytes: first_bytes.len() as u64,
+                media_type: "image/png".into(),
+            },
+        )
+        .unwrap();
+        service
+            .apply_device_desired_state_mutation(first, Some(first_bytes), 2)
+            .await
+            .unwrap();
+
+        let bytes = b"rejected asset".to_vec();
+        let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+        let operation = prepare_device_desired_state_mutation(
+            1,
+            "rejected-asset".into(),
+            device_id,
+            DeviceDesiredStateMutation::PutAsset {
+                prepared: prepare_asset(asset_path, "image.png".into(), Some(99)).unwrap(),
+                digest: digest.clone(),
+                size_bytes: bytes.len() as u64,
+                media_type: "image/png".into(),
+            },
+        )
+        .unwrap();
+
+        let execution = service
+            .apply_device_desired_state_mutation(operation, Some(bytes), 3)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            execution.result,
+            DeviceMutationResult::Rejected { .. }
+        ));
+        assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+        assert!(
+            blob_path
+                .join(&first_digest[..2])
+                .join(first_digest)
+                .exists()
+        );
+        drop(service);
+        runtime.finish().await.unwrap();
     }
 
     #[test]
