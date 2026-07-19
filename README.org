@@ -1,56 +1,90 @@
-
 * Gnosis
 
-Gnosis is a personal knowledge management and spaced repetition system
-for Emacs.  It integrates two complementary subsystems in a single
-package: a Zettelkasten-style note system called *nodes*, and a
-flashcard-based self-testing system built around *themata*.  Both
-subsystems share a single SQLite database, and their contents are
-linked together so that flashcard questions can refer directly to the
-notes they are drawn from.
+Gnosis is the GNU Emacs client for =gnosisd=.  The current 0.13 development
+tree provides the authenticated HTTP, OpenAPI, asset-cache, and presentation
+foundation.  =gnosisd= remains the sole owner of data, scheduling, grading,
+history, authoring rules, and persistence.
 
-** Why Gnosis
++ [[https://elpa.gnu.org/packages/doc/gnosis.html][Manual]]
++ [[https://thanosapollo.org/projects/gnosis/][Homepage]]
 
-Most spaced repetition tools treat flashcards as isolated units.
-You create a card, review it, and the system schedules the next
-review.  The cards have no relationship to each other or to anything
-outside the review loop.
+** Current scope
 
-Most note-taking tools do the opposite: they help you build a web of
-interconnected ideas, but they offer no mechanism for systematically
-testing and reinforcing what you have written.
+Run =M-x gnosis= to inspect daemon health and the served OpenAPI version.  The
+dashboard, authoring, and review commands remain named for compatibility, but
+their domain operations are not yet available.  They fail before opening a
+buffer or changing local state until bindings are generated from the stable
+official API.
 
-Gnosis bridges these two approaches.  Your notes and your review
-material live in the same system, linked together.  When you write a
-node about a topic, you can create themata whose questions reference
-that node.  When you review, you can review all the questions linked to
-a given note, or follow the link graph to review related topics.  The
-goal is a single system where understanding and recall reinforce each
-other.
+The client does not contain handwritten Gnosis DTOs or temporary route
+bindings.  There is no SQLite access and no local fallback.
 
-** Nodes
+** Requirements
 
-Nodes are Zettelkasten-style notes stored as plain org-mode files.
-Each node is identified by a unique UUID stored as an =#+id:=
-property.  Nodes are indexed in the database so that they can be
-searched, browsed by tag, and linked together using standard org-mode
-=[[id:UUID]]= syntax.
++ GNU Emacs 29.1 or later.
++ A reachable =gnosisd= HTTP service.
++ Bearer credentials in =auth-source= for authenticated operations.
 
-** Themata
+The default service URL is =http://127.0.0.1:7842=.  Plain HTTP is accepted only
+for loopback hosts; remote services require HTTPS.
 
-A /thema/ (plural /themata/) is a review card.  Each thema consists of
-a /keimenon/ (the question or prompt), an /answer/, and an optional
-/parathema/ (supplementary context shown after the answer).  Themata
-are reviewed using a spaced repetition algorithm that adapts the
-interval between reviews based on performance.
+** Authentication
 
-Themata support five question types: basic, double, MCQ, cloze, and
-mc-cloze.
+Store the daemon token with =auth-source= rather than an Emacs customization:
 
-** The Link Between Nodes and Themata
+#+begin_src authinfo
+machine 127.0.0.1 login gnosis port 7842 password TOKEN
+machine gnosis.example.org login gnosis port 443 password TOKEN
+#+end_src
 
-When you write a node about a topic, you can create themata whose
-keimenon or parathema contains an =[[id:NODE-UUID]]= link to that
-node.  Gnosis records these relationships so that you can later review
-all themata associated with a particular node via
-~gnosis-review-topic~.
+Protect the authinfo file with mode 0600.  Customize the connection only when
+needed:
+
+#+begin_src emacs-lisp
+(setopt gnosis-core-base-url "https://gnosis.example.org"
+        gnosis-core-auth-user "gnosis")
+#+end_src
+
+Tokens are resolved per request and are never stored in package state, logs,
+or cache files.
+
+** Managed assets
+
+The project-mandated =assets/DIGEST/NAME= references are fetched through
+authenticated =/v1/assets= operations, verified against their SHA-256 path
+digest, and stored in a private local cache.
+
+** OpenAPI generation
+
+The daemon serves its contract at =/v1/openapi.json=.  Generate a deterministic
+temporary operation manifest with:
+
+#+begin_src sh
+make OPENAPI_FILE=/path/to/openapi.json \
+     OPENAPI_OUTPUT=build/gnosis-openapi-contract.el openapi
+#+end_src
+
+The manifest records operation identity, method, path, and authentication.  It
+is not a shipped seventh module and does not bind domain flows.  The integration
+harness starts an isolated daemon, fetches the live document, generates and
+byte-compiles the manifest, then checks health and authenticated transport.
+
+** Development
+
+#+begin_src sh
+make clean && make test
+make integration
+make lint
+make doc
+nix build
+nix flake check
+#+end_src
+
+Runtime source consists of exactly six modules:
+
++ =gnosis.el=
++ =gnosis-core.el=
++ =gnosis-core-assets.el=
++ =gnosis-edit.el=
++ =gnosis-review.el=
++ =gnosis-completion.el=

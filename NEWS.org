@@ -3,6 +3,84 @@
 + [[https://git.thanosapollo.org/gnosis/][Upstream]]
 + [[https://thanosapollo.org/log/gnosis/][Changelog]]
 
+* 0.13.0
+#+date: 2026/07/16
+
+** Authenticated HTTP client
+
++ Reduced the package to six focused client modules.  Removed embedded
+  persistence, scheduling, grading, import, note, and compatibility backends.
++ Added bounded HTTP transport, bearer credentials resolved through
+  =auth-source=, future-compatible bounded error envelopes, safe GET retries,
+  and strict loopback/HTTPS authority validation.
++ Added a deterministic OpenAPI 3.1 operation-manifest generator and isolated
+  live contract harness.  Generated manifests remain build artifacts and do
+  not add a seventh runtime module.
++ Removed handwritten success DTOs and provisional dashboard, authoring, and
+  review route bindings while the official API is changing.  Public domain
+  commands fail before transport or local mutation until generated bindings
+  are available.
++ Added a foundation dashboard for daemon health and OpenAPI visibility.
++ Fetch managed review assets through authenticated HTTP and publish only
+  private SHA-256-verified cache entries.
+
+* 0.12.0
+#+date: 2026/07/14
+
+** Core review dogfood
+
++ Reviews can opt into a server-authoritative ~gnosisd~ backend over
+  ~$XDG_RUNTIME_DIR/gnosis/gnosis.sock~.  The established basic, cloze, MCQ,
+  and MC-cloze UI now submits structured responses while the daemon owns
+  grading, scheduling, override, suspension, session recovery, and commits.
++ Managed review assets are fetched in bounded chunks and published only after
+  digest verification into a private Emacs cache.
++ Core opt-in now requires the daemon's operational readiness response.
+  Unix-socket status remains a separate protocol liveness check.
++ The legacy review backend remains the default.  Core errors never fall back
+  to embedded SQLite, and review-loop edit and delete are disabled in core mode
+  until typed operations exist.
++ This is review dogfood, not a full frontend cutover.  Compatibility history,
+  dashboard, authoring, edit, archive, capture, import, note indexing, and link
+  maintenance do not mirror core review events and may remain stale.
+
+** Review history
+
++ Every accepted review now records one immutable event with its exact time,
+  session context, outcome, resolved parameters, and complete scheduling
+  transition.  Current state and daily activity update atomically with it.
++ The history browser drills down by day, thema, session, and linked node.
+  Node status and the dashboard expose due, new, failure, and derived Gnosis
+  scores.
++ Every history column is sortable.  Node learning metrics include unique
+  themata from all forward descendants, and node tables default to the highest
+  total Gnosis.
++ Archived themata retain their learning history.  Exact history has a separate
+  backed-up, strongly confirmed purge command.
+
+** Notes and review
+
++ ~gnosis-capture-thema~ creates a linked thema from the active region, current
+  heading, or note title and opens the existing editor for completion.
++ Ordinary note discovery can recurse below ~gnosis-nodes-dir~ while keeping the
+  journal directory and configured metadata directories special.
++ Failed basic reviews can continue into typing remediation after the accepted
+  result has been recorded.
++ History, node, and thema tables now reflow automatically when their window
+  width changes.
+
+** Data safety
+
++ Schema v9 introduces constrained review sessions, immutable review events,
+  explicit current review state, archived themata, and an honest exact-history
+  cutover.  Existing v6 and later databases upgrade through one atomic path.
++ ~gnosis-archive-create~ and ~gnosis-archive-restore~ provide verified private
+  full-database archives independently of Git.
++ Automatic Git commits run only in an existing repository.  Git failures do
+  not invalidate completed database work, and private archives are never staged.
++ Thema links to nodes or journal entries that are not currently indexed are
+  preserved as unresolved edges and resolve automatically when targets return.
+
 * 0.10.6
 #+date: 2026/05/08
 

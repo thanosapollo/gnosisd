@@ -1,95 +1,135 @@
 .POSIX:
-.PHONY: all doc test load clean
+.PHONY: all doc do-doc compile do-compile test do-test test-oneshot \
+	openapi do-openapi integration do-integration lint do-lint load clean
 
-EMACS = emacs
-GUIX_SHELL ?= guix shell -D -f guix.scm --pure --
+NIX := $(shell command -v nix 2>/dev/null)
+ENV_MAKE = $(MAKE) --no-print-directory
+ifeq ($(GNOSIS_ENV_WRAPPED),)
+ifneq ($(NIX),)
+ENV_MAKE = nix develop --no-write-lock-file path:. --command env GNOSIS_ENV_WRAPPED=1 $(MAKE) --no-print-directory
+endif
+endif
+
+EMACS ?= emacs
 ORG := docs/gnosis.org
 TEXI := docs/gnosis.texi
 INFO := docs/gnosis.info
 LISP_DIR := lisp
-TEST_FILES := tests/gnosis-test-sqlite.el \
-	tests/gnosis-test-algorithm.el \
-	tests/gnosis-test-export-import.el \
+TEST_DIR := tests
+TOOL_DIR := tools
+EL_FILES := gnosis-completion.el gnosis-core.el gnosis-core-assets.el gnosis-edit.el gnosis.el gnosis-review.el
+LISP_FILES := $(addprefix $(LISP_DIR)/,$(EL_FILES))
+TOOL_FILES := $(TOOL_DIR)/gnosis-openapi-generator.el
+TEST_FILES := tests/gnosis-test-core.el \
+	tests/gnosis-test-core-assets.el \
+	tests/gnosis-test-openapi.el \
+	tests/gnosis-test-edit.el \
 	tests/gnosis-test-dashboard.el \
-	tests/gnosis-test-cloze.el \
-	tests/gnosis-test-bulk-link.el \
-	tests/gnosis-test-script-detection.el \
-	tests/gnosis-test-insert-template.el \
-	tests/gnosis-test-org.el \
-	tests/gnosis-test-nodes.el \
 	tests/gnosis-test-review.el \
-	tests/gnosis-test-journal.el \
-	tests/gnosis-test-migration.el \
-	tests/gnosis-test-anki.el \
+	tests/gnosis-test-boundary.el \
+	tests/gnosis-package-smoke.el \
+	tests/gnosis-test-core-integration.el
+TEST_FEATURES := $(basename $(notdir $(TEST_FILES)))
+TEST ?=
+SELECTED_TEST_FILES = $(if $(TEST),$(TEST),$(TEST_FILES))
+SELECTED_TEST_FEATURES = $(basename $(notdir $(SELECTED_TEST_FILES)))
 
 all: doc
 
-doc:	$(ORG)
-	$(GUIX_SHELL) $(EMACS) --batch \
-	-Q \
-	--load org \
-	--eval "(with-current-buffer (find-file \"$(ORG)\") (org-texinfo-export-to-info))" \
-	--kill
+doc:
+	@$(ENV_MAKE) do-doc
 
+do-doc: $(ORG)
+	$(EMACS) --batch -Q \
+		--eval "(require 'org)" \
+		--eval "(with-current-buffer (find-file \"$(ORG)\") (org-texinfo-export-to-info))" \
+		--kill
+
+compile:
+	@$(ENV_MAKE) do-compile
+
+do-compile:
+	rm -f $(LISP_DIR)/*.elc
+	$(EMACS) --batch -q \
+		--eval "(setq byte-compile-error-on-warn t byte-compile-warnings t)" \
+		-L $(LISP_DIR) -f batch-byte-compile $(LISP_FILES)
 
 test:
-	rm -f $(LISP_DIR)/*.elc
-	@for f in $(TEST_FILES); do \
-		echo "Running $$f..."; \
-		$(GUIX_SHELL) $(EMACS) --batch \
-		-q \
-		--eval "(add-to-list 'load-path \"$(shell pwd)/$(LISP_DIR)\")" \
-		--load $$f; \
-	done
+	@$(ENV_MAKE) do-test
 
-EL_FILES := gnosis-sqlite.el gnosis-tl.el gnosis-utils.el gnosis-org.el \
-	gnosis-algorithm.el gnosis-cloze.el gnosis-db.el gnosis-vc.el \
-	gnosis-tags.el gnosis-custom-values.el gnosis-links.el \
-	gnosis.el gnosis-nodes.el gnosis-journal.el \
-	gnosis-review.el gnosis-dashboard.el gnosis-export-import.el \
-	gnosis-anki.el gnosis-monkeytype.el
+do-test:
+	@build=$$(mktemp -d "$${TMPDIR:-/tmp}/gnosis-tests.XXXXXX"); \
+	trap 'rm -rf "$$build"' EXIT HUP INT TERM; \
+	cp $(LISP_FILES) $(TOOL_FILES) $(SELECTED_TEST_FILES) "$$build"/; \
+	$(EMACS) --batch -q \
+		--eval "(setq byte-compile-error-on-warn t byte-compile-warnings t)" \
+		-L "$$build" -f batch-byte-compile "$$build"/*.el; \
+	$(EMACS) --batch -q -L "$$build" \
+		--eval "(mapc #'require '($(SELECTED_TEST_FEATURES)))" \
+		-f ert-run-tests-batch-and-exit
+
+test-oneshot: test
+
+openapi:
+	@$(ENV_MAKE) do-openapi
+
+do-openapi:
+	@GNOSIS_OPENAPI_INPUT="$(OPENAPI_FILE)" \
+	GNOSIS_OPENAPI_OUTPUT="$(OPENAPI_OUTPUT)" \
+	$(EMACS) --batch -Q -L $(TOOL_DIR) \
+		-l gnosis-openapi-generator \
+		-f gnosis-openapi-generate-from-environment
+
+integration:
+	@$(ENV_MAKE) do-integration
+
+do-integration:
+	@tools/run-temp-integration.sh
+
+lint:
+	@$(ENV_MAKE) do-lint
+
+do-lint:
+	@lisp_version=$$(sed -n 's/^;; Version: //p' lisp/gnosis.el); \
+	news_version=$$(sed -n 's/^\* //p' NEWS.org | head -n 1); \
+	if test -z "$$lisp_version" || test "$$lisp_version" != "$$news_version"; then \
+		echo "Version mismatch: gnosis.el=$$lisp_version NEWS.org=$$news_version"; \
+		exit 1; \
+	fi
+	@set -e; for file in $(LISP_FILES); do \
+		echo "checkdoc $$file"; \
+		$(EMACS) --batch -q -L $(LISP_DIR) \
+			--eval "(require 'checkdoc)" \
+			--eval "(progn (checkdoc-file \"$$file\") (let ((buffer (get-buffer \"*Warnings*\"))) (when (and buffer (> (buffer-size buffer) 0)) (kill-emacs 1))))"; \
+	done
+	$(EMACS) --batch -q \
+		--eval "(require 'check-declare)" \
+		--eval "(let ((errors (apply #'check-declare-files command-line-args-left))) (kill-emacs (if errors 1 0)))" \
+		$(LISP_FILES)
+	$(EMACS) --batch -q -L $(LISP_DIR) \
+		--eval "(package-initialize)" \
+		--eval "(require 'package-lint)" \
+		--eval "(setq package-lint-main-file \"lisp/gnosis.el\")" \
+		-f package-lint-batch-and-exit $(LISP_FILES)
 
 load:
 	rm -f $(LISP_DIR)/*.elc
-	@emacsclient -e "(progn \
-	  (dolist (sym '(gnosis-dashboard-common-map \
-	               gnosis-dashboard-themata-mode-map \
-	               gnosis-dashboard-tags-mode-map \
-	               gnosis-dashboard-mode-map \
-	               gnosis-dashboard-nodes-mode-map \
-	               gnosis-dashboard-nodes-sort-map \
-	               gnosis-dashboard-nodes-search-map \
-	               gnosis-dashboard-nodes-filter-map \
-	               gnosis-dashboard-nodes-map \
-	               gnosis-dashboard-themata-map \
-	               gnosis-import-diff-mode-map \
-	               gnosis-review-map)) \
-	    (when (boundp sym) (makunbound sym))) \
-	  (dolist (sym '(gnosis-dashboard-menu \
-	               gnosis-dashboard-themata-mode-menu \
-	               gnosis-dashboard-tags-mode-menu \
-	               gnosis-dashboard-nodes-mode-menu \
-	               gnosis-dashboard-menu-nodes \
-	               gnosis-dashboard-menu-themata \
-	               gnosis-dashboard-nodes-sort-menu \
-	               gnosis-dashboard-nodes-search-menu \
-	               gnosis-dashboard-nodes-filter-menu \
-	               gnosis-import-diff-menu)) \
-	    (when (fboundp sym) (fmakunbound sym))))" > /dev/null
-	@for f in $(EL_FILES); do \
-		emacsclient -e "(load-file \"$(shell pwd)/$(LISP_DIR)/$$f\")" > /dev/null; \
+	@emacsclient --eval "(dolist (symbol \
+	    '(gnosis-dashboard-mode-map gnosis-edit-mode-map \
+	      gnosis-review-mode-map)) \
+	  (when (boundp symbol) (makunbound symbol)))" > /dev/null
+	@set -e; for file in $(EL_FILES); do \
+		emacsclient -e "(load-file \"$(shell pwd)/$(LISP_DIR)/$$file\")" > /dev/null; \
 	done
-	@emacsclient -e "(dolist (buf (buffer-list)) \
-	  (with-current-buffer buf \
-	    (cond ((derived-mode-p 'gnosis-dashboard-themata-mode) \
-	           (use-local-map gnosis-dashboard-themata-mode-map)) \
-	          ((derived-mode-p 'gnosis-dashboard-tags-mode) \
-	           (use-local-map gnosis-dashboard-tags-mode-map)) \
-	          ((derived-mode-p 'gnosis-dashboard-nodes-mode) \
-	           (use-local-map gnosis-dashboard-nodes-mode-map)) \
-	          ((derived-mode-p 'gnosis-dashboard-mode) \
-	           (use-local-map gnosis-dashboard-mode-map)))))" > /dev/null
+	@emacsclient --eval "(dolist (buffer (buffer-list)) \
+	  (with-current-buffer buffer \
+	    (pcase major-mode \
+	      ('gnosis-dashboard-mode (use-local-map gnosis-dashboard-mode-map)) \
+	      ('gnosis-edit-mode (use-local-map gnosis-edit-mode-map)) \
+	      ('gnosis-review-mode (use-local-map gnosis-review-mode-map)) \
+	      )))" > /dev/null
 	@echo "Loaded $(words $(EL_FILES)) files."
 
 clean:
-	rm -f $(TEXI) $(INFO) $(LISP_DIR)/*.elc *-pkg.el*
+	rm -rf .test-results .test-results.* build result
+	rm -f $(TEXI) $(INFO) *-pkg.el* $(LISP_DIR)/*.elc $(TEST_DIR)/*.elc

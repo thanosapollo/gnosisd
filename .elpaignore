@@ -1,9 +1,7 @@
-CONTRIBUTING.org
 LICENSE
 Makefile
-manifest.scm
-guix.scm
+flake.nix
+flake.lock
 
 tests
-
-decks
+tools
