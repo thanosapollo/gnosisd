@@ -5323,6 +5323,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_thema_create_conflict_is_retained_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blobs = directory.path().join("blobs");
+        let operation_id = "thema-create-conflict";
+        let device = generate_device(
+            "thema-create".into(),
+            vec!["content:write".into(), "read".into()],
+        )
+        .unwrap();
+        let token = device.token.clone();
+        let thema_id = durable_created_thema_id(&device.device_id, operation_id);
+        let input = ThemaWriteRequestV1 {
+            kind: "basic".into(),
+            keimenon: "Question".into(),
+            hypothesis: vec![],
+            answer: vec!["Answer".into()],
+            source_guid: None,
+            parathema: None,
+            review_image: None,
+            tags: vec![],
+            concepts: vec![],
+            asset_paths: vec![],
+        };
+        let runtime = ServiceRuntime::start(database.clone(), blobs.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        service.create_device(device, 1).await.unwrap();
+        service
+            .put_thema(
+                prepare_thema(
+                    Some(thema_id.clone()),
+                    thema_content(
+                        "basic",
+                        "Question".into(),
+                        vec![],
+                        vec!["Answer".into()],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+                20260719,
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        let app = router(service.clone());
+        let request = || {
+            authorized_mutation(
+                "POST",
+                "/v1/themata",
+                &token,
+                operation_id,
+                None,
+                Body::from(serde_json::to_vec(&input).unwrap()),
+            )
+        };
+
+        let first = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        assert_eq!(first["status"], "rejected");
+        assert_eq!(first["rejection"]["reason"], "revision_conflict");
+        assert!(first["rejection"]["expected_revision"].is_null());
+        assert_eq!(first["rejection"]["current_revision"], 1);
+        let fetched = authenticated_json(&app, &token, &format!("/v1/themata/{thema_id}")).await;
+        assert_eq!(fetched["revision"], 1);
+        assert_eq!(fetched["keimenon"], "Question");
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let runtime = ServiceRuntime::start(database, blobs, 8).await.unwrap();
+        let service = runtime.handle();
+        let app = router(service.clone());
+        let replay = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(response_json(replay).await, first);
+        let fetched = authenticated_json(&app, &token, &format!("/v1/themata/{thema_id}")).await;
+        assert_eq!(fetched["revision"], 1);
+        assert_eq!(fetched["keimenon"], "Question");
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn invalid_thema_archive_id_is_rejected_before_receipt_persistence() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(

@@ -220,6 +220,7 @@ fn apply_desired_state_mutation(
                 *initial_review_day,
                 created_at_us,
                 author,
+                true,
             )?;
             Ok((
                 changed,
@@ -888,6 +889,88 @@ mod tests {
             ));
         }
         assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+    }
+
+    #[test]
+    fn durable_thema_create_requires_absence_and_replays_conflict() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gnosis.sqlite");
+        let mut store = SqliteStore::open(&path).unwrap();
+        let device = add_device(&mut store, "thema-create-conflict");
+        let prepared = |question: &str| {
+            prepare_thema(
+                Some("thema".into()),
+                thema_content(
+                    "basic",
+                    question.into(),
+                    vec![],
+                    vec!["Answer".into()],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+                vec![],
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap()
+        };
+        store
+            .put_thema(&prepared("Question"), 20260719, 1, None)
+            .unwrap();
+        let operation = |operation_id: &str, question: &str| {
+            prepare_device_desired_state_mutation(
+                1,
+                operation_id.into(),
+                device.clone(),
+                DeviceDesiredStateMutation::PutThema {
+                    prepared: prepared(question),
+                    initial_review_day: 20260719,
+                },
+            )
+            .unwrap()
+        };
+        let same = operation("same", "Question");
+        let changed = operation("changed", "Changed");
+        let before = store.get_thema("thema").unwrap().unwrap();
+        let content_changes = row_count(&store, "content_change");
+        let history = row_count(&store, "thema_revision");
+
+        let same_result = store.apply_device_desired_state_mutation(&same, 2).unwrap();
+        let changed_result = store
+            .apply_device_desired_state_mutation(&changed, 3)
+            .unwrap();
+        for result in [&same_result, &changed_result] {
+            assert!(!result.replayed);
+            assert!(matches!(
+                result.result,
+                DeviceMutationResult::Rejected {
+                    rejection: DeviceMutationRejection::RevisionConflict {
+                        expected: None,
+                        actual: Some(1),
+                    },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(store.get_thema("thema").unwrap().unwrap(), before);
+        assert_eq!(row_count(&store, "content_change"), content_changes);
+        assert_eq!(row_count(&store, "thema_revision"), history);
+        drop(store);
+
+        let mut store = SqliteStore::open(path).unwrap();
+        for (operation, retained) in [(&same, &same_result), (&changed, &changed_result)] {
+            let replay = store
+                .apply_device_desired_state_mutation(operation, 4)
+                .unwrap();
+            assert!(replay.replayed);
+            assert_eq!(replay.result, retained.result);
+        }
+        assert_eq!(store.get_thema("thema").unwrap().unwrap(), before);
+        assert_eq!(row_count(&store, "content_change"), content_changes);
+        assert_eq!(row_count(&store, "thema_revision"), history);
     }
 
     #[test]
