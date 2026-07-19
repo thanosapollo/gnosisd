@@ -1,4 +1,4 @@
-;;; gnosis.el --- Emacs client foundation for Gnosis  -*- lexical-binding: t; -*-
+;;; gnosis.el --- Emacs client for Gnosis  -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2022-2026  Free Software Foundation, Inc.
 ;; Author: Thanos Apollo <public@thanosapollo.org>
@@ -14,9 +14,8 @@
 
 ;;; Commentary:
 
-;; Gnosis provides the authenticated HTTP, OpenAPI, and presentation
-;; foundation for the gnosisd service.  Domain commands remain unavailable
-;; until generated bindings target the stable public contract.
+;; Gnosis presents server-owned dashboard, authoring, and review projections
+;; from the authenticated gnosisd HTTP API.
 
 ;;; Code:
 
@@ -61,7 +60,7 @@
 
 (defface gnosis-face-dashboard-header
   '((t :inherit (bold font-lock-constant-face)))
-  "Face for the Gnosis foundation dashboard header."
+  "Face for the Gnosis dashboard header."
   :group 'gnosis)
 
 (defcustom gnosis-center-content-during-review t
@@ -75,7 +74,7 @@
   :group 'gnosis)
 
 (defvar gnosis-dashboard-buffer-name "*Gnosis Dashboard*"
-  "Foundation dashboard buffer name.")
+  "Gnosis dashboard buffer name.")
 
 (defvar-local gnosis-center-content t
   "Non-nil means center content in the current Gnosis buffer.")
@@ -128,48 +127,74 @@
         (mapconcat #'gnosis-center-string (split-string formatted "\n") "\n")
       formatted)))
 
-(defun gnosis--foundation-state ()
-  "Return validated daemon health and OpenAPI values."
-  (list :health (gnosis-core-status) :openapi (gnosis-core-openapi)))
+(defun gnosis--dashboard-session-text (session)
+  "Return dashboard text for server-projected SESSION metadata."
+  (if (eq session gnosis-core--json-null)
+      "Active session: none"
+    (format "Active session: %s, %s, position %d, queue length %d"
+            (plist-get session :status)
+            (plist-get session :mode)
+            (plist-get session :current_position)
+            (plist-get session :queue_length))))
 
-(defun gnosis--openapi-path-count (document)
-  "Return number of paths in OpenAPI DOCUMENT."
-  (/ (length (plist-get document :paths)) 2))
+(defun gnosis--dashboard-text (state)
+  "Return display text for server dashboard projection STATE."
+  (let ((today (plist-get state :today))
+        (window (plist-get state :window))
+        (queue (plist-get state :queue))
+        (content (plist-get state :content)))
+    (string-join
+     (list
+      "Gnosis" ""
+      (format "Review day: %d" (plist-get state :review_day))
+      (format "Today: %d reviews, %d successful, %d failed"
+              (plist-get today :review_count)
+              (plist-get today :success_count)
+              (plist-get today :failure_count))
+      (format "Queue: %d new, %d due, %d overdue, %d suspended"
+              (plist-get queue :new_count) (plist-get queue :due_count)
+              (plist-get queue :overdue_count) (plist-get queue :suspended_count))
+      (format "Content: %d themata, %d archived, %d documents, %d nodes"
+              (plist-get content :active_themata)
+              (plist-get content :archived_themata)
+              (plist-get content :active_documents)
+              (plist-get content :active_nodes))
+      (format "%d days: %d reviews, success rate %.2f"
+              (plist-get window :days)
+              (plist-get (plist-get window :totals) :review_count)
+              (plist-get window :success_rate))
+      (gnosis--dashboard-session-text (plist-get state :active_session)))
+     "\n")))
 
-(defun gnosis--render-foundation (state)
-  "Render foundation STATE in the current dashboard buffer."
-  (let* ((health (plist-get state :health))
-         (openapi (plist-get state :openapi))
-         (inhibit-read-only t))
+(defun gnosis--render-dashboard (state)
+  "Render server dashboard projection STATE in the current buffer."
+  (let ((inhibit-read-only t))
     (erase-buffer)
-    (insert (propertize "Gnosis" 'face 'gnosis-face-dashboard-header)
-            "\n\nDaemon: " (plist-get health :status)
-            "\nOpenAPI: " (plist-get openapi :openapi)
-            "\nPaths: "
-            (number-to-string (gnosis--openapi-path-count openapi))
-            "\n\nDomain commands are not yet available.\n"
-            "Bindings will be generated after the public API stabilizes.\n")
+    (insert (gnosis-format-string (gnosis--dashboard-text state)))
+    (goto-char (point-min))
+    (add-face-text-property
+     (point-min) (line-end-position) 'gnosis-face-dashboard-header)
     (goto-char (point-min))))
 
 (defun gnosis-dashboard-refresh ()
-  "Refresh the current Gnosis foundation dashboard."
+  "Refresh the current Gnosis dashboard from the server projection."
   (interactive)
   (unless (derived-mode-p 'gnosis-dashboard-mode)
     (user-error "Not in a Gnosis dashboard"))
-  (gnosis--render-foundation (gnosis--foundation-state)))
+  (gnosis--render-dashboard (gnosis-core-dashboard)))
 
 (defun gnosis-dashboard ()
-  "Open the Gnosis foundation dashboard."
+  "Open the server-projected Gnosis dashboard."
   (interactive)
-  (let ((state (gnosis--foundation-state))
+  (let ((state (gnosis-core-dashboard))
         (buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (gnosis-dashboard-mode)
-    (gnosis--render-foundation state)))
+    (gnosis--render-dashboard state)))
 
 ;;;###autoload
 (defun gnosis ()
-  "Open the Gnosis foundation dashboard."
+  "Open the Gnosis dashboard."
   (interactive)
   (gnosis-dashboard))
 

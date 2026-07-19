@@ -70,7 +70,7 @@ done
 
 device=$(
     "$gnosis_cli" --socket "$state/gnosis.sock" \
-        device-create emacs-contract --scope read
+        device-create emacs-contract --scope read --scope review
 )
 token=$(printf '%s\n' "$device" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 [ -n "$token" ] || { echo "Temporary device token missing" >&2; exit 1; }

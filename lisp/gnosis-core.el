@@ -919,6 +919,28 @@ the remaining declared request inputs."
         (gnosis-core--invalid "Invalid Gnosis operation response"))
       value)))
 
+(defun gnosis-core-dashboard (&optional days)
+  "Return the server dashboard projection for optional window DAYS."
+  (if days
+      (gnosis-core--typed-request
+       "get_dashboard" nil (list (cons "days" days)))
+    (gnosis-core--typed-request "get_dashboard")))
+
+(defun gnosis-core-nodes (&optional query after limit)
+  "Return a server node page filtered by optional QUERY, AFTER, and LIMIT."
+  (let ((parameters
+         (delq nil (list (and after (cons "after" after))
+                         (and limit (cons "limit" limit))
+                         (and query (cons "q" query))))))
+    (if parameters
+        (gnosis-core--typed-request "get_nodes" nil parameters)
+      (gnosis-core--typed-request "get_nodes"))))
+
+(defun gnosis-core-thema (thema-id)
+  "Return the server projection for opaque THEMA-ID."
+  (gnosis-core--typed-request
+   "get_themata__id_" (list (cons "id" thema-id))))
+
 (defun gnosis-core-api-unavailable (operation)
   "Signal that generated bindings for OPERATION are not available."
   (signal 'gnosis-core-api-unavailable

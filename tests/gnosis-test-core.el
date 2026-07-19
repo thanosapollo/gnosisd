@@ -299,6 +299,34 @@ CONTENT-TYPE defaults to application/json."
         (gnosis-core--contract)
         (should (= calls 2))))))
 
+(ert-deftest gnosis-core-read-bindings-use-operation-identities ()
+  (let (calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 '(:projection t))))
+      (should (equal '(:projection t) (gnosis-core-dashboard 90)))
+      (should (equal '(:projection t)
+                     (gnosis-core-nodes "logic" "opaque/cursor" 25)))
+      (should (equal '(:projection t)
+                     (gnosis-core-thema "opaque/thema?id"))))
+    (should
+     (equal
+      '(("get_dashboard" nil (("days" . 90)))
+        ("get_nodes" nil
+         (("after" . "opaque/cursor") ("limit" . 25) ("q" . "logic")))
+        ("get_themata__id_" (("id" . "opaque/thema?id"))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-read-bindings-omit-absent-query-values ()
+  (let (calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments) (push arguments calls) nil)))
+      (gnosis-core-dashboard)
+      (gnosis-core-nodes nil nil nil))
+    (should (equal '(("get_dashboard") ("get_nodes"))
+                   (nreverse calls)))))
+
 (ert-deftest gnosis-core-openapi-request-is-public-and-retryable ()
   (let (calls)
     (cl-letf (((symbol-function 'gnosis-core--request)

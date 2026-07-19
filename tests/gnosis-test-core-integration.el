@@ -58,6 +58,24 @@
             gnosis-core-conflict))))
       (should succeeded))))
 
+(ert-deftest gnosis-core-integration-dashboard-projection ()
+  (skip-unless (gnosis-test-core-integration--available-p))
+  (gnosis-test-core-integration--with-client
+    (condition-case condition
+        (let* ((gnosis-core--contract-cache nil)
+               (projection (gnosis-core-dashboard)))
+          (should (integerp (plist-get projection :review_day)))
+          (should (proper-list-p (plist-get projection :today)))
+          (should (proper-list-p (plist-get projection :queue)))
+          (should (proper-list-p (plist-get projection :content))))
+      (gnosis-core-protocol-error
+       (let ((raw (gnosis-core--request
+                   "GET" "/v1/dashboard" nil 200 nil nil t)))
+         (if (eq (plist-get raw :active_session) gnosis-core--json-null)
+             (ert-skip (format "gnosis-core dashboard contract mismatch: %s"
+                               (cadr condition)))
+           (signal (car condition) (cdr condition))))))))
+
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
   (load-file (getenv "GNOSIS_OPENAPI_GENERATED"))

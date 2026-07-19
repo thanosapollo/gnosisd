@@ -24,12 +24,16 @@
 
 (ert-deftest gnosis-boundary-exposes-no-domain-or-database-api ()
   (dolist (symbol '(gnosis-core-request gnosis-core-sql
-                    gnosis-core-dashboard gnosis-core-nodes
                     gnosis-core-themata gnosis-core-thema-create
                     gnosis-core-review-session-create
                     gnosis-core-review-attempt-answer
                     gnosis-db-select gnosis-db-update))
     (should-not (fboundp symbol))))
+
+(ert-deftest gnosis-boundary-exposes-typed-read-operations ()
+  (dolist (symbol '(gnosis-core-dashboard gnosis-core-nodes gnosis-core-thema))
+    (should (fboundp symbol)))
+  (should-not (fboundp 'gnosis-core-request)))
 
 (ert-deftest gnosis-boundary-retains-public-command-names ()
   (dolist (command '(gnosis gnosis-add-thema gnosis-edit-thema
