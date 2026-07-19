@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::{
     domain::{
-        DocumentId, DocumentProjection, NodeId, ThemaContent, ThemaContentError, ThemaId, ThemaKind,
+        DocumentId, DocumentProjection, NodeId, ThemaConcept, ThemaConceptRelation, ThemaContent,
+        ThemaContentError, ThemaId, ThemaKind,
     },
     is_canonical_sha256,
     parser::org::{OrgParseError, parse_org},
@@ -48,7 +49,7 @@ pub(crate) struct PreparedThema {
     pub(crate) thema_id: ThemaId,
     pub(crate) content: ThemaContent,
     pub(crate) tags: Vec<String>,
-    pub(crate) node_ids: Vec<NodeId>,
+    pub(crate) concepts: Vec<ThemaConcept>,
     pub(crate) asset_paths: Vec<String>,
     pub(crate) content_sha256: String,
     pub(crate) expected_revision: Option<u64>,
@@ -202,7 +203,7 @@ pub(crate) struct ThemaRecord {
     pub(crate) content: ThemaContent,
     pub(crate) content_sha256: String,
     pub(crate) tags: Vec<String>,
-    pub(crate) node_ids: Vec<String>,
+    pub(crate) concepts: Vec<ThemaConcept>,
     pub(crate) asset_paths: Vec<String>,
     pub(crate) archived: bool,
 }
@@ -232,23 +233,23 @@ pub(crate) fn prepare_thema(
     thema_id: Option<String>,
     content: ThemaContent,
     tags: Vec<String>,
-    node_ids: Vec<String>,
+    concepts: Vec<(String, ThemaConceptRelation)>,
     asset_paths: Vec<String>,
     expected_revision: Option<u64>,
 ) -> Result<PreparedThema, ContentError> {
     let content = content.validate()?;
     let tags = validated_tags(tags)?;
-    let node_ids = validated_nodes(node_ids)?;
-    let asset_paths = validated_assets(asset_paths)?;
-    validate_thema_references(&content, &asset_paths)?;
     let thema_id = ThemaId::new(thema_id.unwrap_or_else(|| Uuid::now_v7().to_string()))
         .map_err(|_| ContentError::ThemaId)?;
-    let content_sha256 = thema_digest(&content, &tags, &node_ids, &asset_paths)?;
+    let concepts = validated_concepts(&thema_id, concepts)?;
+    let asset_paths = validated_assets(asset_paths)?;
+    validate_thema_references(&content, &asset_paths)?;
+    let content_sha256 = thema_digest(&content, &tags, &concepts, &asset_paths)?;
     Ok(PreparedThema {
         thema_id,
         content,
         tags,
-        node_ids,
+        concepts,
         asset_paths,
         content_sha256,
         expected_revision,
@@ -310,12 +311,29 @@ fn validated_tags(values: Vec<String>) -> Result<Vec<String>, ContentError> {
         .collect())
 }
 
-fn validated_nodes(values: Vec<String>) -> Result<Vec<NodeId>, ContentError> {
-    values
+fn validated_concepts(
+    thema_id: &ThemaId,
+    values: Vec<(String, ThemaConceptRelation)>,
+) -> Result<Vec<ThemaConcept>, ContentError> {
+    let mut concepts = std::collections::BTreeMap::new();
+    for (node_id, relation) in values {
+        let node_id = NodeId::new(node_id).map_err(|_| ContentError::NodeId)?;
+        if concepts
+            .insert(node_id.as_str().to_owned(), relation)
+            .is_some_and(|current| current != relation)
+        {
+            return Err(ContentError::ConceptRelation);
+        }
+    }
+    concepts
         .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|value| NodeId::new(value).map_err(|_| ContentError::NodeId))
+        .map(|(node_id, relation)| {
+            Ok(ThemaConcept::new(
+                thema_id.clone(),
+                NodeId::new(node_id).map_err(|_| ContentError::NodeId)?,
+                relation,
+            ))
+        })
         .collect()
 }
 
@@ -402,7 +420,7 @@ fn validate_thema_asset_reference(
 fn thema_digest(
     content: &ThemaContent,
     tags: &[String],
-    nodes: &[NodeId],
+    concepts: &[ThemaConcept],
     assets: &[String],
 ) -> Result<String, ContentError> {
     let canonical = serde_json::to_vec(&serde_json::json!({
@@ -411,7 +429,10 @@ fn thema_digest(
         "hypothesis": content.hypothesis,
         "keimenon": content.keimenon,
         "kind": content.kind.as_str(),
-        "nodes": nodes.iter().map(NodeId::as_str).collect::<Vec<_>>(),
+        "concepts": concepts.iter().map(|concept| serde_json::json!({
+            "node_id": concept.concept_id().as_str(),
+            "relation": concept.relation().as_str(),
+        })).collect::<Vec<_>>(),
         "parathema": content.parathema,
         "review_image": content.review_image,
         "source_guid": content.source_guid,
@@ -596,6 +617,8 @@ pub(crate) enum ContentError {
     ThemaId,
     #[error("invalid node ID")]
     NodeId,
+    #[error("a node cannot have multiple thema concept relations")]
+    ConceptRelation,
     #[error("invalid tag")]
     Tag,
     #[error("logical path is invalid")]
@@ -616,6 +639,8 @@ pub(crate) enum ContentError {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain::ThemaConceptRelation;
+
     use super::{
         ContentError, canonical_asset_path, prepare_note, prepare_thema, thema_content,
         validate_asset_path,
@@ -683,6 +708,72 @@ mod tests {
         assert_eq!(
             prepare_thema(None, content, vec![], vec![], vec![], None).unwrap_err(),
             ContentError::UnmanagedAsset
+        );
+    }
+
+    #[test]
+    fn thema_concepts_preserve_relations_and_reject_conflicts() {
+        let content = thema_content(
+            "basic",
+            "Question".into(),
+            vec![],
+            vec!["Answer".into()],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let prepared = prepare_thema(
+            Some("thema".into()),
+            content.clone(),
+            vec![],
+            vec![
+                ("supporting".into(), ThemaConceptRelation::Supporting),
+                ("primary".into(), ThemaConceptRelation::Primary),
+                ("reference".into(), ThemaConceptRelation::Reference),
+                ("primary".into(), ThemaConceptRelation::Primary),
+            ],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared
+                .concepts
+                .iter()
+                .map(|concept| (concept.concept_id().as_str(), concept.relation()))
+                .collect::<Vec<_>>(),
+            [
+                ("primary", ThemaConceptRelation::Primary),
+                ("reference", ThemaConceptRelation::Reference),
+                ("supporting", ThemaConceptRelation::Supporting),
+            ]
+        );
+
+        let changed_relation = prepare_thema(
+            Some("thema".into()),
+            content.clone(),
+            vec![],
+            vec![("primary".into(), ThemaConceptRelation::Reference)],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_ne!(prepared.content_sha256, changed_relation.content_sha256);
+        assert_eq!(
+            prepare_thema(
+                Some("thema".into()),
+                content,
+                vec![],
+                vec![
+                    ("primary".into(), ThemaConceptRelation::Primary),
+                    ("primary".into(), ThemaConceptRelation::Supporting),
+                ],
+                vec![],
+                None,
+            )
+            .unwrap_err(),
+            ContentError::ConceptRelation
         );
     }
 

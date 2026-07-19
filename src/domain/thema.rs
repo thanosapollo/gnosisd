@@ -136,6 +136,25 @@ impl ThemaConcept {
     }
 }
 
+impl ThemaConceptRelation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Supporting => "supporting",
+            Self::Reference => "reference",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "primary" => Some(Self::Primary),
+            "supporting" => Some(Self::Supporting),
+            "reference" => Some(Self::Reference),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ThemaConcept, ThemaConceptRelation};

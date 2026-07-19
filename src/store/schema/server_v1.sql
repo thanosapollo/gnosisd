@@ -17,6 +17,9 @@ CREATE TABLE document(
   REFERENCES node(document_id, node_id)
   DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
+CREATE TABLE node_identity(
+  node_id TEXT PRIMARY KEY CHECK(length(node_id) > 0)
+) STRICT;
 CREATE TABLE node(
   document_id TEXT NOT NULL,
   ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
@@ -30,6 +33,7 @@ CREATE TABLE node(
   UNIQUE(document_id, ordinal),
   UNIQUE(node_id),
   FOREIGN KEY(document_id) REFERENCES document(document_id) ON DELETE CASCADE,
+  FOREIGN KEY(node_id) REFERENCES node_identity(node_id) ON DELETE RESTRICT,
   FOREIGN KEY(document_id, parent_id)
   REFERENCES node(document_id, node_id)
   DEFERRABLE INITIALLY DEFERRED
@@ -83,7 +87,7 @@ CREATE TABLE thema_concept(
   PRIMARY KEY(thema_id, concept_id),
   FOREIGN KEY(thema_id) REFERENCES thema(thema_id) ON DELETE CASCADE,
   FOREIGN KEY(concept_id)
-  REFERENCES node(node_id)
+  REFERENCES node_identity(node_id)
   DEFERRABLE INITIALLY DEFERRED
 ) STRICT;
 CREATE UNIQUE INDEX document_logical_path_unique
@@ -141,14 +145,6 @@ CREATE TABLE thema_tag(
   thema_id TEXT NOT NULL,
   tag TEXT NOT NULL CHECK(length(tag) > 0),
   PRIMARY KEY(thema_id, tag),
-  FOREIGN KEY(thema_id) REFERENCES thema(thema_id) ON DELETE CASCADE
-) STRICT;
-CREATE TABLE thema_node_link(
-  thema_id TEXT NOT NULL,
-  node_id TEXT NOT NULL,
-  relation TEXT NOT NULL DEFAULT 'supporting'
-  CHECK(relation IN('primary', 'supporting', 'reference')),
-  PRIMARY KEY(thema_id, node_id),
   FOREIGN KEY(thema_id) REFERENCES thema(thema_id) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE thema_asset(
@@ -456,7 +452,7 @@ CREATE TABLE thema_revision(
   parathema TEXT,
   review_image TEXT,
   tags_json TEXT NOT NULL,
-  node_ids_json TEXT NOT NULL,
+  concepts_json TEXT NOT NULL,
   asset_paths_json TEXT NOT NULL,
   content_sha256 TEXT NOT NULL CHECK(length(content_sha256) = 64 AND content_sha256 NOT GLOB '*[^0-9a-f]*'),
 archived INTEGER NOT NULL CHECK(archived IN(0, 1)),

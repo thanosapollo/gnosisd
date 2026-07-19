@@ -1384,18 +1384,26 @@ fn validate_thema(thema: &ThemaV1, expected_id: &str) -> bool {
         Some(thema.thema_id.clone()),
         content,
         thema.tags.clone(),
-        thema.node_ids.clone(),
+        thema
+            .concepts
+            .iter()
+            .map(|concept| (concept.node_id.clone(), concept.relation.into()))
+            .collect(),
         thema.asset_paths.clone(),
         None,
     )
     .is_ok_and(|prepared| {
         prepared.content_sha256 == thema.content_sha256
             && prepared.tags == thema.tags
+            && prepared.concepts.len() == thema.concepts.len()
             && prepared
-                .node_ids
+                .concepts
                 .iter()
-                .map(NodeId::as_str)
-                .eq(thema.node_ids.iter().map(String::as_str))
+                .zip(&thema.concepts)
+                .all(|(prepared, wire)| {
+                    prepared.concept_id().as_str() == wire.node_id
+                        && prepared.relation() == wire.relation.into()
+                })
             && prepared.asset_paths == thema.asset_paths
     })
 }
@@ -1841,7 +1849,7 @@ mod tests {
             parathema: None,
             review_image: None,
             tags: vec![],
-            node_ids: vec![],
+            concepts: vec![],
             asset_paths: vec![],
             content_sha256: prepared.content_sha256,
             archived: false,

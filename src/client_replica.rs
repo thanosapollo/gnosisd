@@ -1897,6 +1897,7 @@ mod tests {
             NewDevice, ReviewSource, ReviewSourceKind, canonical_asset_path, generate_device,
             prepare_asset, prepare_note, prepare_thema, thema_content,
         },
+        domain::ThemaConceptRelation,
         protocol::{
             OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineContentSubmission,
             OfflineReviewSubmission, decode_cursor, decode_snapshot_cursor, encode_cursor,
@@ -3841,7 +3842,7 @@ mod tests {
             Some("thema".into()),
             content,
             vec!["tag".into()],
-            vec!["node".into()],
+            vec![("node".into(), ThemaConceptRelation::Supporting)],
             vec![],
             None,
         )

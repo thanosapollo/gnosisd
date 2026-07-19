@@ -7,7 +7,7 @@ use crate::application::{
     DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, SettingsInput,
     SettingsRecord, ThemaRecord,
 };
-use crate::domain::ThemaKind;
+use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -332,7 +332,7 @@ pub struct ThemaWriteRequestV1 {
     pub tags: Vec<String>,
     #[serde(default)]
     #[schemars(default)]
-    pub node_ids: Vec<String>,
+    pub concepts: Vec<ThemaConceptV1>,
     #[serde(default)]
     #[schemars(default)]
     pub asset_paths: Vec<String>,
@@ -357,7 +357,7 @@ pub struct ThemaV1 {
     #[schemars(required)]
     pub review_image: Option<String>,
     pub tags: Vec<String>,
-    pub node_ids: Vec<String>,
+    pub concepts: Vec<ThemaConceptV1>,
     pub asset_paths: Vec<String>,
     pub content_sha256: String,
     pub archived: bool,
@@ -376,10 +376,54 @@ impl ThemaV1 {
             parathema: value.content.parathema.clone(),
             review_image: value.content.review_image.clone(),
             tags: value.tags.clone(),
-            node_ids: value.node_ids.clone(),
+            concepts: value.concepts.iter().map(ThemaConceptV1::from).collect(),
             asset_paths: value.asset_paths.clone(),
             content_sha256: value.content_sha256.clone(),
             archived: value.archived,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaConceptV1 {
+    pub node_id: String,
+    pub relation: ThemaConceptRelationV1,
+}
+
+impl From<&ThemaConcept> for ThemaConceptV1 {
+    fn from(value: &ThemaConcept) -> Self {
+        Self {
+            node_id: value.concept_id().to_string(),
+            relation: value.relation().into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemaConceptRelationV1 {
+    Primary,
+    Supporting,
+    Reference,
+}
+
+impl From<ThemaConceptRelationV1> for ThemaConceptRelation {
+    fn from(value: ThemaConceptRelationV1) -> Self {
+        match value {
+            ThemaConceptRelationV1::Primary => Self::Primary,
+            ThemaConceptRelationV1::Supporting => Self::Supporting,
+            ThemaConceptRelationV1::Reference => Self::Reference,
+        }
+    }
+}
+
+impl From<ThemaConceptRelation> for ThemaConceptRelationV1 {
+    fn from(value: ThemaConceptRelation) -> Self {
+        match value {
+            ThemaConceptRelation::Primary => Self::Primary,
+            ThemaConceptRelation::Supporting => Self::Supporting,
+            ThemaConceptRelation::Reference => Self::Reference,
         }
     }
 }

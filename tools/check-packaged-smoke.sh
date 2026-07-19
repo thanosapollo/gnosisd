@@ -102,7 +102,7 @@ curl --fail-with-body --silent --show-error -H "$auth" \
 
 thema=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Content-Type: application/json' \
-    -d '{"kind":"basic","keimenon":"Ready?","hypothesis":[],"answer":["yes"],"tags":["smoke"],"node_ids":["smoke-node"],"asset_paths":[]}' \
+    -d '{"kind":"basic","keimenon":"Ready?","hypothesis":[],"answer":["yes"],"tags":["smoke"],"concepts":[{"node_id":"smoke-node","relation":"primary"}],"asset_paths":[]}' \
     "$api/themata")
 thema_id=$(printf %s "$thema" | jq -er .thema_id)
 

@@ -1480,7 +1480,7 @@ fn select_topic(
                  SELECT node_id FROM forward UNION SELECT node_id FROM backward
              )
          SELECT DISTINCT thema.thema_id FROM graph
-         JOIN thema_node_link AS link ON link.node_id = graph.node_id
+         JOIN thema_concept AS link ON link.concept_id = graph.node_id
          JOIN thema ON thema.thema_id = link.thema_id
          JOIN review_state AS state ON state.thema_id = thema.thema_id
          WHERE thema.archived_at_us IS NULL AND state.suspended = 0

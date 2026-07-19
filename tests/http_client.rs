@@ -1405,7 +1405,7 @@ async fn projection_clients_reject_non_strict_responses() {
         "parathema": null,
         "review_image": null,
         "tags": [],
-        "node_ids": [],
+        "concepts": [],
         "asset_paths": [],
         "content_sha256": "0".repeat(64),
         "archived": false
@@ -1631,7 +1631,7 @@ async fn projection_clients_reject_semantic_mismatches() {
         "parathema": null,
         "review_image": null,
         "tags": [],
-        "node_ids": [],
+        "concepts": [],
         "asset_paths": [],
         "content_sha256": "0".repeat(64),
         "archived": false
@@ -3278,7 +3278,7 @@ fn review_thema_request() -> ThemaWriteRequestV1 {
         parathema: None,
         review_image: None,
         tags: Vec::new(),
-        node_ids: Vec::new(),
+        concepts: Vec::new(),
         asset_paths: Vec::new(),
     }
 }

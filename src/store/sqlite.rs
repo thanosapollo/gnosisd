@@ -6,12 +6,13 @@ use std::{
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::domain::{
     DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LinkOccurrence, Node,
-    NodeEdge, NodeId, SourceSpan, ThemaId, TitlePath,
+    NodeEdge, NodeId, SourceSpan, ThemaConcept, ThemaConceptRelation, ThemaId, TitlePath,
 };
 use crate::{
     application::{
@@ -92,6 +93,13 @@ pub(crate) struct StoredDocument {
     document_id: DocumentId,
     revision: u64,
     projection: DocumentProjection,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredThemaConcept {
+    node_id: String,
+    relation: String,
 }
 
 impl StoredDocument {
@@ -1794,7 +1802,7 @@ fn load_thema_revision(
     let row = connection
         .query_row(
             "SELECT thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
-                    source_guid, parathema, review_image, tags_json, node_ids_json,
+                    source_guid, parathema, review_image, tags_json, concepts_json,
                     asset_paths_json, content_sha256, archived, operation,
                     created_at_us, author_device_id
              FROM thema_revision WHERE thema_id = ?1 AND revision = ?2",
@@ -1836,13 +1844,14 @@ fn load_thema_revision(
     .map_err(|_| StoreError::CorruptData {
         field: "thema content history",
     })?;
+    let concepts = parse_stored_concepts(&row.0, &row.10)?;
     Ok(ThemaRevision {
         record: ThemaRecord {
             thema_id: row.0,
             revision: to_u64(row.1, "thema revision")?,
             content,
             tags: serde_json::from_str(&row.9).map_err(StoreError::storage)?,
-            node_ids: serde_json::from_str(&row.10).map_err(StoreError::storage)?,
+            concepts,
             asset_paths: serde_json::from_str(&row.11).map_err(StoreError::storage)?,
             content_sha256: row.12,
             archived: row.13,
@@ -2419,8 +2428,8 @@ fn validate_thema_associations(
     connection: &Connection,
     prepared: &PreparedThema,
 ) -> Result<(), StoreError> {
-    for node_id in &prepared.node_ids {
-        require_active(connection, "node", "node_id", node_id.as_str())?;
+    for concept in &prepared.concepts {
+        require_active(connection, "node", "node_id", concept.concept_id().as_str())?;
     }
     for asset_path in &prepared.asset_paths {
         require_active(connection, "managed_asset", "asset_path", asset_path)?;
@@ -2578,7 +2587,7 @@ fn replace_thema_associations(
     transaction: &Transaction<'_>,
     prepared: &PreparedThema,
 ) -> Result<(), StoreError> {
-    for table in ["thema_tag", "thema_node_link", "thema_asset"] {
+    for table in ["thema_tag", "thema_concept", "thema_asset"] {
         transaction
             .execute(
                 &format!("DELETE FROM {table} WHERE thema_id = ?1"),
@@ -2587,7 +2596,7 @@ fn replace_thema_associations(
             .map_err(StoreError::storage)?;
     }
     insert_thema_tags(transaction, prepared)?;
-    insert_thema_nodes(transaction, prepared)?;
+    insert_thema_concepts(transaction, prepared)?;
     insert_thema_assets(transaction, prepared)
 }
 
@@ -2606,16 +2615,22 @@ fn insert_thema_tags(
     Ok(())
 }
 
-fn insert_thema_nodes(
+fn insert_thema_concepts(
     transaction: &Transaction<'_>,
     prepared: &PreparedThema,
 ) -> Result<(), StoreError> {
     let mut insert = transaction
-        .prepare_cached("INSERT INTO thema_node_link(thema_id, node_id) VALUES (?1, ?2)")
+        .prepare_cached(
+            "INSERT INTO thema_concept(thema_id, concept_id, relation) VALUES (?1, ?2, ?3)",
+        )
         .map_err(StoreError::storage)?;
-    for node_id in &prepared.node_ids {
+    for concept in &prepared.concepts {
         insert
-            .execute(params![prepared.thema_id.as_str(), node_id.as_str()])
+            .execute(params![
+                prepared.thema_id.as_str(),
+                concept.concept_id().as_str(),
+                concept.relation().as_str(),
+            ])
             .map_err(StoreError::storage)?;
     }
     Ok(())
@@ -2693,7 +2708,7 @@ fn insert_thema_history(
         .execute(
             "INSERT INTO thema_revision(
                  thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
-                 source_guid, parathema, review_image, tags_json, node_ids_json,
+                 source_guid, parathema, review_image, tags_json, concepts_json,
                  asset_paths_json, content_sha256, archived, operation,
                  created_at_us, author_device_id
              ) VALUES (
@@ -2711,7 +2726,8 @@ fn insert_thema_history(
                 record.content.parathema,
                 record.content.review_image,
                 serde_json::to_string(&record.tags).map_err(StoreError::storage)?,
-                serde_json::to_string(&record.node_ids).map_err(StoreError::storage)?,
+                serde_json::to_string(&stored_concepts(&record.concepts))
+                    .map_err(StoreError::storage)?,
                 serde_json::to_string(&record.asset_paths).map_err(StoreError::storage)?,
                 record.content_sha256,
                 i64::from(record.archived),
@@ -2830,11 +2846,7 @@ fn materialize_thema_record(
             "SELECT tag FROM thema_tag WHERE thema_id = ?1 ORDER BY tag",
             &id,
         )?,
-        node_ids: query_strings(
-            connection,
-            "SELECT node_id FROM thema_node_link WHERE thema_id = ?1 ORDER BY node_id",
-            &id,
-        )?,
+        concepts: query_thema_concepts(connection, &id)?,
         asset_paths: query_strings(
             connection,
             "SELECT asset_path FROM thema_asset WHERE thema_id = ?1 ORDER BY asset_path",
@@ -2846,6 +2858,70 @@ fn materialize_thema_record(
         content_sha256: digest,
         archived,
     })
+}
+
+fn stored_concepts(concepts: &[ThemaConcept]) -> Vec<StoredThemaConcept> {
+    concepts
+        .iter()
+        .map(|concept| StoredThemaConcept {
+            node_id: concept.concept_id().to_string(),
+            relation: concept.relation().as_str().to_owned(),
+        })
+        .collect()
+}
+
+fn parse_stored_concepts(thema_id: &str, value: &str) -> Result<Vec<ThemaConcept>, StoreError> {
+    let concepts: Vec<StoredThemaConcept> =
+        serde_json::from_str(value).map_err(StoreError::storage)?;
+    materialize_thema_concepts(
+        thema_id,
+        concepts
+            .into_iter()
+            .map(|concept| (concept.node_id, concept.relation))
+            .collect(),
+    )
+}
+
+fn query_thema_concepts(
+    connection: &Connection,
+    thema_id: &str,
+) -> Result<Vec<ThemaConcept>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT concept_id, relation FROM thema_concept \
+             WHERE thema_id = ?1 ORDER BY concept_id",
+        )
+        .map_err(StoreError::storage)?;
+    let concepts = statement
+        .query_map([thema_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)?;
+    materialize_thema_concepts(thema_id, concepts)
+}
+
+fn materialize_thema_concepts(
+    thema_id: &str,
+    concepts: Vec<(String, String)>,
+) -> Result<Vec<ThemaConcept>, StoreError> {
+    let thema_id = ThemaId::new(thema_id.to_owned()).map_err(|_| StoreError::CorruptData {
+        field: "thema concept",
+    })?;
+    concepts
+        .into_iter()
+        .map(|(concept_id, relation)| {
+            let concept_id = NodeId::new(concept_id).map_err(|_| StoreError::CorruptData {
+                field: "thema concept",
+            })?;
+            let relation =
+                ThemaConceptRelation::parse(&relation).ok_or(StoreError::CorruptData {
+                    field: "thema concept",
+                })?;
+            Ok(ThemaConcept::new(thema_id.clone(), concept_id, relation))
+        })
+        .collect()
 }
 
 fn load_node(connection: &Connection, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
@@ -2961,7 +3037,7 @@ fn query_node_tags(
 fn linked_themata(connection: &Connection, node_id: &str) -> Result<Vec<String>, StoreError> {
     query_strings(
         connection,
-        "SELECT thema_id FROM thema_node_link WHERE node_id = ?1 ORDER BY thema_id",
+        "SELECT thema_id FROM thema_concept WHERE concept_id = ?1 ORDER BY thema_id",
         node_id,
     )
 }
@@ -3678,6 +3754,12 @@ fn insert_node(
         serde_json::to_string(node.title_path().parts()).map_err(StoreError::storage)?;
     transaction
         .execute(
+            "INSERT INTO node_identity(node_id) VALUES (?1) ON CONFLICT DO NOTHING",
+            [node.id().as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
             "INSERT INTO node (\
              document_id, ordinal, node_id, title, title_path_json, parent_id, level\
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -3979,16 +4061,16 @@ mod tests {
 
     use super::{
         APPLICATION_ID, FailPoint, SCHEMA_VERSION, SqliteStore, StoreError, application_id,
-        initialize_schema, schema_version,
+        initialize_schema, replace_rows, retire_removed_nodes, schema_version,
     };
     use crate::application::{
-        ReplicaProjection, SettingsInput, generate_device, prepare_asset, prepare_note,
-        prepare_thema, thema_content,
+        PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind, SettingsInput,
+        generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
-        SourceSpan, TitlePath,
+        SourceSpan, ThemaConceptRelation, TitlePath,
     };
 
     fn projection(title: &str, digest: &str) -> DocumentProjection {
@@ -4022,6 +4104,37 @@ mod tests {
             ],
             compatibility_sha1: "sha1".into(),
             content_sha256: digest.into(),
+        })
+        .unwrap()
+    }
+
+    fn concept_projection() -> DocumentProjection {
+        let primary = NodeId::new("primary").unwrap();
+        DocumentProjection::new(DocumentProjectionInput {
+            title: "Concepts".into(),
+            file_node_id: Some(primary.clone()),
+            file_tags: vec![],
+            nodes: [
+                (primary, "Primary"),
+                (NodeId::new("supporting").unwrap(), "Supporting"),
+                (NodeId::new("reference").unwrap(), "Reference"),
+            ]
+            .into_iter()
+            .map(|(node_id, title)| {
+                Node::new(
+                    node_id,
+                    title.into(),
+                    TitlePath::new(vec![title.into()]).unwrap(),
+                    vec![],
+                    None,
+                    0,
+                )
+                .unwrap()
+            })
+            .collect(),
+            link_occurrences: vec![],
+            compatibility_sha1: "concept-sha1".into(),
+            content_sha256: "concept-digest".into(),
         })
         .unwrap()
     }
@@ -4085,6 +4198,45 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+    }
+
+    #[test]
+    fn thema_concepts_require_known_nodes_and_typed_relations() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        store
+            .connection
+            .execute("INSERT INTO thema (thema_id) VALUES ('thema')", [])
+            .unwrap();
+        let missing = store
+            .connection
+            .execute(
+                "INSERT INTO thema_concept (thema_id, concept_id, relation) \
+                 VALUES ('thema', 'missing', 'primary')",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("FOREIGN KEY constraint failed")
+        );
+
+        store
+            .replace_document(
+                &DocumentId::new("document").unwrap(),
+                &projection("Document", "digest"),
+                None,
+            )
+            .unwrap();
+        let relation = store
+            .connection
+            .execute(
+                "INSERT INTO thema_concept (thema_id, concept_id, relation) \
+                 VALUES ('thema', 'root', 'related')",
+                [],
+            )
+            .unwrap_err();
+        assert!(relation.to_string().contains("CHECK constraint failed"));
     }
 
     #[test]
@@ -4506,6 +4658,169 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(review_states.len(), 1);
         assert_eq!(review_states[0].state.state_revision, 0);
+    }
+
+    #[test]
+    fn thema_concepts_round_trip_through_search_history_snapshot_and_replacement() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+        let document_id = DocumentId::new("concept-document").unwrap();
+        store
+            .replace_document(&document_id, &concept_projection(), None)
+            .unwrap();
+
+        let first = prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                "Question".into(),
+                vec![],
+                vec!["Answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            vec![],
+            vec![
+                ("primary".into(), ThemaConceptRelation::Primary),
+                ("supporting".into(), ThemaConceptRelation::Supporting),
+                ("reference".into(), ThemaConceptRelation::Reference),
+            ],
+            vec![],
+            None,
+        )
+        .unwrap();
+        store.put_thema(&first, 20260715, 2, None).unwrap();
+        assert_eq!(
+            store
+                .get_thema("thema")
+                .unwrap()
+                .unwrap()
+                .concepts
+                .iter()
+                .map(|concept| (concept.concept_id().to_string(), concept.relation()))
+                .collect::<Vec<_>>(),
+            [
+                ("primary".into(), ThemaConceptRelation::Primary),
+                ("reference".into(), ThemaConceptRelation::Reference),
+                ("supporting".into(), ThemaConceptRelation::Supporting),
+            ]
+        );
+        assert_eq!(
+            store.search_themata("question", 10, None).unwrap()[0]
+                .concepts
+                .len(),
+            3
+        );
+        for node_id in ["primary", "supporting", "reference"] {
+            let source = ReviewSource {
+                kind: ReviewSourceKind::Topic,
+                tags: vec![],
+                exclude_tags: vec![],
+                topic_node_id: Some(node_id.into()),
+                topic_forward_depth: Some(0),
+                topic_backward_depth: Some(0),
+                manual_ids: vec![],
+            };
+            assert_eq!(
+                super::review::select_queue(&store.connection, &source, 20260715, None).unwrap(),
+                ["thema"],
+                "{node_id}"
+            );
+        }
+
+        let replacement = projection("Concepts", "replacement");
+        store
+            .connection
+            .execute(
+                "UPDATE document SET logical_path = 'concepts.org', path_key = 'concepts.org' \
+                 WHERE document_id = ?1",
+                [document_id.as_str()],
+            )
+            .unwrap();
+        let prepared_replacement = PreparedNote {
+            document_id: document_id.clone(),
+            explicit_document_id: true,
+            logical_path_is_request_input: true,
+            logical_path: "concepts.org".into(),
+            path_key: "concepts.org".into(),
+            org: String::new(),
+            blob_sha256: "replacement".into(),
+            asset_paths: vec![],
+            projection: replacement,
+            expected_revision: Some(1),
+        };
+        let transaction = store.connection.transaction().unwrap();
+        retire_removed_nodes(&transaction, &prepared_replacement, 2).unwrap();
+        replace_rows(
+            &transaction,
+            &document_id,
+            &prepared_replacement.projection,
+            2,
+            FailPoint::None,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let retired = store.get_node("supporting").unwrap().unwrap();
+        assert!(!retired.active);
+        assert_eq!(retired.thema_ids, ["thema"]);
+
+        let second = prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                "Updated".into(),
+                vec![],
+                vec!["Answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            vec![],
+            vec![("root".into(), ThemaConceptRelation::Reference)],
+            vec![],
+            Some(1),
+        )
+        .unwrap();
+        store.put_thema(&second, 20260715, 3, None).unwrap();
+        assert!(
+            store
+                .get_node("supporting")
+                .unwrap()
+                .unwrap()
+                .thema_ids
+                .is_empty()
+        );
+
+        let state = store.replica_state(&device_id).unwrap();
+        let (changes, _, _) = store
+            .replica_changes(&state.server_id, 0, &initial.cursor_token, 20)
+            .unwrap();
+        let revisions = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::Thema(value) => Some(&value.record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].concepts.len(), 3);
+        assert_eq!(
+            revisions[1].concepts[0].relation(),
+            ThemaConceptRelation::Reference
+        );
+
+        let snapshot = store.create_replica_snapshot(&device_id, 4, 100).unwrap();
+        let snapshot_thema = snapshot.items.iter().find_map(|item| match item {
+            ReplicaProjection::Thema(value) => Some(&value.record),
+            _ => None,
+        });
+        assert_eq!(snapshot_thema.unwrap().concepts, revisions[1].concepts);
     }
 
     #[test]

@@ -16,8 +16,8 @@ use super::http_v1::{
     DocumentRevisionV1, FsrsAlgorithmV1, FsrsConfigV1, FsrsImplementationV1, FsrsModelV1,
     ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1, ReplicaChangePageV1, ReplicaChangeV1,
     ReplicaProjectionV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewStateRevisionV1,
-    ReviewStateV1, SettingsOperationV1, SettingsRevisionV1, ThemaKindV1, ThemaOperationV1,
-    ThemaRevisionV1,
+    ReviewStateV1, SettingsOperationV1, SettingsRevisionV1, ThemaConceptV1, ThemaKindV1,
+    ThemaOperationV1, ThemaRevisionV1,
 };
 
 pub(crate) const REPLICA_VERSION: u32 = 1;
@@ -570,7 +570,11 @@ fn thema_identity(value: &ThemaRevisionV1) -> Result<ProjectionIdentity, Replica
         Some(value.thema_id.clone()),
         content,
         value.tags.clone(),
-        value.node_ids.clone(),
+        value
+            .concepts
+            .iter()
+            .map(|concept| (concept.node_id.clone(), concept.relation.into()))
+            .collect(),
         value.asset_paths.clone(),
         None,
     )
@@ -810,7 +814,12 @@ impl TryFrom<&crate::application::ThemaRevision> for ThemaRevisionV1 {
             parathema: value.record.content.parathema.clone(),
             review_image: value.record.content.review_image.clone(),
             tags: value.record.tags.clone(),
-            node_ids: value.record.node_ids.clone(),
+            concepts: value
+                .record
+                .concepts
+                .iter()
+                .map(ThemaConceptV1::from)
+                .collect(),
             asset_paths: value.record.asset_paths.clone(),
             content_sha256: value.record.content_sha256.clone(),
             archived: value.record.archived,
@@ -872,6 +881,7 @@ mod tests {
         SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition, ThemaRecord,
         ThemaRevision, prepare_thema, thema_content,
     };
+    use crate::domain::{NodeId, ThemaConcept, ThemaConceptRelation, ThemaId};
 
     #[test]
     fn opaque_cursors_round_trip_and_reject_unknown_versions() {
@@ -1048,7 +1058,7 @@ mod tests {
                     content,
                     content_sha256: digest,
                     tags: vec![],
-                    node_ids: vec![],
+                    concepts: vec![],
                     asset_paths: vec![],
                     archived: false,
                 },
@@ -1144,7 +1154,11 @@ mod tests {
                 .unwrap(),
                 content_sha256: "d".repeat(64),
                 tags: vec!["tag".into()],
-                node_ids: vec!["node".into()],
+                concepts: vec![ThemaConcept::new(
+                    ThemaId::new("thema").unwrap(),
+                    NodeId::new("node").unwrap(),
+                    ThemaConceptRelation::Supporting,
+                )],
                 asset_paths: vec![],
                 archived: false,
             },

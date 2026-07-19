@@ -92,7 +92,7 @@
           "thema_id": "thema", "revision": 3, "kind": "basic",
           "keimenon": "Question", "hypothesis": [null], "answer": ["Answer"],
           "source_guid": "source", "parathema": null, "review_image": null,
-          "tags": ["tag"], "node_ids": ["node"], "asset_paths": [],
+          "tags": ["tag"], "concepts": [{"node_id": "node", "relation": "supporting"}], "asset_paths": [],
           "content_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
           "archived": false, "operation": "update", "created_at_us": 22,
           "author_device_id": "device"

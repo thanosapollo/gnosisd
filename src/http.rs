@@ -1211,7 +1211,11 @@ fn prepared_thema(
         id,
         content,
         input.tags,
-        input.node_ids,
+        input
+            .concepts
+            .into_iter()
+            .map(|concept| (concept.node_id, concept.relation.into()))
+            .collect(),
         input.asset_paths,
         revision,
     )
@@ -1230,7 +1234,7 @@ fn ensure_thema_response_budget(input: &ThemaWriteRequestV1) -> Result<(), ApiEr
         "parathema": input.parathema,
         "review_image": input.review_image,
         "tags": input.tags,
-        "node_ids": input.node_ids,
+        "concepts": input.concepts,
         "asset_paths": input.asset_paths,
         "content_sha256": "0".repeat(64),
         "archived": true
@@ -3716,6 +3720,30 @@ mod tests {
     }
 
     #[test]
+    fn openapi_exposes_typed_thema_concepts_without_legacy_node_ids() {
+        let api = openapi_document();
+        let schemas = &api["components"]["schemas"];
+        assert_eq!(
+            schemas["ThemaConceptRelationV1"]["enum"],
+            json!(["primary", "supporting", "reference"])
+        );
+        assert_eq!(schemas["ThemaConceptV1"]["additionalProperties"], false);
+        assert_eq!(
+            schemas["ThemaConceptV1"]["required"],
+            json!(["node_id", "relation"])
+        );
+        for schema in ["ThemaWriteRequestV1", "ThemaV1"] {
+            let properties = schemas[schema]["properties"].as_object().unwrap();
+            assert!(properties.contains_key("concepts"), "{schema}");
+            assert!(!properties.contains_key("node_ids"), "{schema}");
+            assert_eq!(
+                properties["concepts"]["items"]["$ref"],
+                "#/components/schemas/ThemaConceptV1"
+            );
+        }
+    }
+
+    #[test]
     fn openapi_types_due_query_exactly() {
         let api = openapi_document();
         let operation = &api["paths"]["/v1/review/due"]["get"];
@@ -3799,7 +3827,7 @@ mod tests {
             parathema: None,
             review_image: None,
             tags: vec![],
-            node_ids: vec![],
+            concepts: vec![],
             asset_paths: vec![],
         };
         let base_size = serde_json::to_vec(&input).unwrap().len();
@@ -4897,7 +4925,7 @@ mod tests {
             "parathema",
             "review_image",
             "tags",
-            "node_ids",
+            "concepts",
             "asset_paths",
         ] {
             assert!(!thema_required.contains(&json!(optional)), "{optional}");

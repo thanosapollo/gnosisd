@@ -8,8 +8,8 @@ use gnosis_core::protocol::http_v1::{
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
     ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, ReviewStateV1,
-    SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaPageV1,
-    ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
+    ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -673,13 +673,46 @@ fn public_content_requests_are_strict_and_preserve_defaults() {
     }));
 
     let thema: ThemaWriteRequestV1 = serde_json::from_value(json!({
-        "kind":"basic","keimenon":"Question","answer":["Answer"]
+        "kind":"basic","keimenon":"Question","answer":["Answer"],
+        "concepts":[
+            {"node_id":"primary","relation":"primary"},
+            {"node_id":"supporting","relation":"supporting"},
+            {"node_id":"reference","relation":"reference"}
+        ]
     }))
     .unwrap();
     assert!(thema.hypothesis.is_empty());
     assert!(thema.tags.is_empty());
-    assert!(thema.node_ids.is_empty());
+    assert_eq!(
+        thema
+            .concepts
+            .iter()
+            .map(|concept| concept.relation)
+            .collect::<Vec<_>>(),
+        [
+            ThemaConceptRelationV1::Primary,
+            ThemaConceptRelationV1::Supporting,
+            ThemaConceptRelationV1::Reference,
+        ]
+    );
     assert!(thema.asset_paths.is_empty());
+    for relation in ["other", "Primary", ""] {
+        assert!(
+            serde_json::from_value::<ThemaWriteRequestV1>(json!({
+                "kind":"basic","keimenon":"Question","answer":["Answer"],
+                "concepts":[{"node_id":"node","relation":relation}]
+            }))
+            .is_err(),
+            "{relation}"
+        );
+    }
+    assert!(
+        serde_json::from_value::<ThemaWriteRequestV1>(json!({
+            "kind":"basic","keimenon":"Question","answer":["Answer"],
+            "node_ids":["legacy"]
+        }))
+        .is_err()
+    );
 
     let settings: UpdateSettingsRequestV1 = serde_json::from_value(settings_wire(false)).unwrap();
     assert_eq!(settings.desired_retention, 0.9);
@@ -725,7 +758,11 @@ fn thema_wire() -> Value {
     json!({
         "thema_id":"thema","revision":1,"kind":"basic","keimenon":"Question",
         "hypothesis":[null],"answer":["Answer"],"source_guid":null,"parathema":null,
-        "review_image":null,"tags":[],"node_ids":[],"asset_paths":[],
+        "review_image":null,"tags":[],"concepts":[
+            {"node_id":"primary","relation":"primary"},
+            {"node_id":"supporting","relation":"supporting"},
+            {"node_id":"reference","relation":"reference"}
+        ],"asset_paths":[],
         "content_sha256":"a".repeat(64),"archived":false
     })
 }
