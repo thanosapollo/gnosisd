@@ -313,6 +313,11 @@ CONTENT-TYPE defaults to application/json."
              "allowed" '(:enum ["allowed"]) contract))
     (should (gnosis-core--schema-valid-p
              "allowed" '(:not (:enum ["blocked"])) contract))
+    (should (gnosis-core--schema-valid-p
+             gnosis-core--json-null
+             '(:anyOf [(:$ref "#/components/schemas/Widget")
+                       (:type "null")])
+             contract))
     (should-not
      (gnosis-core--schema-valid-p
       '(:kind "allowed")
