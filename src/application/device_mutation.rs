@@ -6,7 +6,7 @@ use super::{
     AssetHead, PreparedAsset, PreparedNote, PreparedThema, SettingsInput, SettingsRecord,
     ThemaRecord, valid_operation_id, validate_org_path,
 };
-use crate::domain::DocumentId;
+use crate::domain::{DocumentId, ThemaId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum DeviceMutationKind {
@@ -100,7 +100,7 @@ pub(crate) enum DeviceDesiredStateMutation {
         initial_review_day: u32,
     },
     SetThemaArchived {
-        thema_id: String,
+        thema_id: ThemaId,
         expected_revision: u64,
         archived: bool,
     },
@@ -132,7 +132,7 @@ impl DeviceDesiredStateMutation {
             Self::PutAsset { prepared, .. } => prepared.logical_path.clone(),
             Self::TombstoneAsset { asset_path, .. } => asset_path.clone(),
             Self::PutThema { prepared, .. } => prepared.thema_id.to_string(),
-            Self::SetThemaArchived { thema_id, .. } => thema_id.clone(),
+            Self::SetThemaArchived { thema_id, .. } => thema_id.to_string(),
             Self::ReplaceSettings { .. } => "canonical".to_owned(),
         }
     }
@@ -594,7 +594,7 @@ fn desired_state_request_json(
         } => serde_json::json!({
             "format_version": format_version,
             "mutation_kind": mutation.kind(),
-            "thema_id": thema_id,
+            "thema_id": thema_id.as_str(),
             "expected_revision": expected_revision,
             "archived": archived,
         }),

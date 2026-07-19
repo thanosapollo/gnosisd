@@ -269,6 +269,10 @@ fn desired_state_rejection(error: &StoreError) -> Option<DeviceMutationRejection
                 actual: *actual,
             })
         }
+        StoreError::ExpectedAbsent { actual } => Some(DeviceMutationRejection::RevisionConflict {
+            expected: None,
+            actual: Some(*actual),
+        }),
         StoreError::NotFound => Some(DeviceMutationRejection::NotFound),
         StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
         StoreError::BlobMetadata | StoreError::InvalidProjection { .. } => {
@@ -892,13 +896,18 @@ mod tests {
         let device = add_device(&mut store, "asset-metadata");
         let digest = format!("{:x}", Sha256::digest(b"asset"));
         let logical_path = format!("assets/{digest}/a.png");
-        let operation = |operation_id: &str, media_type: &str| {
+        let operation = |operation_id: &str, media_type: &str, expected_revision| {
             prepare_device_desired_state_mutation(
                 1,
                 operation_id.into(),
                 device.clone(),
                 DeviceDesiredStateMutation::PutAsset {
-                    prepared: prepare_asset(logical_path.clone(), "a.png".into(), None).unwrap(),
+                    prepared: prepare_asset(
+                        logical_path.clone(),
+                        "a.png".into(),
+                        expected_revision,
+                    )
+                    .unwrap(),
                     digest: digest.clone(),
                     size_bytes: 5,
                     media_type: media_type.into(),
@@ -907,11 +916,11 @@ mod tests {
             .unwrap()
         };
         store
-            .apply_device_desired_state_mutation(&operation("first", "image/png"), 1)
+            .apply_device_desired_state_mutation(&operation("first", "image/png", None), 1)
             .unwrap();
 
         let result = store
-            .apply_device_desired_state_mutation(&operation("second", "image/jpeg"), 2)
+            .apply_device_desired_state_mutation(&operation("second", "image/jpeg", Some(1)), 2)
             .unwrap();
 
         assert!(matches!(

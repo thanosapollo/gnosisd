@@ -450,6 +450,7 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
             ProtocolError::new(ErrorCode::Conflict, "review state conflict")
         }
         StoreError::Conflict { .. }
+        | StoreError::ExpectedAbsent { .. }
         | StoreError::DeviceSequence { .. }
         | StoreError::ReplicaCursor
         | StoreError::ReplicaServer

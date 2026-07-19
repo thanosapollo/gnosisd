@@ -42,6 +42,8 @@ const SCHEMA_VERSION: u32 = 1;
 pub(crate) enum StoreError {
     #[error("revision conflict: expected {expected}, current revision is {actual:?}")]
     Conflict { expected: u64, actual: Option<u64> },
+    #[error("resource already exists at revision {actual}")]
+    ExpectedAbsent { actual: u64 },
     #[error("resource was not found")]
     NotFound,
     #[error("another review session is active")]
@@ -173,6 +175,16 @@ pub(super) fn asset_write_decision(
         prepared.expected_revision,
         current.as_ref().map(|(_, revision, _)| *revision),
     )?;
+    if require_matching_blob_metadata
+        && prepared.expected_revision.is_none()
+        && let Some((_, revision, _)) = current.as_ref()
+    {
+        return Err(StoreError::ExpectedAbsent {
+            actual: u64::try_from(*revision).map_err(|_| StoreError::CorruptData {
+                field: "asset revision",
+            })?,
+        });
+    }
     let stored_blob: Option<(i64, String)> = connection
         .query_row(
             "SELECT size_bytes, media_type FROM blob WHERE content_sha256 = ?1",

@@ -37,7 +37,7 @@ use crate::{
         prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
         thema_content, validate_org_path,
     },
-    domain::{DocumentId, DueThema},
+    domain::{DocumentId, DueThema, ThemaId},
     is_canonical_sha256,
     protocol::{
         DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
@@ -1302,12 +1302,13 @@ async fn set_archive(
     require(&principal, DeviceScope::ContentWrite)?;
     let operation_id = idempotency_key(&headers)?;
     let expected_revision = if_match(&headers)?;
+    let thema_id = ThemaId::new(id).map_err(|_| ApiError::bad_request("invalid thema ID"))?;
     apply_desired_state_mutation(
         &state,
         principal,
         operation_id,
         DeviceDesiredStateMutation::SetThemaArchived {
-            thema_id: id,
+            thema_id,
             expected_revision,
             archived,
         },
@@ -2242,6 +2243,7 @@ impl ApiError {
         match error {
             StoreError::NotFound => Self::not_found(),
             StoreError::Conflict { expected, actual } => Self::conflict(expected, actual),
+            StoreError::ExpectedAbsent { .. } => Self::internal(),
             StoreError::ActiveReviewSession => Self::new(
                 StatusCode::CONFLICT,
                 ApiErrorCodeV1::ActiveSession,
@@ -2585,7 +2587,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "408", "409", "412", "413", "422", "428", "500", "503",
+                "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
             ],
         )),
 
@@ -2646,7 +2648,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "404", "408", "409", "412", "413", "422", "500", "503",
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
             ],
         )),
         ("/v1/assets/{digest}/{name}", "delete") => Some(json_contract(
@@ -2655,7 +2657,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "404", "408", "409", "412", "422", "428", "500", "503",
+                "400", "401", "403", "408", "409", "422", "428", "500", "503",
             ],
         )),
         ("/v1/themata", "get") => Some(json_contract(
@@ -2671,7 +2673,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+                "400", "401", "403", "408", "409", "413", "422", "500", "503",
             ],
         )),
         ("/v1/themata/{id}", "get") => Some(json_contract(
@@ -2687,7 +2689,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "200",
             "DesiredStateMutationResultV1",
             &[
-                "400", "401", "403", "404", "408", "409", "412", "413", "422", "428", "500", "503",
+                "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
             ],
         )),
         ("/v1/themata/{id}/archive", "post") | ("/v1/themata/{id}/unarchive", "post") => {
@@ -2697,7 +2699,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "400", "401", "403", "404", "408", "409", "412", "422", "428", "500", "503",
+                    "400", "401", "403", "408", "409", "422", "428", "500", "503",
                 ],
             ))
         }
@@ -4441,8 +4443,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "408", "409", "412", "413", "422", "428", "500",
-                    "503",
+                    "200", "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4517,8 +4518,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "409", "412", "413", "422", "500",
-                    "503",
+                    "200", "400", "401", "403", "408", "409", "413", "422", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4529,8 +4529,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "409", "412", "422", "428", "500",
-                    "503",
+                    "200", "400", "401", "403", "408", "409", "422", "428", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4550,7 +4549,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+                    "200", "400", "401", "403", "408", "409", "413", "422", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4570,8 +4569,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "409", "412", "413", "422", "428",
-                    "500", "503",
+                    "200", "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4582,8 +4580,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "409", "412", "422", "428", "500",
-                    "503",
+                    "200", "400", "401", "403", "408", "409", "422", "428", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -4594,8 +4591,7 @@ mod tests {
                 "200",
                 "DesiredStateMutationResultV1",
                 &[
-                    "200", "400", "401", "403", "404", "408", "409", "412", "422", "428", "500",
-                    "503",
+                    "200", "400", "401", "403", "408", "409", "422", "428", "500", "503",
                 ],
             ),
             expected_json_contract(
@@ -5248,6 +5244,26 @@ mod tests {
         assert_eq!(replay.status(), StatusCode::OK);
         assert_eq!(response_json(replay).await, created_body);
 
+        let mut duplicate_request = authorized_with_type(
+            "PUT",
+            &path,
+            &token,
+            "image/png",
+            Body::from(bytes.to_vec()),
+        );
+        duplicate_request.headers_mut().insert(
+            "Idempotency-Key",
+            axum::http::HeaderValue::from_static("asset-create-duplicate"),
+        );
+        let duplicate = app.clone().oneshot(duplicate_request).await.unwrap();
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate_body = response_json(duplicate).await;
+        assert_eq!(duplicate_body["status"], "rejected");
+        assert_eq!(duplicate_body["rejection"]["reason"], "revision_conflict");
+        assert!(duplicate_body["rejection"]["expected_revision"].is_null());
+        assert_eq!(duplicate_body["rejection"]["current_revision"], 1);
+        assert_eq!(duplicate_body["cursor"], created_body["cursor"]);
+
         let mut reused_request = authorized_with_type(
             "PUT",
             &format!("/v1/assets/{digest}/image-2.png"),
@@ -5289,6 +5305,63 @@ mod tests {
             response_json(invalid).await["error"]["code"],
             "invalid_content"
         );
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_thema_archive_id_is_rejected_before_receipt_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("thema".into(), vec!["content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+
+        for action in ["archive", "unarchive"] {
+            let operation_id = format!("invalid-{action}");
+            let invalid_path = format!("/v1/themata/{}/{action}", "x".repeat(257));
+            let invalid = app
+                .clone()
+                .oneshot(authorized_mutation(
+                    "POST",
+                    &invalid_path,
+                    &token,
+                    &operation_id,
+                    Some("1"),
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+            let retained_not_found = app
+                .clone()
+                .oneshot(authorized_mutation(
+                    "POST",
+                    &format!("/v1/themata/missing/{action}"),
+                    &token,
+                    &operation_id,
+                    Some("1"),
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(retained_not_found.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(retained_not_found).await["rejection"]["reason"],
+                "not_found"
+            );
+        }
 
         drop(app);
         drop(service);
