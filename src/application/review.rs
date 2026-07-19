@@ -113,6 +113,7 @@ impl ReviewSource {
                     && self.topic_forward_depth.is_none()
                     && self.topic_backward_depth.is_none()
                     && !self.manual_ids.is_empty()
+                    && self.manual_ids.len() <= MAX_REVIEW_PACK_ITEMS
                     && self.manual_ids.iter().all(|id| !id.is_empty())
             }
         };
@@ -1094,6 +1095,8 @@ pub(crate) enum ReviewError {
 mod tests {
     use serde::Deserialize;
 
+    use crate::application::MAX_REVIEW_PACK_ITEMS;
+
     use super::{
         PresentationSnapshot, ReviewAttemptMutation, ReviewAttemptOperation, ReviewResponsePrompt,
         ReviewSource, ReviewSourceKind, review_day_at, review_question,
@@ -1255,6 +1258,23 @@ mod tests {
             topic_forward_depth: Some(1_000_000),
             topic_backward_depth: Some(1),
             manual_ids: vec![],
+        };
+
+        assert!(source.validate().is_err());
+    }
+
+    #[test]
+    fn manual_sources_reject_more_than_the_session_maximum() {
+        let source = ReviewSource {
+            kind: ReviewSourceKind::Manual,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: (0..=MAX_REVIEW_PACK_ITEMS)
+                .map(|index| format!("thema-{index}"))
+                .collect(),
         };
 
         assert!(source.validate().is_err());

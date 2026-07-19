@@ -507,6 +507,7 @@ pub struct ReviewSourceInputV1 {
     pub topic_forward_depth: Option<u32>,
     pub topic_backward_depth: Option<u32>,
     #[serde(default)]
+    #[schemars(length(max = 500))]
     pub manual_ids: Vec<String>,
 }
 

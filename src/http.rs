@@ -3954,6 +3954,10 @@ mod tests {
         assert_eq!(target_count["minimum"], 1);
         assert_eq!(target_count["maximum"], 500);
         assert_eq!(
+            api["components"]["schemas"]["ReviewSourceInputV1"]["properties"]["manual_ids"]["maxItems"],
+            500
+        );
+        assert_eq!(
             sessions["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ReviewSessionV1"
         );
@@ -6007,7 +6011,7 @@ mod tests {
                     "POST",
                     "/v1/review/sessions",
                     &token,
-                    Body::from(review_queue_session_body_with_target(target_count)),
+                    Body::from(review_queue_session_body(500, target_count)),
                 ))
                 .await
                 .unwrap();
@@ -6025,7 +6029,7 @@ mod tests {
                     "POST",
                     "/v1/review/sessions",
                     &token,
-                    Body::from(review_queue_session_body_with_target(Some(target_count))),
+                    Body::from(review_queue_session_body(500, Some(target_count))),
                 ))
                 .await
                 .unwrap();
@@ -6033,6 +6037,22 @@ mod tests {
             let active = authenticated_json(&app, &token, "/v1/review/sessions/active").await;
             assert_eq!(active["session"], Value::Null);
         }
+
+        let oversized_source = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/sessions",
+                &token,
+                Body::from(review_queue_session_body(501, Some(1))),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(oversized_source.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            authenticated_json(&app, &token, "/v1/review/sessions/active").await["session"],
+            Value::Null
+        );
 
         drop(app);
         drop(service);
@@ -6125,8 +6145,8 @@ mod tests {
         .unwrap()
     }
 
-    fn review_queue_session_body_with_target(target_count: Option<u32>) -> Vec<u8> {
-        let manual_ids = (0..500)
+    fn review_queue_session_body(item_count: usize, target_count: Option<u32>) -> Vec<u8> {
+        let manual_ids = (0..item_count)
             .map(|index| format!("thema-{index:03}"))
             .collect::<Vec<_>>();
         serde_json::to_vec(&json!({

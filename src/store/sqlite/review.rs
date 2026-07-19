@@ -50,6 +50,8 @@ impl SqliteStore {
     ) -> Result<ReviewSessionView, StoreError> {
         let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
         if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+            || source.kind == ReviewSourceKind::Manual
+                && source.manual_ids.len() > MAX_REVIEW_PACK_ITEMS
         {
             return Err(StoreError::InvalidReviewState);
         }
@@ -3989,6 +3991,16 @@ mod tests {
                 Err(StoreError::InvalidReviewState)
             ));
         }
+        let oversized_source = ReviewSource {
+            manual_ids: (0..=MAX_REVIEW_PACK_ITEMS)
+                .map(|index| format!("thema-{index}"))
+                .collect(),
+            ..source.clone()
+        };
+        assert!(matches!(
+            store.create_review_session(&oversized_source, Some(1), None, 1),
+            Err(StoreError::InvalidReviewState)
+        ));
         assert_eq!(
             store
                 .active_review_session(None)
