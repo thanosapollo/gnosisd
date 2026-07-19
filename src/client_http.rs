@@ -2184,12 +2184,14 @@ mod tests {
     use super::*;
     use crate::{
         application::{
-            ReviewSource, ReviewSourceKind, generate_device, prepare_thema, thema_content,
+            ReviewSource, ReviewSourceKind, generate_device, prepare_note, prepare_thema,
+            thema_content,
         },
         client_replica::{LocalReplica, OfflineAnswer, OfflineResponse},
+        domain::ThemaConceptRelation,
         protocol::{
             DaemonConfig, DaemonServer,
-            http_v1::{ReviewSourceInputV1, ReviewSourceKindV1},
+            http_v1::{ReviewSourceInputV1, ReviewSourceKindV1, ThemaConceptRelationV1},
             offline_asset_capabilities, offline_content_capabilities, replica_snapshot_page,
             replica_state_response, review_pack_response,
         },
@@ -2216,6 +2218,141 @@ mod tests {
         let mut unordered = page;
         unordered.items.reverse();
         assert!(checked_node_themata_page(unordered, 2, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn node_themata_http_pages_and_rejects_unauthorized_or_stale_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let socket = directory.path().join("gnosis.sock");
+        let runtime = ServiceRuntime::start(database.clone(), database.with_extension("blobs"), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let reader = generate_device("reader".into(), vec!["read".into()]).unwrap();
+        let reader_token = reader.token.clone();
+        service.create_device(reader, 1).await.unwrap();
+        let writer = generate_device("writer".into(), vec!["content:write".into()]).unwrap();
+        let writer_token = writer.token.clone();
+        service.create_device(writer, 2).await.unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    Some("document".into()),
+                    "note.org".into(),
+                    "#+title: Note\n\n* Heading\n:PROPERTIES:\n:ID: node\n:END:\nBody\n".into(),
+                    None,
+                )
+                .unwrap(),
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        for index in 0..501 {
+            let relation = match index % 3 {
+                0 => ThemaConceptRelation::Primary,
+                1 => ThemaConceptRelation::Supporting,
+                _ => ThemaConceptRelation::Reference,
+            };
+            service
+                .put_thema(
+                    test_thema(
+                        &format!("thema-{index:04}"),
+                        vec![("node".into(), relation)],
+                        None,
+                    ),
+                    20260719,
+                    i64::from(index) + 4,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let daemon = TestDaemon::start_paths(&socket, &database).await;
+        let reader = HttpClient::new(
+            &daemon.base_url,
+            SecretToken::new(reader_token.clone()).unwrap(),
+        )
+        .unwrap();
+        let node_id = NodeId::new("node").unwrap();
+        let first = reader.node_themata(&node_id, 500, None).await.unwrap();
+        assert_eq!(first.items.len(), 500);
+        assert_eq!(first.items[0].thema_id, "thema-0000");
+        assert_eq!(first.items[0].relation, ThemaConceptRelationV1::Primary);
+        assert_eq!(first.next.as_deref(), Some("thema-0499"));
+        let second = reader
+            .node_themata(&node_id, 500, first.next.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].thema_id, "thema-0500");
+        assert!(matches!(
+            reader.node_themata(&node_id, 501, None).await,
+            Err(HttpClientError::InvalidMutation)
+        ));
+        assert!(matches!(
+            reader.node_themata(&node_id, 500, Some("missing")).await,
+            Err(HttpClientError::Server(error)) if error.status == 400
+        ));
+        let writer =
+            HttpClient::new(&daemon.base_url, SecretToken::new(writer_token).unwrap()).unwrap();
+        assert!(matches!(
+            writer.node_themata(&node_id, 500, None).await,
+            Err(HttpClientError::Server(error)) if error.status == 403
+        ));
+        daemon.stop().await;
+
+        let runtime = ServiceRuntime::start(database.clone(), database.with_extension("blobs"), 8)
+            .await
+            .unwrap();
+        runtime
+            .handle()
+            .put_thema(
+                test_thema("thema-0000", vec![], Some(1)),
+                20260719,
+                506,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime.finish().await.unwrap();
+        let daemon = TestDaemon::start_paths(&socket, &database).await;
+        let reader =
+            HttpClient::new(&daemon.base_url, SecretToken::new(reader_token).unwrap()).unwrap();
+        assert!(matches!(
+            reader.node_themata(&node_id, 500, Some("thema-0000")).await,
+            Err(HttpClientError::Server(error)) if error.status == 400
+        ));
+        daemon.stop().await;
+    }
+
+    fn test_thema(
+        id: &str,
+        concepts: Vec<(String, ThemaConceptRelation)>,
+        expected_revision: Option<u64>,
+    ) -> crate::application::PreparedThema {
+        prepare_thema(
+            Some(id.into()),
+            thema_content(
+                "basic",
+                "Question".into(),
+                vec![None],
+                vec!["answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            vec![],
+            concepts,
+            vec![],
+            expected_revision,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2960,7 +3097,11 @@ mod tests {
 
     impl TestDaemon {
         async fn start(fixture: &ReviewFixture) -> Self {
-            let mut config = DaemonConfig::new(&fixture.socket, &fixture.database);
+            Self::start_paths(&fixture.socket, &fixture.database).await
+        }
+
+        async fn start_paths(socket: &std::path::Path, database: &std::path::Path) -> Self {
+            let mut config = DaemonConfig::new(socket, database);
             config.http_addr = Some("127.0.0.1:0".parse().unwrap());
             let server = DaemonServer::bind(config).await.unwrap();
             let address = server.http_addr().unwrap();
