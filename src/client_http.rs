@@ -43,7 +43,7 @@ use crate::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1,
             DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DeviceIdentityV1,
-            DocumentImportRequestV1, DocumentMutationResultV1, NoteRenameRequestV1,
+            DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1, NoteRenameRequestV1,
             NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
             ReviewAnswerV1, ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1,
             ReviewAttemptV1, ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
@@ -51,8 +51,8 @@ use crate::{
             ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
             ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
             ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, StagedBlobV1, ThemaKindV1,
-            ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
+            ThemaKindV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
             valid_bearer_token,
         },
     },
@@ -1596,13 +1596,18 @@ fn valid_desired_projection(
                 expected_revision,
             },
         ) => {
-            settings.timezone == input.timezone
-                && settings.day_boundary_hour == input.day_boundary_hour
-                && settings.scheduler.desired_retention == input.desired_retention
+            settings_matches_input(settings, input)
                 && valid_mutation_revision(settings.revision, Some(*expected_revision), changed)
         }
         _ => false,
     }
+}
+
+fn settings_matches_input(settings: &SettingsV1, input: &UpdateSettingsRequestV1) -> bool {
+    let expected_scheduler = input.clone().into_application().scheduler();
+    settings.timezone == input.timezone
+        && settings.day_boundary_hour == input.day_boundary_hour
+        && settings.scheduler == FsrsConfigV1::from(&expected_scheduler)
 }
 
 fn valid_mutation_revision(revision: u64, expected_revision: Option<u64>, changed: bool) -> bool {
@@ -2380,32 +2385,32 @@ mod tests {
         };
         assert!(!valid_desired_projection(&thema, true, &create_expectation));
 
-        let settings: DesiredStateMutationProjectionV1 =
-            serde_json::from_value(serde_json::json!({
-                "kind": "settings",
-                "value": {
-                    "revision": 2,
-                    "timezone": "UTC",
-                    "day_boundary_hour": 4,
-                    "scheduler": {
-                        "algorithm": "fsrs",
-                        "model": "fsrs6",
-                        "implementation": "fsrs-6.6.1",
-                        "desired_retention": 0.9,
-                        "parameters": vec![0.0; 21]
-                    }
-                }
-            }))
-            .unwrap();
+        let settings_input = UpdateSettingsRequestV1 {
+            timezone: "UTC".into(),
+            day_boundary_hour: 4,
+            desired_retention: 0.9,
+        };
+        let scheduler = settings_input.clone().into_application().scheduler();
+        let mut settings = DesiredStateMutationProjectionV1::Settings(SettingsV1 {
+            revision: 2,
+            timezone: "UTC".into(),
+            day_boundary_hour: 4,
+            scheduler: FsrsConfigV1::from(&scheduler),
+        });
         let settings_expectation = DesiredMutationExpectation::Settings {
-            input: UpdateSettingsRequestV1 {
-                timezone: "UTC".into(),
-                day_boundary_hour: 4,
-                desired_retention: 0.9,
-            },
+            input: settings_input,
             expected_revision: 1,
         };
         assert!(valid_desired_projection(
+            &settings,
+            true,
+            &settings_expectation
+        ));
+        let DesiredStateMutationProjectionV1::Settings(settings_value) = &mut settings else {
+            unreachable!();
+        };
+        settings_value.scheduler.parameters[0] += 1.0;
+        assert!(!valid_desired_projection(
             &settings,
             true,
             &settings_expectation
@@ -2577,6 +2582,59 @@ mod tests {
 
         let error = client
             .set_thema_archived("thema", "operation", 1, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HttpClientError::InvalidResponse {
+                delivery: DeliveryStatus::Unknown
+            }
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settings_rejects_noncanonical_scheduler_with_unknown_delivery() {
+        let input = UpdateSettingsRequestV1 {
+            timezone: "UTC".into(),
+            day_boundary_hour: 4,
+            desired_retention: 0.9,
+        };
+        let scheduler = input.clone().into_application().scheduler();
+        let mut settings = SettingsV1 {
+            revision: 2,
+            timezone: "UTC".into(),
+            day_boundary_hour: 4,
+            scheduler: FsrsConfigV1::from(&scheduler),
+        };
+        settings.scheduler.parameters[0] += 1.0;
+        let body = serde_json::json!({
+            "status": "applied",
+            "format_version": 1,
+            "operation_id": "operation",
+            "authoritative": DesiredStateMutationProjectionV1::Settings(settings),
+            "cursor": "cursor",
+            "changed": true
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let base_url = format!("http://{address}/");
+        let client = HttpClient::new(&base_url, token).unwrap();
+
+        let error = client
+            .update_settings("operation", 1, &input)
             .await
             .unwrap_err();
         assert!(matches!(
