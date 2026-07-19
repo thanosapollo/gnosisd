@@ -83,6 +83,8 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 (define-error 'gnosis-core-validation-error "Gnosis request rejected" 'gnosis-core-error)
 (define-error 'gnosis-core-unavailable "Gnosis service unavailable" 'gnosis-core-transport-error)
 (define-error 'gnosis-core-protocol-error "Invalid Gnosis response" 'gnosis-core-error)
+(define-error 'gnosis-core-mutation-uncertain
+  "Gnosis mutation outcome is uncertain" 'gnosis-core-error)
 (define-error 'gnosis-core-api-unavailable "Gnosis API bindings unavailable" 'gnosis-core-error)
 
 (defun gnosis-core--invalid (message)
@@ -589,8 +591,11 @@ one transport failure using the exact request.  AUTH-P defaults to non-nil;
   "Return non-nil when VALUE has decoded JSON object shape."
   (and (proper-list-p value)
        (cl-evenp (length value))
-       (cl-loop for (key _item) on value by #'cddr
-                always (keywordp key))))
+       (let ((keys (cl-loop for (key _item) on value by #'cddr
+                            collect key)))
+         (and (cl-every #'keywordp keys)
+              (= (length keys)
+                 (length (delete-dups (copy-sequence keys))))))))
 
 (defun gnosis-core--schema-ref (contract reference)
   "Resolve schema REFERENCE in CONTRACT or return nil."
@@ -870,6 +875,29 @@ PATH-VALUES, QUERY, and HEADERS contain the supplied bindings."
   (plist-get (plist-get (plist-get container :content) :application/json)
              :schema))
 
+(defun gnosis-core--schema-properties (schema contract)
+  "Return object properties from SCHEMA after resolving it in CONTRACT."
+  (let ((resolved
+         (if-let* ((reference (plist-get schema :$ref)))
+             (gnosis-core--schema-ref contract reference)
+           schema)))
+    (and resolved (plist-get resolved :properties))))
+
+(defun gnosis-core--shared-response-fields-valid-p
+    (body response-schema contract)
+  "Check BODY against matching RESPONSE-SCHEMA fields using CONTRACT."
+  (let ((properties
+         (and (gnosis-core--json-object-p body)
+              (gnosis-core--schema-properties response-schema contract))))
+    (or (not (gnosis-core--json-object-p body))
+        (not properties)
+        (cl-loop for (key value) on body by #'cddr
+                 for schema = (and (plist-member properties key)
+                                   (plist-get properties key))
+                 always (or (not schema)
+                            (gnosis-core--schema-valid-p
+                             value schema contract))))))
+
 (defun gnosis-core--operation-success (operation)
   "Return the sole success status and response schema for OPERATION."
   (let ((matches
@@ -908,15 +936,27 @@ the remaining declared request inputs."
                (not (and request-schema
                          (gnosis-core--schema-valid-p body request-schema contract))))
       (gnosis-core--invalid "Invalid Gnosis request body"))
+    (unless (gnosis-core--shared-response-fields-valid-p
+             body (cdr success) contract)
+      (gnosis-core--invalid
+       "Gnosis request cannot satisfy its response contract"))
     (let ((value
-           (gnosis-core--request
-            method
-            (gnosis-core--operation-path
-             template path-values query)
-            body (car success) nil (equal method "GET") t headers)))
+           (condition-case condition
+               (gnosis-core--request
+                method
+                (gnosis-core--operation-path template path-values query)
+                body (car success) nil (equal method "GET") t headers)
+             ((gnosis-core-transport-error gnosis-core-protocol-error)
+              (if (equal method "GET")
+                  (signal (car condition) (cdr condition))
+                (signal 'gnosis-core-mutation-uncertain
+                        '("Gnosis mutation outcome is uncertain")))))))
       (unless (and (cdr success)
                    (gnosis-core--schema-valid-p value (cdr success) contract))
-        (gnosis-core--invalid "Invalid Gnosis operation response"))
+        (if (equal method "GET")
+            (gnosis-core--invalid "Invalid Gnosis operation response")
+          (signal 'gnosis-core-mutation-uncertain
+                  '("Gnosis mutation response is invalid"))))
       value)))
 
 (defun gnosis-core-dashboard (&optional days)
@@ -938,8 +978,51 @@ the remaining declared request inputs."
 
 (defun gnosis-core-thema (thema-id)
   "Return the server projection for opaque THEMA-ID."
-  (gnosis-core--typed-request
-   "get_themata__id_" (list (cons "id" thema-id))))
+  (let ((projection
+         (gnosis-core--typed-request
+          "get_themata__id_" (list (cons "id" thema-id)))))
+    (unless (equal thema-id (plist-get projection :thema_id))
+      (gnosis-core--invalid "Gnosis thema identity mismatch"))
+    projection))
+
+(defun gnosis-core--operation-request-view (identity projection)
+  "Project IDENTITY's request fields from server PROJECTION."
+  (let* ((contract (gnosis-core--contract))
+         (operation (plist-get (gnosis-core--operation-entry identity) :operation))
+         (request-schema
+          (gnosis-core--operation-json-schema
+           (plist-get operation :requestBody)))
+         (schema (if-let* ((reference (plist-get request-schema :$ref)))
+                     (gnosis-core--schema-ref contract reference)
+                   request-schema))
+         (properties (and schema (plist-get schema :properties)))
+         (view
+          (cl-loop for (key _property) on properties by #'cddr
+                   when (plist-member projection key)
+                   append (list key (plist-get projection key)))))
+    (unless (and properties
+                 (gnosis-core--schema-valid-p view schema contract))
+      (gnosis-core--invalid "Invalid Gnosis write projection"))
+    view))
+
+(defun gnosis-core-thema-write-view (projection)
+  "Return thema write fields derived from server PROJECTION."
+  (gnosis-core--operation-request-view "put_themata__id_" projection))
+
+(defun gnosis-core-thema-create (request)
+  "Create and return a thema from REQUEST without automatic retry."
+  (gnosis-core--typed-request "post_themata" nil nil request))
+
+(defun gnosis-core-thema-update (thema-id revision request)
+  "Update opaque THEMA-ID at REVISION from REQUEST without automatic retry."
+  (let ((projection
+         (gnosis-core--typed-request
+          "put_themata__id_" (list (cons "id" thema-id)) nil request
+          (list (gnosis-core--if-match-header revision)))))
+    (unless (equal thema-id (plist-get projection :thema_id))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis mutation response identity is invalid")))
+    projection))
 
 (defun gnosis-core-api-unavailable (operation)
   "Signal that generated bindings for OPERATION are not available."

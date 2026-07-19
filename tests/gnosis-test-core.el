@@ -52,6 +52,41 @@ CONTENT-TYPE defaults to application/json."
       (:type "object" :additionalProperties ,gnosis-core--json-false
        :required ["id"] :properties (:id (:type "string")))))))
 
+(defun gnosis-test-core--thema-contract ()
+  "Return a small live-contract fixture for thema write tests."
+  `(:openapi "3.1.0" :info (:title "Gnosis API" :version "1.0.0")
+    :paths
+    (:/v1/themata/{id}
+     (:put
+      (:operationId "put_themata__id_"
+       :parameters
+       [(:in "path" :name "id" :required t :schema (:type "string"))
+        (:in "header" :name "If-Match" :required t :schema (:type "string"))]
+       :requestBody
+       (:required t :content
+        (:application/json (:schema (:$ref "#/components/schemas/ThemaWrite"))))
+       :responses (:200 (:description "ok" :content
+                         (:application/json (:schema (:type "object")))))
+       :security [(:bearerAuth [])]
+       :x-gnosis-required-scopes ["content:write"])))
+    :components
+    (:schemas
+     (:ThemaWrite
+      (:type "object" :additionalProperties ,gnosis-core--json-false
+       :required ["kind" "keimenon" "answer"]
+       :properties
+       (:kind (:enum ["basic" "cloze"] :type "string")
+        :keimenon (:type "string")
+        :answer (:type "array" :items (:type "string"))
+        :concepts
+        (:type "array" :items
+         (:type "object" :additionalProperties ,gnosis-core--json-false
+          :required ["node_id" "relation"]
+          :properties
+          (:node_id (:type "string")
+           :relation (:enum ["primary" "supporting" "reference"]
+                      :type "string"))))))))))
+
 (ert-deftest gnosis-core-validates-service-authority ()
   (dolist (url '("http://127.0.0.1:7842" "http://localhost:7842"
                  "https://gnosis.example.org"))
@@ -77,6 +112,9 @@ CONTENT-TYPE defaults to application/json."
                 "{\"empty\":[],\"items\":[\"one\"]}")))
     (should (vectorp (plist-get value :empty)))
     (should (equal ["one"] (plist-get value :items)))))
+
+(ert-deftest gnosis-core-rejects-duplicate-json-object-keys ()
+  (should-not (gnosis-core--json-object-p '(:value "one" :value "two"))))
 
 (ert-deftest gnosis-core-encodes-opaque-path-and-query-values ()
   (should (equal "opaque%2Fid%3Fx" (gnosis-core--path-segment "opaque/id?x")))
@@ -212,11 +250,11 @@ CONTENT-TYPE defaults to application/json."
        (gnosis-core--typed-request
         "put_widget" '(("id" . "widget")) nil '(:value "text")
         '(("If-Match" . "\"3\"")))
-       :type 'gnosis-core-protocol-error))))
+       :type 'gnosis-core-mutation-uncertain))))
 
 (ert-deftest gnosis-core-typed-request-requires-bearer-scope-metadata ()
   (dolist (key '(:security :x-gnosis-required-scopes))
-    (let* ((contract (gnosis-test-core--contract))
+    (let* ((contract (copy-tree (gnosis-test-core--contract) t))
            (operation (plist-get
                        (plist-get (plist-get contract :paths)
                                   :/v1/widgets/{id})
@@ -231,7 +269,7 @@ CONTENT-TYPE defaults to application/json."
        :type 'gnosis-core-protocol-error))))
 
 (ert-deftest gnosis-core-typed-request-rejects-compound-authentication ()
-  (let* ((contract (gnosis-test-core--contract))
+  (let* ((contract (copy-tree (gnosis-test-core--contract) t))
          (operation (plist-get
                      (plist-get (plist-get contract :paths)
                                 :/v1/widgets/{id})
@@ -257,7 +295,7 @@ CONTENT-TYPE defaults to application/json."
      :type 'gnosis-core-protocol-error)))
 
 (ert-deftest gnosis-core-typed-request-rejects-incoherent-path-template ()
-  (let* ((contract (gnosis-test-core--contract))
+  (let* ((contract (copy-tree (gnosis-test-core--contract) t))
          (item (plist-get (plist-get contract :paths) :/v1/widgets/{id}))
          (gnosis-core--contract-cache
           (list :base "http://127.0.0.1:7842"
@@ -304,11 +342,13 @@ CONTENT-TYPE defaults to application/json."
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
                  (push arguments calls)
-                 '(:projection t))))
+                 (if (equal (car arguments) "get_themata__id_")
+                     '(:thema_id "opaque/thema?id")
+                   '(:projection t)))))
       (should (equal '(:projection t) (gnosis-core-dashboard 90)))
       (should (equal '(:projection t)
                      (gnosis-core-nodes "logic" "opaque/cursor" 25)))
-      (should (equal '(:projection t)
+      (should (equal '(:thema_id "opaque/thema?id")
                      (gnosis-core-thema "opaque/thema?id"))))
     (should
      (equal
@@ -326,6 +366,99 @@ CONTENT-TYPE defaults to application/json."
       (gnosis-core-nodes nil nil nil))
     (should (equal '(("get_dashboard") ("get_nodes"))
                    (nreverse calls)))))
+
+(ert-deftest gnosis-core-thema-write-bindings-are-single-shot-and-revisioned ()
+  (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
+        calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 (if (equal (car arguments) "put_themata__id_")
+                     '(:thema_id "opaque/id" :saved t)
+                   '(:saved t)))))
+      (should (equal '(:saved t) (gnosis-core-thema-create request)))
+      (should (equal '(:thema_id "opaque/id" :saved t)
+                     (gnosis-core-thema-update "opaque/id" 7 request))))
+    (should
+     (equal
+      `(("post_themata" nil nil ,request)
+        ("put_themata__id_" (("id" . "opaque/id")) nil ,request
+         (("If-Match" . "\"7\""))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-thema-bindings-reject-wrong-response-identity ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _) '(:thema_id "different"))))
+    (should-error (gnosis-core-thema "expected")
+                  :type 'gnosis-core-protocol-error)
+    (should-error
+     (gnosis-core-thema-update
+      "expected" 1 '(:kind "basic" :keimenon "Q" :answer ["A"]))
+     :type 'gnosis-core-mutation-uncertain)))
+
+(ert-deftest gnosis-core-thema-write-view-follows-request-schema ()
+  (let* ((contract (gnosis-test-core--thema-contract))
+         (gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842" :document contract))
+         (projection
+          '(:thema_id "opaque" :revision 7 :kind "basic" :keimenon "Q"
+            :answer ["A"] :concepts [(:node_id "node/id"
+                                      :relation "primary")])))
+    (should
+     (equal '(:kind "basic" :keimenon "Q" :answer ["A"]
+              :concepts [(:node_id "node/id" :relation "primary")])
+            (gnosis-core-thema-write-view projection)))
+    (setf (plist-get (aref (plist-get projection :concepts) 0) :relation)
+          "invented")
+    (should-error (gnosis-core-thema-write-view projection)
+                  :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-core-mutation-rejects-incoherent-response-before-transport ()
+  (let* ((contract (copy-tree (gnosis-test-core--contract) t))
+         (write (plist-get
+                 (plist-get (plist-get contract :components) :schemas)
+                 :WidgetWrite))
+         (response (plist-get
+                    (plist-get (plist-get contract :components) :schemas)
+                    :Widget))
+         (gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842" :document contract))
+         (calls 0))
+    (setf (plist-get (plist-get (plist-get write :properties) :value) :type)
+          ["string" "null"])
+    (setf (plist-get response :required) ["id" "value"])
+    (setf (plist-get (plist-get response :properties) :value)
+          '(:type "string"))
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _) (cl-incf calls))))
+      (should-error
+       (gnosis-core--typed-request
+        "put_widget" '(("id" . "widget")) nil
+        `(:value ,gnosis-core--json-null) '(("If-Match" . "\"3\"")))
+       :type 'gnosis-core-protocol-error))
+    (should (= calls 0))))
+
+(ert-deftest gnosis-core-shared-response-check-ignores-array-bodies ()
+  (should
+   (gnosis-core--shared-response-fields-valid-p
+    ["value"] '(:type "object" :properties (:value (:type "string")))
+    (gnosis-test-core--contract))))
+
+(ert-deftest gnosis-core-mutation-does-not-hide-uncertain-outcome ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0))
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf calls)
+                 (signal 'gnosis-core-timeout '("timeout")))))
+      (should-error
+       (gnosis-core--typed-request
+        "put_widget" '(("id" . "widget")) nil '(:value "text")
+        '(("If-Match" . "\"3\"")))
+       :type 'gnosis-core-mutation-uncertain))
+    (should (= calls 1))))
 
 (ert-deftest gnosis-core-openapi-request-is-public-and-retryable ()
   (let (calls)

@@ -24,14 +24,15 @@
 
 (ert-deftest gnosis-boundary-exposes-no-domain-or-database-api ()
   (dolist (symbol '(gnosis-core-request gnosis-core-sql
-                    gnosis-core-themata gnosis-core-thema-create
+                    gnosis-core-themata
                     gnosis-core-review-session-create
                     gnosis-core-review-attempt-answer
                     gnosis-db-select gnosis-db-update))
     (should-not (fboundp symbol))))
 
-(ert-deftest gnosis-boundary-exposes-typed-read-operations ()
-  (dolist (symbol '(gnosis-core-dashboard gnosis-core-nodes gnosis-core-thema))
+(ert-deftest gnosis-boundary-exposes-typed-http-operations ()
+  (dolist (symbol '(gnosis-core-dashboard gnosis-core-nodes gnosis-core-thema
+                    gnosis-core-thema-create gnosis-core-thema-update))
     (should (fboundp symbol)))
   (should-not (fboundp 'gnosis-core-request)))
 
@@ -41,24 +42,22 @@
                     gnosis-review-resume))
     (should (commandp command))))
 
-(ert-deftest gnosis-boundary-unbound-flows-fail-before-local-mutation ()
+(ert-deftest gnosis-boundary-review-flows-fail-before-local-mutation ()
   (dolist (buffer '("*Gnosis New*" "*Gnosis Edit*" "*gnosis*"))
     (when-let* ((live (get-buffer buffer))) (kill-buffer live)))
-  (dolist (call '((gnosis-add-thema)
-                  (gnosis-edit-thema "thema")
-                  (gnosis-review)
+  (dolist (call '((gnosis-review)
                   (gnosis-review-topic "node")
                   (gnosis-review-resume)))
     (should-error (eval call t) :type 'gnosis-core-api-unavailable))
   (dolist (buffer '("*Gnosis New*" "*Gnosis Edit*" "*gnosis*"))
     (should-not (get-buffer buffer))))
 
-(ert-deftest gnosis-boundary-has-no-handwritten-domain-dtos-or-routes ()
+(ert-deftest gnosis-boundary-has-no-dead-dtos-or-handwritten-routes ()
   (dolist (feature '(gnosis gnosis-core gnosis-edit gnosis-review))
     (let ((source (gnosis-test-boundary--library-string feature)))
       (should-not
        (string-match-p
-        "node_ids\\|source_guid\\|content_type\\|concepts\\|operation_id\\|expected_revision\\|receipt\\|attempt_revision\\|proposed_transition"
+        "node_ids\\|content_type\\|operation_id\\|expected_revision\\|receipt\\|attempt_revision\\|proposed_transition"
         source))))
   (let ((source (gnosis-test-boundary--library-string 'gnosis-core)))
     (dolist (route '("/v1/dashboard" "/v1/nodes" "/v1/themata"
