@@ -125,8 +125,9 @@ impl StoredDocument {
 pub(crate) struct DocumentAssetSource {
     pub(crate) document_id: String,
     pub(crate) revision: u64,
-    pub(crate) blob_sha256: String,
+    pub(crate) blob_sha256: Option<String>,
     pub(crate) active_head: bool,
+    pub(crate) head_revision: bool,
 }
 
 pub(crate) struct DocumentAssetAssociation {
@@ -134,6 +135,7 @@ pub(crate) struct DocumentAssetAssociation {
     pub(crate) revision: u64,
     pub(crate) asset_paths: Vec<String>,
     pub(crate) active_head: bool,
+    pub(crate) head_revision: bool,
 }
 
 pub(crate) struct SqliteStore {
@@ -1040,12 +1042,12 @@ impl SqliteStore {
         load_blob_rows(&self.connection)
     }
 
-    pub(crate) fn referenced_blobs_page(
+    pub(crate) fn blobs_page(
         &self,
         after: Option<&str>,
         limit: u16,
     ) -> Result<Vec<(String, u64)>, StoreError> {
-        load_blob_rows_page(&self.connection, after, limit)
+        load_digest_rows_page(&self.connection, "blob", after, limit)
     }
 
     pub(crate) fn has_blob_record(&self, digest: &str) -> Result<bool, StoreError> {
@@ -1058,17 +1060,20 @@ impl SqliteStore {
             .map_err(StoreError::storage)
     }
 
-    pub(crate) fn is_blob_referenced(&self, digest: &str) -> Result<bool, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM blob WHERE content_sha256 = ?1
-                     UNION SELECT 1 FROM offline_asset_evidence WHERE content_sha256 = ?1
-                 )",
-                [digest],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::storage)
+    pub(crate) fn staged_blobs_page(
+        &self,
+        after: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        load_digest_rows_page(&self.connection, "staged_blob", after, limit)
+    }
+
+    pub(crate) fn offline_asset_evidence_page(
+        &self,
+        after: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<(String, String, u64)>, StoreError> {
+        load_offline_asset_evidence_page(&self.connection, after, limit)
     }
 
     pub(crate) fn document_asset_sources_page(
@@ -1077,6 +1082,14 @@ impl SqliteStore {
         limit: u16,
     ) -> Result<Vec<DocumentAssetSource>, StoreError> {
         load_document_asset_sources_page(&self.connection, after, limit)
+    }
+
+    pub(crate) fn document_asset_heads_page(
+        &self,
+        after: Option<&str>,
+        limit: u16,
+    ) -> Result<Vec<DocumentAssetSource>, StoreError> {
+        load_document_asset_heads_page(&self.connection, after, limit)
     }
 
     pub(crate) fn repair_document_assets(
@@ -2239,23 +2252,47 @@ fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreEr
         .map_err(StoreError::storage)
 }
 
-fn load_blob_rows_page(
+fn load_digest_rows_page(
     connection: &Connection,
+    table: &str,
     after: Option<&str>,
     limit: u16,
 ) -> Result<Vec<(String, u64)>, StoreError> {
+    debug_assert!(matches!(table, "blob" | "staged_blob"));
     let mut statement = connection
-        .prepare(
-            "SELECT content_sha256, size_bytes FROM (
-                 SELECT content_sha256, size_bytes FROM blob
-                 UNION SELECT content_sha256, size_bytes FROM offline_asset_evidence
-             ) WHERE content_sha256 > coalesce(?1, '')
-             ORDER BY content_sha256 LIMIT ?2",
-        )
+        .prepare(&format!(
+            "SELECT content_sha256, size_bytes FROM {table}
+             WHERE content_sha256 > coalesce(?1, '')
+             ORDER BY content_sha256 LIMIT ?2"
+        ))
         .map_err(StoreError::storage)?;
     statement
         .query_map(params![after, i64::from(limit)], |row| {
             Ok((row.get::<_, String>(0)?, row_u64(row, 1)?))
+        })
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
+}
+
+fn load_offline_asset_evidence_page(
+    connection: &Connection,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<Vec<(String, String, u64)>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT operation_id, content_sha256, size_bytes FROM offline_asset_evidence
+             WHERE operation_id > coalesce(?1, '') ORDER BY operation_id LIMIT ?2",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map(params![after, i64::from(limit)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row_u64(row, 2)?,
+            ))
         })
         .map_err(StoreError::storage)?
         .collect::<Result<Vec<_>, _>>()
@@ -2269,12 +2306,10 @@ fn load_document_asset_sources_page(
 ) -> Result<Vec<DocumentAssetSource>, StoreError> {
     let mut statement = connection
         .prepare(
-            "SELECT revision.document_id, revision.revision, revision.blob_sha256,
-                    document.active = 1 AND document.revision = revision.revision
+            "SELECT revision.document_id, revision.revision, revision.blob_sha256, 0, 0
              FROM document_revision AS revision
              JOIN document USING(document_id)
-             WHERE revision.blob_sha256 IS NOT NULL
-               AND (revision.document_id, revision.revision) >
+             WHERE (revision.document_id, revision.revision) >
                    (coalesce(?1, ''), coalesce(?2, 0))
              ORDER BY revision.document_id, revision.revision LIMIT ?3",
         )
@@ -2294,9 +2329,42 @@ fn load_document_asset_sources_page(
                     revision: row_u64(row, 1)?,
                     blob_sha256: row.get(2)?,
                     active_head: row.get(3)?,
+                    head_revision: row.get(4)?,
                 })
             },
         )
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
+}
+
+fn load_document_asset_heads_page(
+    connection: &Connection,
+    after: Option<&str>,
+    limit: u16,
+) -> Result<Vec<DocumentAssetSource>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT document.document_id, document.revision, revision.blob_sha256,
+                    document.active = 1, 1
+             FROM document
+             JOIN document_revision AS revision
+               ON revision.document_id = document.document_id
+              AND revision.revision = document.revision
+             WHERE document.document_id > coalesce(?1, '')
+             ORDER BY document.document_id LIMIT ?2",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map(params![after, i64::from(limit)], |row| {
+            Ok(DocumentAssetSource {
+                document_id: row.get(0)?,
+                revision: row_u64(row, 1)?,
+                blob_sha256: row.get(2)?,
+                active_head: row.get(3)?,
+                head_revision: row.get(4)?,
+            })
+        })
         .map_err(StoreError::storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::storage)
@@ -2331,14 +2399,16 @@ fn repair_document_asset_rows(
             association.revision,
             &association.asset_paths,
         )?;
-        if association.active_head {
+        if association.head_revision {
             transaction
                 .execute(
                     "DELETE FROM document_asset WHERE document_id = ?1",
                     [document_id.as_str()],
                 )
                 .map_err(StoreError::storage)?;
-            insert_current_document_assets(&transaction, association)?;
+            if association.active_head {
+                insert_current_document_assets(&transaction, association)?;
+            }
         }
     }
     transaction.commit().map_err(StoreError::storage)
@@ -5286,6 +5356,46 @@ mod tests {
     }
 
     #[test]
+    fn repair_pages_use_indexed_keyset_queries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        for query in [
+            "SELECT content_sha256, size_bytes FROM blob
+             WHERE content_sha256 > '' ORDER BY content_sha256 LIMIT 1",
+            "SELECT content_sha256, size_bytes FROM staged_blob
+             WHERE content_sha256 > '' ORDER BY content_sha256 LIMIT 1",
+            "SELECT operation_id, content_sha256, size_bytes FROM offline_asset_evidence
+             WHERE operation_id > '' ORDER BY operation_id LIMIT 1",
+            "SELECT revision.document_id, revision.revision, revision.blob_sha256, 0, 0
+             FROM document_revision AS revision JOIN document USING(document_id)
+             WHERE (revision.document_id, revision.revision) > ('', 0)
+             ORDER BY revision.document_id, revision.revision LIMIT 1",
+            "SELECT document.document_id, document.revision, revision.blob_sha256,
+                    document.active = 1, 1
+             FROM document JOIN document_revision AS revision
+               ON revision.document_id = document.document_id
+              AND revision.revision = document.revision
+             WHERE document.document_id > '' ORDER BY document.document_id LIMIT 1",
+        ] {
+            let mut statement = store
+                .connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap();
+            let details: Vec<String> = statement
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(details.iter().any(|detail| detail.contains("SEARCH")));
+            assert!(
+                details
+                    .iter()
+                    .all(|detail| !detail.contains("USE TEMP B-TREE")),
+                "unbounded repair query plan: {details:?}"
+            );
+        }
+    }
+
+    #[test]
     fn paged_repair_preserves_current_and_history_associations() {
         use crate::application::retained_asset_paths_in_org;
         let mut store = SqliteStore::open_in_memory().unwrap();
@@ -5310,6 +5420,43 @@ mod tests {
 
         let first_assets = retained_asset_paths_in_org(&first.org);
         let second_assets = retained_asset_paths_in_org(&second.org);
+        let document_id = DocumentId::new("document").unwrap();
+        store.tombstone_document(&document_id, 2, 4, None).unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM document_revision_asset WHERE document_id = ?1",
+                [document_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO document_asset(document_id, asset_path) VALUES (?1, ?2)",
+                rusqlite::params![document_id.as_str(), second_assets[0]],
+            )
+            .unwrap();
+
+        let heads = store.document_asset_heads_page(None, 1).unwrap();
+        assert_eq!(heads.len(), 1);
+        store
+            .repair_document_assets(&[DocumentAssetAssociation {
+                document_id: heads[0].document_id.clone(),
+                revision: heads[0].revision,
+                asset_paths: Vec::new(),
+                active_head: heads[0].active_head,
+                head_revision: heads[0].head_revision,
+            }])
+            .unwrap();
+        let stale_current: u32 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM document_asset WHERE document_id = ?1",
+                [document_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_current, 0);
 
         let mut page_cursor: Option<(String, u64)> = None;
         let mut visited = 0_u32;
@@ -5327,12 +5474,13 @@ mod tests {
             let association = DocumentAssetAssociation {
                 document_id: sources[0].document_id.clone(),
                 revision: sources[0].revision,
-                asset_paths: retained_asset_paths_in_org(if sources[0].revision == 1 {
-                    &first.org
-                } else {
-                    &second.org
-                }),
+                asset_paths: match sources[0].revision {
+                    1 => retained_asset_paths_in_org(&first.org),
+                    2 => retained_asset_paths_in_org(&second.org),
+                    _ => Vec::new(),
+                },
                 active_head: sources[0].active_head,
+                head_revision: sources[0].head_revision,
             };
             store
                 .repair_document_assets(std::slice::from_ref(&association))
@@ -5340,9 +5488,8 @@ mod tests {
             visited += 1;
             page_cursor = Some((sources[0].document_id.clone(), sources[0].revision));
         }
-        assert_eq!(visited, 2);
+        assert_eq!(visited, 3);
 
-        let document_id = DocumentId::new("document").unwrap();
         let mut statement = store
             .connection
             .prepare(
@@ -5354,7 +5501,7 @@ mod tests {
             .unwrap()
             .map(|row| row.unwrap())
             .collect();
-        assert_eq!(current_assets, second_assets);
+        assert!(current_assets.is_empty());
 
         let mut history_statement = store
             .connection

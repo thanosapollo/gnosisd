@@ -1,5 +1,4 @@
 use std::{
-    io,
     path::PathBuf,
     sync::{
         Arc,
@@ -50,11 +49,12 @@ use crate::{
     domain::{ClozeCheck, DocumentId, DueThema},
     protocol::MAX_REPAIR_BATCH_SIZE,
     store::{
-        DeviceMutationExecution, DocumentAssetAssociation, SqliteStore, StoreError, StoredDocument,
+        DeviceMutationExecution, DocumentAssetAssociation, DocumentAssetSource, SqliteStore,
+        StoreError, StoredDocument,
     },
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RepairSummary {
     pub(crate) document_revisions_repaired: u64,
     pub(crate) blobs_verified: u64,
@@ -1697,11 +1697,21 @@ fn repair_canonical_state(
     blobs: &BlobStore,
     batch_size: u16,
 ) -> Result<RepairSummary, StoreError> {
-    let mut summary = RepairSummary {
-        document_revisions_repaired: 0,
-        blobs_verified: 0,
-        max_batch_observed: 0,
-    };
+    let mut summary = RepairSummary::default();
+    let mut head_cursor = None;
+    loop {
+        let sources = store.document_asset_heads_page(head_cursor.as_deref(), batch_size)?;
+        summary.max_batch_observed = summary
+            .max_batch_observed
+            .max(u16::try_from(sources.len()).unwrap_or(u16::MAX));
+        if sources.is_empty() {
+            break;
+        }
+        let associations = document_asset_associations(&sources, blobs)?;
+        store.repair_document_assets(&associations)?;
+        head_cursor = sources.last().map(|source| source.document_id.clone());
+    }
+
     let mut document_cursor: Option<(String, u64)> = None;
     loop {
         let sources = store.document_asset_sources_page(
@@ -1716,21 +1726,7 @@ fn repair_canonical_state(
         if sources.is_empty() {
             break;
         }
-        let mut associations = Vec::with_capacity(sources.len());
-        for source in &sources {
-            let bytes = blobs
-                .read(&source.blob_sha256)
-                .map_err(|error| StoreError::Storage(Box::new(error)))?;
-            let org = String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
-                field: "document blob UTF-8",
-            })?;
-            associations.push(DocumentAssetAssociation {
-                document_id: source.document_id.clone(),
-                revision: source.revision,
-                asset_paths: retained_asset_paths_in_org(&org),
-                active_head: source.active_head,
-            });
-        }
+        let associations = document_asset_associations(&sources, blobs)?;
         store.repair_document_assets(&associations)?;
         summary.document_revisions_repaired += sources.len() as u64;
         document_cursor = sources
@@ -1740,7 +1736,7 @@ fn repair_canonical_state(
 
     let mut blob_cursor = None;
     loop {
-        let page = store.referenced_blobs_page(blob_cursor.as_deref(), batch_size)?;
+        let page = store.blobs_page(blob_cursor.as_deref(), batch_size)?;
         summary.max_batch_observed = summary
             .max_batch_observed
             .max(u16::try_from(page.len()).unwrap_or(u16::MAX));
@@ -1756,17 +1752,75 @@ fn repair_canonical_state(
         blob_cursor = page.last().map(|(digest, _)| digest.clone());
     }
 
-    let store_ref: &SqliteStore = store;
+    let mut staged_cursor = None;
+    loop {
+        let page = store.staged_blobs_page(staged_cursor.as_deref(), batch_size)?;
+        summary.max_batch_observed = summary
+            .max_batch_observed
+            .max(u16::try_from(page.len()).unwrap_or(u16::MAX));
+        if page.is_empty() {
+            break;
+        }
+        for (digest, size) in &page {
+            blobs
+                .verify(digest, *size)
+                .map_err(|error| StoreError::Storage(Box::new(error)))?;
+        }
+        summary.blobs_verified += page.len() as u64;
+        staged_cursor = page.last().map(|(digest, _)| digest.clone());
+    }
+
+    let mut evidence_cursor = None;
+    loop {
+        let page = store.offline_asset_evidence_page(evidence_cursor.as_deref(), batch_size)?;
+        summary.max_batch_observed = summary
+            .max_batch_observed
+            .max(u16::try_from(page.len()).unwrap_or(u16::MAX));
+        if page.is_empty() {
+            break;
+        }
+        for (_, digest, size) in &page {
+            blobs
+                .verify(digest, *size)
+                .map_err(|error| StoreError::Storage(Box::new(error)))?;
+        }
+        summary.blobs_verified += page.len() as u64;
+        evidence_cursor = page.last().map(|(operation_id, _, _)| operation_id.clone());
+    }
+
     blobs
-        .cleanup_orphans(|digest| {
-            store_ref.is_blob_referenced(digest).map_err(|error| {
-                BlobError::Io(io::Error::other(format!(
-                    "referenced blob lookup failed: {error}"
-                )))
-            })
-        })
+        .cleanup_temporary()
         .map_err(|error| StoreError::Storage(Box::new(error)))?;
     Ok(summary)
+}
+
+fn document_asset_associations(
+    sources: &[DocumentAssetSource],
+    blobs: &BlobStore,
+) -> Result<Vec<DocumentAssetAssociation>, StoreError> {
+    sources
+        .iter()
+        .map(|source| {
+            let asset_paths = if let Some(blob_sha256) = &source.blob_sha256 {
+                let bytes = blobs
+                    .read(blob_sha256)
+                    .map_err(|error| StoreError::Storage(Box::new(error)))?;
+                let org = String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
+                    field: "document blob UTF-8",
+                })?;
+                retained_asset_paths_in_org(&org)
+            } else {
+                Vec::new()
+            };
+            Ok(DocumentAssetAssociation {
+                document_id: source.document_id.clone(),
+                revision: source.revision,
+                asset_paths,
+                active_head: source.active_head,
+                head_revision: source.head_revision,
+            })
+        })
+        .collect()
 }
 
 struct ContentCommand<'a> {
@@ -2701,7 +2755,10 @@ mod tests {
     use sha2::Digest as _;
     use tokio::sync::oneshot;
 
-    use super::{ServiceError, ServiceHandle, ServiceRuntime, StoreCommand, store_actor};
+    use super::{
+        ServiceError, ServiceHandle, ServiceRuntime, StoreCommand, repair_canonical_state,
+        store_actor,
+    };
     use crate::application::{
         AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
         ImportDocument, OfflineAssetConflictReason, OfflineAssetOperation, ReplicaProjection,
@@ -2709,7 +2766,7 @@ mod tests {
         prepare_device_desired_state_mutation, prepare_device_document_mutation, prepare_note,
         prepare_thema, thema_content,
     };
-    use crate::blob::BlobStore;
+    use crate::blob::{BlobMeta, BlobStore};
     use crate::protocol::canonical_asset_operation;
     use crate::store::{SqliteStore, StoreError};
 
@@ -2755,6 +2812,31 @@ mod tests {
 
         assert!(matches!(result, Err(ServiceError::Busy)));
         assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[test]
+    fn repair_pages_and_preserves_staged_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(directory.path().join("blobs")).unwrap();
+        let mut store = SqliteStore::open(directory.path().join("gnosis.sqlite")).unwrap();
+        for (created_at_us, bytes) in [(1, b"one".as_slice()), (2, b"two".as_slice())] {
+            let blob = blobs.put(bytes, "application/octet-stream").unwrap();
+            store
+                .stage_blob(
+                    &BlobMeta {
+                        sha256: blob.sha256,
+                        size_bytes: blob.size_bytes,
+                        media_type: blob.media_type,
+                    },
+                    created_at_us,
+                )
+                .unwrap();
+        }
+
+        let summary = repair_canonical_state(&mut store, &blobs, 1).unwrap();
+        assert_eq!(summary.blobs_verified, 2);
+        assert_eq!(summary.max_batch_observed, 1);
+        assert_eq!(store.staged_blobs_page(None, 10).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -3025,6 +3107,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
+        let repair = service.repair(1).await.unwrap();
+        assert_eq!(repair.blobs_verified, 1);
+        assert_eq!(repair.max_batch_observed, 1);
         let backup = service
             .create_backup(directory.path().join("backup"), 5)
             .await

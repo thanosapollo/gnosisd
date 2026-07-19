@@ -99,10 +99,7 @@ impl BlobStore {
         verify_file(&self.blob_path(digest)?, digest, size)
     }
 
-    pub(crate) fn cleanup_orphans(
-        &self,
-        mut is_referenced: impl FnMut(&str) -> Result<bool, BlobError>,
-    ) -> Result<u64, BlobError> {
+    pub(crate) fn cleanup_temporary(&self) -> Result<u64, BlobError> {
         let mut removed = 0_u64;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -116,7 +113,7 @@ impl BlobStore {
                 }
                 continue;
             }
-            removed += cleanup_orphan_prefix(&path, name, &mut is_referenced)?;
+            validate_prefix(&path, name)?;
         }
         if removed > 0 {
             sync_directory(&self.root)?;
@@ -161,11 +158,7 @@ fn sync_directory(path: &Path) -> Result<(), BlobError> {
     Ok(())
 }
 
-fn cleanup_orphan_prefix(
-    path: &Path,
-    prefix: &str,
-    is_referenced: &mut impl FnMut(&str) -> Result<bool, BlobError>,
-) -> Result<u64, BlobError> {
+fn validate_prefix(path: &Path, prefix: &str) -> Result<(), BlobError> {
     let metadata = fs::symlink_metadata(path)?;
     if prefix.len() != 2
         || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -173,7 +166,6 @@ fn cleanup_orphan_prefix(
     {
         return Err(BlobError::Corrupt);
     }
-    let mut removed = 0_u64;
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let digest = entry
@@ -185,16 +177,8 @@ fn cleanup_orphan_prefix(
         if &digest[..2] != prefix || !entry.file_type()?.is_file() {
             return Err(BlobError::Corrupt);
         }
-        if !is_referenced(&digest)? {
-            fs::remove_file(entry.path())?;
-            removed += 1;
-        }
     }
-    if removed > 0 && fs::read_dir(path)?.next().is_none() {
-        sync_directory(path)?;
-        fs::remove_dir(path)?;
-    }
-    Ok(removed)
+    Ok(())
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), BlobError> {
@@ -283,19 +267,17 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_orphans_removes_unreferenced_and_temp_files() {
+    fn cleanup_temporary_preserves_regular_blobs() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("blobs");
         let store = BlobStore::open(&root).unwrap();
         let keep = store.put(b"keep", "text/plain").unwrap();
         let orphan = store.put(b"orphan", "text/plain").unwrap();
         std::fs::write(root.join(".tmp-interrupted"), b"partial").unwrap();
-        let removed = store
-            .cleanup_orphans(|digest| Ok(digest == keep.sha256))
-            .unwrap();
-        assert_eq!(removed, 2);
+        let removed = store.cleanup_temporary().unwrap();
+        assert_eq!(removed, 1);
         assert!(root.join(&keep.sha256[..2]).join(&keep.sha256).exists());
-        assert!(!root.join(&orphan.sha256[..2]).exists());
+        assert!(root.join(&orphan.sha256[..2]).join(&orphan.sha256).exists());
         assert!(!root.join(".tmp-interrupted").exists());
     }
 }
