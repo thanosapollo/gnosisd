@@ -18,7 +18,10 @@ mod backup;
 mod import;
 
 pub(crate) use backup::BackupSummary;
-use backup::{BackupError, create_backup, prune_backups, validate_restore, verify_backup};
+use backup::{
+    BackupError, BackupSnapshot, create_backup, prune_backups, snapshot_backup, validate_restore,
+    verify_backup,
+};
 #[cfg(test)]
 use import::persist_server_import;
 pub(crate) use import::protocol_logical_path;
@@ -64,7 +67,36 @@ pub(crate) struct RepairSummary {
 #[derive(Clone)]
 pub(crate) struct ServiceHandle {
     sender: SyncSender<StoreCommand>,
+    backup_sender: SyncSender<BackupCommand>,
     blobs: Arc<BlobStore>,
+}
+
+enum BackupCommand {
+    #[cfg(test)]
+    Block {
+        started: SyncSender<()>,
+        release: mpsc::Receiver<()>,
+    },
+    Create {
+        snapshot: BackupSnapshot,
+        destination: PathBuf,
+        created_at_us: u64,
+        response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
+    },
+    Verify {
+        path: PathBuf,
+        response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
+    },
+    Prune {
+        directory: PathBuf,
+        keep: u16,
+        response: oneshot::Sender<Result<Vec<PathBuf>, ServiceError>>,
+    },
+    ValidateRestore {
+        path: PathBuf,
+        temporary: PathBuf,
+        response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
+    },
 }
 
 #[allow(dead_code)]
@@ -90,9 +122,12 @@ impl ServiceHandle {
     #[cfg(test)]
     pub(crate) fn stopped_for_test(blob_path: PathBuf) -> Result<Self, BlobError> {
         let (sender, receiver) = mpsc::sync_channel(1);
+        let (backup_sender, backup_receiver) = mpsc::sync_channel(1);
         drop(receiver);
+        drop(backup_receiver);
         Ok(Self {
             sender,
+            backup_sender,
             blobs: Arc::new(BlobStore::open(blob_path)?),
         })
     }
@@ -1155,20 +1190,17 @@ impl ServiceHandle {
         request(&self.sender, |response| StoreCommand::CreateBackup {
             destination,
             created_at_us,
-            blobs: self.blobs.clone(),
             response,
         })
         .await?
-        .map_err(ServiceError::Backup)
     }
 
     pub(crate) async fn verify_backup(&self, path: PathBuf) -> Result<BackupSummary, ServiceError> {
-        request(&self.sender, |response| StoreCommand::VerifyBackup {
+        backup_request(&self.backup_sender, |response| BackupCommand::Verify {
             path,
             response,
         })
-        .await?
-        .map_err(ServiceError::Backup)
+        .await
     }
 
     pub(crate) async fn prune_backups(
@@ -1176,13 +1208,12 @@ impl ServiceHandle {
         directory: PathBuf,
         keep: u16,
     ) -> Result<Vec<PathBuf>, ServiceError> {
-        request(&self.sender, |response| StoreCommand::PruneBackups {
+        backup_request(&self.backup_sender, |response| BackupCommand::Prune {
             directory,
             keep,
             response,
         })
-        .await?
-        .map_err(ServiceError::Backup)
+        .await
     }
 
     pub(crate) async fn validate_restore(
@@ -1190,13 +1221,14 @@ impl ServiceHandle {
         backup: PathBuf,
         temporary: PathBuf,
     ) -> Result<BackupSummary, ServiceError> {
-        request(&self.sender, |response| StoreCommand::ValidateRestore {
-            backup,
-            temporary,
-            response,
+        backup_request(&self.backup_sender, |response| {
+            BackupCommand::ValidateRestore {
+                path: backup,
+                temporary,
+                response,
+            }
         })
-        .await?
-        .map_err(ServiceError::Backup)
+        .await
     }
 }
 
@@ -1209,7 +1241,8 @@ async fn read_blob(blobs: Arc<BlobStore>, digest: String) -> Result<Vec<u8>, Ser
 
 pub(crate) struct ServiceRuntime {
     handle: ServiceHandle,
-    join: thread::JoinHandle<()>,
+    store_thread: thread::JoinHandle<()>,
+    backup_thread: thread::JoinHandle<()>,
 }
 
 impl ServiceRuntime {
@@ -1232,19 +1265,39 @@ impl ServiceRuntime {
     ) -> Result<Self, ServiceStartError> {
         let blobs = Arc::new(BlobStore::open(blob_path).map_err(ServiceStartError::Blob)?);
         let (sender, receiver) = mpsc::sync_channel(capacity);
+        let (backup_sender, backup_receiver) = mpsc::sync_channel(capacity);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let actor_blobs = blobs.clone();
-        let join = thread::Builder::new()
+        let backup_blobs = blobs.clone();
+        let backup_thread = thread::Builder::new()
+            .name("gnosis-backup".into())
+            .spawn(move || backup_actor(backup_blobs, backup_receiver))
+            .map_err(ServiceStartError::Thread)?;
+        let actor_backup_sender = backup_sender.clone();
+        let store_thread = thread::Builder::new()
             .name("gnosis-sqlite".into())
-            .spawn(move || store_actor(database_path, actor_blobs, receiver, ready_sender))
+            .spawn(move || {
+                store_actor(
+                    database_path,
+                    actor_blobs,
+                    actor_backup_sender,
+                    receiver,
+                    ready_sender,
+                )
+            })
             .map_err(ServiceStartError::Thread)?;
         ready_receiver
             .recv()
             .map_err(|_| ServiceStartError::Stopped)?
             .map_err(ServiceStartError::Store)?;
         Ok(Self {
-            handle: ServiceHandle { sender, blobs },
-            join,
+            handle: ServiceHandle {
+                sender,
+                backup_sender,
+                blobs,
+            },
+            store_thread,
+            backup_thread,
         })
     }
 
@@ -1253,11 +1306,18 @@ impl ServiceRuntime {
     }
 
     pub(crate) async fn finish(self) -> Result<(), ServiceError> {
-        drop(self.handle);
-        tokio::task::spawn_blocking(move || self.join.join())
-            .await
-            .map_err(|_| ServiceError::Stopped)?
-            .map_err(|_| ServiceError::Stopped)
+        let Self {
+            handle,
+            store_thread,
+            backup_thread,
+        } = self;
+        drop(handle);
+        tokio::task::spawn_blocking(move || {
+            store_thread.join().map_err(|_| ServiceError::Stopped)?;
+            backup_thread.join().map_err(|_| ServiceError::Stopped)
+        })
+        .await
+        .map_err(|_| ServiceError::Stopped)?
     }
 }
 
@@ -1631,22 +1691,7 @@ enum StoreCommand {
     CreateBackup {
         destination: PathBuf,
         created_at_us: u64,
-        blobs: Arc<BlobStore>,
-        response: oneshot::Sender<Result<BackupSummary, BackupError>>,
-    },
-    VerifyBackup {
-        path: PathBuf,
-        response: oneshot::Sender<Result<BackupSummary, BackupError>>,
-    },
-    PruneBackups {
-        directory: PathBuf,
-        keep: u16,
-        response: oneshot::Sender<Result<Vec<PathBuf>, BackupError>>,
-    },
-    ValidateRestore {
-        backup: PathBuf,
-        temporary: PathBuf,
-        response: oneshot::Sender<Result<BackupSummary, BackupError>>,
+        response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
     },
 }
 
@@ -1657,6 +1702,18 @@ async fn request<T>(
     let (response_sender, response_receiver) = oneshot::channel();
     enqueue(sender, command(response_sender))?;
     response_receiver.await.map_err(|_| ServiceError::Stopped)
+}
+
+async fn backup_request<T>(
+    sender: &SyncSender<BackupCommand>,
+    command: impl FnOnce(oneshot::Sender<Result<T, ServiceError>>) -> BackupCommand,
+) -> Result<T, ServiceError> {
+    let (response_sender, response_receiver) = oneshot::channel();
+    match sender.try_send(command(response_sender)) {
+        Ok(()) => response_receiver.await.map_err(|_| ServiceError::Stopped)?,
+        Err(TrySendError::Full(_)) => Err(ServiceError::Busy),
+        Err(TrySendError::Disconnected(_)) => Err(ServiceError::Stopped),
+    }
 }
 
 fn enqueue(sender: &SyncSender<StoreCommand>, command: StoreCommand) -> Result<(), ServiceError> {
@@ -1670,6 +1727,7 @@ fn enqueue(sender: &SyncSender<StoreCommand>, command: StoreCommand) -> Result<(
 fn store_actor(
     path: PathBuf,
     blobs: Arc<BlobStore>,
+    backup_sender: SyncSender<BackupCommand>,
     receiver: mpsc::Receiver<StoreCommand>,
     ready: SyncSender<Result<(), StoreError>>,
 ) {
@@ -1688,7 +1746,7 @@ fn store_actor(
         return;
     }
     for command in receiver {
-        run_store_command(&mut store, &blobs, command);
+        run_store_command(&mut store, &blobs, &backup_sender, command);
     }
 }
 
@@ -2062,7 +2120,12 @@ fn stage_blob_command(
     Ok(blob)
 }
 
-fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreCommand) {
+fn run_store_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+    backup_sender: &SyncSender<BackupCommand>,
+    command: StoreCommand,
+) {
     match command {
         StoreCommand::Ready { response } => send(response, store.settings().map(drop)),
         StoreCommand::Repair {
@@ -2637,23 +2700,69 @@ fn run_store_command(store: &mut SqliteStore, blobs: &BlobStore, command: StoreC
         StoreCommand::CreateBackup {
             destination,
             created_at_us,
-            blobs,
             response,
-        } => send(
-            response,
-            create_backup(store, &blobs, &destination, created_at_us),
-        ),
-        StoreCommand::VerifyBackup { path, response } => send(response, verify_backup(&path)),
-        StoreCommand::PruneBackups {
-            directory,
-            keep,
-            response,
-        } => send(response, prune_backups(&directory, keep)),
-        StoreCommand::ValidateRestore {
-            backup,
-            temporary,
-            response,
-        } => send(response, validate_restore(&backup, &temporary)),
+        } => match snapshot_backup(store, &destination) {
+            Ok(snapshot) => {
+                let command = BackupCommand::Create {
+                    snapshot,
+                    destination,
+                    created_at_us,
+                    response,
+                };
+                match backup_sender.try_send(command) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(BackupCommand::Create { response, .. })) => {
+                        send(response, Err(ServiceError::Busy));
+                    }
+                    Err(TrySendError::Disconnected(BackupCommand::Create { response, .. })) => {
+                        send(response, Err(ServiceError::Stopped));
+                    }
+                    Err(_) => unreachable!("backup command kind changed during send"),
+                }
+            }
+            Err(error) => send(response, Err(ServiceError::Backup(error))),
+        },
+    }
+}
+
+fn backup_actor(blobs: Arc<BlobStore>, receiver: mpsc::Receiver<BackupCommand>) {
+    for command in receiver {
+        match command {
+            #[cfg(test)]
+            BackupCommand::Block { started, release } => {
+                let _ = started.send(());
+                let _ = release.recv();
+            }
+            BackupCommand::Create {
+                snapshot,
+                destination,
+                created_at_us,
+                response,
+            } => send(
+                response,
+                create_backup(snapshot, &blobs, &destination, created_at_us)
+                    .map_err(ServiceError::Backup),
+            ),
+            BackupCommand::Verify { path, response } => {
+                send(response, verify_backup(&path).map_err(ServiceError::Backup))
+            }
+            BackupCommand::Prune {
+                directory,
+                keep,
+                response,
+            } => send(
+                response,
+                prune_backups(&directory, keep).map_err(ServiceError::Backup),
+            ),
+            BackupCommand::ValidateRestore {
+                path,
+                temporary,
+                response,
+            } => send(
+                response,
+                validate_restore(&path, &temporary).map_err(ServiceError::Backup),
+            ),
+        }
     }
 }
 
@@ -2750,14 +2859,15 @@ mod tests {
     use std::{
         sync::{Arc, mpsc},
         thread,
+        time::Duration,
     };
 
     use sha2::Digest as _;
     use tokio::sync::oneshot;
 
     use super::{
-        ServiceError, ServiceHandle, ServiceRuntime, StoreCommand, repair_canonical_state,
-        store_actor,
+        BackupCommand, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
+        repair_canonical_state, store_actor,
     };
     use crate::application::{
         AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
@@ -2791,8 +2901,14 @@ mod tests {
 
         let blobs = Arc::new(BlobStore::open(directory.path().join("stopped-blobs")).unwrap());
         let (sender, receiver) = mpsc::sync_channel(1);
+        let (backup_sender, backup_receiver) = mpsc::sync_channel(1);
         drop(receiver);
-        let stopped = ServiceHandle { sender, blobs };
+        drop(backup_receiver);
+        let stopped = ServiceHandle {
+            sender,
+            backup_sender,
+            blobs,
+        };
         assert!(matches!(stopped.ready().await, Err(ServiceError::Stopped)));
     }
 
@@ -2802,7 +2918,12 @@ mod tests {
         let blob_path = directory.path().join("blobs");
         let blobs = Arc::new(BlobStore::open(&blob_path).unwrap());
         let (sender, _receiver) = mpsc::sync_channel(0);
-        let service = ServiceHandle { sender, blobs };
+        let (backup_sender, _backup_receiver) = mpsc::sync_channel(0);
+        let service = ServiceHandle {
+            sender,
+            backup_sender,
+            blobs,
+        };
         let bytes = b"not accepted".to_vec();
         let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
 
@@ -3103,10 +3224,12 @@ mod tests {
         drop(response_receiver);
 
         let (ready, readiness) = mpsc::sync_channel(1);
+        let (backup_sender, _backup_receiver) = mpsc::sync_channel(1);
         let actor_blobs = blobs.clone();
         let actor_database = database.clone();
-        let actor =
-            thread::spawn(move || store_actor(actor_database, actor_blobs, receiver, ready));
+        let actor = thread::spawn(move || {
+            store_actor(actor_database, actor_blobs, backup_sender, receiver, ready)
+        });
         readiness.recv().unwrap().unwrap();
         drop(sender);
         actor.join().unwrap();
@@ -3156,10 +3279,12 @@ mod tests {
         drop(response_receiver);
 
         let (ready, readiness) = mpsc::sync_channel(1);
+        let (backup_sender, _backup_receiver) = mpsc::sync_channel(1);
         let actor_blobs = blobs.clone();
         let actor_database = database.clone();
-        let actor =
-            thread::spawn(move || store_actor(actor_database, actor_blobs, receiver, ready));
+        let actor = thread::spawn(move || {
+            store_actor(actor_database, actor_blobs, backup_sender, receiver, ready)
+        });
         readiness.recv().unwrap().unwrap();
         drop(sender);
         actor.join().unwrap();
@@ -3207,6 +3332,135 @@ mod tests {
         assert!(!restore.exists());
         drop(service);
         runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_filesystem_work_does_not_occupy_the_store_actor() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            2,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let (started, started_receiver) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::sync_channel(1);
+        service
+            .backup_sender
+            .try_send(BackupCommand::Block {
+                started,
+                release: release_receiver,
+            })
+            .unwrap();
+        tokio::task::spawn_blocking(move || started_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (response, backup_result) = oneshot::channel();
+        service
+            .sender
+            .try_send(StoreCommand::CreateBackup {
+                destination: directory.path().join("backup"),
+                created_at_us: 1,
+                response,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), service.ready())
+            .await
+            .expect("store actor stayed available")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), service.settings())
+            .await
+            .expect("normal read stayed available")
+            .unwrap();
+
+        let (second_started, second_started_receiver) = mpsc::sync_channel(1);
+        let (second_release, second_release_receiver) = mpsc::sync_channel(1);
+        service
+            .backup_sender
+            .try_send(BackupCommand::Block {
+                started: second_started,
+                release: second_release_receiver,
+            })
+            .unwrap();
+        assert!(matches!(
+            service
+                .verify_backup(directory.path().join("never-enqueued"))
+                .await,
+            Err(ServiceError::Busy)
+        ));
+
+        release.send(()).unwrap();
+        backup_result.await.unwrap().unwrap();
+        tokio::task::spawn_blocking(move || second_started_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        second_release.send(()).unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_an_accepted_backup_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup = directory.path().join("backup");
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            1,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let (started, started_receiver) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::sync_channel(1);
+        service
+            .backup_sender
+            .try_send(BackupCommand::Block {
+                started,
+                release: release_receiver,
+            })
+            .unwrap();
+        tokio::task::spawn_blocking(move || started_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (response, backup_result) = oneshot::channel();
+        service
+            .sender
+            .try_send(StoreCommand::CreateBackup {
+                destination: backup.clone(),
+                created_at_us: 1,
+                response,
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match service.ready().await {
+                    Err(ServiceError::Busy) => tokio::task::yield_now().await,
+                    result => break result,
+                }
+            }
+        })
+        .await
+        .expect("store actor accepted readiness after backup dispatch")
+        .unwrap();
+        drop(service);
+
+        let mut finish = tokio::spawn(runtime.finish());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut finish)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        finish.await.unwrap().unwrap();
+        backup_result.await.unwrap().unwrap();
+        assert!(super::verify_backup(&backup).is_ok());
     }
 
     #[tokio::test]

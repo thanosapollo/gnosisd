@@ -21,8 +21,11 @@ use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::broadcast;
-use tokio_stream::{StreamExt as _, wrappers::BroadcastStream};
+use tokio::sync::{broadcast, watch};
+use tokio_stream::{
+    StreamExt as _,
+    wrappers::{BroadcastStream, WatchStream},
+};
 use tower::{ServiceBuilder, limit::ConcurrencyLimitLayer, timeout::TimeoutLayer};
 
 use crate::{
@@ -80,11 +83,25 @@ const MAX_REPLICA_PAGE: u16 = 32;
 pub(crate) struct HttpState {
     service: ServiceHandle,
     cursors: broadcast::Sender<u64>,
+    shutdown: watch::Receiver<bool>,
 }
 
+#[cfg(test)]
 pub(crate) fn router(service: ServiceHandle) -> Router {
+    let (_shutdown, receiver) = watch::channel(false);
+    router_with_shutdown(service, receiver)
+}
+
+pub(crate) fn router_with_shutdown(
+    service: ServiceHandle,
+    shutdown: watch::Receiver<bool>,
+) -> Router {
     let (cursors, _) = broadcast::channel(64);
-    let state = HttpState { service, cursors };
+    let state = HttpState {
+        service,
+        cursors,
+        shutdown,
+    };
     let data =
         data_router().route_layer(middleware::from_fn_with_state(state.clone(), authenticate));
     Router::new()
@@ -697,11 +714,19 @@ async fn events(
     Extension(principal): Extension<DevicePrincipal>,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     require(&principal, DeviceScope::Read)?;
-    let stream = BroadcastStream::new(state.cursors.subscribe()).filter_map(|cursor| {
-        cursor
-            .ok()
-            .map(|cursor| Ok(Event::default().event("cursor").data(cursor.to_string())))
-    });
+    let events = BroadcastStream::new(state.cursors.subscribe())
+        .filter_map(|cursor| {
+            cursor
+                .ok()
+                .map(|cursor| Ok(Event::default().event("cursor").data(cursor.to_string())))
+        })
+        .map(Some);
+    let shutdown =
+        WatchStream::new(state.shutdown.clone()).filter_map(|requested| requested.then_some(None));
+    let stream = events
+        .merge(shutdown)
+        .take_while(Option::is_some)
+        .filter_map(std::convert::identity);
     Ok(Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 

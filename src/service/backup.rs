@@ -4,10 +4,11 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -20,6 +21,7 @@ use crate::{
 const DATABASE_FILE: &str = "gnosis.sqlite";
 const MANIFEST_FILE: &str = "manifest.json";
 const BACKUP_FORMAT_VERSION: u32 = 1;
+static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackupSummary {
@@ -27,6 +29,17 @@ pub(crate) struct BackupSummary {
     pub(crate) created_at_us: u64,
     pub(crate) database_sha256: String,
     pub(crate) blob_count: u64,
+}
+
+pub(crate) struct BackupSnapshot {
+    database: PathBuf,
+    blobs: Vec<(String, u64)>,
+}
+
+impl Drop for BackupSnapshot {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.database);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -43,8 +56,52 @@ struct ManifestBlob {
     size_bytes: u64,
 }
 
-pub(crate) fn create_backup(
+pub(crate) fn snapshot_backup(
     store: &SqliteStore,
+    destination: &Path,
+) -> Result<BackupSnapshot, BackupError> {
+    require_new_directory(destination)?;
+    let parent = destination.parent().ok_or(BackupError::Destination)?;
+    let sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let database = parent.join(format!(
+        ".gnosis-backup-snapshot-{}-{sequence}.sqlite",
+        std::process::id()
+    ));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&database)?;
+    if let Err(error) = store.backup_database(&database) {
+        let _ = fs::remove_file(&database);
+        return Err(error.into());
+    }
+    let blobs = match store.referenced_blobs() {
+        Ok(blobs) => blobs,
+        Err(error) => {
+            let _ = fs::remove_file(&database);
+            return Err(error.into());
+        }
+    };
+    Ok(BackupSnapshot { database, blobs })
+}
+
+pub(crate) fn create_backup(
+    snapshot: BackupSnapshot,
+    blobs: &BlobStore,
+    destination: &Path,
+    created_at_us: u64,
+) -> Result<BackupSummary, BackupError> {
+    let result = create_backup_inner(&snapshot, blobs, destination, created_at_us);
+    let cleanup = fs::remove_file(&snapshot.database);
+    result.and_then(|summary| {
+        cleanup?;
+        Ok(summary)
+    })
+}
+
+fn create_backup_inner(
+    snapshot: &BackupSnapshot,
     blobs: &BlobStore,
     destination: &Path,
     created_at_us: u64,
@@ -53,7 +110,7 @@ pub(crate) fn create_backup(
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
-    let result = create_staging_backup(store, blobs, &staging, created_at_us);
+    let result = create_staging_backup(snapshot, blobs, &staging, created_at_us);
     let summary = match result {
         Ok(summary) => summary,
         Err(error) => {
@@ -75,15 +132,15 @@ pub(crate) fn create_backup(
 }
 
 fn create_staging_backup(
-    store: &SqliteStore,
+    snapshot: &BackupSnapshot,
     blobs: &BlobStore,
     staging: &Path,
     created_at_us: u64,
 ) -> Result<BackupSummary, BackupError> {
     let database = staging.join(DATABASE_FILE);
-    store.backup_database(&database)?;
+    fs::copy(&snapshot.database, &database)?;
     fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
-    let rows = store.referenced_blobs()?;
+    let rows = snapshot.blobs.clone();
     for (digest, size) in &rows {
         blobs.copy_to(digest, *size, &staging.join("blobs"))?;
     }

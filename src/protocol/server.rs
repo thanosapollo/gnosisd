@@ -31,6 +31,7 @@ const DEFAULT_STORE_QUEUE_CAPACITY: usize = 8;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_STORE_QUEUE_CAPACITY: usize = 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonConfig {
@@ -150,13 +151,27 @@ impl DaemonServer {
 async fn serve_http(
     listener: TcpListener,
     service: ServiceHandle,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, crate::http::router(service))
-        .with_graceful_shutdown(async move {
-            while !*shutdown.borrow_and_update() && shutdown.changed().await.is_ok() {}
-        })
-        .await
+    let app = crate::http::router_with_shutdown(service, shutdown.clone());
+    let drain_shutdown = shutdown.clone();
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown)),
+    );
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        () = shutdown_requested(drain_shutdown) => {
+            match timeout(HTTP_DRAIN_TIMEOUT, &mut server).await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
+        }
+    }
+}
+
+async fn shutdown_requested(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow_and_update() && shutdown.changed().await.is_ok() {}
 }
 
 async fn accept_until_shutdown(
@@ -665,7 +680,7 @@ impl ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::net::UnixListener as StdUnixListener};
+    use std::{fs, os::unix::net::UnixListener as StdUnixListener, time::Duration};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -674,7 +689,7 @@ mod tests {
         validate_config,
     };
     use crate::{
-        application::ApplicationError,
+        application::{ApplicationError, generate_device},
         protocol::{DeviceView, ErrorCode, ResponseOutcome, ResponseResult},
         service::ServiceError,
         store::StoreError,
@@ -798,5 +813,103 @@ mod tests {
         assert!(response.ends_with("{\"status\":\"ready\"}"));
         shutdown.send(()).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_listener_has_no_uptime_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = DaemonConfig::new(
+            directory.path().join("gnosis.sock"),
+            directory.path().join("gnosis.sqlite"),
+        );
+        config.http_addr = Some("127.0.0.1:0".parse().unwrap());
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = stopped.await;
+        }));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!task.is_finished());
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_sse_after_an_accepted_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let mut config = DaemonConfig::new(directory.path().join("gnosis.sock"), &database);
+        config.http_addr = Some("127.0.0.1:0".parse().unwrap());
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        let service = server.service.handle();
+        let device =
+            generate_device("writer".into(), vec!["read".into(), "content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let address = server.http_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = stopped.await;
+        }));
+
+        let mut events = tokio::net::TcpStream::connect(address).await.unwrap();
+        events
+            .write_all(
+                format!(
+                    "GET /v1/events HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut event_headers = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !event_headers.ends_with(b"\r\n\r\n") {
+                event_headers.push(events.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .expect("SSE response headers");
+        assert!(event_headers.starts_with(b"HTTP/1.1 200 OK"));
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "logical_path": "shutdown.org",
+            "org": "#+title: Shutdown\n",
+        }))
+        .unwrap();
+        let mut mutation = tokio::net::TcpStream::connect(address).await.unwrap();
+        mutation
+            .write_all(
+                format!(
+                    "POST /v1/document-mutations HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: shutdown-write\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        mutation.write_all(&body).await.unwrap();
+        let mut mutation_response = String::new();
+        mutation
+            .read_to_string(&mut mutation_response)
+            .await
+            .unwrap();
+        assert!(mutation_response.starts_with("HTTP/1.1 200 OK"));
+        drop(service);
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("SSE shutdown stayed within the graceful deadline")
+            .unwrap()
+            .unwrap();
+        drop(events);
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let revisions: u64 = connection
+            .query_row("SELECT count(*) FROM document_revision", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(revisions, 1);
     }
 }
