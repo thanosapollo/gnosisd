@@ -1579,9 +1579,10 @@ fn valid_desired_projection(
                 expected_revision,
             },
         ) => {
-            thema_id
-                .as_ref()
-                .is_none_or(|expected| thema.thema_id == *expected)
+            validate_thema(thema, &thema.thema_id)
+                && thema_id
+                    .as_ref()
+                    .is_none_or(|expected| thema.thema_id == *expected)
                 && input
                     .as_ref()
                     .is_none_or(|expected| thema_matches_input(thema, expected))
@@ -1614,9 +1615,6 @@ fn valid_mutation_revision(revision: u64, expected_revision: Option<u64>, change
 }
 
 fn thema_matches_input(thema: &ThemaV1, input: &ThemaWriteRequestV1) -> bool {
-    if !validate_thema(thema, &thema.thema_id) {
-        return false;
-    }
     let kind = match thema.kind {
         ThemaKindV1::Basic => "basic",
         ThemaKindV1::Cloze => "cloze",
@@ -2117,7 +2115,12 @@ mod tests {
     use std::path::PathBuf;
 
     use tempfile::TempDir;
-    use tokio::{io::AsyncReadExt as _, net::TcpListener, sync::oneshot, time::timeout};
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        net::TcpListener,
+        sync::oneshot,
+        time::timeout,
+    };
 
     use super::*;
     use crate::{
@@ -2352,11 +2355,23 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(!valid_desired_projection(&thema, true, &thema_expectation));
+        let archive_expectation = DesiredMutationExpectation::Thema {
+            thema_id: Some("thema".into()),
+            input: None,
+            archived: Some(false),
+            expected_revision: Some(1),
+        };
+        assert!(!valid_desired_projection(
+            &thema,
+            true,
+            &archive_expectation
+        ));
         let DesiredStateMutationProjectionV1::Thema(thema_value) = &mut thema else {
             unreachable!();
         };
         thema_value.content_sha256 = valid_digest;
-        thema_value.thema_id = "../thema".into();
+        thema_value.thema_id = "x".repeat(129);
+        thema_value.revision = 1;
         let create_expectation = DesiredMutationExpectation::Thema {
             thema_id: None,
             input: Some(thema_input),
@@ -2513,6 +2528,64 @@ mod tests {
             assert!(matches!(error, HttpClientError::InvalidMutation));
             assert_eq!(error.delivery(), DeliveryStatus::NotSent);
         }
+    }
+
+    #[tokio::test]
+    async fn archive_rejects_noncanonical_authoritative_thema_with_unknown_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "status": "applied",
+            "format_version": 1,
+            "operation_id": "operation",
+            "authoritative": {
+                "kind": "thema",
+                "value": {
+                    "thema_id": "thema",
+                    "revision": 2,
+                    "kind": "basic",
+                    "keimenon": "Question",
+                    "hypothesis": [],
+                    "answer": ["Answer"],
+                    "source_guid": null,
+                    "parathema": null,
+                    "review_image": null,
+                    "tags": [],
+                    "concepts": [],
+                    "asset_paths": [],
+                    "content_sha256": "b".repeat(64),
+                    "archived": true
+                }
+            },
+            "cursor": "cursor",
+            "changed": true
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let base_url = format!("http://{address}/");
+        let client = HttpClient::new(&base_url, token).unwrap();
+
+        let error = client
+            .set_thema_archived("thema", "operation", 1, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HttpClientError::InvalidResponse {
+                delivery: DeliveryStatus::Unknown
+            }
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]
