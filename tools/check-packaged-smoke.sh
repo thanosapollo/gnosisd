@@ -91,11 +91,40 @@ token=$(printf %s "$device" | jq -er .token)
 api=$http/v1
 auth="Authorization: Bearer $token"
 
+stage asset
+token_file=$temporary/device.token
+printf '%s\n' "$token" >"$token_file"
+chmod 600 "$token_file"
+asset_source=$temporary/image.png
+asset_fetch=$temporary/fetched.png
+asset_blob=$temporary/blob.png
+printf 'packaged managed asset' >"$asset_source"
+asset_size=$(wc -c <"$asset_source" | tr -d ' ')
+asset_digest=$(sha256sum "$asset_source" | cut -d ' ' -f 1)
+asset_path=assets/$asset_digest/image.png
+asset_put=$($gnosis --http-url "$http" --token-file "$token_file" \
+    asset put "$asset_digest" image.png --operation-id smoke-put-asset \
+    --media-type image/png <"$asset_source")
+printf %s "$asset_put" | jq -e \
+    --arg digest "$asset_digest" --arg path "$asset_path" \
+    '.status == "applied" and .operation_id == "smoke-put-asset" and
+     .authoritative.kind == "asset" and .authoritative.value.logical_path == $path and
+     .authoritative.value.content_sha256 == $digest and
+     .authoritative.value.media_type == "image/png" and
+     .authoritative.value.revision == 1 and .authoritative.value.active == true' >/dev/null
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset fetch "$asset_digest" image.png --revision 1 \
+    --size-bytes "$asset_size" --media-type image/png >"$asset_fetch"
+cmp "$asset_source" "$asset_fetch"
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset blob "$asset_digest" >"$asset_blob"
+cmp "$asset_source" "$asset_blob"
+
 stage content
 note=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Idempotency-Key: smoke-create-document' \
     -H 'Content-Type: application/json' \
-    -d '{"logical_path":"smoke.org","org":"#+TITLE: Smoke\n* Node\n:PROPERTIES:\n:ID: smoke-node\n:END:\n"}' \
+    -d "{\"logical_path\":\"smoke.org\",\"org\":\"#+TITLE: Smoke\\n* Node\\n:PROPERTIES:\\n:ID: smoke-node\\n:END:\\n[[file:$asset_path]]\\n\"}" \
     "$api/document-mutations")
 document_id=$(printf %s "$note" | jq -er .authoritative.document_id)
 curl --fail-with-body --silent --show-error -H "$auth" \
@@ -104,7 +133,7 @@ curl --fail-with-body --silent --show-error -H "$auth" \
 thema=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Idempotency-Key: smoke-create-thema' \
     -H 'Content-Type: application/json' \
-    -d '{"kind":"basic","keimenon":"Ready?","hypothesis":[],"answer":["yes"],"tags":["smoke"],"concepts":[{"node_id":"smoke-node","relation":"primary"}],"asset_paths":[]}' \
+    -d "{\"kind\":\"basic\",\"keimenon\":\"Ready?\",\"hypothesis\":[],\"answer\":[\"yes\"],\"tags\":[\"smoke\"],\"concepts\":[{\"node_id\":\"smoke-node\",\"relation\":\"primary\"}],\"asset_paths\":[\"$asset_path\"]}" \
     "$api/themata")
 thema_id=$(printf %s "$thema" | jq -er .authoritative.value.thema_id)
 
@@ -144,6 +173,26 @@ curl --fail-with-body --silent --show-error -H "$auth" \
     -H 'Idempotency-Key: smoke-delete-document' -H 'If-Match: "1"' \
     -X DELETE "$api/document-mutations/$document_id" \
     | jq -e '.authoritative.active == false' >/dev/null
+
+stage cleanup-asset
+asset_deleted=$($gnosis --http-url "$http" --token-file "$token_file" \
+    asset tombstone "$asset_digest" image.png --operation-id smoke-delete-asset \
+    --if-revision 1)
+printf %s "$asset_deleted" | jq -e \
+    '.status == "applied" and .operation_id == "smoke-delete-asset" and
+     .authoritative.kind == "asset" and .authoritative.value.revision == 2 and
+     .authoritative.value.active == false and .authoritative.value.content_sha256 == null and
+     .authoritative.value.media_type == null' >/dev/null
+if $gnosis --http-url "$http" --token-file "$token_file" \
+    asset fetch "$asset_digest" image.png --revision 2 \
+    --size-bytes "$asset_size" --media-type image/png \
+    >"$asset_fetch" 2>/dev/null; then
+    echo "tombstoned asset remained accessible" >&2
+    exit 1
+fi
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset blob "$asset_digest" >"$asset_blob"
+cmp "$asset_source" "$asset_blob"
 
 stage backup
 backup_json=$($gnosis --socket "$socket" admin backup create --directory "$backups")

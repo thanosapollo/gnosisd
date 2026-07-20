@@ -12,7 +12,7 @@ use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
 use chrono::NaiveDate;
 use reqwest::{
     RequestBuilder, Response, StatusCode, Url,
-    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue},
+    header::{AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderMap, HeaderValue},
     redirect::Policy,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -23,7 +23,7 @@ use crate::{
     application::{
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES,
         MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path, prepare_thema, thema_content,
-        valid_operation_id, validate_org_path,
+        valid_operation_id, validate_asset_path, validate_blob_metadata, validate_org_path,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
@@ -41,7 +41,7 @@ use crate::{
         decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, ContentCapabilitiesV1, DashboardV1,
+            AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, DashboardV1,
             DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DeviceIdentityV1,
             DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1,
             NodeThemaAssociationPageV1, NoteRenameRequestV1, NoteWriteRequestV1,
@@ -220,7 +220,31 @@ impl HttpClient {
         let url = self.endpoint(&format!("v1/blobs/{digest}"))?;
         let limit = MAX_OFFLINE_ASSET_BYTES as usize;
         let bytes = execute_bytes(self.client.get(url), limit).await?;
-        if format!("{:x}", Sha256::digest(&bytes)) != digest {
+        if bytes.is_empty() || format!("{:x}", Sha256::digest(&bytes)) != digest {
+            return Err(invalid_response());
+        }
+        Ok(bytes)
+    }
+
+    pub async fn asset(
+        &self,
+        head: &AssetHeadV1,
+        size_bytes: u64,
+    ) -> Result<Vec<u8>, HttpClientError> {
+        let (digest, name, media_type) = managed_asset_identity(head)?;
+        let limit = usize::try_from(size_bytes).map_err(|_| HttpClientError::InvalidUpload)?;
+        if size_bytes == 0 || size_bytes > MAX_OFFLINE_ASSET_BYTES {
+            return Err(HttpClientError::InvalidUpload);
+        }
+        let bytes = execute_managed_asset(
+            self.client.get(self.asset_endpoint(digest, name)?),
+            limit,
+            media_type,
+            head.revision,
+        )
+        .await?;
+        let actual_size = u64::try_from(bytes.len()).map_err(|_| invalid_response())?;
+        if actual_size != size_bytes || format!("{:x}", Sha256::digest(&bytes)) != digest {
             return Err(invalid_response());
         }
         Ok(bytes)
@@ -395,7 +419,15 @@ impl HttpClient {
     ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
         require_digest(digest)?;
         require_operation_id(operation_id)?;
-        if format!("{:x}", Sha256::digest(bytes)) != digest {
+        if expected_revision == Some(0) {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let logical_path =
+            canonical_asset_path(digest, name).map_err(|_| HttpClientError::InvalidUpload)?;
+        let size_bytes = u64::try_from(bytes.len()).map_err(|_| HttpClientError::InvalidUpload)?;
+        if validate_blob_metadata(size_bytes, media_type).is_err()
+            || format!("{:x}", Sha256::digest(bytes)) != digest
+        {
             return Err(HttpClientError::InvalidUpload);
         }
         let media_type =
@@ -413,7 +445,7 @@ impl HttpClient {
             request,
             operation_id,
             DesiredMutationExpectation::Asset {
-                logical_path: format!("assets/{digest}/{name}"),
+                logical_path,
                 digest: Some(digest.to_owned()),
                 media_type: Some(
                     media_type
@@ -437,6 +469,11 @@ impl HttpClient {
     ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
         require_digest(digest)?;
         require_operation_id(operation_id)?;
+        if expected_revision == 0 {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let logical_path =
+            canonical_asset_path(digest, name).map_err(|_| HttpClientError::InvalidUpload)?;
         let request = self
             .client
             .delete(self.asset_endpoint(digest, name)?)
@@ -446,7 +483,7 @@ impl HttpClient {
             request,
             operation_id,
             DesiredMutationExpectation::Asset {
-                logical_path: format!("assets/{digest}/{name}"),
+                logical_path,
                 digest: None,
                 media_type: None,
                 active: false,
@@ -1320,6 +1357,29 @@ fn valid_review_day(value: u32) -> bool {
         .is_ok_and(|year| NaiveDate::from_ymd_opt(year, value / 100 % 100, value % 100).is_some())
 }
 
+fn managed_asset_identity(head: &AssetHeadV1) -> Result<(&str, &str, &str), HttpClientError> {
+    validate_asset_path(&head.logical_path).map_err(|_| HttpClientError::InvalidUpload)?;
+    let path = head
+        .logical_path
+        .strip_prefix("assets/")
+        .and_then(|value| value.split_once('/'))
+        .ok_or(HttpClientError::InvalidUpload)?;
+    let digest = head
+        .content_sha256
+        .as_deref()
+        .filter(|digest| *digest == path.0)
+        .ok_or(HttpClientError::InvalidUpload)?;
+    let media_type = head
+        .media_type
+        .as_deref()
+        .filter(|value| HeaderValue::from_str(value).is_ok())
+        .ok_or(HttpClientError::InvalidUpload)?;
+    if !head.active || head.revision == 0 || validate_blob_metadata(1, media_type).is_err() {
+        return Err(HttpClientError::InvalidUpload);
+    }
+    Ok((digest, path.1, media_type))
+}
+
 fn require_digest(digest: &str) -> Result<(), HttpClientError> {
     is_canonical_sha256(digest)
         .then_some(())
@@ -1937,6 +1997,36 @@ async fn execute_bytes(
     server_error(status, &bytes)
 }
 
+async fn execute_managed_asset(
+    request: RequestBuilder,
+    max_bytes: usize,
+    expected_media_type: &str,
+    expected_revision: u64,
+) -> Result<Vec<u8>, HttpClientError> {
+    let response = request.send().await.map_err(transport_error)?;
+    let status = response.status();
+    if status != StatusCode::OK {
+        if status.is_success() {
+            return Err(invalid_response());
+        }
+        return execute_error_response(response, status).await;
+    }
+    let media_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let etag = response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok());
+    if !media_type.is_some_and(|value| value.eq_ignore_ascii_case(expected_media_type))
+        || etag != Some(format!("\"{expected_revision}\"").as_str())
+    {
+        return Err(invalid_response());
+    }
+    read_bounded(response, max_bytes).await
+}
+
 async fn execute_pack_asset(
     request: RequestBuilder,
     max_bytes: usize,
@@ -2489,14 +2579,14 @@ mod tests {
     #[test]
     fn desired_state_validators_bind_kind_identity_state_and_revision() {
         let digest = "a".repeat(64);
-        let asset =
-            DesiredStateMutationProjectionV1::Asset(crate::protocol::http_v1::AssetHeadV1 {
-                logical_path: format!("assets/{digest}/a.png"),
-                revision: 1,
-                content_sha256: Some(digest.clone()),
-                media_type: Some("image/png".into()),
-                active: true,
-            });
+        let asset_head = AssetHeadV1 {
+            logical_path: format!("assets/{digest}/a.png"),
+            revision: 1,
+            content_sha256: Some(digest.clone()),
+            media_type: Some("image/png".into()),
+            active: true,
+        };
+        let asset = DesiredStateMutationProjectionV1::Asset(asset_head.clone());
         let asset_expectation = DesiredMutationExpectation::Asset {
             logical_path: format!("assets/{digest}/a.png"),
             digest: Some(digest),
@@ -2506,6 +2596,34 @@ mod tests {
         };
         assert!(valid_desired_projection(&asset, true, &asset_expectation));
         assert!(!valid_desired_projection(&asset, false, &asset_expectation));
+        for malformed in [
+            AssetHeadV1 {
+                logical_path: "assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/other.png".into(),
+                ..asset_head.clone()
+            },
+            AssetHeadV1 {
+                revision: 2,
+                ..asset_head.clone()
+            },
+            AssetHeadV1 {
+                content_sha256: Some("b".repeat(64)),
+                ..asset_head.clone()
+            },
+            AssetHeadV1 {
+                media_type: Some("image/jpeg".into()),
+                ..asset_head.clone()
+            },
+            AssetHeadV1 {
+                active: false,
+                ..asset_head.clone()
+            },
+        ] {
+            assert!(!valid_desired_projection(
+                &DesiredStateMutationProjectionV1::Asset(malformed),
+                true,
+                &asset_expectation
+            ));
+        }
 
         let thema_input = ThemaWriteRequestV1 {
             kind: "basic".into(),

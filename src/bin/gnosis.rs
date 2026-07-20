@@ -28,7 +28,7 @@ use gnosis_core::{
             ReviewPackCurrentV1, ReviewPackReceiptV1, valid_client_operation_id,
         },
         http_v1::{
-            DocumentImportRequestV1, OfflineAnswerV1, SetAcceptedSuccessRequestV1,
+            AssetHeadV1, DocumentImportRequestV1, OfflineAnswerV1, SetAcceptedSuccessRequestV1,
             SetSuspensionRequestV1,
         },
         request,
@@ -65,6 +65,10 @@ enum Command {
     ReviewPack {
         #[command(subcommand)]
         command: ReviewPackCommand,
+    },
+    Asset {
+        #[command(subcommand)]
+        command: AssetCommand,
     },
     SystemInfo,
     ImportOrg {
@@ -125,6 +129,41 @@ enum Command {
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AssetCommand {
+    Put {
+        digest: String,
+        name: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long, value_name = "N")]
+        if_revision: Option<u64>,
+        #[arg(long)]
+        media_type: String,
+    },
+    Fetch {
+        digest: String,
+        name: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        size_bytes: u64,
+        #[arg(long)]
+        media_type: String,
+    },
+    Blob {
+        digest: String,
+    },
+    Tombstone {
+        digest: String,
+        name: String,
+        #[arg(long)]
+        operation_id: String,
+        #[arg(long)]
+        if_revision: u64,
     },
 }
 
@@ -254,6 +293,15 @@ enum CliError {
         #[source]
         source: Box<CliError>,
     },
+    #[error(
+        "asset operation {operation_id} failed ({delivery} delivery); if retried, use the same operation ID: {source}"
+    )]
+    AssetOperation {
+        operation_id: String,
+        delivery: DeliveryStatus,
+        #[source]
+        source: Box<CliError>,
+    },
     #[error("client result failed ({delivery} delivery): {source}")]
     ClientResult {
         delivery: DeliveryStatus,
@@ -325,6 +373,11 @@ fn client_failure(error: &CliError) -> ClientFailureV1 {
     match error {
         CliError::Http(source) => http_failure(source, None),
         CliError::ReviewOperation {
+            operation_id,
+            delivery,
+            source,
+        }
+        | CliError::AssetOperation {
             operation_id,
             delivery,
             source,
@@ -449,7 +502,7 @@ fn print_client_error(error: &CliError) {
             let body = &server.body().error;
             eprintln!("{}: {}", body.code().as_str(), body.message());
         }
-        CliError::ReviewOperation { source, .. } => {
+        CliError::ReviewOperation { source, .. } | CliError::AssetOperation { source, .. } => {
             if let CliError::Http(HttpClientError::Server(server)) = source.as_ref() {
                 let body = &server.body().error;
                 eprintln!("{error}: {}: {}", body.code().as_str(), body.message());
@@ -470,6 +523,7 @@ async fn run(cli: Cli) -> Result<(), RunError> {
         Command::ReviewPack { command } => {
             run_review_pack(&cli.http_url, cli.token_file, command).await
         }
+        Command::Asset { command } => run_asset(&cli.http_url, cli.token_file, command).await,
         Command::ReviewAttemptState { attempt_id } => {
             run_http_state(&cli.http_url, cli.token_file, attempt_id).await
         }
@@ -554,6 +608,77 @@ async fn run(cli: Cli) -> Result<(), RunError> {
         | Command::DeviceList
         | Command::DeviceRevoke { .. }
         | Command::Admin { .. }) => run_socket(cli.socket, command).await,
+    }
+}
+
+async fn run_asset(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    command: AssetCommand,
+) -> Result<(), RunError> {
+    let client = http_client(base_url, token_file)?;
+    match command {
+        AssetCommand::Put {
+            digest,
+            name,
+            operation_id,
+            if_revision,
+            media_type,
+        } => {
+            let bytes = read_client_bytes()?;
+            let result = client
+                .put_asset(
+                    &digest,
+                    &name,
+                    &operation_id,
+                    if_revision,
+                    &media_type,
+                    &bytes,
+                )
+                .await
+                .map_err(|source| asset_http_operation_error(operation_id.clone(), source))?;
+            write_json(&result).map_err(|source| {
+                asset_operation_error(operation_id, DeliveryStatus::Confirmed, source).into()
+            })
+        }
+        AssetCommand::Fetch {
+            digest,
+            name,
+            revision,
+            size_bytes,
+            media_type,
+        } => {
+            let head = AssetHeadV1 {
+                logical_path: format!("assets/{digest}/{name}"),
+                revision,
+                content_sha256: Some(digest),
+                media_type: Some(media_type),
+                active: true,
+            };
+            let bytes = client
+                .asset(&head, size_bytes)
+                .await
+                .map_err(CliError::from)?;
+            write_bytes(&bytes).map_err(Into::into)
+        }
+        AssetCommand::Blob { digest } => {
+            let bytes = client.blob(&digest).await.map_err(CliError::from)?;
+            write_bytes(&bytes).map_err(Into::into)
+        }
+        AssetCommand::Tombstone {
+            digest,
+            name,
+            operation_id,
+            if_revision,
+        } => {
+            let result = client
+                .tombstone_asset(&digest, &name, &operation_id, if_revision)
+                .await
+                .map_err(|source| asset_http_operation_error(operation_id.clone(), source))?;
+            write_json(&result).map_err(|source| {
+                asset_operation_error(operation_id, DeliveryStatus::Confirmed, source).into()
+            })
+        }
     }
 }
 
@@ -953,6 +1078,23 @@ fn read_device_token(path: PathBuf) -> Result<SecretToken, CliError> {
     SecretToken::new(value.to_owned()).map_err(Into::into)
 }
 
+fn asset_http_operation_error(operation_id: String, source: HttpClientError) -> CliError {
+    let delivery = source.delivery();
+    asset_operation_error(operation_id, delivery, source.into())
+}
+
+fn asset_operation_error(
+    operation_id: String,
+    delivery: DeliveryStatus,
+    source: CliError,
+) -> CliError {
+    CliError::AssetOperation {
+        operation_id,
+        delivery,
+        source: Box::new(source),
+    }
+}
+
 fn review_http_operation_error(operation_id: String, source: HttpClientError) -> CliError {
     let delivery = source.delivery();
     review_operation_error(operation_id, delivery, source.into())
@@ -981,6 +1123,7 @@ fn command_request(command: Command) -> Result<Request, CliError> {
     match command {
         Command::Sync { .. } => unreachable!("HTTP command reached socket"),
         Command::ReviewPack { .. } => unreachable!("HTTP command reached socket"),
+        Command::Asset { .. } => unreachable!("HTTP command reached socket"),
         Command::SystemInfo => Ok(Request::SystemInfo {}),
         Command::ImportOrg { .. }
         | Command::GetDocument { .. }
@@ -1080,6 +1223,18 @@ where
     serde_json::from_slice(&input).map_err(CliError::DecodeClientInput)
 }
 
+fn read_client_bytes() -> Result<Vec<u8>, CliError> {
+    let mut input = Vec::new();
+    io::stdin()
+        .take(CLIENT_INPUT_LIMIT + 1)
+        .read_to_end(&mut input)
+        .map_err(CliError::ReadClientInput)?;
+    if input.len() > CLIENT_INPUT_LIMIT as usize {
+        return Err(CliError::ClientInputTooLarge);
+    }
+    Ok(input)
+}
+
 fn write_result(result: &ResponseResult) -> Result<(), CliError> {
     match result {
         ResponseResult::SystemInfo(value) => write_json(value),
@@ -1097,6 +1252,13 @@ fn write_json(value: &impl Serialize) -> Result<(), CliError> {
     let mut output = io::stdout().lock();
     output.write_all(&body).map_err(CliError::WriteOutput)?;
     writeln!(output).map_err(CliError::WriteOutput)
+}
+
+fn write_bytes(value: &[u8]) -> Result<(), CliError> {
+    io::stdout()
+        .lock()
+        .write_all(value)
+        .map_err(CliError::WriteOutput)
 }
 
 fn error_code(code: ErrorCode) -> &'static str {
@@ -1130,8 +1292,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        CLIENT_INPUT_LIMIT, Cli, CliError, Command, correlation_id, read_device_token,
-        read_org_from,
+        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, correlation_id,
+        read_device_token, read_org_from,
     };
 
     #[test]
@@ -1171,6 +1333,35 @@ mod tests {
         ));
         assert!(cli.socket.is_none());
         assert_eq!(cli.http_url, "http://127.0.0.1:7842");
+    }
+
+    #[test]
+    fn managed_asset_cli_requires_durable_mutation_identity() {
+        let cli = Cli::try_parse_from([
+            "gnosis",
+            "asset",
+            "put",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image.png",
+            "--operation-id",
+            "asset-put",
+            "--if-revision",
+            "7",
+            "--media-type",
+            "image/png",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Asset {
+                command: AssetCommand::Put {
+                    operation_id,
+                    if_revision: Some(7),
+                    ..
+                }
+            } if operation_id == "asset-put"
+        ));
     }
 
     #[test]

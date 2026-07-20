@@ -22,10 +22,11 @@ use gnosis_core::{
         ResponseResult, ServerError,
         client_v1::{ClientDeliveryV1, ClientFailureCodeV1, ClientFailureV1},
         http_v1::{
-            ApiErrorCodeV1, DocumentImportRequestV1, DocumentMutationResultV1, NoteRenameRequestV1,
-            NoteWriteRequestV1, ReviewAnswerV1, ReviewPackAssetV2, ReviewSessionRequestV1,
-            ReviewSourceInputV1, ReviewSourceKindV1, SetAcceptedSuccessRequestV1,
-            SetSuspensionRequestV1, ThemaWriteRequestV1,
+            ApiErrorCodeV1, AssetHeadV1, DesiredStateMutationProjectionV1,
+            DesiredStateMutationResultV1, DocumentImportRequestV1, DocumentMutationResultV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, ReviewAnswerV1, ReviewPackAssetV2,
+            ReviewSessionRequestV1, ReviewSourceInputV1, ReviewSourceKindV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, ThemaWriteRequestV1,
         },
         request,
     },
@@ -194,6 +195,134 @@ async fn client_authenticates_and_decodes_replica_bootstrap() {
     assert_eq!(device_id.len(), 36);
 
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn client_runs_managed_asset_lifecycle_and_retains_blob() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let bytes = b"managed asset";
+    let digest = format!("{:x}", Sha256::digest(bytes));
+
+    let put = client
+        .put_asset(&digest, "image.png", "asset-put", None, "image/png", bytes)
+        .await
+        .unwrap();
+    let head = applied_asset(&put);
+    assert_eq!(head.revision, 1);
+    assert_eq!(client.asset(head, bytes.len() as u64).await.unwrap(), bytes);
+    assert_eq!(client.blob(&digest).await.unwrap(), bytes);
+
+    let rejected = client
+        .put_asset(
+            &digest,
+            "image.png",
+            "asset-stale-put",
+            Some(99),
+            "image/png",
+            bytes,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        rejected,
+        DesiredStateMutationResultV1::Rejected { operation_id, .. }
+            if operation_id == "asset-stale-put"
+    ));
+
+    let deleted = client
+        .tombstone_asset(&digest, "image.png", "asset-delete", head.revision)
+        .await
+        .unwrap();
+    let deleted_head = applied_asset(&deleted);
+    assert!(!deleted_head.active);
+    assert_eq!(deleted_head.revision, 2);
+    assert!(matches!(
+        client.asset(head, bytes.len() as u64).await,
+        Err(HttpClientError::Server(error))
+            if error.body().error.code() == ApiErrorCodeV1::NotFound
+    ));
+    assert_eq!(client.blob(&digest).await.unwrap(), bytes);
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn managed_asset_fetch_rejects_malformed_success_metadata() {
+    let bytes = b"asset";
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let head = AssetHeadV1 {
+        logical_path: format!("assets/{digest}/image.png"),
+        revision: 7,
+        content_sha256: Some(digest),
+        media_type: Some("image/png".into()),
+        active: true,
+    };
+
+    for response in [
+        b"HTTP/1.1 201 Created\r\nContent-Type: image/png\r\nETag: \"7\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nETag: \"7\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nETag: \"8\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nETag: \"7\"\r\nContent-Length: 5\r\nConnection: close\r\n\r\nother".as_slice(),
+    ] {
+        let raw = spawn_raw_server(response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert!(matches!(
+            client.asset(&head, bytes.len() as u64).await,
+            Err(HttpClientError::InvalidResponse { .. })
+        ));
+        raw.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn managed_asset_mutations_reject_invalid_local_input_before_delivery() {
+    let client = HttpClient::new("http://127.0.0.1:1", token()).unwrap();
+    let bytes = b"asset";
+    let digest = format!("{:x}", Sha256::digest(bytes));
+
+    for result in [
+        client
+            .put_asset(&digest, "image.png", "put", None, "", bytes)
+            .await,
+        client
+            .put_asset(&digest, "image.png", "put", None, "image/png", b"")
+            .await,
+        client
+            .put_asset(&digest, "image.png", "put", None, "image/png ", bytes)
+            .await,
+    ] {
+        assert!(matches!(result, Err(HttpClientError::InvalidUpload)));
+    }
+    assert!(matches!(
+        client
+            .put_asset(&digest, "image.png", "put", Some(0), "image/png", bytes)
+            .await,
+        Err(HttpClientError::InvalidMutation)
+    ));
+    assert!(matches!(
+        client
+            .tombstone_asset(&digest, "image.png", "delete", 0)
+            .await,
+        Err(HttpClientError::InvalidMutation)
+    ));
+
+    let oversized = vec![b'x'; 1024 * 1024 + 1];
+    let oversized_digest = format!("{:x}", Sha256::digest(&oversized));
+    assert!(matches!(
+        client
+            .put_asset(
+                &oversized_digest,
+                "image.png",
+                "put-large",
+                None,
+                "image/png",
+                &oversized,
+            )
+            .await,
+        Err(HttpClientError::InvalidUpload)
+    ));
 }
 
 #[tokio::test]
@@ -3420,6 +3549,16 @@ async fn create_review_thema_from(
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn applied_asset(result: &DesiredStateMutationResultV1) -> &AssetHeadV1 {
+    match result {
+        DesiredStateMutationResultV1::Applied {
+            authoritative: DesiredStateMutationProjectionV1::Asset(asset),
+            ..
+        } => asset,
+        _ => panic!("expected applied asset mutation"),
+    }
 }
 
 fn next_operation_id(prefix: &str) -> String {
