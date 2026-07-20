@@ -64,6 +64,8 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
   :group 'gnosis-nodes)
 
 (define-error 'gnosis-nodes-error "Gnosis Org synchronization failed")
+(define-error 'gnosis-nodes-busy "Gnosis Org synchronization is busy"
+  'gnosis-nodes-error)
 (define-error 'gnosis-nodes-path-error "Unsafe Gnosis Org path" 'gnosis-nodes-error)
 (define-error 'gnosis-nodes-conflict "Gnosis Org conflict" 'gnosis-nodes-error)
 
@@ -601,6 +603,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
          (remote-path (plist-get projection :logical_path))
          (local-path (plist-get record :local-path))
          (destination (gnosis-nodes--safe-path gnosis-nodes-dir remote-path))
+         (destination-buffer (get-file-buffer destination))
          (remote-bytes (gnosis-nodes--working-bytes destination))
          (remote-digest (gnosis-nodes--projection-digest projection)))
     (if (equal operation "tombstone")
@@ -615,7 +618,8 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                         (gnosis-nodes--conflict-directory
                          (plist-get record :document-id))
                         backup)))))
-      (and remote-bytes
+      (and (not (buffer-live-p destination-buffer))
+           remote-bytes
            (equal remote-digest (gnosis-nodes--digest remote-bytes))
            (or (equal local-path remote-path)
                (null (gnosis-nodes--working-bytes
@@ -796,7 +800,8 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
   "Return validated decoded TOKEN, or nil.
 Require snapshot cursor shape when SNAPSHOT-P is non-nil."
   (condition-case nil
-      (when (stringp token)
+      (when (and (stringp token)
+                 (string-match-p "\\`[A-Za-z0-9_-]+\\'" token))
         (let* ((translated
                 (replace-regexp-in-string
                  "_" "/" (replace-regexp-in-string "-" "+" token t t) t t))
@@ -806,28 +811,45 @@ Require snapshot cursor shape when SNAPSHOT-P is non-nil."
                                                 0
                                               (- 4 remainder))
                                             ?=)))
+               (raw (base64-decode-string padded))
+               (canonical
+                (replace-regexp-in-string
+                 "=+\\'" ""
+                 (replace-regexp-in-string
+                  "/" "_" (replace-regexp-in-string
+                           "+" "-" (base64-encode-string raw t) t t)
+                  t t)))
+               (text (decode-coding-string raw 'utf-8))
                (decoded
                 (json-parse-string
-                 (decode-coding-string (base64-decode-string padded) 'utf-8)
-                 :object-type 'plist :array-type 'array
+                 text :object-type 'plist :array-type 'array
                  :null-object nil :false-object nil))
                (keys (cl-loop for (key _) on decoded by #'cddr collect key))
                (expected (if snapshot-p
                              '(:version :snapshot_id :server_id
                                :cut_cursor :cut_token :after)
-                           '(:version :server_id :position :token))))
+                           '(:version :server_id :position :token)))
+               (numeric-keys (if snapshot-p
+                                 '(:cut_cursor :after)
+                               '(:position))))
           (and (/= remainder 1)
+               (equal token canonical)
+               (equal raw (encode-coding-string text 'utf-8))
                (= (length keys) (length expected))
                (seq-every-p (lambda (key) (memq key expected)) keys)
-               (= (or (plist-get decoded :version) -1) 1)
+               (integerp (plist-get decoded :version))
+               (= (plist-get decoded :version) 1)
                (stringp (plist-get decoded :server_id))
+               (seq-every-p
+                (lambda (key)
+                  (let ((value (plist-get decoded key)))
+                    (and (integerp value)
+                         (<= 0 value #xffffffffffffffff))))
+                numeric-keys)
                (if snapshot-p
                    (and (stringp (plist-get decoded :snapshot_id))
-                        (natnump (plist-get decoded :cut_cursor))
-                        (stringp (plist-get decoded :cut_token))
-                        (natnump (plist-get decoded :after)))
-                 (and (natnump (plist-get decoded :position))
-                      (stringp (plist-get decoded :token))))
+                        (stringp (plist-get decoded :cut_token)))
+                 (stringp (plist-get decoded :token)))
                decoded)))
     (error nil)))
 
@@ -1627,7 +1649,7 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
      (condition-case nil
          (lock-file lock)
        (file-locked
-        (signal 'gnosis-nodes-error '("Gnosis synchronization is busy"))))
+        (signal 'gnosis-nodes-busy '("Gnosis synchronization is busy"))))
      (unwind-protect (progn ,@body)
        (unlock-file lock))))
 
@@ -2058,29 +2080,35 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 (defun gnosis-nodes--abandon-ediff-session (session-id)
   "Invalidate and remove abandoned Ediff SESSION-ID artifacts."
   (when-let ((session (gethash session-id gnosis-nodes--ediff-sessions)))
-    (remhash session-id gnosis-nodes--ediff-sessions)
-    (let ((merge-file (plist-get session :merge-file)))
-      (when (and (stringp merge-file)
-                 (file-in-directory-p merge-file
-                                      (gnosis-nodes--state-directory))
-                 (file-regular-p merge-file))
-        (delete-file merge-file)))
-    (dolist (buffer (plist-get session :disposable-buffers))
-      (when (buffer-live-p buffer) (kill-buffer buffer)))
-    (gnosis-nodes--with-lock
-      (let* ((state (gnosis-nodes--read-state))
-             (conflicts (plist-get state :conflicts))
-             changed)
-        (cl-loop for record across conflicts
-                 when (and (equal session-id
-                                  (plist-get record :merge-session-id))
-                           (eq :editing (plist-get record :status)))
-                 do (setf (plist-get record :status) :unresolved
-                          (plist-get record :merge-file) nil
-                          (plist-get record :merge-start-digest) nil
-                          (plist-get record :merge-session-id) nil
-                          changed t))
-        (when changed (gnosis-nodes--write-state state))))))
+    (condition-case nil
+        (progn
+          (gnosis-nodes--with-lock
+            (let* ((state (gnosis-nodes--read-state))
+                   (conflicts (plist-get state :conflicts))
+                   changed)
+              (cl-loop for record across conflicts
+                       when (and
+                             (equal session-id
+                                    (plist-get record :merge-session-id))
+                             (eq :editing (plist-get record :status)))
+                       do (setf (plist-get record :status) :unresolved
+                                (plist-get record :merge-file) nil
+                                (plist-get record :merge-start-digest) nil
+                                (plist-get record :merge-session-id) nil
+                                changed t))
+              (when changed (gnosis-nodes--write-state state))))
+          (remhash session-id gnosis-nodes--ediff-sessions)
+          (let ((merge-file (plist-get session :merge-file)))
+            (when (and (stringp merge-file)
+                       (file-in-directory-p merge-file
+                                            (gnosis-nodes--state-directory))
+                       (file-regular-p merge-file))
+              (delete-file merge-file)))
+          (dolist (buffer (plist-get session :disposable-buffers))
+            (when (buffer-live-p buffer) (kill-buffer buffer))))
+      (gnosis-nodes-busy
+       (run-at-time 0.1 nil #'gnosis-nodes--abandon-ediff-session
+                    session-id)))))
 
 (defun gnosis-nodes--ediff-session-active-p (record)
   "Return non-nil when RECORD belongs to its matching live Ediff session."

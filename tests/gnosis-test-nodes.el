@@ -20,6 +20,15 @@
      (replace-regexp-in-string
       "/" "_" (replace-regexp-in-string "+" "-" encoded t t) t t))))
 
+(defun gnosis-test-nodes--encode-cursor-json (json)
+  "Return unpadded URL-safe cursor token for JSON bytes."
+  (replace-regexp-in-string
+   "=+\\'" ""
+   (replace-regexp-in-string
+    "/" "_"
+    (replace-regexp-in-string "+" "-" (base64-encode-string json t) t t)
+    t t)))
+
 
 (defvar gnosis-nodes-max-pages-per-pass)
 (defvar gnosis-nodes-max-local-scan-per-pass)
@@ -2001,7 +2010,9 @@
                    :remote-digest "remote" :status :editing
                    :merge-start-digest "start" :merge-file ,merge-file
                    :merge-session-id ,session-id))
-         (state `(:bases [] :outbox [] :conflicts [,record])))
+         (state `(:bases [] :outbox [] :conflicts [,record]))
+         (lock-attempts 0)
+         pending)
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "note.org" "original")
@@ -2015,9 +2026,23 @@
                      (lambda () state))
                     ((symbol-function 'gnosis-nodes--write-state)
                      (lambda (value) (setq state value)))
-                    ((symbol-function 'lock-file) #'ignore)
-                    ((symbol-function 'unlock-file) #'ignore))
+                    ((symbol-function 'lock-file)
+                     (lambda (_)
+                       (cl-incf lock-attempts)
+                       (when (= lock-attempts 1)
+                         (signal 'gnosis-nodes-busy '("busy")))))
+                    ((symbol-function 'unlock-file) #'ignore)
+                    ((symbol-function 'run-at-time)
+                     (lambda (_delay _repeat function &rest args)
+                       (setq pending (cons function args)))))
             (gnosis-nodes--abandon-ediff-session session-id)
+            (should pending)
+            (should (gethash session-id gnosis-nodes--ediff-sessions))
+            (should (file-exists-p merge-file))
+            (should (eq :editing
+                        (plist-get (aref (plist-get state :conflicts) 0)
+                                   :status)))
+            (apply (car pending) (cdr pending))
             (should-error (gnosis-nodes-accept-conflict) :type 'user-error))
           (should-not (file-exists-p merge-file))
           (should-not (buffer-live-p remote-buffer))
@@ -2033,6 +2058,56 @@
       (dolist (buffer (list control-buffer remote-buffer))
         (when (buffer-live-p buffer) (kill-buffer buffer)))
       (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-accepted-remote-replay-rejects-visited-destination ()
+  (let* ((directory (make-temp-file "gnosis-nodes-accepted-visited" t))
+         (gnosis-nodes-dir directory)
+         (remote (string-to-unibyte "remote"))
+         (digest (gnosis-nodes--digest remote))
+         (projection `(:operation "update" :logical_path "new.org"
+                       :content_sha256 ,digest))
+         (record `(:kind :rename :local-path "old.org"
+                   :remote-path "new.org" :remote-digest ,digest))
+         buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "new.org" remote)
+          (setq buffer (find-file-noselect
+                        (expand-file-name "new.org" directory)))
+          (should-not (gnosis-nodes--accepted-remote-effect-p
+                       record projection))
+          (with-current-buffer buffer (set-buffer-modified-p t))
+          (should-not (gnosis-nodes--accepted-remote-effect-p
+                       record projection))
+          (should (equal remote
+                         (gnosis-nodes--managed-bytes
+                          directory (expand-file-name "new.org" directory)))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-cursor-codec-matches-rust-domain ()
+  (let* ((maximum (1- (expt 2 64)))
+         (cursor (gnosis-test-nodes--cursor "server" maximum))
+         (snapshot (gnosis-test-nodes--cursor "server" maximum "snapshot"))
+         (padded (concat cursor "="))
+         (overflow (gnosis-test-nodes--encode-cursor-json
+                    (format "{\"version\":1,\"server_id\":\"server\",\"position\":%s,\"token\":\"token\"}"
+                            (1+ maximum))))
+         (float-version (gnosis-test-nodes--encode-cursor-json
+                         "{\"version\":1.0,\"server_id\":\"server\",\"position\":1,\"token\":\"token\"}"))
+         (float-position (gnosis-test-nodes--encode-cursor-json
+                          "{\"version\":1,\"server_id\":\"server\",\"position\":1.0,\"token\":\"token\"}"))
+         (unknown (gnosis-test-nodes--encode-cursor-json
+                   "{\"version\":1,\"server_id\":\"server\",\"position\":1,\"token\":\"token\",\"extra\":1}"))
+         (malformed-utf8 (gnosis-test-nodes--encode-cursor-json
+                          (unibyte-string #xff))))
+    (should (gnosis-nodes--decode-cursor cursor))
+    (should (gnosis-nodes--decode-cursor snapshot t))
+    (dolist (invalid (list padded "+" float-version float-position
+                           overflow unknown malformed-utf8))
+      (should-not (gnosis-nodes--decode-cursor invalid)))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
