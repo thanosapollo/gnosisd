@@ -558,5 +558,33 @@
       (should (equal (plist-get head :operation-id)
                      (plist-get blocked :depends-on))))))
 
+(ert-deftest gnosis-nodes-confirmed-applied-receipt-is-pruned ()
+  (let* ((projection '(:document_id "doc" :revision 2 :logical_path "note.org"
+                       :content_sha256 "digest" :operation "update"))
+         (entry `(:operation-id "op" :status :applied :payload "large"
+                  :result (:status "applied" :authoritative ,projection)))
+         (other '(:operation-id "other" :status :uncertain :document-id "other"))
+         (state `(:bases [] :outbox [,entry ,other] :conflicts [])))
+    (setq state (gnosis-nodes--record-base state projection))
+    (should (= 1 (length (plist-get state :outbox))))
+    (should (equal "other"
+                   (plist-get (aref (plist-get state :outbox) 0)
+                              :operation-id)))))
+
+(ert-deftest gnosis-nodes-explicit-acceptance-supersedes-rejected-head ()
+  (let* ((head (gnosis-nodes--outbox-entry
+                :replace "doc" 1 "note.org" "old" nil
+                (string-to-unibyte "old")))
+         (entry (gnosis-nodes--outbox-entry
+                 :replace "doc" 2 "note.org" "merged" nil
+                 (string-to-unibyte "merged")))
+         (state `(:outbox [,head])))
+    (setf (plist-get head :status) :rejected)
+    (setq state (gnosis-nodes--enqueue-after-head state entry "doc" "note.org"))
+    (should (eq :superseded
+                (plist-get (aref (plist-get state :outbox) 0) :status)))
+    (should (eq :pending
+                (plist-get (aref (plist-get state :outbox) 1) :status)))))
+
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here

@@ -410,11 +410,18 @@ PAYLOAD captures exact bytes at enqueue time."
        (vconcat
         (seq-remove
          (lambda (entry)
-           (let ((result (plist-get entry :result)))
+           (let* ((result (plist-get entry :result))
+                  (authoritative (plist-get result :authoritative))
+                  (entry-document-id
+                   (or (plist-get entry :document-id)
+                       (plist-get authoritative :document_id)))
+                  (entry-revision
+                   (or (plist-get result :revision)
+                       (plist-get authoritative :revision)
+                       0)))
              (and (eq :applied (plist-get entry :status))
-                  (equal document-id (plist-get result :document_id))
-                  (<= (or (plist-get result :revision) 0)
-                      (plist-get base :revision)))))
+                  (equal document-id entry-document-id)
+                  (<= entry-revision (plist-get base :revision)))))
          outbox))))))
 
 (defun gnosis-nodes--conflict-directory (document-id)
@@ -892,8 +899,10 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
   "Append ENTRY after unresolved head for DOCUMENT-ID or LOGICAL-PATH in STATE."
   (when-let* ((head (gnosis-nodes--outbox-entry-for
                      state document-id logical-path)))
-    (setf (plist-get entry :status) :blocked
-          (plist-get entry :depends-on) (plist-get head :operation-id)))
+    (if (eq :rejected (plist-get head :status))
+        (setf (plist-get head :status) :superseded)
+      (setf (plist-get entry :status) :blocked
+            (plist-get entry :depends-on) (plist-get head :operation-id))))
   (gnosis-nodes--enqueue state entry))
 
 (defun gnosis-nodes--scan (state)
