@@ -1767,10 +1767,7 @@ fn store_actor(
             return;
         }
     };
-    if let Err(error) = store.clear_staged_blobs() {
-        let _ = ready.send(Err(error));
-        return;
-    }
+
     if ready.send(Ok(())).is_err() {
         return;
     }
@@ -2157,11 +2154,24 @@ fn stage_blob_command(
     media_type: &str,
     created_at_us: i64,
 ) -> Result<BlobMeta, ServiceError> {
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    let existed = blobs.contains(&digest)?;
     let blob = blobs.put(bytes, media_type)?;
-    store
-        .stage_blob(&blob, created_at_us)
-        .map_err(ServiceError::Store)?;
-    Ok(blob)
+    match store.stage_blob(&blob, created_at_us) {
+        Ok(()) => Ok(blob),
+        Err(stage) if existed => Err(ServiceError::Store(stage)),
+        Err(stage) => match store.has_blob_reference(&blob.sha256) {
+            Ok(true) => Err(ServiceError::Store(stage)),
+            Ok(false) => match blobs.discard(&blob.sha256) {
+                Ok(()) => Err(ServiceError::Store(stage)),
+                Err(cleanup) => Err(ServiceError::StageBlobCleanup { stage, cleanup }),
+            },
+            Err(reference_check) => Err(ServiceError::StageBlobReferenceCheck {
+                stage,
+                reference_check,
+            }),
+        },
+    }
 }
 
 fn run_store_command(
@@ -2856,6 +2866,18 @@ pub(crate) enum ServiceError {
     Blob(#[from] BlobError),
     #[error("store operation failed")]
     Store(#[source] StoreError),
+    #[error("blob staging failed and reference verification also failed")]
+    StageBlobReferenceCheck {
+        #[source]
+        stage: StoreError,
+        reference_check: StoreError,
+    },
+    #[error("blob staging failed and file cleanup also failed")]
+    StageBlobCleanup {
+        #[source]
+        stage: StoreError,
+        cleanup: BlobError,
+    },
     #[error("application operation failed")]
     Application(#[source] ApplicationError),
     #[error("review request is invalid")]
@@ -2900,7 +2922,7 @@ mod tests {
 
     use super::{
         BackupCommand, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
-        repair_canonical_state, store_actor,
+        repair_canonical_state, stage_blob_command, store_actor,
     };
     use crate::application::{
         AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
@@ -2966,6 +2988,112 @@ mod tests {
 
         assert!(matches!(result, Err(ServiceError::Busy)));
         assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[tokio::test]
+    async fn restart_preserves_large_staged_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_path = directory.path().join("blobs");
+        let blobs = BlobStore::open(&blob_path).unwrap();
+        drop(SqliteStore::open(&database).unwrap());
+        let mut connection = rusqlite::Connection::open(&database).unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut preserved_digest = None;
+        for value in 1_u64..=256 {
+            let blob = blobs
+                .put(&value.to_le_bytes(), "application/octet-stream")
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO staged_blob(content_sha256, size_bytes, staged_at_us)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![blob.sha256, blob.size_bytes, value],
+                )
+                .unwrap();
+            preserved_digest.get_or_insert(blob.sha256);
+        }
+        transaction.commit().unwrap();
+        let expected_count: u64 = connection
+            .query_row("SELECT count(*) FROM staged_blob", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let runtime = ServiceRuntime::start(database.clone(), blob_path.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        service.ready().await.unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let actual_count: u64 = connection
+            .query_row("SELECT count(*) FROM staged_blob", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(actual_count, expected_count);
+        let preserved_digest = preserved_digest.unwrap();
+        assert!(blobs.contains(&preserved_digest).unwrap());
+    }
+
+    #[test]
+    fn failed_stage_removes_only_new_unreferenced_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_path = directory.path().join("blobs");
+        let blobs = BlobStore::open(&blob_path).unwrap();
+        let mut store = SqliteStore::open(&database).unwrap();
+        let existing = blobs
+            .put(b"canonical blob", "application/octet-stream")
+            .unwrap();
+        let asset_path = canonical_asset_path(&existing.sha256, "existing.png").unwrap();
+        let prepared = prepare_asset(asset_path, "existing.png".into(), None).unwrap();
+        store.put_asset(&prepared, &existing, 1, None).unwrap();
+        blobs.discard(&existing.sha256).unwrap();
+
+        let new_bytes = b"new staged blob";
+        let new_digest = format!("{:x}", sha2::Sha256::digest(new_bytes));
+        let new_error =
+            stage_blob_command(&mut store, &blobs, new_bytes, "application/octet-stream", 0)
+                .unwrap_err();
+        assert!(matches!(new_error, ServiceError::Store(_)));
+        assert!(!blob_path.join(&new_digest[..2]).join(&new_digest).exists());
+
+        let existing_error = stage_blob_command(
+            &mut store,
+            &blobs,
+            b"canonical blob",
+            "application/octet-stream",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(existing_error, ServiceError::Store(_)));
+        assert!(
+            blob_path
+                .join(&existing.sha256[..2])
+                .join(&existing.sha256)
+                .exists()
+        );
+
+        let staged_bytes = b"catalogued staged blob";
+        let staged = blobs.put(staged_bytes, "application/octet-stream").unwrap();
+        store.stage_blob(&staged, 4).unwrap();
+        blobs.discard(&staged.sha256).unwrap();
+        let staged_error = stage_blob_command(
+            &mut store,
+            &blobs,
+            staged_bytes,
+            "application/octet-stream",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(staged_error, ServiceError::Store(_)));
+        assert!(
+            blob_path
+                .join(&staged.sha256[..2])
+                .join(&staged.sha256)
+                .exists()
+        );
     }
 
     #[test]
@@ -3573,8 +3701,23 @@ mod tests {
         drop(service);
         runtime.finish().await.unwrap();
 
-        let runtime = ServiceRuntime::start(database, blobs, 8).await.unwrap();
+        let runtime = ServiceRuntime::start(database, blobs.clone(), 8)
+            .await
+            .unwrap();
         let service = runtime.handle();
+        let blob_path = blobs.join(&digest[..2]).join(&digest);
+        std::fs::remove_file(&blob_path).unwrap();
+        let stage_error = service
+            .stage_blob(
+                &digest,
+                b"conflicted asset".to_vec(),
+                "application/octet-stream".into(),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(stage_error, ServiceError::Store(_)));
+        assert!(blob_path.exists());
         let replay = service
             .reconcile_asset_operation(1, operation.clone(), payload, Some(device_id.clone()), 6)
             .await

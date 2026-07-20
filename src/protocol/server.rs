@@ -473,6 +473,8 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         | ServiceError::AssetDigest
         | ServiceError::InvalidBlobMetadata
         | ServiceError::InvalidRepairBatchSize
+        | ServiceError::StageBlobReferenceCheck { .. }
+        | ServiceError::StageBlobCleanup { .. }
         | ServiceError::Blob(_)
         | ServiceError::Review(_)
         | ServiceError::Settings(_)

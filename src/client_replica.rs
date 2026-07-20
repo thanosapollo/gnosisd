@@ -2637,23 +2637,7 @@ mod tests {
         let mut replica = LocalReplica::open(&replica_path, &device_id).unwrap();
         let retry = replica.next_asset_upload().unwrap().unwrap();
         assert_eq!(retry.canonical_payload, upload.canonical_payload);
-        let missing_after_restart = reconcile_asset_upload(&service, &retry, &device_id, 22).await;
-        assert!(matches!(
-            missing_after_restart,
-            Err(crate::service::ServiceError::Store(
-                crate::store::StoreError::BlobRequired { .. }
-            ))
-        ));
-        service
-            .stage_blob(
-                &retry.content_sha256,
-                retry.bytes.clone(),
-                retry.media_type.clone(),
-                23,
-            )
-            .await
-            .unwrap();
-        let accepted = reconcile_asset_upload(&service, &retry, &device_id, 24)
+        let accepted = reconcile_asset_upload(&service, &retry, &device_id, 22)
             .await
             .unwrap();
         assert_eq!(accepted["result"]["status"], "accepted");

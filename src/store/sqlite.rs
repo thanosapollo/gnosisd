@@ -672,13 +672,6 @@ impl SqliteStore {
         transaction.commit().map_err(StoreError::storage)
     }
 
-    pub(crate) fn clear_staged_blobs(&mut self) -> Result<(), StoreError> {
-        self.connection
-            .execute("DELETE FROM staged_blob", [])
-            .map(|_| ())
-            .map_err(StoreError::storage)
-    }
-
     pub(crate) fn document_head(
         &self,
         document_id: &DocumentId,
@@ -1059,6 +1052,22 @@ impl SqliteStore {
         self.connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM blob WHERE content_sha256 = ?1)",
+                [digest],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::storage)
+    }
+
+    pub(crate) fn has_blob_reference(&self, digest: &str) -> Result<bool, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM blob WHERE content_sha256 = ?1
+                     UNION ALL
+                     SELECT 1 FROM staged_blob WHERE content_sha256 = ?1
+                     UNION ALL
+                     SELECT 1 FROM offline_asset_evidence WHERE content_sha256 = ?1
+                 )",
                 [digest],
                 |row| row.get(0),
             )

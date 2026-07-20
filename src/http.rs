@@ -2290,6 +2290,8 @@ impl ApiError {
             ServiceError::Stopped
             | ServiceError::Corrupt
             | ServiceError::InvalidRepairBatchSize
+            | ServiceError::StageBlobReferenceCheck { .. }
+            | ServiceError::StageBlobCleanup { .. }
             | ServiceError::Blob(_)
             | ServiceError::Backup(_) => Self::internal(),
         }
