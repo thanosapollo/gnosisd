@@ -83,6 +83,8 @@ pub(crate) enum StoreError {
     CorruptData { field: &'static str },
     #[error("database schema version {found} is unsupported; expected version {supported}")]
     UnsupportedSchemaVersion { found: u32, supported: u32 },
+    #[error("database schema layout is unsupported")]
+    UnsupportedSchemaLayout,
     #[error("database application ID {found} is unsupported; expected {expected}")]
     UnsupportedApplicationId { found: u32, expected: u32 },
     #[error("storage operation failed")]
@@ -3459,7 +3461,10 @@ enum FailPoint {
 fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
     let found = schema_version(connection)?;
     match found {
-        SCHEMA_VERSION => require_application_id(connection),
+        SCHEMA_VERSION => {
+            require_application_id(connection)?;
+            require_current_schema_layout(connection)
+        }
         0 if user_schema_is_empty(connection)? => connection
             .execute_batch(CURRENT_SCHEMA)
             .map_err(StoreError::storage),
@@ -3468,6 +3473,36 @@ fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
             supported: SCHEMA_VERSION,
         }),
     }
+}
+
+fn require_current_schema_layout(connection: &Connection) -> Result<(), StoreError> {
+    let expected = Connection::open_in_memory().map_err(StoreError::storage)?;
+    expected
+        .execute_batch(CURRENT_SCHEMA)
+        .map_err(StoreError::storage)?;
+    if schema_objects(connection)? == schema_objects(&expected)? {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedSchemaLayout)
+    }
+}
+
+fn schema_objects(
+    connection: &Connection,
+) -> Result<Vec<(String, String, String, String)>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema \
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)
 }
 
 fn require_application_id(connection: &Connection) -> Result<(), StoreError> {
@@ -4442,9 +4477,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        APPLICATION_ID, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION, SqliteStore,
-        StoreError, application_id, backup_database_with_step, initialize_schema, replace_rows,
-        retire_removed_nodes, schema_version,
+        APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION,
+        SqliteStore, StoreError, application_id, backup_database_with_step, initialize_schema,
+        replace_rows, retire_removed_nodes, schema_version,
     };
     use crate::application::{
         NodeThemaAssociation, PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind,
@@ -4833,6 +4868,32 @@ mod tests {
             connection
                 .query_row("SELECT value FROM marker", [], |row| row
                     .get::<_, String>(0))
+                .unwrap(),
+            "preserved"
+        );
+    }
+
+    #[test]
+    fn rejects_stale_current_version_layout_without_changes() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection.execute_batch(CURRENT_SCHEMA).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE document ADD COLUMN stale_value TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE stale_table(value TEXT) STRICT;
+                 INSERT INTO stale_table VALUES ('preserved');",
+            )
+            .unwrap();
+
+        let error = initialize_schema(&connection).unwrap_err();
+
+        assert!(matches!(error, StoreError::UnsupportedSchemaLayout));
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM stale_table", [], |row| {
+                    row.get::<_, String>(0)
+                })
                 .unwrap(),
             "preserved"
         );

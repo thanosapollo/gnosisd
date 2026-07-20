@@ -520,6 +520,7 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::InvalidProjection { .. }
         | StoreError::CorruptData { .. }
         | StoreError::UnsupportedSchemaVersion { .. }
+        | StoreError::UnsupportedSchemaLayout
         | StoreError::UnsupportedApplicationId { .. }
         | StoreError::Storage(_) => internal_error(),
     }
