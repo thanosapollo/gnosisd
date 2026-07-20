@@ -448,6 +448,51 @@
       (when (buffer-live-p control-buffer) (kill-buffer control-buffer))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-accept-conflict-restores-file-when-state-write-fails ()
+  (let* ((directory (make-temp-file "gnosis-nodes-conflict-write" t))
+         (gnosis-nodes-dir directory)
+         (original (string-to-unibyte "before"))
+         (merged (string-to-unibyte "merged"))
+         (merge-file (expand-file-name "merge.org" directory))
+         (control-buffer (generate-new-buffer " *gnosis-ediff-control*"))
+         (session-id "write-failure")
+         (record `(:document-id "doc" :logical-path "note.org"
+                   :remote-revision 2 :remote-digest "remote"
+                   :status :editing
+                   :merge-start-digest ,(gnosis-nodes--digest original)
+                   :merge-file ,merge-file :merge-session-id ,session-id))
+         (state `(:bases [] :outbox [] :conflicts [,record]))
+         (writes 0))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" original)
+          (gnosis-nodes--write-bytes merge-file merged)
+          (puthash session-id
+                   (list :document-id "doc" :merge-file merge-file
+                         :control-buffer control-buffer)
+                   gnosis-nodes--ediff-sessions)
+          (cl-letf (((symbol-function 'gnosis-nodes--read-state)
+                     (lambda () state))
+                    ((symbol-function 'gnosis-nodes--conflict-directory)
+                     (lambda (_) directory))
+                    ((symbol-function 'gnosis-nodes--write-state)
+                     (lambda (value)
+                       (cl-incf writes)
+                       (if (= writes 1)
+                           (signal 'file-error '("state write failed"))
+                         (setq state value))))
+                    ((symbol-function 'gnosis-nodes--remote-conflict-current-p)
+                     (lambda (&rest _) t)))
+            (should-error (gnosis-nodes-accept-conflict) :type 'file-error))
+          (should (equal original
+                         (gnosis-nodes--managed-bytes
+                          directory (expand-file-name "note.org" directory))))
+          (should (eq :unresolved
+                      (plist-get (aref (plist-get state :conflicts) 0) :status))))
+      (remhash session-id gnosis-nodes--ediff-sessions)
+      (when (buffer-live-p control-buffer) (kill-buffer control-buffer))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-sync-all-files-skips-symlink-escape ()
   (let* ((directory (make-temp-file "gnosis-nodes-all-safe" t))
          (outside (make-temp-file "gnosis-nodes-outside" nil ".org" "outside"))
@@ -634,6 +679,24 @@
     (should (equal "other"
                    (plist-get (aref (plist-get state :outbox) 0)
                               :operation-id)))))
+
+(ert-deftest gnosis-nodes-applied-receipt-promotes-dependent-before-pruning ()
+  (let* ((projection '(:document_id "doc" :revision 1
+                       :logical_path "note.org" :content_sha256 "digest"
+                       :operation "create"))
+         (applied `(:operation-id "create-op" :status :applied
+                    :result (:status "applied" :authoritative ,projection)))
+         (dependent '(:operation-id "replace-op" :kind :replace
+                      :logical-path "note.org" :status :blocked
+                      :depends-on "create-op"))
+         (state `(:bases [] :outbox [,applied ,dependent] :conflicts [])))
+    (setq state (gnosis-nodes--record-base state projection))
+    (should (= 1 (length (plist-get state :outbox))))
+    (let ((promoted (aref (plist-get state :outbox) 0)))
+      (should (eq :pending (plist-get promoted :status)))
+      (should (equal "doc" (plist-get promoted :document-id)))
+      (should (= 1 (plist-get promoted :revision)))
+      (should-not (plist-get promoted :depends-on)))))
 
 (ert-deftest gnosis-nodes-explicit-acceptance-supersedes-rejected-head ()
   (let* ((head (gnosis-nodes--outbox-entry
@@ -1310,9 +1373,12 @@
           (list :document_id "doc" :revision 2 :logical_path "new.org"
                 :operation "rename" :content_sha256 digest
                 :blob_url "/blobs/body" :active t))
+         (receipt
+          (list :operation-id "rename-op" :status :applied
+                :result (list :authoritative projection)))
          (state (list :version 1 :server-id "server" :device-id "device"
                       :cursor nil :bases (vector base)
-                      :outbox [] :conflicts [])))
+                      :outbox (vector receipt) :conflicts [])))
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "new.org" bytes)
@@ -1709,6 +1775,26 @@
                          :active)))
             (should (gnosis-nodes--entry-confirms-conflict-p
                      stored-entry stored-record))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-state-round-trips-unicode-and-rejects-invalid-utf-8 ()
+  (let* ((directory (make-temp-file "gnosis-nodes-state-utf8" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (state '(:version 1 :server-id "διακομιστής" :device-id "συσκευή"
+                  :cursor "cursor" :bases [] :outbox [] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (should (equal "διακομιστής"
+                         (plist-get (gnosis-nodes--read-state) :server-id)))
+          (gnosis-nodes--write-bytes
+           (gnosis-nodes--state-file)
+           (concat (string-to-unibyte "{\"version\":1,\"server-id\":\"")
+                   (unibyte-string #xff)
+                   (string-to-unibyte "\"}")))
+          (should-error (gnosis-nodes--read-state) :type 'gnosis-nodes-error))
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-accept-remote-finishes-post-effect-restart ()
