@@ -422,8 +422,7 @@ impl HttpClient {
         if expected_revision == Some(0) {
             return Err(HttpClientError::InvalidMutation);
         }
-        let logical_path =
-            canonical_asset_path(digest, name).map_err(|_| HttpClientError::InvalidUpload)?;
+        let logical_path = canonical_http_asset_path(digest, name)?;
         let size_bytes = u64::try_from(bytes.len()).map_err(|_| HttpClientError::InvalidUpload)?;
         if validate_blob_metadata(size_bytes, media_type).is_err()
             || format!("{:x}", Sha256::digest(bytes)) != digest
@@ -472,8 +471,7 @@ impl HttpClient {
         if expected_revision == 0 {
             return Err(HttpClientError::InvalidMutation);
         }
-        let logical_path =
-            canonical_asset_path(digest, name).map_err(|_| HttpClientError::InvalidUpload)?;
+        let logical_path = canonical_http_asset_path(digest, name)?;
         let request = self
             .client
             .delete(self.asset_endpoint(digest, name)?)
@@ -980,6 +978,7 @@ impl HttpClient {
     }
 
     fn asset_endpoint(&self, digest: &str, name: &str) -> Result<Url, HttpClientError> {
+        canonical_http_asset_path(digest, name)?;
         let mut url = self.endpoint("v1/assets/")?;
         url.path_segments_mut()
             .map_err(|_| HttpClientError::InvalidBaseUrl)?
@@ -1355,6 +1354,15 @@ fn validate_review_history_query(query: &ReviewHistoryRequestV1) -> Result<(), H
 fn valid_review_day(value: u32) -> bool {
     i32::try_from(value / 10_000)
         .is_ok_and(|year| NaiveDate::from_ymd_opt(year, value / 100 % 100, value % 100).is_some())
+}
+
+fn canonical_http_asset_path(digest: &str, name: &str) -> Result<String, HttpClientError> {
+    let logical_path =
+        canonical_asset_path(digest, name).map_err(|_| HttpClientError::InvalidUpload)?;
+    if logical_path != format!("assets/{digest}/{name}") {
+        return Err(HttpClientError::InvalidUpload);
+    }
+    Ok(logical_path)
 }
 
 fn managed_asset_identity(head: &AssetHeadV1) -> Result<(&str, &str, &str), HttpClientError> {

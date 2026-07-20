@@ -214,6 +214,37 @@ async fn client_runs_managed_asset_lifecycle_and_retains_blob() {
     assert_eq!(client.asset(head, bytes.len() as u64).await.unwrap(), bytes);
     assert_eq!(client.blob(&digest).await.unwrap(), bytes);
 
+    for (alias, put_operation_id, delete_operation_id) in [
+        (
+            "nested/image.png",
+            "alias-nested-asset",
+            "delete-nested-asset",
+        ),
+        ("./image.png", "alias-dot-asset", "delete-dot-asset"),
+    ] {
+        let put_alias = client
+            .put_asset(
+                &digest,
+                alias,
+                put_operation_id,
+                Some(1),
+                "image/png",
+                bytes,
+            )
+            .await;
+        assert!(
+            matches!(put_alias, Err(HttpClientError::InvalidUpload)),
+            "{alias}: {put_alias:?}"
+        );
+        assert!(matches!(
+            client
+                .tombstone_asset(&digest, alias, delete_operation_id, 1)
+                .await,
+            Err(HttpClientError::InvalidUpload)
+        ));
+    }
+    assert_eq!(client.asset(head, bytes.len() as u64).await.unwrap(), bytes);
+
     let rejected = client
         .put_asset(
             &digest,
