@@ -297,10 +297,17 @@ fn materialize_restore(
         .map(|blob| (blob.sha256.clone(), blob.size_bytes))
         .collect::<Vec<_>>();
     if rows != expected {
-        Err(BackupError::BlobManifest)
-    } else {
-        verify_manifest_blobs(temporary, &manifest.blobs)
+        return Err(BackupError::BlobManifest);
     }
+    verify_manifest_blobs(temporary, &manifest.blobs)?;
+    for sidecar in sqlite_sidecar_paths(&database) {
+        match fs::symlink_metadata(sidecar) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => return Err(BackupError::Format),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn activate_restore(
@@ -315,29 +322,39 @@ fn activate_restore(
     if blob_root.exists() {
         require_directory(blob_root)?;
     }
+    let sidecars = sqlite_sidecar_paths(database);
+    for sidecar in &sidecars {
+        match fs::symlink_metadata(sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err(BackupError::Format),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     fs::create_dir(rollback)?;
     fs::set_permissions(rollback, fs::Permissions::from_mode(0o700))?;
     let rollback_database = rollback.join(DATABASE_FILE);
     let rollback_blobs = rollback.join("blobs");
-    if database.exists() {
-        fs::rename(database, &rollback_database)?;
-    }
-    if blob_root.exists()
-        && let Err(error) = fs::rename(blob_root, &rollback_blobs)
-    {
-        if rollback_database.exists() {
-            fs::rename(&rollback_database, database)?;
+    let relocation = (|| {
+        if database.exists() {
+            fs::rename(database, &rollback_database)?;
         }
-        fs::remove_dir(rollback)?;
-        sync_parent(database)?;
-        return Err(error.into());
-    }
-    let durability = File::open(rollback)
-        .and_then(|directory| directory.sync_all())
-        .map_err(BackupError::from)
-        .and_then(|()| sync_parent(database));
-    if let Err(error) = durability {
-        rollback_failed_activation(rollback, database, blob_root)?;
+        if blob_root.exists() {
+            fs::rename(blob_root, &rollback_blobs)?;
+        }
+        for sidecar in &sidecars {
+            if sidecar.exists() {
+                fs::rename(
+                    sidecar,
+                    rollback.join(sidecar.file_name().ok_or(BackupError::Destination)?),
+                )?;
+            }
+        }
+        File::open(rollback)?.sync_all()?;
+        sync_parent(database)
+    })();
+    if let Err(error) = relocation {
+        rollback_failed_activation(rollback, database, blob_root, &sidecars, false)?;
         return Err(error);
     }
 
@@ -348,7 +365,7 @@ fn activate_restore(
         sync_parent(database)
     })();
     if let Err(error) = activation {
-        rollback_failed_activation(rollback, database, blob_root)?;
+        rollback_failed_activation(rollback, database, blob_root, &sidecars, true)?;
         return Err(error);
     }
     Ok(())
@@ -358,12 +375,14 @@ fn rollback_failed_activation(
     rollback: &Path,
     database: &Path,
     blob_root: &Path,
+    sidecars: &[PathBuf; 3],
+    remove_activated_targets: bool,
 ) -> Result<(), BackupError> {
-    if database.exists() {
+    if remove_activated_targets && database.exists() {
         require_regular_file(database)?;
         fs::remove_file(database)?;
     }
-    if blob_root.exists() {
+    if remove_activated_targets && blob_root.exists() {
         require_directory(blob_root)?;
         fs::remove_dir_all(blob_root)?;
     }
@@ -375,8 +394,25 @@ fn rollback_failed_activation(
     if rollback_blobs.exists() {
         fs::rename(rollback_blobs, blob_root)?;
     }
+    for sidecar in sidecars {
+        let rollback_sidecar = rollback.join(sidecar.file_name().ok_or(BackupError::Destination)?);
+        if rollback_sidecar.exists() {
+            if remove_activated_targets && sidecar.exists() {
+                fs::remove_file(sidecar)?;
+            }
+            fs::rename(rollback_sidecar, sidecar)?;
+        }
+    }
     fs::remove_dir(rollback)?;
     sync_parent(database)
+}
+
+fn sqlite_sidecar_paths(database: &Path) -> [PathBuf; 3] {
+    ["-journal", "-wal", "-shm"].map(|suffix| {
+        let mut path = database.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    })
 }
 
 fn copy_manifest_blob(
@@ -590,14 +626,14 @@ pub(crate) enum BackupError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt as _, path::Path};
+    use std::{fs, mem, os::unix::fs::PermissionsExt as _, path::Path};
 
     use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::{
         BackupError, create_backup, read_manifest, restore_backup, restore_backup_with_hook,
-        restore_staging_path, sha256_file, snapshot_backup,
+        restore_staging_path, sha256_file, snapshot_backup, sqlite_sidecar_paths,
     };
     use crate::{
         application::{canonical_asset_path, prepare_asset},
@@ -715,8 +751,75 @@ mod tests {
     }
 
     #[test]
-    fn restore_rejects_wrong_identity_foreign_keys_and_blob_content() {
-        for corruption in ["database-hash", "identity", "foreign-key", "blob"] {
+    fn restore_quarantines_hot_sqlite_sidecars() {
+        let directory = tempdir().unwrap();
+        let (backup, _, _) = backup_fixture(directory.path());
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_root = directory.path().join("blobs");
+        fs::copy(backup.join("gnosis.sqlite"), &database).unwrap();
+        fs::create_dir(&blob_root).unwrap();
+
+        let backup_timezone: String = Connection::open(backup.join("gnosis.sqlite"))
+            .unwrap()
+            .query_row("SELECT timezone FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let target = Connection::open(&database).unwrap();
+        target
+            .execute(
+                "UPDATE settings SET timezone = 'Europe/Athens' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        drop(target);
+        let hot = Connection::open(&database).unwrap();
+        hot.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             BEGIN IMMEDIATE;
+             UPDATE settings SET timezone = 'Europe/Berlin' WHERE id = 1;",
+        )
+        .unwrap();
+        let sidecars = sqlite_sidecar_paths(&database);
+        assert!(sidecars[0].exists());
+        fs::write(&sidecars[1], b"old wal").unwrap();
+        fs::write(&sidecars[2], b"old shm").unwrap();
+
+        let rollback = restore_backup(&backup, &database, &blob_root).unwrap();
+        mem::forget(hot);
+
+        let restored_timezone: String = Connection::open(&database)
+            .unwrap()
+            .query_row("SELECT timezone FROM settings WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(restored_timezone, backup_timezone);
+        for sidecar in &sidecars {
+            assert!(!sidecar.exists());
+            assert!(rollback.join(sidecar.file_name().unwrap()).exists());
+        }
+        assert_eq!(
+            fs::read(rollback.join(sidecars[1].file_name().unwrap())).unwrap(),
+            b"old wal"
+        );
+        assert_eq!(
+            fs::read(rollback.join(sidecars[2].file_name().unwrap())).unwrap(),
+            b"old shm"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_corrupt_or_incomplete_backups_before_target_mutation() {
+        for corruption in [
+            "database-hash",
+            "identity",
+            "schema",
+            "integrity",
+            "foreign-key",
+            "blob",
+            "extra-blob",
+        ] {
             let directory = tempdir().unwrap();
             let (backup, digest, _) = backup_fixture(directory.path());
             match corruption {
@@ -725,6 +828,26 @@ mod tests {
                     let database = Connection::open(backup.join("gnosis.sqlite")).unwrap();
                     database
                         .execute_batch("PRAGMA application_id = 0;")
+                        .unwrap();
+                    drop(database);
+                    rewrite_database_digest(&backup);
+                }
+                "schema" => {
+                    let database = Connection::open(backup.join("gnosis.sqlite")).unwrap();
+                    database.pragma_update(None, "user_version", 999).unwrap();
+                    drop(database);
+                    rewrite_database_digest(&backup);
+                }
+                "integrity" => {
+                    let database = Connection::open(backup.join("gnosis.sqlite")).unwrap();
+                    database
+                        .execute_batch(
+                            "PRAGMA writable_schema = ON;
+                             UPDATE sqlite_schema SET rootpage =
+                                 (SELECT rootpage FROM sqlite_schema WHERE name = 'settings')
+                             WHERE type = 'table' AND name = 'review_event';
+                             PRAGMA writable_schema = OFF;",
+                        )
                         .unwrap();
                     drop(database);
                     rewrite_database_digest(&backup);
@@ -747,6 +870,12 @@ mod tests {
                     b"corrupt",
                 )
                 .unwrap(),
+                "extra-blob" => {
+                    let extra = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+                    fs::create_dir_all(backup.join("blobs").join(&extra[..2])).unwrap();
+                    fs::write(backup.join("blobs").join(&extra[..2]).join(extra), b"hello")
+                        .unwrap();
+                }
                 _ => unreachable!(),
             }
             let database = directory.path().join("target.sqlite");
@@ -765,11 +894,22 @@ mod tests {
                         StoreError::UnsupportedApplicationId { .. }
                     ))
                 )),
+                "schema" => assert!(matches!(
+                    result,
+                    Err(BackupError::Store(
+                        StoreError::UnsupportedSchemaVersion { .. }
+                    ))
+                )),
+                "integrity" => assert!(matches!(
+                    result,
+                    Err(BackupError::Store(StoreError::CorruptData { .. }))
+                )),
                 "foreign-key" => assert!(matches!(
                     result,
                     Err(BackupError::Store(StoreError::CorruptData { .. }))
                 )),
                 "blob" => assert!(matches!(result, Err(BackupError::BlobDigest))),
+                "extra-blob" => assert!(matches!(result, Err(BackupError::BlobManifest))),
                 _ => unreachable!(),
             }
             assert_eq!(fs::read(&database).unwrap(), b"old database");

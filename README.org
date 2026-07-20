@@ -352,7 +352,9 @@ systemctl --user start gnosisd
 
 Restore refuses a running daemon, occupied socket path, invalid backup, or
 existing rollback directory. Verify service state and restored data before
-removing the reported rollback directory.
+removing the reported rollback directory. Rollback also preserves any prior
+SQLite ~-journal~, ~-wal~, and ~-shm~ sidecars; move them with the database when
+rolling back.
 
 * Scope
 

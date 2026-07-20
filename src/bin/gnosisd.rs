@@ -37,10 +37,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(backup) = cli.restore_from {
         let rollback = DaemonServer::restore_backup(config, backup).await?;
-        println!(
-            "restore complete; rollback preserved at {}",
-            rollback.display()
-        );
+        println!("{}", rollback.display());
         return Ok(());
     }
     let server = DaemonServer::bind(config).await?;

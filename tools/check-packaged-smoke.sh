@@ -105,7 +105,7 @@ stage content
 note=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Idempotency-Key: smoke-create-document' \
     -H 'Content-Type: application/json' \
-    -d '{"logical_path":"smoke.org","org":"#+TITLE: Smoke\n* Node\n:PROPERTIES:\n:ID: smoke-node\n:END:\n"}' \
+    -d '{"logical_path":"smoke.org","org":"#+TITLE: Smoke\n* Node\n:PROPERTIES:\n:ID: smoke-node\n:END:\nSee [[id:smoke-linked][Linked]].\n* Linked\n:PROPERTIES:\n:ID: smoke-linked\n:END:\n"}' \
     "$api/document-mutations")
 document_id=$(printf %s "$note" | jq -er .authoritative.document_id)
 curl --fail-with-body --silent --show-error -H "$auth" \
@@ -166,11 +166,18 @@ daemon_pid=
 
 stage cold-restore
 printf 'simulated database loss\n' >"$database"
+printf 'simulated old journal\n' >"$database-journal"
+printf 'simulated old wal\n' >"$database-wal"
+printf 'simulated old shm\n' >"$database-shm"
 "$gnosisd" --socket "$socket" --database "$database" --blob-root "$blobs" \
-    --restore-from "$backup" >/dev/null
-rollback=$temporary/data/.gnosis.sqlite.restore-rollback
+    --restore-from "$backup" >"$temporary/rollback-path"
+rollback=$(cat "$temporary/rollback-path")
 test -f "$rollback/gnosis.sqlite"
 test -d "$rollback/blobs"
+for suffix in -journal -wal -shm; do
+    test -f "$rollback/gnosis.sqlite$suffix"
+    test ! -e "$database$suffix"
+done
 test "$(stat -c %a "$rollback")" = 700
 
 stage restart-restored
@@ -198,6 +205,10 @@ curl --fail-with-body --silent --show-error -H "$auth" "$api/notes/$document_id"
     | grep -q '#+TITLE: Smoke'
 curl --fail-with-body --silent --show-error -H "$auth" "$api/nodes/smoke-node" \
     | jq -e '.node_id == "smoke-node"' >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" "$api/nodes/smoke-linked" \
+    | jq -e '.node_id == "smoke-linked"' >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" "$api/nodes/smoke-node/outbound" \
+    | jq -e '.items | map(.node_id) == ["smoke-linked"]' >/dev/null
 curl --fail-with-body --silent --show-error -H "$auth" "$api/themata/$thema_id" \
     | jq -e --arg asset "$asset_path" \
         '.concepts == [{"node_id":"smoke-node","relation":"primary"}] and .asset_paths == [$asset]' \
