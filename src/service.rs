@@ -71,6 +71,9 @@ pub(crate) struct ServiceHandle {
 }
 
 enum BackupCommand {
+    Shutdown {
+        response: SyncSender<()>,
+    },
     #[cfg(test)]
     Block {
         started: SyncSender<()>,
@@ -1310,8 +1313,14 @@ impl ServiceRuntime {
             store_thread,
             backup_thread,
         } = self;
-        drop(handle);
         tokio::task::spawn_blocking(move || {
+            let (response, receiver) = mpsc::sync_channel(0);
+            handle
+                .sender
+                .send(StoreCommand::Shutdown { response })
+                .map_err(|_| ServiceError::Stopped)?;
+            receiver.recv().map_err(|_| ServiceError::Stopped)?;
+            drop(handle);
             store_thread.join().map_err(|_| ServiceError::Stopped)?;
             backup_thread.join().map_err(|_| ServiceError::Stopped)
         })
@@ -1329,6 +1338,9 @@ enum PreparedContentOperation {
 
 #[allow(dead_code)]
 enum StoreCommand {
+    Shutdown {
+        response: SyncSender<()>,
+    },
     Ready {
         response: oneshot::Sender<StoreResult<()>>,
     },
@@ -1745,7 +1757,22 @@ fn store_actor(
         return;
     }
     for command in receiver {
-        run_store_command(&mut store, &path, &blobs, &backup_sender, command);
+        match command {
+            StoreCommand::Shutdown { response } => {
+                let (backup_response, backup_receiver) = mpsc::sync_channel(0);
+                if backup_sender
+                    .send(BackupCommand::Shutdown {
+                        response: backup_response,
+                    })
+                    .is_ok()
+                {
+                    let _ = backup_receiver.recv();
+                }
+                let _ = response.send(());
+                break;
+            }
+            command => run_store_command(&mut store, &path, &blobs, &backup_sender, command),
+        }
     }
 }
 
@@ -2719,12 +2746,17 @@ fn run_store_command(
                 Err(_) => unreachable!("backup command kind changed during send"),
             }
         }
+        StoreCommand::Shutdown { .. } => unreachable!("shutdown handled by store actor"),
     }
 }
 
 fn backup_actor(blobs: Arc<BlobStore>, receiver: mpsc::Receiver<BackupCommand>) {
     for command in receiver {
         match command {
+            BackupCommand::Shutdown { response } => {
+                let _ = response.send(());
+                break;
+            }
             #[cfg(test)]
             BackupCommand::Block { started, release } => {
                 let _ = started.send(());

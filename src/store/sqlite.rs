@@ -4,7 +4,9 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    backup::{Backup, StepResult},
+    params,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1033,10 +1035,7 @@ impl SqliteStore {
     }
 
     pub(crate) fn backup_database(source: &Path, destination: &Path) -> Result<(), StoreError> {
-        Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(StoreError::storage)?
-            .backup(rusqlite::MAIN_DB, destination, None)
-            .map_err(StoreError::storage)
+        backup_database_with_step(source, destination, |_| {})
     }
 
     #[cfg(test)]
@@ -4401,6 +4400,28 @@ fn node_id(value: String) -> Result<NodeId, StoreError> {
     NodeId::new(value).map_err(|_| StoreError::CorruptData { field: "node ID" })
 }
 
+fn backup_database_with_step(
+    source: &Path,
+    destination: &Path,
+    mut after_step: impl FnMut(StepResult),
+) -> Result<(), StoreError> {
+    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(StoreError::storage)?;
+    source
+        .busy_timeout(Duration::ZERO)
+        .map_err(StoreError::storage)?;
+    let mut destination = Connection::open(destination).map_err(StoreError::storage)?;
+    let backup = Backup::new(&source, &mut destination).map_err(StoreError::storage)?;
+    loop {
+        let result = backup.step(100).map_err(StoreError::storage)?;
+        after_step(result);
+        if result == StepResult::Done {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn from_json(value: &str, field: &'static str) -> Result<Vec<String>, StoreError> {
     serde_json::from_str(value).map_err(|_| StoreError::CorruptData { field })
 }
@@ -4419,15 +4440,16 @@ fn to_usize(value: i64, field: &'static str) -> Result<usize, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{fs, os::unix::fs::PermissionsExt, sync::mpsc, thread, time::Duration};
 
+    use rusqlite::{Connection, backup::StepResult};
     use sha2::Digest as _;
     use tempfile::tempdir;
 
     use super::{
         APPLICATION_ID, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION, SqliteStore,
-        StoreError, application_id, initialize_schema, replace_rows, retire_removed_nodes,
-        schema_version,
+        StoreError, application_id, backup_database_with_step, initialize_schema, replace_rows,
+        retire_removed_nodes, schema_version,
     };
     use crate::application::{
         NodeThemaAssociation, PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind,
@@ -4438,6 +4460,57 @@ mod tests {
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
         SourceSpan, ThemaConceptRelation, TitlePath,
     };
+
+    #[test]
+    fn backup_retries_while_source_writer_holds_lock() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let destination_path = directory.path().join("backup.sqlite3");
+        let writer = Connection::open(&source_path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE content (value BLOB NOT NULL);
+                 WITH RECURSIVE rows(n) AS (
+                     SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 255
+                 )
+                 INSERT INTO content SELECT zeroblob(4096) FROM rows;
+                 BEGIN EXCLUSIVE;
+                 INSERT INTO content VALUES (zeroblob(4096));",
+            )
+            .unwrap();
+
+        let (busy_sender, busy_receiver) = mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = mpsc::sync_channel(0);
+        let backup = thread::spawn(move || {
+            let mut saw_busy = false;
+            let result = backup_database_with_step(&source_path, &destination_path, |result| {
+                if matches!(result, StepResult::Busy | StepResult::Locked) && !saw_busy {
+                    saw_busy = true;
+                    busy_sender.send(()).unwrap();
+                    release_receiver.recv().unwrap();
+                }
+            });
+            (result, destination_path)
+        });
+
+        busy_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("backup must observe writer contention");
+        writer.execute_batch("COMMIT;").unwrap();
+        release_sender.send(()).unwrap();
+
+        let (result, destination_path) = backup.join().unwrap();
+        result.unwrap();
+        let destination = Connection::open(destination_path).unwrap();
+        let rows: u64 = destination
+            .query_row("SELECT COUNT(*) FROM content", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 256);
+        let integrity: String = destination
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
 
     fn projection(title: &str, digest: &str) -> DocumentProjection {
         let root = NodeId::new("root").unwrap();

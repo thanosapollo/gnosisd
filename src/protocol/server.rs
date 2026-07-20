@@ -31,7 +31,10 @@ const DEFAULT_STORE_QUEUE_CAPACITY: usize = 8;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_STORE_QUEUE_CAPACITY: usize = 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
 const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DaemonConfig {
@@ -835,7 +838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_closes_sse_after_an_accepted_write() {
+    async fn shutdown_closes_sse_and_stalled_request_after_an_accepted_write() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("gnosis.sqlite");
         let mut config = DaemonConfig::new(directory.path().join("gnosis.sock"), &database);
@@ -895,13 +898,22 @@ mod tests {
             .await
             .unwrap();
         assert!(mutation_response.starts_with("HTTP/1.1 200 OK"));
+
+        let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+        stalled
+            .write_all(
+                b"POST /v1/document-mutations HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n",
+            )
+            .await
+            .unwrap();
         drop(service);
         shutdown.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
-            .expect("SSE shutdown stayed within the graceful deadline")
+            .expect("stalled request retained daemon beyond the HTTP drain deadline")
             .unwrap()
             .unwrap();
+        drop(stalled);
         drop(events);
 
         let connection = rusqlite::Connection::open(database).unwrap();
