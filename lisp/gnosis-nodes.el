@@ -1564,18 +1564,24 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
       (kill-buffer buffer))))
 
 (defun gnosis-nodes--accept-remote-conflict (state record)
-  "Apply explicit remote resolution for RECORD and return updated STATE."
+  "Apply RECORD remote projection and clear it from STATE."
   (let* ((projection (plist-get record :projection))
          (local-path (or (plist-get record :local-path)
                          (plist-get record :logical-path)))
          (remote-path (plist-get record :logical-path))
          (path (gnosis-nodes--safe-path gnosis-nodes-directory local-path))
+         (head (gnosis-nodes--outbox-entry-for
+                state (plist-get record :document-id) local-path))
          (local-bytes (and (file-exists-p path) (gnosis-nodes--read-bytes path)))
          (local-digest (and local-bytes (gnosis-nodes--digest local-bytes))))
     (unless projection
       (user-error "Conflict predates explicit remote resolution; synchronize again"))
     (unless (equal local-digest (plist-get record :local-digest))
       (user-error "Local conflict file changed; synchronize again"))
+    (when (memq (plist-get head :status) '(:sending :uncertain :applied))
+      (user-error "Pending delivery must reconcile before accepting remote"))
+    (when (memq (plist-get head :status) '(:pending :blocked :rejected))
+      (setf (plist-get head :status) :superseded))
     (if (eq :tombstone (plist-get record :kind))
         (gnosis-nodes--delete-local-conflict-file
          local-path

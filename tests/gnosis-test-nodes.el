@@ -763,15 +763,20 @@
                    :local-digest ,(gnosis-nodes--digest bytes)
                    :remote-digest nil :remote-revision 2
                    :projection ,projection))
+         (head (gnosis-nodes--outbox-entry
+                :delete "doc" 2 "note.org" nil nil))
          (state `(:bases [(:document-id "doc" :logical-path "note.org"
                            :revision 1 :digest "old" :active t)]
-                  :outbox [] :conflicts [,record])))
+                  :outbox [,head] :conflicts [,record])))
+    (setf (plist-get head :status) :rejected)
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "note.org" bytes)
           (setq state (gnosis-nodes--accept-remote-conflict state record))
           (should-not (file-exists-p (expand-file-name "note.org" directory)))
           (should (= 0 (length (plist-get state :conflicts))))
+          (should (eq :superseded
+                      (plist-get (aref (plist-get state :outbox) 0) :status)))
           (should (equal bytes
                          (gnosis-nodes--read-bytes
                           (expand-file-name
