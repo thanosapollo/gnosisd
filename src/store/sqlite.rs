@@ -2245,26 +2245,28 @@ fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreEr
     let mut statement = connection
         .prepare(
             "SELECT content_sha256, size_bytes FROM blob
-             UNION SELECT content_sha256, size_bytes FROM offline_asset_evidence
-             ORDER BY content_sha256",
+             UNION ALL SELECT content_sha256, size_bytes FROM staged_blob
+             UNION ALL SELECT content_sha256, size_bytes FROM offline_asset_evidence
+             ORDER BY content_sha256, size_bytes",
         )
         .map_err(StoreError::storage)?;
-    statement
-        .query_map([], |row| {
-            let digest = row.get::<_, String>(0)?;
-            let size = row.get::<_, i64>(1)?;
-            let size = u64::try_from(size).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })?;
-            Ok((digest, size))
-        })
-        .map_err(StoreError::storage)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(StoreError::storage)
+    let rows = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row_u64(row, 1)?)))
+        .map_err(StoreError::storage)?;
+    let mut blobs = Vec::new();
+    for row in rows {
+        let (digest, size) = row.map_err(StoreError::storage)?;
+        if let Some((previous_digest, previous_size)) = blobs.last()
+            && previous_digest == &digest
+        {
+            if previous_size != &size {
+                return Err(StoreError::BlobMetadata);
+            }
+            continue;
+        }
+        blobs.push((digest, size));
+    }
+    Ok(blobs)
 }
 
 fn load_digest_rows_page(

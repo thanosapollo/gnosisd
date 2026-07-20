@@ -878,12 +878,13 @@ mod tests {
         ActivationStep, BackupError, canonical_restore_target, create_backup,
         ensure_restore_complete, read_manifest, restore_backup, restore_backup_with_hook,
         restore_backup_with_hooks, restore_backup_with_sync_hooks, restore_staging_path,
-        sha256_file, snapshot_backup, sqlite_sidecar_paths, sync_directory,
+        sha256_file, snapshot_backup, sqlite_sidecar_paths, sync_directory, verify_backup,
     };
     use crate::{
         application::{canonical_asset_path, prepare_asset},
         blob::BlobStore,
         protocol::{DaemonConfig, DaemonServer, ServerError},
+        service::repair_canonical_state,
         store::{SqliteStore, StoreError},
     };
 
@@ -918,6 +919,140 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
+    }
+
+    fn staged_blob_fixture(root: &Path) -> (std::path::PathBuf, BlobStore, crate::blob::BlobMeta) {
+        let database = root.join("source.sqlite");
+        let blobs = BlobStore::open(root.join("source-blobs")).unwrap();
+        let blob = blobs
+            .put(
+                b"otherwise unreferenced staged blob",
+                "application/octet-stream",
+            )
+            .unwrap();
+        let mut store = SqliteStore::open(&database).unwrap();
+        store.stage_blob(&blob, 1).unwrap();
+        drop(store);
+        (database, blobs, blob)
+    }
+
+    #[test]
+    fn staged_blob_survives_backup_restore_and_paged_repair() {
+        let directory = tempdir().unwrap();
+        let (source_database, source_blobs, blob) = staged_blob_fixture(directory.path());
+        let backup = directory.path().join("backup");
+        let snapshot = snapshot_backup(&source_database, &backup).unwrap();
+        let summary = create_backup(snapshot, &source_blobs, &backup, 2).unwrap();
+        assert_eq!(summary.blob_count, 1);
+        verify_backup(&backup).unwrap();
+
+        let database = directory.path().join("restored.sqlite");
+        let blob_root = directory.path().join("restored-blobs");
+        restore_backup(&backup, &database, &blob_root).unwrap();
+        let mut restored_store = SqliteStore::open(&database).unwrap();
+        let restored_blobs = BlobStore::open(&blob_root).unwrap();
+        assert_eq!(
+            restored_store.staged_blobs_page(None, 1).unwrap(),
+            [(blob.sha256.clone(), blob.size_bytes)]
+        );
+        restored_blobs
+            .verify(&blob.sha256, blob.size_bytes)
+            .unwrap();
+        let repair = repair_canonical_state(&mut restored_store, &restored_blobs, 1).unwrap();
+        assert_eq!(repair.blobs_verified, 1);
+        assert_eq!(repair.max_batch_observed, 1);
+    }
+
+    #[test]
+    fn missing_or_corrupt_staged_blob_rejects_backup_creation() {
+        for corruption in ["missing", "corrupt"] {
+            let directory = tempdir().unwrap();
+            let (source_database, source_blobs, blob) = staged_blob_fixture(directory.path());
+            let backup = directory.path().join("backup");
+            let snapshot = snapshot_backup(&source_database, &backup).unwrap();
+            let path = directory
+                .path()
+                .join("source-blobs")
+                .join(&blob.sha256[..2])
+                .join(&blob.sha256);
+            if corruption == "missing" {
+                fs::remove_file(path).unwrap();
+            } else {
+                fs::write(path, vec![b'x'; blob.size_bytes as usize]).unwrap();
+            }
+
+            assert!(matches!(
+                create_backup(snapshot, &source_blobs, &backup, 2),
+                Err(BackupError::Blob(_))
+            ));
+            assert!(!backup.exists());
+        }
+    }
+
+    #[test]
+    fn corrupt_staged_blob_rejects_restore_before_target_mutation() {
+        let directory = tempdir().unwrap();
+        let (source_database, source_blobs, blob) = staged_blob_fixture(directory.path());
+        let backup = directory.path().join("backup");
+        let snapshot = snapshot_backup(&source_database, &backup).unwrap();
+        create_backup(snapshot, &source_blobs, &backup, 2).unwrap();
+        fs::write(
+            backup
+                .join("blobs")
+                .join(&blob.sha256[..2])
+                .join(&blob.sha256),
+            vec![b'x'; blob.size_bytes as usize],
+        )
+        .unwrap();
+        let database = directory.path().join("target.sqlite");
+        let blob_root = directory.path().join("target-blobs");
+        fs::write(&database, b"old database").unwrap();
+        fs::create_dir(&blob_root).unwrap();
+        fs::write(blob_root.join("old-blob"), b"old blob").unwrap();
+
+        assert!(matches!(
+            restore_backup(&backup, &database, &blob_root),
+            Err(BackupError::BlobDigest)
+        ));
+        assert_eq!(fs::read(&database).unwrap(), b"old database");
+        assert_eq!(fs::read(blob_root.join("old-blob")).unwrap(), b"old blob");
+    }
+
+    #[test]
+    fn backup_inventory_deduplicates_equal_metadata_and_rejects_conflicts() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("source.sqlite");
+        let blobs = BlobStore::open(directory.path().join("source-blobs")).unwrap();
+        let blob = blobs.put(b"canonical and staged", "image/png").unwrap();
+        let logical_path = canonical_asset_path(&blob.sha256, "image.png").unwrap();
+        let mut store = SqliteStore::open(&database).unwrap();
+        store
+            .put_asset(
+                &prepare_asset(logical_path, "image.png".into(), None).unwrap(),
+                &blob,
+                1,
+                None,
+            )
+            .unwrap();
+        store.stage_blob(&blob, 2).unwrap();
+        drop(store);
+
+        let snapshot = snapshot_backup(&database, &directory.path().join("equal-backup")).unwrap();
+        assert_eq!(snapshot.blobs, [(blob.sha256.clone(), blob.size_bytes)]);
+        drop(snapshot);
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE staged_blob SET size_bytes = size_bytes + 1 WHERE content_sha256 = ?1",
+                [&blob.sha256],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            snapshot_backup(&database, &directory.path().join("conflict-backup")),
+            Err(BackupError::Store(StoreError::BlobMetadata))
+        ));
     }
 
     #[test]
