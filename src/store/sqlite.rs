@@ -1113,6 +1113,7 @@ impl SqliteStore {
             });
         }
         require_application_id(&connection)?;
+        require_current_schema_layout(&connection)?;
         let integrity: String = connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(StoreError::storage)?;
@@ -4897,6 +4898,22 @@ mod tests {
                 .unwrap(),
             "preserved"
         );
+    }
+
+    #[test]
+    fn rejects_stale_current_version_backup_layout() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("backup.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute_batch(CURRENT_SCHEMA).unwrap();
+        connection
+            .execute_batch("CREATE TABLE stale_table(value TEXT) STRICT;")
+            .unwrap();
+        drop(connection);
+
+        let error = SqliteStore::verify_database_file(&database).unwrap_err();
+
+        assert!(matches!(error, StoreError::UnsupportedSchemaLayout));
     }
 
     #[test]

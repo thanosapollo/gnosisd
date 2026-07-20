@@ -1290,6 +1290,7 @@ mod tests {
             "database-hash",
             "identity",
             "schema",
+            "layout",
             "integrity",
             "foreign-key",
             "blob",
@@ -1310,6 +1311,14 @@ mod tests {
                 "schema" => {
                     let database = Connection::open(backup.join("gnosis.sqlite")).unwrap();
                     database.pragma_update(None, "user_version", 999).unwrap();
+                    drop(database);
+                    rewrite_database_digest(&backup);
+                }
+                "layout" => {
+                    let database = Connection::open(backup.join("gnosis.sqlite")).unwrap();
+                    database
+                        .execute_batch("CREATE TABLE stale_table(value TEXT) STRICT;")
+                        .unwrap();
                     drop(database);
                     rewrite_database_digest(&backup);
                 }
@@ -1374,6 +1383,10 @@ mod tests {
                     Err(BackupError::Store(
                         StoreError::UnsupportedSchemaVersion { .. }
                     ))
+                )),
+                "layout" => assert!(matches!(
+                    result,
+                    Err(BackupError::Store(StoreError::UnsupportedSchemaLayout))
                 )),
                 "integrity" => assert!(matches!(
                     result,
