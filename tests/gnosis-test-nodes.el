@@ -5,6 +5,7 @@
 (require 'ert)
 (require 'gnosis-nodes)
 
+
 (defvar gnosis-nodes-max-pages-per-pass)
 (defvar gnosis-nodes-max-local-scan-per-pass)
 (defvar gnosis-nodes-dir)
@@ -1152,7 +1153,8 @@
   (should (fboundp 'gnosis-nodes-auto-sync-mode))
   (should-not (boundp 'gnosis-nodes-directory))
   (should-not (fboundp 'global-gnosis-nodes-mode))
-  (should-not (fboundp 'gnosis-nodes-track-file))
+  (should (commandp 'gnosis-nodes-track-file))
+  (should (commandp 'gnosis-nodes-list-conflicts))
   (should-not (fboundp 'gnosis-nodes-track-all-files)))
 
 (ert-deftest gnosis-nodes-save-after-uncertain-create-queues-dependent-replace ()
@@ -1229,6 +1231,64 @@
                 (plist-get (aref (plist-get state :outbox) 0) :status)))
     (should (eq :pending
                 (plist-get (aref (plist-get state :outbox) 1) :status)))))
+
+(ert-deftest gnosis-nodes-rename-replay-recognizes-materialized-destination ()
+  (let* ((root (make-temp-file "gnosis-nodes-rename-replay-" t))
+         (gnosis-nodes-dir root)
+         (bytes (string-to-unibyte "body"))
+         (digest (gnosis-nodes--digest bytes))
+         (base (list :document-id "doc" :revision 1 :logical-path "old.org"
+                     :digest digest :fingerprint "old" :active t))
+         (projection
+          (list :document_id "doc" :revision 2 :logical_path "new.org"
+                :operation "rename" :content_sha256 digest
+                :blob_url "/blobs/body" :active t))
+         (state (list :version 1 :server-id "server" :device-id "device"
+                      :cursor nil :bases (vector base)
+                      :outbox [] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "new.org" bytes)
+          (setq state
+                (gnosis-nodes--apply-document
+                 state projection (list (cons digest bytes))))
+          (should (= 0 (length (plist-get state :conflicts))))
+          (let ((updated (gnosis-nodes--base state "doc" "new.org")))
+            (should updated)
+            (should (= 2 (plist-get updated :revision)))))
+      (delete-directory root t))))
+
+(ert-deftest gnosis-nodes-track-file-enrolls-only-selected-file-offline ()
+  (let* ((root (make-temp-file "gnosis-nodes-track-command-" t))
+         (user-emacs-directory (file-name-as-directory root))
+         (gnosis-nodes-dir (expand-file-name "notes" root))
+         (gnosis-nodes-state-file nil)
+         (first (expand-file-name "first.org" gnosis-nodes-dir))
+         (second (expand-file-name "second.org" gnosis-nodes-dir)))
+    (unwind-protect
+        (progn
+          (make-directory gnosis-nodes-dir t)
+          (gnosis-nodes--write-bytes first "first")
+          (gnosis-nodes--write-bytes second "second")
+          (gnosis-nodes--write-state
+           '(:version 1 :server-id "server" :device-id "device"
+             :cursor "cursor" :bases [] :outbox [] :conflicts []))
+          (gnosis-nodes-track-file first)
+          (let ((outbox (plist-get (gnosis-nodes--read-state) :outbox)))
+            (should (= 1 (length outbox)))
+            (should (equal "first.org" (plist-get (aref outbox 0) :logical-path)))))
+      (delete-directory root t))))
+
+(ert-deftest gnosis-nodes-conflict-selection-can-choose-second-record ()
+  (let* ((first '(:document-id "one" :logical-path "one.org" :kind :edit))
+         (second '(:document-id "two" :logical-path "two.org" :kind :edit))
+         (conflicts (vector first second)))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _)
+                 (gnosis-nodes--conflict-label 1 second))))
+      (let ((selection (gnosis-nodes--select-conflict conflicts)))
+        (should (= 1 (car selection)))
+        (should (eq second (cdr selection)))))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here

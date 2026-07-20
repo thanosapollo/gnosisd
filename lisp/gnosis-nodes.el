@@ -586,6 +586,20 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
               (and remote-digest
                    (or (cdr (assoc remote-digest blobs))
                        (gnosis-core-blob remote-digest))))
+             (destination-path
+              (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
+             (destination-buffer (get-file-buffer destination-path))
+             (replayed-move
+              (and active base-path
+                   (not (equal base-path logical-path))
+                   (null local-bytes)
+                   (file-regular-p destination-path)
+                   (not (file-symlink-p destination-path))
+                   (not (and (buffer-live-p destination-buffer)
+                             (buffer-modified-p destination-buffer)))
+                   (equal remote-digest
+                          (gnosis-nodes--digest
+                           (gnosis-nodes--read-bytes destination-path)))))
              (unresolved
               (seq-find
                (lambda (entry)
@@ -595,7 +609,9 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                           (equal logical-path (plist-get entry :logical-path))
                           (equal logical-path (plist-get entry :old-logical-path)))))
                (append (plist-get state :outbox) nil)))
-             (plan (if unresolved
+             (plan (if replayed-move
+                       '(:action :record)
+                     (if unresolved
                        '(:action :conflict)
                      (if (and base-path (not (equal base-path logical-path)))
                        (if (and active
@@ -608,13 +624,15 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                      (if (and active (null remote-digest) local-bytes (null base))
                          '(:action :conflict)
                        (gnosis-nodes--plan-document
-                        base-digest local-digest remote-digest active))))))
+                        base-digest local-digest remote-digest active)))))))
         (pcase (plist-get plan :action)
           (:materialize
            (gnosis-nodes--write-document logical-path remote-bytes)
            (gnosis-nodes--record-base state projection))
           (:move
            (gnosis-nodes--move-document base-path logical-path remote-bytes)
+           (gnosis-nodes--record-base state projection))
+          (:record
            (gnosis-nodes--record-base state projection))
           (:conflict
            (gnosis-nodes--record-conflict
@@ -1480,6 +1498,20 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
   state)
 
 ;;;###autoload
+(defun gnosis-nodes-track-file (file)
+  "Explicitly enroll Org FILE without contacting the server."
+  (interactive "fOrg file to track: ")
+  (gnosis-nodes--with-lock
+    (let* ((state (gnosis-nodes--read-state))
+           (logical-path (file-relative-name (expand-file-name file)
+                                             gnosis-nodes-dir)))
+      (when (or (gnosis-nodes--base state nil logical-path)
+                (gnosis-nodes--outbox-entry-for state nil logical-path))
+        (user-error "Org file is already tracked"))
+      (gnosis-nodes--write-state
+       (gnosis-nodes--enroll-file state file)))))
+
+;;;###autoload
 (defun gnosis-nodes-rename-file (file new-logical-path)
   "Explicitly queue tracked FILE rename to NEW-LOGICAL-PATH."
   (interactive "fTracked Org file: \nsNew logical path: ")
@@ -1519,15 +1551,55 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
              (plist-get base :document-id) logical-path))
       (gnosis-nodes--write-state state))))
 
+(defun gnosis-nodes--conflict-label (index record)
+  "Return selection label for conflict INDEX and RECORD."
+  (format "%d  %s  %s"
+          (1+ index)
+          (or (plist-get record :logical-path)
+              (plist-get record :local-path)
+              "<deleted>")
+          (plist-get record :kind)))
+
+(defun gnosis-nodes--select-conflict (conflicts)
+  "Return selected (INDEX . RECORD) from CONFLICTS."
+  (unless (> (length conflicts) 0)
+    (user-error "No Gnosis Org conflicts"))
+  (let* ((choices
+          (cl-loop for record across conflicts
+                   for index from 0
+                   collect (cons (gnosis-nodes--conflict-label index record)
+                                 index)))
+         (index (if (= (length choices) 1)
+                    0
+                  (cdr (assoc (completing-read "Conflict: " choices nil t)
+                              choices)))))
+    (cons index (aref conflicts index))))
+
+;;;###autoload
+(defun gnosis-nodes-list-conflicts ()
+  "Display recorded conflicts and return their labels."
+  (interactive)
+  (let* ((conflicts (plist-get (gnosis-nodes--read-state) :conflicts))
+         (labels (cl-loop for record across conflicts
+                          for index from 0
+                          collect (gnosis-nodes--conflict-label index record))))
+    (when (called-interactively-p 'interactive)
+      (with-output-to-temp-buffer "*Gnosis Conflicts*"
+        (princ (if labels
+                   (concat (mapconcat #'identity labels "\n") "\n")
+                 "No Gnosis Org conflicts\n"))))
+    labels))
+
 ;;;###autoload
 (defun gnosis-nodes-resolve-conflict ()
-  "Open first recorded conflict in three-way Ediff merge."
+  "Select a recorded conflict and open its three-way Ediff merge."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
            (conflicts (plist-get state :conflicts))
-           (record (and (> (length conflicts) 0) (aref conflicts 0))))
-      (unless record (user-error "No Gnosis Org conflicts"))
+           (selection (gnosis-nodes--select-conflict conflicts))
+           (index (car selection))
+           (record (cdr selection)))
       (let* ((local (gnosis-nodes--safe-path
                      gnosis-nodes-dir
                      (or (plist-get record :local-path)
@@ -1547,7 +1619,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
         (setf (plist-get record :merge-start-digest) (gnosis-nodes--digest bytes)
               (plist-get record :merge-file) merge-file
               (plist-get record :status) :editing)
-        (aset conflicts 0 record)
+        (aset conflicts index record)
         (gnosis-nodes--write-state state)
         (require 'ediff)
         (ediff-merge-buffers-with-ancestor
@@ -1598,14 +1670,15 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 
 ;;;###autoload
 (defun gnosis-nodes-accept-conflict ()
-  "Accept current local merge for first conflict as revisioned replacement.
+  "Select and accept current local merge as a revisioned replacement.
 Revalidate local merged bytes and remote head before durable queueing."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
            (conflicts (plist-get state :conflicts))
-           (record (and (> (length conflicts) 0) (aref conflicts 0))))
-      (unless record (user-error "No Gnosis Org conflicts"))
+           (selection (gnosis-nodes--select-conflict conflicts))
+           (index (car selection))
+           (record (cdr selection)))
       (let* ((logical-path (plist-get record :logical-path))
              (local-path (or (plist-get record :local-path) logical-path))
              (path (gnosis-nodes--safe-path gnosis-nodes-dir local-path))
@@ -1642,7 +1715,7 @@ Revalidate local merged bytes and remote head before durable queueing."
           (setf (plist-get record :accepted-digest) digest
                 (plist-get record :operation-id) (plist-get entry :operation-id)
                 (plist-get record :status) :queued)
-          (aset conflicts 0 record))
+          (aset conflicts index record))
         (gnosis-nodes--write-document local-path bytes)
         (gnosis-nodes--write-state state)
         (message "Gnosis conflict merge queued")))))
@@ -1811,13 +1884,12 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
 
 ;;;###autoload
 (defun gnosis-nodes-keep-local-conflict ()
-  "Resolve first conflict by queueing exact local intent."
+  "Select a conflict and resolve it by queueing exact local intent."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
            (conflicts (plist-get state :conflicts))
-           (record (and (> (length conflicts) 0) (aref conflicts 0))))
-      (unless record (user-error "No Gnosis Org conflicts"))
+           (record (cdr (gnosis-nodes--select-conflict conflicts))))
       (unless (gnosis-nodes--remote-conflict-current-p state record)
         (user-error "Remote head changed; synchronize before resolving"))
       (let* ((path (gnosis-nodes--safe-path
@@ -1831,13 +1903,12 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
 
 ;;;###autoload
 (defun gnosis-nodes-accept-remote-conflict ()
-  "Resolve first conflict by accepting its validated remote state."
+  "Select a conflict and resolve it by accepting validated remote state."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
            (conflicts (plist-get state :conflicts))
-           (record (and (> (length conflicts) 0) (aref conflicts 0))))
-      (unless record (user-error "No Gnosis Org conflicts"))
+           (record (cdr (gnosis-nodes--select-conflict conflicts))))
       (unless (gnosis-nodes--remote-conflict-current-p state record)
         (user-error "Remote head changed; synchronize before resolving"))
       (setq state (gnosis-nodes--accept-remote-conflict state record))

@@ -29,6 +29,8 @@ for save hooks and one idle synchronization timer.  Private state records
 identity, cursor, document bases, pending operations, and conflicts; it is not a
 domain database.
 Delivery-unknown mutations are never retried automatically.
+Use =gnosis-nodes-track-file= for offline one-file enrollment and
+=gnosis-nodes-list-conflicts= before selecting a conflict resolution command.
 
 File discovery never implies create, rename, or deletion.  Use
 =M-x gnosis-nodes-rename-file= and =M-x gnosis-nodes-tombstone-file= for explicit
