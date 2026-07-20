@@ -217,15 +217,19 @@ where
     if rollback.exists() {
         return Err(BackupError::RollbackExists);
     }
+    let manifest = verified_manifest(backup)?;
+    let backup = fs::canonicalize(backup)?;
+    if backup.starts_with(&staging) || staging.starts_with(&backup) {
+        return Err(BackupError::Destination);
+    }
     if staging.exists() {
         require_directory(&staging)?;
         fs::remove_dir_all(&staging)?;
         sync_parent(&staging)?;
     }
-    let manifest = verified_manifest(backup)?;
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
-    if let Err(error) = materialize_restore(backup, &staging, &manifest) {
+    if let Err(error) = materialize_restore(&backup, &staging, &manifest) {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
@@ -807,6 +811,43 @@ mod tests {
             fs::read(rollback.join(sidecars[2].file_name().unwrap())).unwrap(),
             b"old shm"
         );
+    }
+
+    #[test]
+    fn restore_rejects_backups_at_or_beneath_staging_without_mutation() {
+        for nested in [false, true] {
+            let directory = tempdir().unwrap();
+            let (source, _, _) = backup_fixture(directory.path());
+            let database = directory.path().join("target.sqlite");
+            let blob_root = directory.path().join("target-blobs");
+            fs::write(&database, b"old database").unwrap();
+            fs::create_dir(&blob_root).unwrap();
+            fs::write(blob_root.join("old-blob"), b"old blob").unwrap();
+            let sidecars = sqlite_sidecar_paths(&database);
+            for sidecar in &sidecars {
+                fs::write(sidecar, b"old sidecar").unwrap();
+            }
+            let staging = restore_staging_path(&database, &blob_root).unwrap();
+            let backup = if nested {
+                fs::create_dir(&staging).unwrap();
+                staging.join("nested-backup")
+            } else {
+                staging.clone()
+            };
+            fs::rename(source, &backup).unwrap();
+
+            assert!(matches!(
+                restore_backup(&backup, &database, &blob_root),
+                Err(BackupError::Destination)
+            ));
+            assert!(backup.join("manifest.json").is_file());
+            assert!(backup.join("gnosis.sqlite").is_file());
+            assert_eq!(fs::read(&database).unwrap(), b"old database");
+            assert_eq!(fs::read(blob_root.join("old-blob")).unwrap(), b"old blob");
+            for sidecar in &sidecars {
+                assert_eq!(fs::read(sidecar).unwrap(), b"old sidecar");
+            }
+        }
     }
 
     #[test]

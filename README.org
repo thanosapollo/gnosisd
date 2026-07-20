@@ -343,6 +343,7 @@ database and blob tree in a mode-0700 ~.DATABASE.restore-rollback~ directory:
 
 #+begin_src sh
 systemctl --user stop gnosisd
+install -d -m 0700 "$XDG_RUNTIME_DIR/gnosis"
 gnosisd --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
   --blob-root "$HOME/.local/share/gnosis/blobs" \

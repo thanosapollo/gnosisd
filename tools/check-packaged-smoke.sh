@@ -163,6 +163,9 @@ stage shutdown
 kill -TERM "$daemon_pid"
 wait "$daemon_pid"
 daemon_pid=
+rmdir "$runtime/gnosis"
+install -d -m 0700 "$runtime/gnosis"
+test "$(stat -c %a "$runtime/gnosis")" = 700
 
 stage cold-restore
 printf 'simulated database loss\n' >"$database"
