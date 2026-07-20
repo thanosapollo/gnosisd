@@ -5,6 +5,7 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'gnosis-core)
+(require 'gnosis-nodes)
 
 (defvar gnosis-core--generated-openapi-operations)
 (defvar gnosis-core--generated-openapi-operation-count)
@@ -84,6 +85,62 @@
       (should (member method '("DELETE" "GET" "PATCH" "POST" "PUT")))
       (should (string-prefix-p "/v1/" path))
       (should (memq authenticated '(t nil))))))
+
+(ert-deftest gnosis-core-integration-local-org-sync-journey ()
+  (skip-unless (gnosis-test-core-integration--available-p))
+  (gnosis-test-core-integration--with-client
+    (let* ((root (make-temp-file "gnosis-org-sync-" t))
+         (gnosis-nodes-directory root)
+         (gnosis-nodes-state-file nil)
+         (path (format "integration/%s.org" (gnosis-core-operation-id)))
+         (prefix ":PROPERTIES:\n:ID: integration-root\n:END:\n")
+         (initial (string-to-unibyte (concat prefix "#+TITLE: Initial\n")))
+         (local (string-to-unibyte (concat prefix "#+TITLE: Local\n")))
+         (remote (string-to-unibyte (concat prefix "#+TITLE: Remote\n")))
+         (conflicting-remote
+          (string-to-unibyte (concat prefix "#+TITLE: Remote conflict\n")))
+         create document-id)
+    (unwind-protect
+        (progn
+          (setq create
+                (gnosis-core-document-create
+                 (gnosis-core-operation-id) path initial)
+                document-id
+                (plist-get (plist-get create :authoritative) :document_id))
+          (gnosis-nodes-bootstrap)
+          (should (equal initial (gnosis-nodes--read-bytes
+                                  (gnosis-nodes--safe-path root path))))
+          (gnosis-nodes--write-document path local)
+          (gnosis-nodes-sync)
+          (should (= 2 (plist-get (gnosis-nodes--base
+                                   (gnosis-nodes--read-state) document-id path)
+                                  :revision)))
+          (gnosis-core-document-replace
+           document-id (gnosis-core-operation-id) 2 path remote)
+          (gnosis-nodes-sync)
+          (should (equal remote (gnosis-nodes--read-bytes
+                                 (gnosis-nodes--safe-path root path))))
+          (gnosis-nodes--write-document
+           "integration/restart.org"
+           ":PROPERTIES:\n:ID: integration-restart\n:END:\n#+TITLE: Restart\n")
+          (gnosis-nodes--write-state
+           (gnosis-nodes--scan (gnosis-nodes--read-state)))
+          (gnosis-nodes--send-outbox (gnosis-nodes--read-state))
+          (should (seq-some
+                   (lambda (entry) (eq :applied (plist-get entry :status)))
+                   (append (plist-get (gnosis-nodes--read-state) :outbox) nil)))
+          (gnosis-nodes--write-document
+           path (concat prefix "#+TITLE: Local conflict\n"))
+          (gnosis-core-document-replace
+           document-id (gnosis-core-operation-id) 3 path conflicting-remote)
+          (gnosis-nodes-sync)
+          (should (equal (string-to-unibyte
+                          (concat prefix "#+TITLE: Local conflict\n"))
+                         (gnosis-nodes--read-bytes
+                          (gnosis-nodes--safe-path root path))))
+          (should (= 1 (length (plist-get (gnosis-nodes--read-state)
+                                          :conflicts)))))
+      (delete-directory root t)))))
 
 (provide 'gnosis-test-core-integration)
 ;;; gnosis-test-core-integration.el ends here

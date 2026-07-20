@@ -986,6 +986,148 @@ the remaining declared request inputs."
                   '("Gnosis mutation response is invalid"))))
       value)))
 
+(defun gnosis-core--typed-binary-request (identity &optional path-values query)
+  "Execute binary GET operation IDENTITY from the live contract.
+PATH-VALUES fill path parameters and QUERY supplies query parameters."
+  (let* ((contract (gnosis-core--contract))
+         (entry (gnosis-core--operation-entry identity))
+         (operation (plist-get entry :operation))
+         (method (plist-get entry :method))
+         (template (plist-get entry :path))
+         (success (gnosis-core--operation-success operation)))
+    (unless (and (equal method "GET")
+                 (string-prefix-p "/v1/" template)
+                 (gnosis-core--operation-bearer-p operation)
+                 (gnosis-core--operation-scopes-p operation)
+                 (null (cdr success)))
+      (gnosis-core--invalid "Gnosis binary operation violates client doctrine"))
+    (gnosis-core--validate-operation-bindings
+     operation template path-values query nil contract)
+    (gnosis-core--request
+     method (gnosis-core--operation-path template path-values query)
+     nil (car success) t t t)))
+
+(defun gnosis-core-sync-identity ()
+  "Return authenticated replica device identity."
+  (gnosis-core--typed-request "get_sync_identity"))
+
+(defun gnosis-core-sync-state ()
+  "Return authenticated replica state."
+  (gnosis-core--typed-request "get_sync_state"))
+
+(defun gnosis-core-sync-snapshot (&optional cursor)
+  "Return replica snapshot page after opaque CURSOR."
+  (if cursor
+      (gnosis-core--typed-request
+       "get_sync_snapshot" nil (list (cons "cursor" cursor)))
+    (gnosis-core--typed-request "get_sync_snapshot")))
+
+(defun gnosis-core-sync-changes (cursor)
+  "Return replica change page after opaque CURSOR."
+  (gnosis-core--typed-request
+   "get_sync_changes" nil (list (cons "cursor" cursor))))
+
+(defun gnosis-core-blob (digest)
+  "Return immutable blob bytes matching hexadecimal SHA-256 DIGEST."
+  (unless (and (stringp digest)
+               (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest))
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis blob digest")))
+  (let ((bytes
+         (gnosis-core--typed-binary-request
+          "get_blobs__digest_" (list (cons "digest" digest)))))
+    (unless (equal digest (secure-hash 'sha256 bytes))
+      (gnosis-core--invalid "Gnosis blob digest mismatch"))
+    bytes))
+
+(defun gnosis-core--org-string (bytes)
+  "Return strict UTF-8 Org text decoded from unibyte BYTES."
+  (unless (stringp bytes)
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis Org bytes")))
+  (let* ((raw (string-to-unibyte bytes))
+         (text (decode-coding-string raw 'utf-8)))
+    (unless (equal raw (encode-coding-string text 'utf-8 t))
+      (signal 'gnosis-core-validation-error '("Invalid Gnosis UTF-8 content")))
+    text))
+
+(defun gnosis-core--document-mutation-result
+    (result operation-id &optional document-id revision logical-path digest active)
+  "Validate mutation RESULT against request expectations.
+OPERATION-ID is mandatory.  DOCUMENT-ID, REVISION, LOGICAL-PATH, DIGEST, and
+ACTIVE constrain an applied authoritative head when non-nil."
+  (unless (and (= (or (plist-get result :format_version) -1) 1)
+               (equal operation-id (plist-get result :operation_id))
+               (stringp (plist-get result :cursor)))
+    (signal 'gnosis-core-mutation-uncertain
+            '("Gnosis mutation response correlation failed")))
+  (when (equal "applied" (plist-get result :status))
+    (let ((head (plist-get result :authoritative)))
+      (unless (and head
+                   (or (null document-id)
+                       (equal document-id (plist-get head :document_id)))
+                   (or (null revision)
+                       (= (1+ revision) (plist-get head :revision)))
+                   (or (null logical-path)
+                       (equal logical-path (plist-get head :logical_path)))
+                   (or (null digest)
+                       (equal digest (plist-get head :content_sha256)))
+                   (or (null active)
+                       (eq (not (eq active :inactive))
+                           (not (null (plist-get head :active))))))
+        (signal 'gnosis-core-mutation-uncertain
+                '("Gnosis mutation authoritative head is invalid")))))
+  result)
+
+(defun gnosis-core--document-mutation-headers (operation-id &optional revision)
+  "Return mutation headers for OPERATION-ID and optional REVISION."
+  (delq nil
+        (list (gnosis-core--idempotency-key-header operation-id)
+              (and revision (gnosis-core--if-match-header revision)))))
+
+(defun gnosis-core-document-create (operation-id logical-path bytes)
+  "Create LOGICAL-PATH from exact Org BYTES under OPERATION-ID."
+  (let* ((text (gnosis-core--org-string bytes))
+         (digest (secure-hash 'sha256 (string-to-unibyte bytes)))
+         (result
+          (gnosis-core--typed-request
+           "post_document-mutations" nil nil
+           (list :logical_path logical-path :org text)
+           (gnosis-core--document-mutation-headers operation-id))))
+    (gnosis-core--document-mutation-result
+     result operation-id nil nil logical-path digest t)))
+
+(defun gnosis-core-document-replace
+    (document-id operation-id revision logical-path bytes)
+  "Replace DOCUMENT-ID at REVISION with LOGICAL-PATH and exact Org BYTES.
+Use OPERATION-ID as stable mutation identity."
+  (let* ((text (gnosis-core--org-string bytes))
+         (digest (secure-hash 'sha256 (string-to-unibyte bytes)))
+         (result
+          (gnosis-core--typed-request
+           "put_document-mutations__id_" (list (cons "id" document-id)) nil
+           (list :logical_path logical-path :org text)
+           (gnosis-core--document-mutation-headers operation-id revision))))
+    (gnosis-core--document-mutation-result
+     result operation-id document-id revision logical-path digest t)))
+
+(defun gnosis-core-document-rename
+    (document-id operation-id revision logical-path)
+  "Rename DOCUMENT-ID at REVISION to LOGICAL-PATH.
+Use OPERATION-ID as stable mutation identity."
+  (gnosis-core--document-mutation-result
+   (gnosis-core--typed-request
+    "post_document-mutations__id__rename" (list (cons "id" document-id)) nil
+    (list :logical_path logical-path)
+    (gnosis-core--document-mutation-headers operation-id revision))
+   operation-id document-id revision logical-path nil t))
+
+(defun gnosis-core-document-tombstone (document-id operation-id revision)
+  "Tombstone DOCUMENT-ID at REVISION under OPERATION-ID."
+  (gnosis-core--document-mutation-result
+   (gnosis-core--typed-request
+    "delete_document-mutations__id_" (list (cons "id" document-id)) nil nil
+    (gnosis-core--document-mutation-headers operation-id revision))
+   operation-id document-id revision nil nil :inactive))
+
 (defun gnosis-core-dashboard (&optional days)
   "Return the server dashboard projection for optional window DAYS."
   (if days

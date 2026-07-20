@@ -17,13 +17,14 @@ INFO := docs/gnosis.info
 LISP_DIR := lisp
 TEST_DIR := tests
 TOOL_DIR := tools
-EL_FILES := gnosis-completion.el gnosis-core.el gnosis-core-assets.el gnosis-edit.el gnosis.el gnosis-review.el
+EL_FILES := gnosis-completion.el gnosis-core.el gnosis-core-assets.el gnosis-edit.el gnosis-nodes.el gnosis.el gnosis-review.el
 LISP_FILES := $(addprefix $(LISP_DIR)/,$(EL_FILES))
 TOOL_FILES := $(TOOL_DIR)/gnosis-openapi-generator.el
 TEST_FILES := tests/gnosis-test-core.el \
 	tests/gnosis-test-core-assets.el \
 	tests/gnosis-test-openapi.el \
 	tests/gnosis-test-edit.el \
+	tests/gnosis-test-nodes.el \
 	tests/gnosis-test-dashboard.el \
 	tests/gnosis-test-review.el \
 	tests/gnosis-test-boundary.el \

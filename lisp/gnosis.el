@@ -20,6 +20,7 @@
 ;;; Code:
 
 (require 'gnosis-core)
+(require 'gnosis-nodes)
 (require 'org)
 
 (defgroup gnosis nil

@@ -10,11 +10,11 @@ history, authoring rules, and persistence.
 
 ** Current scope
 
-Run =M-x gnosis= to inspect daemon health and the served OpenAPI version.  The
-dashboard, authoring, and review commands remain named for compatibility, but
-their domain operations are not yet available.  They fail before opening a
-buffer or changing local state until bindings are generated from the stable
-official API.
+Run =M-x gnosis= to inspect daemon health and served OpenAPI version.  For an
+offline-editable Org working tree, customize =gnosis-nodes-directory= and run
+=M-x gnosis-nodes-bootstrap=.  Edit Org files normally; =M-x gnosis-nodes-sync=
+pulls authoritative changes before sending durable local operations.  Conflicts
+preserve local content and require explicit Ediff resolution and acceptance.
 
 The client does not contain handwritten Gnosis DTOs or temporary route
 bindings.  There is no SQLite access and no local fallback.
@@ -80,11 +80,12 @@ nix build
 nix flake check
 #+end_src
 
-Runtime source consists of exactly six modules:
+Runtime source consists of exactly seven modules:
 
 + =gnosis.el=
 + =gnosis-core.el=
 + =gnosis-core-assets.el=
 + =gnosis-edit.el=
++ =gnosis-nodes.el=
 + =gnosis-review.el=
 + =gnosis-completion.el=

@@ -8,11 +8,12 @@
 (require 'gnosis-core)
 (require 'gnosis-core-assets)
 (require 'gnosis-edit)
+(require 'gnosis-nodes)
 (require 'gnosis-review)
 
-(ert-deftest gnosis-package-loads-six-public-modules ()
+(ert-deftest gnosis-package-loads-seven-public-modules ()
   (dolist (feature '(gnosis gnosis-core gnosis-core-assets
-                     gnosis-edit gnosis-review gnosis-completion))
+                     gnosis-edit gnosis-nodes gnosis-review gnosis-completion))
     (should (featurep feature))))
 
 (ert-deftest gnosis-package-exposes-foundation-entrypoints ()

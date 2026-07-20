@@ -15,9 +15,22 @@ foundation.  The daemon owns persistence, content rules, grading, scheduling,
 history, session recovery, and mutations.  The client has no SQLite access and
 no local fallback.
 
-Domain commands are not yet available.  They remain defined and fail before
-opening a buffer or changing local state until bindings are generated from the
-stable official API.
+Offline-editable Org synchronization uses generated OpenAPI operations only.
+The daemon remains authority for parsing, projections, graph state, revisions,
+and scheduling.
+
+* Org synchronization
+
+Customize =gnosis-nodes-directory= to a dedicated working directory, then run
+=M-x gnosis-nodes-bootstrap=.  Edit its Org files offline and run
+=M-x gnosis-nodes-sync= to pull before pushing.  Minimal private state records
+identity, cursor, document bases, pending operations, and conflicts; it is not a
+domain database.  Delivery-unknown mutations are never retried automatically.
+
+Conflicts leave local content untouched.  Run =M-x gnosis-nodes-resolve-conflict=
+for three-way Ediff, save the merge in the local file, then run
+=M-x gnosis-nodes-accept-conflict=.  Acceptance refuses changed local conflict
+content and sends with the captured authoritative revision.
 
 * Installation and setup
 
@@ -97,7 +110,7 @@ make OPENAPI_FILE=/path/to/openapi.json \
 #+end_src
 
 Generated manifests are temporary build artifacts.  They are not installed,
-do not add a seventh runtime module, and do not bind dashboard, content,
+do not add another runtime module, and do not bind dashboard, content,
 document, thema, review, or mutation flows while the API is changing.
 
 * Development

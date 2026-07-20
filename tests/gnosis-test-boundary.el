@@ -14,9 +14,9 @@
     (insert-file-contents (locate-library (symbol-name feature)))
     (buffer-string)))
 
-(ert-deftest gnosis-boundary-loads-only-six-runtime-modules ()
+(ert-deftest gnosis-boundary-loads-only-seven-runtime-modules ()
   (dolist (feature '(gnosis gnosis-core gnosis-core-assets
-                     gnosis-edit gnosis-review gnosis-completion))
+                     gnosis-edit gnosis-nodes gnosis-review gnosis-completion))
     (should (require feature nil t)))
   (dolist (feature '(gnosis-db gnosis-sqlite gnosis-algorithm
                      gnosis-dashboard gnosis-history gnosis-anki))
@@ -53,24 +53,24 @@
     (should-not (get-buffer buffer))))
 
 (ert-deftest gnosis-boundary-has-no-dead-dtos-or-handwritten-routes ()
-  (dolist (feature '(gnosis gnosis-core gnosis-edit gnosis-review))
+  (dolist (feature '(gnosis gnosis-core gnosis-edit gnosis-nodes gnosis-review))
     (let ((source (gnosis-test-boundary--library-string feature)))
       (should-not
        (string-match-p
-        "node_ids\\|content_type\\|operation_id\\|expected_revision\\|receipt\\|attempt_revision\\|proposed_transition"
+        "node_ids\\|content_type\\|receipt\\|attempt_revision\\|proposed_transition"
         source))))
   (let ((source (gnosis-test-boundary--library-string 'gnosis-core)))
     (dolist (route '("/v1/dashboard" "/v1/nodes" "/v1/themata"
                      "/v1/review/" "/v1/documents"))
       (should-not (string-match-p (regexp-quote route) source)))))
 
-(ert-deftest gnosis-boundary-documentation-describes-foundation-state ()
+(ert-deftest gnosis-boundary-documentation-describes-org-sync ()
   (skip-unless (file-exists-p "README.org"))
   (dolist (file '("README.org" "docs/gnosis.org"))
     (with-temp-buffer
       (insert-file-contents file)
       (should (re-search-forward "OpenAPI" nil t))
-      (should (re-search-forward "not yet available" nil t))
+      (should (re-search-forward "gnosis-nodes-bootstrap" nil t))
       (should-not (re-search-forward "POST /v1/themata" nil t)))))
 
 (provide 'gnosis-test-boundary)

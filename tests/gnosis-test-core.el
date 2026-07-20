@@ -629,5 +629,86 @@ CONTENT-TYPE defaults to application/json."
                   (gnosis-core--locator-for-url
                    "https://example.test"))))))
 
+(ert-deftest gnosis-core-sync-read-bindings-use-operation-identities ()
+  (let (calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 '(:ok t))))
+      (gnosis-core-sync-identity)
+      (gnosis-core-sync-state)
+      (gnosis-core-sync-snapshot "snapshot/cursor")
+      (gnosis-core-sync-changes "replica/cursor"))
+    (should
+     (equal
+      '(("get_sync_identity")
+        ("get_sync_state")
+        ("get_sync_snapshot" nil (("cursor" . "snapshot/cursor")))
+        ("get_sync_changes" nil (("cursor" . "replica/cursor"))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-blob-binding-verifies-digest ()
+  (let* ((bytes (encode-coding-string "* Note\n" 'utf-8 t))
+         (digest (secure-hash 'sha256 bytes)))
+    (cl-letf (((symbol-function 'gnosis-core--typed-binary-request)
+               (lambda (&rest _) bytes)))
+      (should (equal bytes (gnosis-core-blob digest))))
+    (cl-letf (((symbol-function 'gnosis-core--typed-binary-request)
+               (lambda (&rest _) "wrong")))
+      (should-error (gnosis-core-blob digest)
+                    :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-document-mutations-use-exact-bindings ()
+  (let ((bytes (encode-coding-string "* Note\n" 'utf-8 t))
+        calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 (let ((operation (car arguments)))
+                   (if (equal operation "post_document-mutations")
+                       `(:status "applied" :format_version 1
+                         :operation_id "op:create" :changed t
+                         :authoritative
+                         (:document_id "doc" :logical_path "note.org"
+                          :revision 1 :content_sha256
+                          ,(secure-hash 'sha256 bytes) :active t)
+                         :cursor "hint")
+                     '(:status "rejected" :format_version 1
+                       :operation_id "op:next"
+                       :rejection (:reason "revision_conflict"
+                                   :expected_revision 1 :current_revision 2)
+                       :cursor "hint"))))))
+      (gnosis-core-document-create "op:create" "note.org" bytes)
+      (gnosis-core-document-replace "doc" "op:next" 1 "note.org" bytes)
+      (gnosis-core-document-rename "doc" "op:next" 1 "moved.org")
+      (gnosis-core-document-tombstone "doc" "op:next" 1))
+    (should
+     (equal
+      `(("post_document-mutations" nil nil
+         (:logical_path "note.org" :org "* Note\n")
+         (("Idempotency-Key" . "op:create")))
+        ("put_document-mutations__id_" (("id" . "doc")) nil
+         (:logical_path "note.org" :org "* Note\n")
+         (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\"")))
+        ("post_document-mutations__id__rename" (("id" . "doc")) nil
+         (:logical_path "moved.org")
+         (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\"")))
+        ("delete_document-mutations__id_" (("id" . "doc")) nil nil
+         (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\""))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-document-mutation-rejects-wrong-operation-id ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               '(:status "applied" :format_version 1
+                 :operation_id "different" :changed t
+                 :authoritative
+                 (:document_id "doc" :logical_path "note.org"
+                  :revision 1 :content_sha256 nil :active t)
+                 :cursor "hint"))))
+    (should-error
+     (gnosis-core-document-create "expected" "note.org" "body")
+     :type 'gnosis-core-mutation-uncertain)))
+
 (provide 'gnosis-test-core)
 ;;; gnosis-test-core.el ends here

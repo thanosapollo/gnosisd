@@ -8,14 +8,18 @@
 
 ** Authenticated HTTP client
 
-+ Reduced the package to six focused client modules.  Removed embedded
++ Added offline-editable Org synchronization through authenticated, generated
+  sync, blob, and mutation operations.  Minimal durable state tracks cursors,
+  bases, outbox entries, and explicit conflicts without duplicating daemon
+  parsing, projections, graph state, revisions, or scheduling.
++ Reduced the package to seven focused client modules.  Removed embedded
   persistence, scheduling, grading, import, note, and compatibility backends.
 + Added bounded HTTP transport, bearer credentials resolved through
   =auth-source=, future-compatible bounded error envelopes, safe GET retries,
   and strict loopback/HTTPS authority validation.
 + Added a deterministic OpenAPI 3.1 operation-manifest generator and isolated
   live contract harness.  Generated manifests remain build artifacts and do
-  not add a seventh runtime module.
+  do not add another runtime module.
 + Removed handwritten success DTOs and provisional dashboard, authoring, and
   review route bindings while the official API is changing.  Public domain
   commands fail before transport or local mutation until generated bindings
