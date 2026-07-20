@@ -19,8 +19,8 @@ mod import;
 
 pub(crate) use backup::BackupSummary;
 use backup::{
-    BackupError, create_backup, prune_backups, restore_backup, snapshot_backup, validate_restore,
-    verify_backup,
+    BackupError, create_backup, ensure_restore_complete, prune_backups, restore_backup,
+    snapshot_backup, validate_restore, verify_backup,
 };
 #[cfg(test)]
 use import::persist_server_import;
@@ -70,6 +70,13 @@ pub(crate) fn cold_restore(
     blob_root: &Path,
 ) -> Result<PathBuf, BackupError> {
     restore_backup(backup, database, blob_root)
+}
+
+pub(crate) fn ensure_cold_restore_complete(
+    database: &Path,
+    blob_root: &Path,
+) -> Result<(), BackupError> {
+    ensure_restore_complete(database, blob_root)
 }
 
 #[derive(Clone)]

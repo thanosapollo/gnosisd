@@ -1,8 +1,8 @@
 use std::{
-    fs,
+    fs::{self, File, OpenOptions},
     future::Future,
     net::SocketAddr,
-    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -65,6 +65,7 @@ pub struct DaemonServer {
     listener: UnixListener,
     http_listener: Option<TcpListener>,
     socket: SocketGuard,
+    target_locks: TargetLocks,
     service: ServiceRuntime,
     max_connections: usize,
 }
@@ -72,6 +73,9 @@ pub struct DaemonServer {
 impl DaemonServer {
     pub async fn bind(config: DaemonConfig) -> Result<Self, ServerError> {
         validate_config(&config)?;
+        let target_locks = TargetLocks::acquire(&config.database_path, &config.blob_path)?;
+        crate::service::ensure_cold_restore_complete(&config.database_path, &config.blob_path)
+            .map_err(|error| ServerError::Restore(Box::new(error)))?;
         let _startup_lock = StartupLock::acquire(&config.socket_path)?;
         prepare_socket(&config.socket_path).await?;
         let listener = UnixListener::bind(&config.socket_path).map_err(ServerError::Socket)?;
@@ -97,6 +101,7 @@ impl DaemonServer {
             listener,
             http_listener,
             socket,
+            target_locks,
             service,
             max_connections: config.max_connections,
         })
@@ -107,10 +112,12 @@ impl DaemonServer {
         backup: impl AsRef<Path>,
     ) -> Result<PathBuf, ServerError> {
         validate_config(&config)?;
+        let target_locks = TargetLocks::acquire(&config.database_path, &config.blob_path)?;
         let startup_lock = StartupLock::acquire(&config.socket_path)?;
         prepare_socket(&config.socket_path).await?;
         let backup = backup.as_ref().to_owned();
         tokio::task::spawn_blocking(move || {
+            let _target_locks = target_locks;
             let _startup_lock = startup_lock;
             crate::service::cold_restore(&backup, &config.database_path, &config.blob_path)
         })
@@ -130,6 +137,7 @@ impl DaemonServer {
             listener,
             http_listener,
             socket,
+            target_locks,
             service,
             max_connections,
         } = self;
@@ -163,6 +171,7 @@ impl DaemonServer {
         };
         drop(state);
         service.finish().await.map_err(ServerError::service)?;
+        drop(target_locks);
         drop(socket);
         accept_error.and(http_result.map_err(ServerError::Http))
     }
@@ -562,6 +571,72 @@ struct SocketGuard {
 }
 
 #[derive(Debug)]
+struct TargetLocks {
+    _files: Vec<File>,
+}
+
+impl TargetLocks {
+    fn acquire(database: &Path, blob_root: &Path) -> Result<Self, ServerError> {
+        let mut paths = vec![target_lock_path(database)?, target_lock_path(blob_root)?];
+        paths.sort();
+        paths.dedup();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err(ServerError::TargetLockInvalid),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ServerError::TargetLock(error)),
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(ServerError::TargetLock)?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(ServerError::TargetLock)?;
+            if !file
+                .metadata()
+                .map_err(ServerError::TargetLock)?
+                .file_type()
+                .is_file()
+            {
+                return Err(ServerError::TargetLockInvalid);
+            }
+            file.try_lock().map_err(|error| match error {
+                std::fs::TryLockError::WouldBlock => ServerError::TargetLocked,
+                std::fs::TryLockError::Error(error) => ServerError::TargetLock(error),
+            })?;
+            files.push(file);
+        }
+        Ok(Self { _files: files })
+    }
+}
+
+fn target_lock_path(target: &Path) -> Result<PathBuf, ServerError> {
+    let target = match fs::canonicalize(target) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = target.parent().ok_or(ServerError::InvalidConfig)?;
+            let name = target.file_name().ok_or(ServerError::InvalidConfig)?;
+            fs::canonicalize(parent)
+                .map_err(ServerError::TargetLock)?
+                .join(name)
+        }
+        Err(error) => return Err(ServerError::TargetLock(error)),
+    };
+    let parent = target.parent().ok_or(ServerError::InvalidConfig)?;
+    let name = target.file_name().ok_or(ServerError::InvalidConfig)?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".gnosis-lock");
+    Ok(parent.join(lock_name))
+}
+
+#[derive(Debug)]
 struct StartupLock {
     path: PathBuf,
     device: u64,
@@ -667,6 +742,12 @@ pub enum ServerError {
     SocketChanged,
     #[error("another daemon startup owns the socket lock")]
     StartupLocked,
+    #[error("another daemon or restore owns the database or blob target")]
+    TargetLocked,
+    #[error("database or blob target lock is not a regular file")]
+    TargetLockInvalid,
+    #[error("database or blob target lock failed")]
+    TargetLock(#[source] std::io::Error),
     #[error("socket operation failed")]
     Socket(#[source] std::io::Error),
     #[error("HTTP listener failed")]
@@ -817,11 +898,15 @@ mod tests {
         drop(startup_lock);
 
         let server = super::DaemonServer::bind(config.clone()).await.unwrap();
-        let error =
-            super::DaemonServer::restore_backup(config, directory.path().join("missing-backup"))
-                .await
-                .unwrap_err();
-        assert!(matches!(error, ServerError::AlreadyRunning));
+        let mut competing_config = config;
+        competing_config.socket_path = directory.path().join("different.socket");
+        let error = super::DaemonServer::restore_backup(
+            competing_config,
+            directory.path().join("missing-backup"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::TargetLocked));
         drop(server);
     }
 

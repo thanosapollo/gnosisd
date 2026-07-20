@@ -19,6 +19,7 @@ use crate::{
 
 const DATABASE_FILE: &str = "gnosis.sqlite";
 const MANIFEST_FILE: &str = "manifest.json";
+const RESTORE_STATE_FILE: &str = "restore-state.json";
 const BACKUP_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,6 +53,24 @@ struct BackupManifest {
 struct ManifestBlob {
     sha256: String,
     size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RestoreState {
+    format_version: u32,
+    complete: bool,
+    had_database: bool,
+    had_blobs: bool,
+    had_sidecars: [bool; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivationStep {
+    DatabaseRelocated,
+    BlobsRelocated,
+    SidecarRelocated(usize),
+    DatabaseActivated,
+    BlobsActivated,
 }
 
 pub(crate) fn snapshot_backup(
@@ -200,9 +219,10 @@ pub(crate) fn restore_backup(
     database: &Path,
     blob_root: &Path,
 ) -> Result<PathBuf, BackupError> {
-    restore_backup_with_hook(backup, database, blob_root, |_| Ok(()))
+    restore_backup_with_hooks(backup, database, blob_root, |_| Ok(()), |_| {})
 }
 
+#[cfg(test)]
 fn restore_backup_with_hook<F>(
     backup: &Path,
     database: &Path,
@@ -212,13 +232,31 @@ fn restore_backup_with_hook<F>(
 where
     F: FnOnce(&Path) -> Result<(), BackupError>,
 {
+    restore_backup_with_hooks(backup, database, blob_root, before_activation, |_| {})
+}
+
+fn restore_backup_with_hooks<F, G>(
+    backup: &Path,
+    database: &Path,
+    blob_root: &Path,
+    before_activation: F,
+    after_step: G,
+) -> Result<PathBuf, BackupError>
+where
+    F: FnOnce(&Path) -> Result<(), BackupError>,
+    G: FnMut(ActivationStep),
+{
     let database = canonical_restore_target(database)?;
     let blob_root = canonical_restore_target(blob_root)?;
     let staging = restore_staging_path(&database, &blob_root)?;
     let rollback = restore_rollback_path(&database, &blob_root)?;
     validate_restore_targets(&database, &blob_root)?;
     if rollback.exists() {
-        return Err(BackupError::RollbackExists);
+        let state = read_restore_state(&rollback)?;
+        if state.complete {
+            return Err(BackupError::RollbackExists);
+        }
+        recover_interrupted_activation(&staging, &rollback, &database, &blob_root, &state)?;
     }
     let backup = fs::canonicalize(backup)?;
     if [&database, &blob_root, &staging, &rollback]
@@ -241,8 +279,25 @@ where
     }
     File::open(&staging)?.sync_all()?;
     before_activation(&staging)?;
-    activate_restore(&staging, &rollback, &database, &blob_root)?;
+    activate_restore(&staging, &rollback, &database, &blob_root, after_step)?;
     Ok(rollback)
+}
+
+pub(crate) fn ensure_restore_complete(
+    database: &Path,
+    blob_root: &Path,
+) -> Result<(), BackupError> {
+    let database = canonical_restore_target(database)?;
+    let blob_root = canonical_restore_target(blob_root)?;
+    let rollback = restore_rollback_path(&database, &blob_root)?;
+    if !rollback.exists() {
+        return Ok(());
+    }
+    if read_restore_state(&rollback)?.complete {
+        Ok(())
+    } else {
+        Err(BackupError::RestoreIncomplete)
+    }
 }
 
 pub(crate) fn prune_backups(directory: &Path, keep: u16) -> Result<Vec<PathBuf>, BackupError> {
@@ -320,88 +375,187 @@ fn materialize_restore(
     Ok(())
 }
 
-fn activate_restore(
+fn activate_restore<F>(
     staging: &Path,
     rollback: &Path,
     database: &Path,
     blob_root: &Path,
-) -> Result<(), BackupError> {
+    mut after_step: F,
+) -> Result<(), BackupError>
+where
+    F: FnMut(ActivationStep),
+{
     validate_restore_targets(database, blob_root)?;
     let sidecars = sqlite_sidecar_paths(database);
+    let mut state = RestoreState {
+        format_version: BACKUP_FORMAT_VERSION,
+        complete: false,
+        had_database: database.exists(),
+        had_blobs: blob_root.exists(),
+        had_sidecars: sidecars.each_ref().map(|path| path.exists()),
+    };
     fs::create_dir(rollback)?;
     fs::set_permissions(rollback, fs::Permissions::from_mode(0o700))?;
+    write_restore_state(rollback, &state)?;
+    sync_parent(rollback)?;
     let rollback_database = rollback.join(DATABASE_FILE);
     let rollback_blobs = rollback.join("blobs");
     let relocation = (|| {
-        if database.exists() {
+        if state.had_database {
             fs::rename(database, &rollback_database)?;
+            sync_parent(database)?;
+            after_step(ActivationStep::DatabaseRelocated);
         }
-        if blob_root.exists() {
+        if state.had_blobs {
             fs::rename(blob_root, &rollback_blobs)?;
+            sync_parent(blob_root)?;
+            after_step(ActivationStep::BlobsRelocated);
         }
-        for sidecar in &sidecars {
-            if sidecar.exists() {
+        for (index, sidecar) in sidecars.iter().enumerate() {
+            if state.had_sidecars[index] {
                 fs::rename(
                     sidecar,
                     rollback.join(sidecar.file_name().ok_or(BackupError::Destination)?),
                 )?;
+                sync_parent(sidecar)?;
+                after_step(ActivationStep::SidecarRelocated(index));
             }
         }
         File::open(rollback)?.sync_all()?;
-        sync_parent(database)
+        Ok(())
     })();
     if let Err(error) = relocation {
-        rollback_failed_activation(rollback, database, blob_root, &sidecars, false)?;
+        recover_interrupted_activation(staging, rollback, database, blob_root, &state)?;
         return Err(error);
     }
 
     let activation = (|| {
         fs::rename(staging.join(DATABASE_FILE), database)?;
+        sync_parent(database)?;
+        after_step(ActivationStep::DatabaseActivated);
         fs::rename(staging.join("blobs"), blob_root)?;
+        sync_parent(blob_root)?;
+        after_step(ActivationStep::BlobsActivated);
         fs::remove_dir(staging)?;
-        sync_parent(database)
+        sync_parent(staging)?;
+        let completed = RestoreState {
+            complete: true,
+            ..state.clone()
+        };
+        write_restore_state(rollback, &completed)?;
+        state.complete = true;
+        Ok(())
     })();
     if let Err(error) = activation {
-        rollback_failed_activation(rollback, database, blob_root, &sidecars, true)?;
+        recover_interrupted_activation(staging, rollback, database, blob_root, &state)?;
         return Err(error);
     }
     Ok(())
 }
 
-fn rollback_failed_activation(
+fn recover_interrupted_activation(
+    staging: &Path,
     rollback: &Path,
     database: &Path,
     blob_root: &Path,
-    sidecars: &[PathBuf; 3],
-    remove_activated_targets: bool,
+    state: &RestoreState,
 ) -> Result<(), BackupError> {
-    if remove_activated_targets && database.exists() {
-        require_regular_file(database)?;
-        fs::remove_file(database)?;
+    if state.format_version != BACKUP_FORMAT_VERSION || state.complete {
+        return Err(BackupError::Format);
     }
-    if remove_activated_targets && blob_root.exists() {
-        require_directory(blob_root)?;
-        fs::remove_dir_all(blob_root)?;
-    }
+    let sidecars = sqlite_sidecar_paths(database);
     let rollback_database = rollback.join(DATABASE_FILE);
     let rollback_blobs = rollback.join("blobs");
-    if rollback_database.exists() {
-        fs::rename(rollback_database, database)?;
-    }
-    if rollback_blobs.exists() {
-        fs::rename(rollback_blobs, blob_root)?;
-    }
-    for sidecar in sidecars {
+    recover_target(database, &rollback_database, state.had_database, false)?;
+    recover_target(blob_root, &rollback_blobs, state.had_blobs, true)?;
+    for (index, sidecar) in sidecars.iter().enumerate() {
         let rollback_sidecar = rollback.join(sidecar.file_name().ok_or(BackupError::Destination)?);
-        if rollback_sidecar.exists() {
-            if remove_activated_targets && sidecar.exists() {
-                fs::remove_file(sidecar)?;
-            }
-            fs::rename(rollback_sidecar, sidecar)?;
-        }
+        recover_target(sidecar, &rollback_sidecar, state.had_sidecars[index], false)?;
     }
+    if staging.exists() {
+        require_directory(staging)?;
+        fs::remove_dir_all(staging)?;
+    }
+    let temporary_state = rollback.join(format!(".{RESTORE_STATE_FILE}.new"));
+    if temporary_state.exists() {
+        require_regular_file(&temporary_state)?;
+        fs::remove_file(temporary_state)?;
+    }
+    fs::remove_file(rollback.join(RESTORE_STATE_FILE))?;
     fs::remove_dir(rollback)?;
     sync_parent(database)
+}
+
+fn recover_target(
+    target: &Path,
+    saved: &Path,
+    existed: bool,
+    directory: bool,
+) -> Result<(), BackupError> {
+    if saved.exists() {
+        validate_optional_target(saved, directory)?;
+        if target.exists() {
+            validate_optional_target(target, directory)?;
+            if directory {
+                fs::remove_dir_all(target)?;
+            } else {
+                fs::remove_file(target)?;
+            }
+        }
+        fs::rename(saved, target)?;
+        sync_parent(target)?;
+        return Ok(());
+    }
+    if existed {
+        if !target.exists() {
+            return Err(BackupError::RestoreIncomplete);
+        }
+        validate_optional_target(target, directory)?;
+    } else if target.exists() {
+        validate_optional_target(target, directory)?;
+        if directory {
+            fs::remove_dir_all(target)?;
+        } else {
+            fs::remove_file(target)?;
+        }
+        sync_parent(target)?;
+    }
+    Ok(())
+}
+
+fn write_restore_state(rollback: &Path, state: &RestoreState) -> Result<(), BackupError> {
+    let bytes = serde_json::to_vec(state).map_err(|_| BackupError::Format)?;
+    let path = rollback.join(RESTORE_STATE_FILE);
+    let temporary = rollback.join(format!(".{RESTORE_STATE_FILE}.new"));
+    if temporary.exists() {
+        require_regular_file(&temporary)?;
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    File::open(rollback)?.sync_all()?;
+    Ok(())
+}
+
+fn read_restore_state(rollback: &Path) -> Result<RestoreState, BackupError> {
+    require_directory(rollback)?;
+    let path = rollback.join(RESTORE_STATE_FILE);
+    require_regular_file(&path)?;
+    if fs::symlink_metadata(&path)?.len() > 4096 {
+        return Err(BackupError::Format);
+    }
+    let bytes = fs::read(path)?;
+    let state: RestoreState = serde_json::from_slice(&bytes).map_err(|_| BackupError::Format)?;
+    if state.format_version != BACKUP_FORMAT_VERSION {
+        return Err(BackupError::Format);
+    }
+    Ok(state)
 }
 
 fn sqlite_sidecar_paths(database: &Path) -> [PathBuf; 3] {
@@ -652,6 +806,8 @@ pub(crate) enum BackupError {
     BlobDigest,
     #[error("a previous restore rollback must be resolved first")]
     RollbackExists,
+    #[error("cold restore activation is incomplete")]
+    RestoreIncomplete,
     #[cfg(test)]
     #[error("restore interrupted before activation")]
     Interrupted,
@@ -669,18 +825,21 @@ mod tests {
         fs, mem,
         os::unix::fs::{PermissionsExt as _, symlink},
         path::Path,
+        process::Command,
     };
 
     use rusqlite::Connection;
     use tempfile::tempdir;
 
     use super::{
-        BackupError, create_backup, read_manifest, restore_backup, restore_backup_with_hook,
-        restore_staging_path, sha256_file, snapshot_backup, sqlite_sidecar_paths,
+        ActivationStep, BackupError, create_backup, ensure_restore_complete, read_manifest,
+        restore_backup, restore_backup_with_hook, restore_backup_with_hooks, restore_staging_path,
+        sha256_file, snapshot_backup, sqlite_sidecar_paths,
     };
     use crate::{
         application::{canonical_asset_path, prepare_asset},
         blob::BlobStore,
+        protocol::{DaemonConfig, DaemonServer, ServerError},
         store::{SqliteStore, StoreError},
     };
 
@@ -850,6 +1009,99 @@ mod tests {
             fs::read(rollback.join(sidecars[2].file_name().unwrap())).unwrap(),
             b"old shm"
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_activation_blocks_startup_and_next_restore_recovers_old_pair() {
+        for interrupted_after in [
+            ActivationStep::DatabaseRelocated,
+            ActivationStep::BlobsRelocated,
+            ActivationStep::SidecarRelocated(0),
+            ActivationStep::SidecarRelocated(1),
+            ActivationStep::SidecarRelocated(2),
+            ActivationStep::DatabaseActivated,
+            ActivationStep::BlobsActivated,
+        ] {
+            let directory = tempdir().unwrap();
+            let (backup, digest, restored_blob) = backup_fixture(directory.path());
+            let database = directory.path().join("gnosis.sqlite");
+            let blob_root = directory.path().join("blobs");
+            drop(SqliteStore::open(&database).unwrap());
+            let old_database = fs::read(&database).unwrap();
+            let old_blobs = BlobStore::open(&blob_root).unwrap();
+            let old_blob = old_blobs.put(b"old target", "text/plain").unwrap();
+            let sidecars = sqlite_sidecar_paths(&database);
+            for (index, sidecar) in sidecars.iter().enumerate() {
+                fs::write(sidecar, format!("old sidecar {index}")).unwrap();
+            }
+
+            let status = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("service::backup::tests::cold_restore_interruption_child")
+                .env("GNOSIS_TEST_RESTORE_BACKUP", &backup)
+                .env("GNOSIS_TEST_RESTORE_DATABASE", &database)
+                .env("GNOSIS_TEST_RESTORE_BLOBS", &blob_root)
+                .env("GNOSIS_TEST_RESTORE_STEP", format!("{interrupted_after:?}"))
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(91));
+            assert!(matches!(
+                ensure_restore_complete(&database, &blob_root),
+                Err(BackupError::RestoreIncomplete)
+            ));
+            let mut config = DaemonConfig::new(directory.path().join("gnosis.sock"), &database);
+            config.blob_path = blob_root.clone();
+            assert!(matches!(
+                DaemonServer::bind(config).await,
+                Err(ServerError::Restore(_))
+            ));
+
+            let rollback = restore_backup(&backup, &database, &blob_root).unwrap();
+            assert_eq!(
+                fs::read(rollback.join("gnosis.sqlite")).unwrap(),
+                old_database
+            );
+            assert_eq!(
+                BlobStore::open(rollback.join("blobs"))
+                    .unwrap()
+                    .read(&old_blob.sha256)
+                    .unwrap(),
+                b"old target"
+            );
+            for (index, sidecar) in sidecars.iter().enumerate() {
+                assert_eq!(
+                    fs::read(rollback.join(sidecar.file_name().unwrap())).unwrap(),
+                    format!("old sidecar {index}").as_bytes()
+                );
+            }
+            assert_eq!(
+                BlobStore::open(&blob_root).unwrap().read(&digest).unwrap(),
+                restored_blob
+            );
+            ensure_restore_complete(&database, &blob_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn cold_restore_interruption_child() {
+        let Ok(backup) = std::env::var("GNOSIS_TEST_RESTORE_BACKUP") else {
+            return;
+        };
+        let database = std::env::var("GNOSIS_TEST_RESTORE_DATABASE").unwrap();
+        let blobs = std::env::var("GNOSIS_TEST_RESTORE_BLOBS").unwrap();
+        let interrupted_after = std::env::var("GNOSIS_TEST_RESTORE_STEP").unwrap();
+        let result = restore_backup_with_hooks(
+            Path::new(&backup),
+            Path::new(&database),
+            Path::new(&blobs),
+            |_| Ok(()),
+            |step| {
+                if format!("{step:?}") == interrupted_after {
+                    std::process::exit(91);
+                }
+            },
+        );
+        panic!("restore reached unexpected result before interruption: {result:?}");
     }
 
     #[test]
