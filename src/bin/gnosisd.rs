@@ -12,6 +12,8 @@ struct Cli {
     database: PathBuf,
     #[arg(long, value_name = "PATH")]
     blob_root: Option<PathBuf>,
+    #[arg(long, value_name = "BACKUP")]
+    restore_from: Option<PathBuf>,
     #[arg(long, value_name = "ADDRESS", default_value = "127.0.0.1:7842")]
     http_listen: SocketAddr,
 }
@@ -32,6 +34,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     config.http_addr = Some(cli.http_listen);
     if let Some(blob_root) = cli.blob_root {
         config.blob_path = blob_root;
+    }
+    if let Some(backup) = cli.restore_from {
+        let rollback = DaemonServer::restore_backup(config, backup).await?;
+        println!(
+            "restore complete; rollback preserved at {}",
+            rollback.display()
+        );
+        return Ok(());
     }
     let server = DaemonServer::bind(config).await?;
     server.run(shutdown_signal()).await?;

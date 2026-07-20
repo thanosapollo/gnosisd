@@ -102,6 +102,23 @@ impl DaemonServer {
         })
     }
 
+    pub async fn restore_backup(
+        config: DaemonConfig,
+        backup: impl AsRef<Path>,
+    ) -> Result<PathBuf, ServerError> {
+        validate_config(&config)?;
+        let startup_lock = StartupLock::acquire(&config.socket_path)?;
+        prepare_socket(&config.socket_path).await?;
+        let backup = backup.as_ref().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _startup_lock = startup_lock;
+            crate::service::cold_restore(&backup, &config.database_path, &config.blob_path)
+        })
+        .await
+        .map_err(|_| ServerError::RestoreTask)?
+        .map_err(|error| ServerError::Restore(Box::new(error)))
+    }
+
     pub fn http_addr(&self) -> Option<SocketAddr> {
         self.http_listener
             .as_ref()
@@ -658,6 +675,10 @@ pub enum ServerError {
     HttpTask,
     #[error("database initialization failed")]
     Store(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("cold restore failed")]
+    Restore(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("cold restore task failed")]
+    RestoreTask,
     #[error("blob storage initialization failed")]
     Blob(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("could not start database owner thread")]
@@ -777,6 +798,31 @@ mod tests {
         assert!(matches!(second, ServerError::StartupLocked));
         drop(first);
         assert!(StartupLock::acquire(&socket).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cold_restore_requires_exclusive_stopped_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("socket");
+        let config = DaemonConfig::new(&socket, directory.path().join("gnosis.sqlite"));
+
+        let startup_lock = StartupLock::acquire(&socket).unwrap();
+        let error = super::DaemonServer::restore_backup(
+            config.clone(),
+            directory.path().join("missing-backup"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ServerError::StartupLocked));
+        drop(startup_lock);
+
+        let server = super::DaemonServer::bind(config.clone()).await.unwrap();
+        let error =
+            super::DaemonServer::restore_backup(config, directory.path().join("missing-backup"))
+                .await
+                .unwrap_err();
+        assert!(matches!(error, ServerError::AlreadyRunning));
+        drop(server);
     }
 
     #[test]

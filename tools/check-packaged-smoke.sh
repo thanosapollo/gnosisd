@@ -85,11 +85,21 @@ test -n "$daemon_pid" || {
 
 stage device
 device=$($gnosis --socket "$socket" device-create packaged-smoke \
-    --scope read --scope review --scope content:write)
+    --scope read --scope review --scope content:write --scope settings:write)
 device_id=$(printf %s "$device" | jq -er .device.device_id)
 token=$(printf %s "$device" | jq -er .token)
 api=$http/v1
-auth="Authorization: Bearer $token"
+auth=$(printf '%s%s' 'Authorization: Bearer ' "$token")
+
+stage asset
+asset_file=$temporary/smoke-asset.png
+printf 'cold restore asset\n' >"$asset_file"
+asset_digest=$(sha256sum "$asset_file" | cut -d ' ' -f 1)
+asset_path=assets/$asset_digest/smoke-asset.png
+curl --fail-with-body --silent --show-error \
+    -H "$auth" -H 'Idempotency-Key: smoke-create-asset' \
+    -H 'Content-Type: image/png' --data-binary "@$asset_file" \
+    -X PUT "$api/$asset_path" >/dev/null
 
 stage content
 note=$(curl --fail-with-body --silent --show-error \
@@ -104,9 +114,16 @@ curl --fail-with-body --silent --show-error -H "$auth" \
 thema=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Idempotency-Key: smoke-create-thema' \
     -H 'Content-Type: application/json' \
-    -d '{"kind":"basic","keimenon":"Ready?","hypothesis":[],"answer":["yes"],"tags":["smoke"],"concepts":[{"node_id":"smoke-node","relation":"primary"}],"asset_paths":[]}' \
+    -d "{\"kind\":\"basic\",\"keimenon\":\"Ready?\",\"hypothesis\":[],\"answer\":[\"yes\"],\"tags\":[\"smoke\"],\"concepts\":[{\"node_id\":\"smoke-node\",\"relation\":\"primary\"}],\"asset_paths\":[\"$asset_path\"]}" \
     "$api/themata")
 thema_id=$(printf %s "$thema" | jq -er .authoritative.value.thema_id)
+
+stage settings
+curl --fail-with-body --silent --show-error \
+    -H "$auth" -H 'Idempotency-Key: smoke-settings' -H 'If-Match: "1"' \
+    -H 'Content-Type: application/json' -X PUT \
+    -d '{"timezone":"Europe/Athens","day_boundary_hour":4,"desired_retention":0.9}' \
+    "$api/settings" | jq -e '.changed == true' >/dev/null
 
 stage review
 session=$(curl --fail-with-body --silent --show-error \
@@ -134,17 +151,6 @@ stage review-commit
 curl --fail-with-body --silent --show-error -H "$auth" -X POST \
     "$api/review/attempts/$attempt_id/commit" | jq -e '.event_id | length > 0' >/dev/null
 
-stage cleanup-content
-curl --fail-with-body --silent --show-error -H "$auth" \
-    -H 'Idempotency-Key: smoke-archive-thema' -H 'If-Match: "1"' \
-    -X POST "$api/themata/$thema_id/archive" \
-    | jq -e '.authoritative.value.archived == true' >/dev/null
-stage cleanup-note
-curl --fail-with-body --silent --show-error -H "$auth" \
-    -H 'Idempotency-Key: smoke-delete-document' -H 'If-Match: "1"' \
-    -X DELETE "$api/document-mutations/$document_id" \
-    | jq -e '.authoritative.active == false' >/dev/null
-
 stage backup
 backup_json=$($gnosis --socket "$socket" admin backup create --directory "$backups")
 backup=$(printf %s "$backup_json" | jq -er .path)
@@ -152,9 +158,59 @@ $gnosis --socket "$socket" admin backup verify "$backup" >/dev/null
 $gnosis --socket "$socket" admin backup restore-validate "$backup" \
     --temporary-directory "$restore" >/dev/null
 test ! -e "$restore"
-$gnosis --socket "$socket" device-revoke "$device_id" >/dev/null
 
 stage shutdown
+kill -TERM "$daemon_pid"
+wait "$daemon_pid"
+daemon_pid=
+
+stage cold-restore
+printf 'simulated database loss\n' >"$database"
+"$gnosisd" --socket "$socket" --database "$database" --blob-root "$blobs" \
+    --restore-from "$backup" >/dev/null
+rollback=$temporary/data/.gnosis.sqlite.restore-rollback
+test -f "$rollback/gnosis.sqlite"
+test -d "$rollback/blobs"
+test "$(stat -c %a "$rollback")" = 700
+
+stage restart-restored
+"$gnosisd" --socket "$socket" --database "$database" \
+    --blob-root "$blobs" --http-listen "127.0.0.1:$port" \
+    >"$log" 2>&1 &
+daemon_pid=$!
+count=0
+while test "$count" -lt 100; do
+    if body=$(curl --fail --silent "$http/health" 2>/dev/null); then
+        test "$body" = '{"status":"ready"}'
+        break
+    fi
+    kill -0 "$daemon_pid" 2>/dev/null || {
+        cat "$log" >&2
+        exit 1
+    }
+    count=$((count + 1))
+    sleep 0.05
+done
+test "$count" -lt 100
+
+stage verify-restored-state
+curl --fail-with-body --silent --show-error -H "$auth" "$api/notes/$document_id" \
+    | grep -q '#+TITLE: Smoke'
+curl --fail-with-body --silent --show-error -H "$auth" "$api/nodes/smoke-node" \
+    | jq -e '.node_id == "smoke-node"' >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" "$api/themata/$thema_id" \
+    | jq -e --arg asset "$asset_path" \
+        '.concepts == [{"node_id":"smoke-node","relation":"primary"}] and .asset_paths == [$asset]' \
+        >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" "$api/$asset_path" \
+    | cmp -s - "$asset_file"
+curl --fail-with-body --silent --show-error -H "$auth" "$api/settings" \
+    | jq -e '.revision == 2 and .timezone == "Europe/Athens" and .day_boundary_hour == 4' \
+        >/dev/null
+curl --fail-with-body --silent --show-error -H "$auth" "$api/review/history" \
+    | jq -e --arg thema "$thema_id" '.items | any(.thema_id == $thema)' >/dev/null
+$gnosis --socket "$socket" device-revoke "$device_id" >/dev/null
+
 kill -TERM "$daemon_pid"
 wait "$daemon_pid"
 daemon_pid=

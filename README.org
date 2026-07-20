@@ -337,6 +337,23 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 Restore validation materializes and checks a temporary instance without
 replacing the live server.
 
+Cold restore requires the daemon to be stopped. It validates and stages the
+complete backup before replacing either target, then preserves the prior
+database and blob tree in a mode-0700 ~.DATABASE.restore-rollback~ directory:
+
+#+begin_src sh
+systemctl --user stop gnosisd
+gnosisd --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
+  --blob-root "$HOME/.local/share/gnosis/blobs" \
+  --restore-from BACKUP_PATH
+systemctl --user start gnosisd
+#+end_src
+
+Restore refuses a running daemon, occupied socket path, invalid backup, or
+existing rollback directory. Verify service state and restored data before
+removing the reported rollback directory.
+
 * Scope
 
 This remains a single-user canonical server. Remote non-Tailnet transport,
