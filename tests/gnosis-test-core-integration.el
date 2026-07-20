@@ -112,6 +112,8 @@
                                   (gnosis-nodes--safe-path root path))))
           (gnosis-nodes--write-document path local)
           (gnosis-nodes-sync)
+          ;; Mutation results never advance the feed-owned base; consume the feed.
+          (gnosis-nodes-sync)
           (should (= 2 (plist-get (gnosis-nodes--base
                                    (gnosis-nodes--read-state) document-id path)
                                   :revision)))

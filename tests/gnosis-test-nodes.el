@@ -61,7 +61,11 @@
     (unwind-protect
         (progn
           (gnosis-nodes--write-state state)
-          (should (equal state (gnosis-nodes--read-state))))
+          (let ((stored (gnosis-nodes--read-state)))
+            (should (equal (plist-get stored :notes-root)
+                           (file-truename (file-name-as-directory directory))))
+            (should (equal (plist-get stored :service-authority)
+                           (gnosis-core--validated-base-url)))))
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-refuses-symlink-materialization ()
@@ -334,6 +338,68 @@
             (gnosis-nodes-track-all-files))
           (should (= 2 (length (plist-get (gnosis-nodes--read-state) :outbox)))))
       (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-dependent-save-waits-for-canonical-feed-base ()
+  (let* ((first (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" "old" nil "old"))
+         (state `(:bases [] :outbox [,first] :conflicts [])))
+    (setf (plist-get first :status) :uncertain)
+    (setq state
+          (gnosis-nodes--queue-save
+           state '(:document-id nil :logical-path "note.org") "new"))
+    (let ((dependent (aref (plist-get state :outbox) 1)))
+      (should (eq :blocked (plist-get dependent :status)))
+      (should (equal (plist-get first :operation-id)
+                     (plist-get dependent :depends-on))))))
+
+(ert-deftest gnosis-nodes-conflict-remains-until-feed-confirms-accepted-bytes ()
+  (let* ((directory (make-temp-file "gnosis-nodes-conflict" t))
+         (gnosis-nodes-directory directory)
+         (bytes (string-to-unibyte "merged"))
+         (digest (gnosis-nodes--digest bytes))
+         (record '(:document-id "doc" :logical-path "note.org"
+                   :remote-revision 2 :remote-digest "remote"))
+         (state `(:bases [] :outbox [] :conflicts [,record])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" bytes)
+          (cl-letf (((symbol-function 'gnosis-nodes--read-state)
+                     (lambda () state))
+                    ((symbol-function 'gnosis-nodes--write-state)
+                     (lambda (value) (setq state value)))
+                    ((symbol-function 'gnosis-nodes--remote-conflict-current-p)
+                     (lambda (&rest _) t)))
+            (gnosis-nodes-accept-conflict))
+          (should (= 1 (length (plist-get state :conflicts))))
+          (should (equal digest
+                         (plist-get (aref (plist-get state :conflicts) 0)
+                                    :accepted-digest))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-track-all-files-skips-symlink-escape ()
+  (let* ((directory (make-temp-file "gnosis-nodes-all-safe" t))
+         (outside (make-temp-file "gnosis-nodes-outside" nil ".org" "outside"))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "private/state.json" directory))
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (make-symbolic-link outside (expand-file-name "linked.org" directory))
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+            (gnosis-nodes-track-all-files))
+          (should (= 0 (length (plist-get (gnosis-nodes--read-state) :outbox)))))
+      (delete-directory directory t)
+      (delete-file outside))))
+
+(ert-deftest gnosis-nodes-idle-sync-refuses-reentry ()
+  (let ((gnosis-nodes--busy t)
+        called)
+    (cl-letf (((symbol-function 'gnosis-nodes-sync)
+               (lambda () (setq called t))))
+      (gnosis-nodes--idle-sync)
+      (should-not called))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here

@@ -58,8 +58,8 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 (defconst gnosis-core--response-header-limit (* 64 1024)
   "Maximum accepted HTTP response header size in bytes.")
 
-(defconst gnosis-core--json-null (make-symbol "gnosis-json-null"))
-(defconst gnosis-core--json-false (make-symbol "gnosis-json-false"))
+(defconst gnosis-core--json-null :gnosis-json-null)
+(defconst gnosis-core--json-false :gnosis-json-false)
 
 (defconst gnosis-core--http-methods
   '("delete" "get" "head" "options" "patch" "post" "put" "trace"))
@@ -1073,8 +1073,11 @@ ACTIVE constrain an applied authoritative head when non-nil."
                     (or (null digest)
                         (equal digest (plist-get head :content_sha256)))
                     (or (null active)
-                        (eq (not (eq active :inactive))
-                            (not (null (plist-get head :active))))))
+                        (pcase active
+                          (:inactive
+                           (eq (plist-get head :active)
+                               gnosis-core--json-false))
+                          (_ (eq (plist-get head :active) t)))))
          (signal 'gnosis-core-mutation-uncertain
                  '("Gnosis mutation authoritative head is invalid")))))
     ("rejected"
