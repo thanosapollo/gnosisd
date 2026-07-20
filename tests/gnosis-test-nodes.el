@@ -451,6 +451,8 @@
 (ert-deftest gnosis-nodes-accept-conflict-restores-file-when-state-write-fails ()
   (let* ((directory (make-temp-file "gnosis-nodes-conflict-write" t))
          (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
          (original (string-to-unibyte "before"))
          (merged (string-to-unibyte "merged"))
          (merge-file (expand-file-name "merge.org" directory))
@@ -487,6 +489,7 @@
           (should (equal original
                          (gnosis-nodes--managed-bytes
                           directory (expand-file-name "note.org" directory))))
+          (should (= writes 2))
           (should (eq :unresolved
                       (plist-get (aref (plist-get state :conflicts) 0) :status))))
       (remhash session-id gnosis-nodes--ediff-sessions)
