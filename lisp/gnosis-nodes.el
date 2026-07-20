@@ -219,6 +219,20 @@ Reject non-regular destinations without opening them."
       (signal 'gnosis-nodes-path-error (list path)))
     (gnosis-nodes--read-bytes path)))
 
+(defun gnosis-nodes--managed-bytes (root path)
+  "Return exact bytes from regular PATH confined below private ROOT."
+  (unless (and (stringp path) (stringp root))
+    (signal 'gnosis-nodes-path-error (list path)))
+  (let* ((root (file-name-as-directory (expand-file-name root)))
+         (path (expand-file-name path)))
+    (unless (and (string-prefix-p root path)
+                 (not (gnosis-nodes--symlink-ancestor-p root))
+                 (not (gnosis-nodes--symlink-component-p root path))
+                 (file-regular-p path)
+                 (not (file-symlink-p path)))
+      (signal 'gnosis-nodes-path-error (list path)))
+    (gnosis-nodes--read-bytes path)))
+
 (defun gnosis-nodes--digest (bytes)
   "Return SHA-256 hex digest of unibyte BYTES."
   (secure-hash 'sha256 (string-to-unibyte bytes)))
@@ -661,6 +675,14 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
      ((and conflict
            (eq :accept-remote (plist-get conflict :resolution)))
       (gnosis-nodes--accept-remote-conflict state conflict))
+     ((and conflict
+           (> (plist-get projection :revision)
+              (plist-get conflict :remote-revision)))
+      (gnosis-nodes--record-conflict
+       state base projection local-bytes
+       (and remote-digest
+            (or (cdr (assoc remote-digest blobs))
+                (gnosis-core-blob remote-digest)))))
      (conflict state)
      ((and base (= (plist-get base :revision)
                    (plist-get projection :revision)))
@@ -686,7 +708,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                              (buffer-modified-p destination-buffer)))
                    (equal remote-digest
                           (gnosis-nodes--digest
-                           (gnosis-nodes--read-bytes destination-path)))))
+                           (gnosis-nodes--working-bytes destination-path)))))
              (unresolved
               (seq-find
                (lambda (entry)
@@ -817,8 +839,9 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
 (defun gnosis-nodes--read-snapshot-page (record)
   "Read checksummed snapshot page from spool RECORD."
   (let* ((file (plist-get record :file))
-         (bytes (and (stringp file) (file-readable-p file)
-                     (gnosis-nodes--read-bytes file))))
+         (bytes (gnosis-nodes--managed-bytes
+                 (expand-file-name "snapshot/" (gnosis-nodes--state-directory))
+                 file)))
     (unless (and bytes
                  (equal (plist-get record :sha256)
                         (gnosis-nodes--digest bytes)))
@@ -858,8 +881,10 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
   "Return verified bytes from snapshot blob RECORD."
   (let* ((digest (plist-get record :sha256))
          (file (plist-get record :file))
-         (bytes (and (stringp file) (file-readable-p file)
-                     (gnosis-nodes--read-bytes file))))
+         (bytes (gnosis-nodes--managed-bytes
+                 (expand-file-name "snapshot/blobs/"
+                                   (gnosis-nodes--state-directory))
+                 file)))
     (unless (and bytes (equal digest (gnosis-nodes--digest bytes)))
       (signal 'gnosis-nodes-error '("Gnosis snapshot blob checksum failed")))
     bytes))
@@ -1908,13 +1933,19 @@ Edit and save Ediff's merge buffer; acceptance reads that separate file."
                      gnosis-nodes-dir
                      (or (plist-get record :local-path)
                          (plist-get record :logical-path))))
-             (bytes (and (file-exists-p local) (gnosis-nodes--read-bytes local)))
-             (local-buffer (find-file-noselect local))
-             (remote-buffer (find-file-noselect (plist-get record :remote-file)))
-             (base-buffer (find-file-noselect (plist-get record :base-file)))
+             (bytes (gnosis-nodes--working-bytes local))
              (conflict-directory
               (gnosis-nodes--conflict-directory
                (plist-get record :document-id)))
+             (local-buffer (find-file-noselect local))
+             (remote-file (plist-get record :remote-file))
+             (base-file (plist-get record :base-file))
+             (_remote-bytes
+              (gnosis-nodes--managed-bytes conflict-directory remote-file))
+             (_base-bytes
+              (gnosis-nodes--managed-bytes conflict-directory base-file))
+             (remote-buffer (find-file-noselect remote-file))
+             (base-buffer (find-file-noselect base-file))
              merge-file)
         (unless bytes (user-error "Local conflict file no longer exists"))
         (make-directory conflict-directory t)
@@ -1986,12 +2017,15 @@ Revalidate merge-buffer bytes and remote head before queueing."
              (local-path (or (plist-get record :local-path) logical-path))
              (path (gnosis-nodes--safe-path gnosis-nodes-dir local-path))
              (merge-file (plist-get record :merge-file))
+             (conflict-directory
+              (gnosis-nodes--conflict-directory
+               (plist-get record :document-id)))
              (local-buffer (get-file-buffer path))
              (merge-buffer (and merge-file (get-file-buffer merge-file)))
-             (local-bytes (and (file-exists-p path)
-                               (gnosis-nodes--read-bytes path)))
-             (bytes (and merge-file (file-exists-p merge-file)
-                         (gnosis-nodes--read-bytes merge-file)))
+             (local-bytes (gnosis-nodes--working-bytes path))
+             (bytes (and merge-file
+                         (gnosis-nodes--managed-bytes
+                          conflict-directory merge-file)))
              (digest (and bytes (gnosis-nodes--digest bytes))))
         (unless bytes (user-error "Local merge file no longer exists"))
         (when (or (and (buffer-live-p local-buffer)
@@ -2192,8 +2226,11 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
            (expand-file-name "local-backup.org"
                              (gnosis-nodes--conflict-directory
                               (plist-get record :document-id))))
-        (let ((remote-bytes (gnosis-nodes--read-bytes
-                             (plist-get record :remote-file))))
+        (let ((remote-bytes
+               (gnosis-nodes--managed-bytes
+                (gnosis-nodes--conflict-directory
+                 (plist-get record :document-id))
+                (plist-get record :remote-file))))
           (unless (equal (gnosis-nodes--digest remote-bytes)
                          (plist-get record :remote-digest))
             (signal 'gnosis-nodes-error '("Invalid remote conflict sidecar")))
@@ -2217,7 +2254,7 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
                     gnosis-nodes-dir
                     (or (plist-get record :local-path)
                         (plist-get record :logical-path))))
-             (bytes (and (file-exists-p path) (gnosis-nodes--read-bytes path))))
+             (bytes (gnosis-nodes--working-bytes path)))
         (setq state (gnosis-nodes--keep-local-conflict state record bytes))
         (gnosis-nodes--write-state state)
         (message "Gnosis local conflict resolution queued")))))

@@ -392,6 +392,8 @@
           (gnosis-nodes--write-bytes merge-file bytes)
           (cl-letf (((symbol-function 'gnosis-nodes--read-state)
                      (lambda () state))
+                    ((symbol-function 'gnosis-nodes--conflict-directory)
+                     (lambda (_) directory))
                     ((symbol-function 'gnosis-nodes--write-state)
                      (lambda (value) (setq state value)))
                     ((symbol-function 'gnosis-nodes--remote-conflict-current-p)
@@ -887,10 +889,8 @@
                (lambda (&rest _) "/dev/null"))
               ((symbol-function 'gnosis-nodes--working-bytes)
                (lambda (_) (string-to-unibyte "local")))
-              ((symbol-function 'gnosis-nodes--read-bytes)
-               (lambda (path)
-                 (if (equal path "remote-file") remote
-                   (string-to-unibyte "local"))))
+              ((symbol-function 'gnosis-nodes--managed-bytes)
+               (lambda (&rest _) remote))
               ((symbol-function 'gnosis-nodes--write-state) #'ignore)
               ((symbol-function 'gnosis-nodes--write-document) #'ignore))
       (setq state (gnosis-nodes--accept-remote-conflict state record))
@@ -1124,8 +1124,9 @@
          (user-emacs-directory (file-name-as-directory root))
          (gnosis-nodes-state-file nil)
          (local (expand-file-name "note.org" root))
-         (base (expand-file-name "base.org" root))
-         (remote (expand-file-name "remote.org" root))
+         (conflict-directory (gnosis-nodes--conflict-directory "doc"))
+         (base (expand-file-name "base.org" conflict-directory))
+         (remote (expand-file-name "remote.org" conflict-directory))
          (record `(:document-id "doc" :local-path "note.org"
                    :logical-path "note.org" :base-file ,base
                    :remote-file ,remote))
@@ -1133,6 +1134,7 @@
          output)
     (unwind-protect
         (progn
+          (make-directory conflict-directory t)
           (dolist (file (list local base remote))
             (gnosis-nodes--write-bytes file "bytes"))
           (require 'ediff)
@@ -1442,7 +1444,9 @@
             (gnosis-nodes--write-document local-path (string-to-unibyte "local"))
             (when remote-bytes
               (gnosis-nodes--write-bytes remote-file remote-bytes))
-            (setq state (gnosis-nodes--apply-document state projection))
+            (cl-letf (((symbol-function 'gnosis-nodes--conflict-directory)
+                       (lambda (_) directory)))
+              (setq state (gnosis-nodes--apply-document state projection)))
             (should (= 0 (length (plist-get state :conflicts))))
             (should (eq :superseded
                         (plist-get (aref (plist-get state :outbox) 0) :status)))
@@ -1775,6 +1779,56 @@
             (should (= 1 (length (plist-get state :conflicts))))
             (should (eq :pending (plist-get entry :status)))))
       (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-newer-remote-head-updates-unresolved-conflict ()
+  (let* ((directory (make-temp-file "gnosis-nodes-new-head" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (entry '(:operation-id "rename" :kind :rename
+                  :document-id "doc" :status :pending))
+         (old '(:document-id "doc" :kind :tombstone
+                :local-path "note.org" :logical-path "note.org"
+                :local-digest nil :remote-digest nil :remote-revision 2
+                :projection (:document_id "doc" :revision 2
+                             :logical_path "note.org"
+                             :content_sha256 nil :operation "tombstone")))
+         (projection '(:document_id "doc" :revision 3
+                       :logical_path "note.org"
+                       :content_sha256 nil :operation "tombstone"))
+         (state `(:bases [] :outbox [,entry] :conflicts [,old])))
+    (unwind-protect
+        (progn
+          (setq state (gnosis-nodes--apply-document state projection))
+          (should (= 3 (plist-get (aref (plist-get state :conflicts) 0)
+                                  :remote-revision)))
+          (should (eq :pending (plist-get entry :status))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-managed-bytes-rejects-unsafe-state-paths-before-read ()
+  (let* ((root (make-temp-file "gnosis-nodes-managed" t))
+         (outside (make-temp-file "gnosis-nodes-outside" nil nil "outside"))
+         (regular (expand-file-name "regular" root))
+         (directory (expand-file-name "directory" root))
+         (link (expand-file-name "link" root))
+         read)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-bytes regular "inside")
+          (make-directory directory)
+          (make-symbolic-link outside link)
+          (cl-letf (((symbol-function 'gnosis-nodes--read-bytes)
+                     (lambda (path)
+                       (setq read path)
+                       "inside")))
+            (should (equal "inside" (gnosis-nodes--managed-bytes root regular)))
+            (dolist (path (list outside directory link))
+              (setq read nil)
+              (should-error (gnosis-nodes--managed-bytes root path)
+                            :type 'gnosis-nodes-path-error)
+              (should-not read))))
+      (delete-directory root t)
+      (delete-file outside))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
