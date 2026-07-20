@@ -1617,5 +1617,125 @@
           (should (= 0 (length (plist-get state :conflicts)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-state-preserves-protocol-false-in-receipts ()
+  (let* ((directory (make-temp-file "gnosis-nodes-state-false" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (projection `(:document_id "doc" :revision 2 :logical_path "note.org"
+                       :content_sha256 nil :active ,gnosis-core--json-false
+                       :operation "tombstone"))
+         (entry `(:operation-id "op" :status :applied :document-id "doc"
+                  :result (:status "applied" :authoritative ,projection)))
+         (record `(:document-id "doc" :projection ,projection))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "cursor" :bases [] :outbox [,entry]
+                  :conflicts [,record])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (let* ((stored (gnosis-nodes--read-state))
+                 (stored-entry (aref (plist-get stored :outbox) 0))
+                 (stored-record (aref (plist-get stored :conflicts) 0)))
+            (should (eq gnosis-core--json-false
+                        (plist-get
+                         (plist-get (plist-get stored-entry :result) :authoritative)
+                         :active)))
+            (should (gnosis-nodes--entry-confirms-conflict-p
+                     stored-entry stored-record))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-accept-remote-finishes-post-effect-restart ()
+  (let* ((directory (make-temp-file "gnosis-nodes-accept-post-effect" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (bytes (string-to-unibyte "remote"))
+         (digest (gnosis-nodes--digest bytes))
+         (projection `(:document_id "doc" :revision 2 :logical_path "note.org"
+                       :content_sha256 ,digest :blob_url ,(concat "/v1/blobs/" digest)
+                       :operation "update" :projection (:active t)))
+         (record `(:document-id "doc" :kind :update :local-path "note.org"
+                   :logical-path "note.org" :local-digest "old"
+                   :remote-digest ,digest :remote-revision 2
+                   :projection ,projection :resolution :accept-remote))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "after" :bases [] :outbox [] :conflicts [,record])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" bytes)
+          (gnosis-nodes--write-state state)
+          (setq state (gnosis-nodes--read-state)
+                record (aref (plist-get state :conflicts) 0)
+                state (gnosis-nodes--accept-remote-conflict state record))
+          (should (= 0 (length (plist-get state :conflicts))))
+          (should (= 2 (plist-get (aref (plist-get state :bases) 0) :revision))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-corrupt-snapshot-restarts-from-first-page ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot-restart" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (first-file (gnosis-nodes--snapshot-spool-file 0))
+         (last-file (gnosis-nodes--snapshot-spool-file 1))
+         (first-bytes (encode-coding-string
+                       (json-serialize '(:version 1 :snapshot_id "s" :cursor nil
+                                         :next "two" :items [])) 'utf-8 t))
+         (last-bytes (encode-coding-string
+                      (json-serialize '(:version 1 :snapshot_id "s" :cursor nil
+                                        :next nil :items [])) 'utf-8 t))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "before" :bases [] :outbox [] :conflicts []
+                  :snapshot (:snapshot-id "s" :next nil :cursor nil
+                             :seen ["two"]
+                             :pages [(:file ,first-file :sha256 "wrong")
+                                     (:file ,last-file
+                                      :sha256 ,(gnosis-nodes--digest last-bytes))]
+                             :blobs [])))
+         calls)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-bytes first-file first-bytes)
+          (gnosis-nodes--write-bytes last-file last-bytes)
+          (gnosis-nodes--write-state state)
+          (should-error (gnosis-nodes--snapshot (gnosis-nodes--read-state))
+                        :type 'gnosis-nodes-error)
+          (should-not (plist-get (gnosis-nodes--read-state) :snapshot))
+          (cl-letf (((symbol-function 'gnosis-core-sync-snapshot)
+                     (lambda (next)
+                       (push next calls)
+                       '(:version 1 :snapshot_id "fresh" :cursor "cut"
+                         :next nil :items []))))
+            (gnosis-nodes--snapshot (gnosis-nodes--read-state)))
+          (should (equal '(nil) calls)))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-snapshot-spools-nested-document-blob ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot-blob" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (bytes (string-to-unibyte "snapshot"))
+         (digest (gnosis-nodes--digest bytes))
+         (item `(:entity_kind "document"
+                 :projection (:document_id "doc" :revision 1
+                              :logical_path "note.org" :operation "snapshot"
+                              :projection (:content_sha256 ,digest :active t))))
+         requested)
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-blob)
+                   (lambda (sha256)
+                     (setq requested sha256)
+                     bytes))
+                  ((symbol-function 'gnosis-nodes--write-state) #'ignore))
+          (let ((blobs
+                 (cdr (gnosis-nodes--snapshot-blobs
+                       '(:snapshot (:blobs []))
+                       (list (list :items (vector item)))))))
+            (should (equal digest requested))
+            (should (equal digest (caar blobs)))))
+      (delete-directory directory t))))
+
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
