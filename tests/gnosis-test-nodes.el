@@ -1788,6 +1788,7 @@
          (entry '(:operation-id "rename" :kind :rename
                   :document-id "doc" :status :pending))
          (old '(:document-id "doc" :kind :tombstone
+                :resolution :accept-remote
                 :local-path "note.org" :logical-path "note.org"
                 :local-digest nil :remote-digest nil :remote-revision 2
                 :projection (:document_id "doc" :revision 2
@@ -1802,6 +1803,8 @@
           (setq state (gnosis-nodes--apply-document state projection))
           (should (= 3 (plist-get (aref (plist-get state :conflicts) 0)
                                   :remote-revision)))
+          (should-not (plist-get (aref (plist-get state :conflicts) 0)
+                                 :resolution))
           (should (eq :pending (plist-get entry :status))))
       (delete-directory directory t))))
 
@@ -1826,9 +1829,29 @@
               (setq read nil)
               (should-error (gnosis-nodes--managed-bytes root path)
                             :type 'gnosis-nodes-path-error)
-              (should-not read))))
+              (should-not read)))
+          (let ((gnosis-nodes-state-file directory))
+            (should-error (gnosis-nodes--read-state)
+                          :type 'gnosis-nodes-path-error)))
       (delete-directory root t)
       (delete-file outside))))
+
+(ert-deftest gnosis-nodes-recovered-snapshot-validation-is-page-bounded ()
+  (let* ((gnosis-nodes-max-pages-per-pass 1)
+         (records [(:file "one") (:file "two") (:file "three")])
+         (state `(:snapshot (:snapshot-id "snapshot" :next nil
+                             :seen [] :pages ,records :blobs [])))
+         (reads 0))
+    (cl-letf (((symbol-function 'gnosis-nodes--read-snapshot-page)
+               (lambda (_record)
+                 (cl-incf reads)
+                 '(:version 1 :snapshot_id "snapshot" :cursor "cursor"
+                   :next nil :items [])))
+              ((symbol-function 'gnosis-nodes--write-state) #'ignore))
+      (let ((result (gnosis-nodes--snapshot state)))
+        (should (= 1 reads))
+        (should (= 1 (plist-get (plist-get result :snapshot)
+                                :validated-pages)))))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here

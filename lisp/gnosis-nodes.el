@@ -324,7 +324,9 @@ PAYLOAD captures exact bytes at enqueue time."
     (unless (file-readable-p file)
       (signal 'gnosis-nodes-error '("Gnosis synchronization is not bootstrapped")))
     (with-temp-buffer
-      (insert-file-contents file)
+      (insert (gnosis-nodes--managed-bytes
+               (file-name-directory file) file))
+      (goto-char (point-min))
       (let ((state
              (json-parse-buffer :object-type 'plist :array-type 'array
                                 :null-object nil
@@ -606,10 +608,12 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                        (gnosis-nodes--conflict-directory
                         (plist-get record :document-id)))))
           (and (null remote-bytes)
-               (file-regular-p backup)
                (equal (plist-get record :local-digest)
                       (gnosis-nodes--digest
-                       (gnosis-nodes--read-bytes backup)))))
+                       (gnosis-nodes--managed-bytes
+                        (gnosis-nodes--conflict-directory
+                         (plist-get record :document-id))
+                        backup)))))
       (and remote-bytes
            (equal remote-digest (gnosis-nodes--digest remote-bytes))
            (or (equal local-path remote-path)
@@ -670,12 +674,6 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
          (fingerprint (gnosis-nodes--projection-fingerprint projection)))
     (cond
      ((and conflict
-           (gnosis-nodes--accepted-remote-effect-p conflict projection))
-      (gnosis-nodes--finish-accept-remote state conflict projection))
-     ((and conflict
-           (eq :accept-remote (plist-get conflict :resolution)))
-      (gnosis-nodes--accept-remote-conflict state conflict))
-     ((and conflict
            (> (plist-get projection :revision)
               (plist-get conflict :remote-revision)))
       (gnosis-nodes--record-conflict
@@ -683,6 +681,12 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
        (and remote-digest
             (or (cdr (assoc remote-digest blobs))
                 (gnosis-core-blob remote-digest)))))
+     ((and conflict
+           (gnosis-nodes--accepted-remote-effect-p conflict projection))
+      (gnosis-nodes--finish-accept-remote state conflict projection))
+     ((and conflict
+           (eq :accept-remote (plist-get conflict :resolution)))
+      (gnosis-nodes--accept-remote-conflict state conflict))
      (conflict state)
      ((and base (= (plist-get base :revision)
                    (plist-get projection :revision)))
@@ -1113,7 +1117,8 @@ Reject a completed manifest that differs from EXPECTED-FINGERPRINT."
 (defun gnosis-nodes--snapshot (state &optional expected-fingerprint)
   "Durably fetch, validate, then materialize a full snapshot into STATE.
 When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
-  (let* ((resume (plist-get state :snapshot))
+  (catch 'gnosis-nodes--snapshot-pass
+    (let* ((resume (plist-get state :snapshot))
          (next (and resume (plist-get resume :next)))
          (pages (and resume (append (plist-get resume :pages) nil)))
          (snapshot-id (and resume (plist-get resume :snapshot-id)))
@@ -1124,10 +1129,23 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
          (pages-left gnosis-nodes-max-pages-per-pass))
     (when pages
       (condition-case nil
-          (let ((decoded-pages
-                 (mapcar #'gnosis-nodes--read-snapshot-page pages)))
-            (unless (gnosis-nodes--snapshot-pages-valid-p decoded-pages)
+          (let* ((validated (or (plist-get resume :validated-pages) 0))
+                 (stop (min (length pages)
+                            (+ validated gnosis-nodes-max-pages-per-pass)))
+                 (records (seq-subseq pages validated stop))
+                 (decoded-pages
+                  (mapcar #'gnosis-nodes--read-snapshot-page records)))
+            (unless (seq-every-p
+                     (lambda (candidate)
+                       (gnosis-nodes--snapshot-page-valid-p
+                        candidate snapshot-id))
+                     decoded-pages)
               (signal 'gnosis-nodes-error '("Invalid recovered snapshot")))
+            (setf (plist-get resume :validated-pages) stop)
+            (setq state (plist-put state :snapshot resume))
+            (gnosis-nodes--write-state state)
+            (when (< stop (length pages))
+              (throw 'gnosis-nodes--snapshot-pass state))
             (setq page (car (last decoded-pages))
                   seen (append (plist-get resume :seen) nil)))
         (error
@@ -1185,7 +1203,7 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
                 (plist-get snapshot :shapes) [])
           (setq state (plist-put state :snapshot snapshot))
           (gnosis-nodes--write-state state))
-        (gnosis-nodes--finalize-snapshot state expected-fingerprint)))))
+        (gnosis-nodes--finalize-snapshot state expected-fingerprint))))))
 
 (defun gnosis-nodes--pull (state)
   "Pull every change after STATE cursor, committing each validated page."
@@ -1718,7 +1736,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
                              :digest (plist-get head :digest)
                              :active t)))))
         (when base
-          (let* ((bytes (gnosis-nodes--read-bytes buffer-file-name))
+          (let* ((bytes (gnosis-nodes--working-bytes buffer-file-name))
                  (digest (gnosis-nodes--digest bytes)))
             (when (or head
                       (not (equal digest (plist-get base :digest))))
@@ -1798,7 +1816,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
     (gnosis-nodes--safe-path gnosis-nodes-dir logical-path)
     (unless (or (gnosis-nodes--base state nil logical-path)
                 (gnosis-nodes--outbox-entry-for state nil logical-path))
-      (let ((bytes (gnosis-nodes--read-bytes file)))
+      (let ((bytes (gnosis-nodes--working-bytes file)))
         (setq state
               (gnosis-nodes--enqueue
                state (gnosis-nodes--outbox-entry
@@ -2180,7 +2198,7 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
     (when (and (buffer-live-p buffer) (buffer-modified-p buffer))
       (signal 'gnosis-nodes-conflict (list logical-path)))
     (when (file-exists-p path)
-      (gnosis-nodes--write-bytes backup-file (gnosis-nodes--read-bytes path))
+      (gnosis-nodes--write-bytes backup-file (gnosis-nodes--working-bytes path))
       (delete-file path))
     (when (buffer-live-p buffer)
       (kill-buffer buffer))))
