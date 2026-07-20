@@ -79,7 +79,8 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 
 (defun gnosis-nodes--private-state-root ()
   "Return configured user's canonical private synchronization root."
-  (file-name-as-directory (locate-user-emacs-file "gnosis/sync/")))
+  (file-name-as-directory
+   (expand-file-name (locate-user-emacs-file "gnosis/sync/"))))
 
 (defun gnosis-nodes--symlink-ancestor-p (path)
   "Return non-nil when an existing component of PATH is a symlink."
@@ -577,7 +578,9 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
 
 (defun gnosis-nodes--accepted-remote-effect-p (record projection)
   "Return non-nil when RECORD's remote PROJECTION is already materialized."
-  (let* ((operation (plist-get projection :operation))
+  (and
+   (eq :accept-remote (plist-get record :resolution))
+   (let* ((operation (plist-get projection :operation))
          (remote-path (plist-get projection :logical_path))
          (local-path (plist-get record :local-path))
          (destination (gnosis-nodes--safe-path gnosis-nodes-dir remote-path))
@@ -606,7 +609,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                           (progn
                             (unless gnosis-nodes--preflight
                               (delete-file local-file))
-                            t)))))))))
+                            t))))))))))
 
 (defun gnosis-nodes--apply-document (state projection &optional blobs)
   "Reconcile document PROJECTION into working files and return STATE."
@@ -658,6 +661,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
      ((and conflict
            (eq :accept-remote (plist-get conflict :resolution)))
       (gnosis-nodes--accept-remote-conflict state conflict))
+     (conflict state)
      ((and base (= (plist-get base :revision)
                    (plist-get projection :revision)))
       (unless (equal (plist-get base :fingerprint) fingerprint)

@@ -1737,5 +1737,44 @@
             (should (equal digest (caar blobs)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-default-state-path-is-absolute-and-confined ()
+  (let ((user-emacs-directory "~/.emacs.d/")
+        (gnosis-nodes-state-file nil))
+    (should (equal (expand-file-name "~/.emacs.d/gnosis/sync/state.json")
+                   (gnosis-nodes--state-file)))))
+
+(ert-deftest gnosis-nodes-unresolved-conflict-preserves-lifecycle-intent ()
+  (let* ((directory (make-temp-file "gnosis-nodes-unresolved" t))
+         (gnosis-nodes-dir directory)
+         (bytes (string-to-unibyte "same"))
+         (digest (gnosis-nodes--digest bytes)))
+    (unwind-protect
+        (dolist (kind '(:rename :tombstone))
+          (let* ((operation (if (eq kind :tombstone) "tombstone" "update"))
+                 (projection
+                  (list :document_id "doc" :revision 2
+                        :logical_path "note.org"
+                        :content_sha256
+                        (unless (eq kind :tombstone) digest)
+                        :operation operation))
+                 (entry (list :operation-id "lifecycle" :kind kind
+                              :document-id "doc" :status :pending))
+                 (conflict
+                  (list :document-id "doc" :local-path "note.org"
+                        :logical-path "note.org" :local-digest digest
+                        :remote-digest
+                        (unless (eq kind :tombstone) digest)
+                        :remote-revision 2 :projection projection))
+                 (state (list :bases [] :outbox (vector entry)
+                              :conflicts (vector conflict))))
+            (if (eq kind :tombstone)
+                (when (file-exists-p (expand-file-name "note.org" directory))
+                  (delete-file (expand-file-name "note.org" directory)))
+              (gnosis-nodes--write-document "note.org" bytes))
+            (setq state (gnosis-nodes--apply-document state projection))
+            (should (= 1 (length (plist-get state :conflicts))))
+            (should (eq :pending (plist-get entry :status)))))
+      (delete-directory directory t))))
+
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
