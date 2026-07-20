@@ -34,11 +34,10 @@ use crate::{
         AnswerInput, ApplicationError, AssetHead, ContentChange,
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
         DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
-        MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord,
-        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
-        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
-        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
-        PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
+        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord, NodeThemaAssociation,
+        OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
+        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
+        PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
         PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
         ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
         ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
@@ -46,7 +45,7 @@ use crate::{
         ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
         SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
         ThemaReviewState, prepare_offline_document, retained_asset_paths_in_org, token_digest,
-        validate_asset_path,
+        validate_asset_path, validate_blob_metadata,
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{ClozeCheck, DocumentId, DueThema},
@@ -379,7 +378,10 @@ impl ServiceHandle {
         media_type: String,
         created_at_us: i64,
     ) -> Result<BlobMeta, ServiceError> {
-        validate_blob_metadata(&bytes, &media_type)?;
+        let size_bytes =
+            u64::try_from(bytes.len()).map_err(|_| ServiceError::InvalidBlobMetadata)?;
+        validate_blob_metadata(size_bytes, &media_type)
+            .map_err(|_| ServiceError::InvalidBlobMetadata)?;
         let actual_digest = format!("{:x}", Sha256::digest(&bytes));
         if actual_digest != expected_digest {
             return Err(ServiceError::AssetDigest);
@@ -2862,21 +2864,6 @@ pub(crate) enum ServiceError {
     Settings(#[source] SettingsError),
     #[error("backup operation failed")]
     Backup(#[source] BackupError),
-}
-
-fn validate_blob_metadata(bytes: &[u8], media_type: &str) -> Result<(), ServiceError> {
-    let valid_media = !media_type.is_empty()
-        && media_type.len() <= 255
-        && media_type
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-        && media_type.trim() == media_type;
-    let size = u64::try_from(bytes.len()).map_err(|_| ServiceError::InvalidBlobMetadata)?;
-    if size == 0 || size > MAX_OFFLINE_ASSET_BYTES || !valid_media {
-        Err(ServiceError::InvalidBlobMetadata)
-    } else {
-        Ok(())
-    }
 }
 
 #[cfg(test)]

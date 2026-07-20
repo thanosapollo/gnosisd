@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
+    application::offline_asset::MAX_OFFLINE_ASSET_BYTES,
     domain::{
         DocumentId, DocumentProjection, NodeId, ThemaConcept, ThemaConceptRelation, ThemaContent,
         ThemaContentError, ThemaId, ThemaKind,
@@ -545,6 +546,23 @@ pub(crate) fn canonical_asset_path(
     Ok(path)
 }
 
+pub(crate) fn validate_blob_metadata(
+    size_bytes: u64,
+    media_type: &str,
+) -> Result<(), ContentError> {
+    let valid_media = !media_type.is_empty()
+        && media_type.len() <= 255
+        && media_type
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        && media_type.trim() == media_type;
+    if size_bytes == 0 || size_bytes > MAX_OFFLINE_ASSET_BYTES || !valid_media {
+        Err(ContentError::BlobMetadata)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn path_key(value: &str) -> String {
     value.to_lowercase()
 }
@@ -629,6 +647,8 @@ pub(crate) enum ContentError {
     Tag,
     #[error("logical path is invalid")]
     Path,
+    #[error("blob metadata is invalid")]
+    BlobMetadata,
     #[error("file type is not supported")]
     UnsupportedType,
     #[error("thema content references an asset that is not attached")]
@@ -648,9 +668,29 @@ mod tests {
     use crate::domain::ThemaConceptRelation;
 
     use super::{
-        ContentError, canonical_asset_path, prepare_note, prepare_thema, thema_content,
-        validate_asset_path,
+        ContentError, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_note, prepare_thema,
+        thema_content, validate_asset_path, validate_blob_metadata,
     };
+
+    #[test]
+    fn blob_metadata_matches_canonical_asset_limits() {
+        assert!(validate_blob_metadata(5, "image/png").is_ok());
+        for (size_bytes, media_type) in [
+            (0, "image/png"),
+            (5, ""),
+            (5, " image/png"),
+            (5, "image/png\n"),
+        ] {
+            assert_eq!(
+                validate_blob_metadata(size_bytes, media_type),
+                Err(ContentError::BlobMetadata)
+            );
+        }
+        assert_eq!(
+            validate_blob_metadata(MAX_OFFLINE_ASSET_BYTES + 1, "image/png"),
+            Err(ContentError::BlobMetadata)
+        );
+    }
 
     #[test]
     fn rejects_escaping_absolute_and_unsupported_links() {

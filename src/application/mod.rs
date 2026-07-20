@@ -34,7 +34,7 @@ pub(crate) use content::{
     PreparedNote, PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
     ThemaRecord, ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
     prepare_note, prepare_thema, retained_asset_paths_in_org, stored_thema_content, thema_content,
-    validate_asset_path, validate_offline_thema_assets, validate_org_path,
+    validate_asset_path, validate_blob_metadata, validate_offline_thema_assets, validate_org_path,
 };
 pub(crate) use device_mutation::{
     DeviceDesiredStateMutation, DeviceDocumentLifecycleMutation, DeviceMutationCursor,

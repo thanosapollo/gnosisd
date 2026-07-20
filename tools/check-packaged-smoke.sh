@@ -92,20 +92,39 @@ api=$http/v1
 auth=$(printf '%s%s' 'Authorization: Bearer ' "$token")
 
 stage asset
-asset_file=$temporary/smoke-asset.png
-printf 'cold restore asset\n' >"$asset_file"
-asset_digest=$(sha256sum "$asset_file" | cut -d ' ' -f 1)
-asset_path=assets/$asset_digest/smoke-asset.png
-curl --fail-with-body --silent --show-error \
-    -H "$auth" -H 'Idempotency-Key: smoke-create-asset' \
-    -H 'Content-Type: image/png' --data-binary "@$asset_file" \
-    -X PUT "$api/$asset_path" >/dev/null
+token_file=$temporary/device.token
+printf '%s\n' "$token" >"$token_file"
+chmod 600 "$token_file"
+asset_source=$temporary/image.png
+asset_fetch=$temporary/fetched.png
+asset_blob=$temporary/blob.png
+printf 'packaged managed asset' >"$asset_source"
+asset_size=$(wc -c <"$asset_source" | tr -d ' ')
+asset_digest=$(sha256sum "$asset_source" | cut -d ' ' -f 1)
+asset_path=assets/$asset_digest/image.png
+asset_put=$($gnosis --http-url "$http" --token-file "$token_file" \
+    asset put "$asset_digest" image.png --operation-id smoke-put-asset \
+    --media-type image/png <"$asset_source")
+printf %s "$asset_put" | jq -e \
+    --arg digest "$asset_digest" --arg path "$asset_path" \
+    '.status == "applied" and .operation_id == "smoke-put-asset" and
+     .authoritative.kind == "asset" and .authoritative.value.logical_path == $path and
+     .authoritative.value.content_sha256 == $digest and
+     .authoritative.value.media_type == "image/png" and
+     .authoritative.value.revision == 1 and .authoritative.value.active == true' >/dev/null
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset fetch "$asset_digest" image.png --revision 1 \
+    --size-bytes "$asset_size" --media-type image/png >"$asset_fetch"
+cmp "$asset_source" "$asset_fetch"
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset blob "$asset_digest" >"$asset_blob"
+cmp "$asset_source" "$asset_blob"
 
 stage content
 note=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Idempotency-Key: smoke-create-document' \
     -H 'Content-Type: application/json' \
-    -d '{"logical_path":"smoke.org","org":"#+TITLE: Smoke\n* Node\n:PROPERTIES:\n:ID: smoke-node\n:END:\nSee [[id:smoke-linked][Linked]].\n* Linked\n:PROPERTIES:\n:ID: smoke-linked\n:END:\n"}' \
+    -d "{\"logical_path\":\"smoke.org\",\"org\":\"#+TITLE: Smoke\\n* Node\\n:PROPERTIES:\\n:ID: smoke-node\\n:END:\\nSee [[id:smoke-linked][Linked]].\\n[[file:$asset_path]]\\n* Linked\\n:PROPERTIES:\\n:ID: smoke-linked\\n:END:\\n\"}" \
     "$api/document-mutations")
 document_id=$(printf %s "$note" | jq -er .authoritative.document_id)
 curl --fail-with-body --silent --show-error -H "$auth" \
@@ -216,13 +235,46 @@ curl --fail-with-body --silent --show-error -H "$auth" "$api/themata/$thema_id" 
     | jq -e --arg asset "$asset_path" \
         '.concepts == [{"node_id":"smoke-node","relation":"primary"}] and .asset_paths == [$asset]' \
         >/dev/null
-curl --fail-with-body --silent --show-error -H "$auth" "$api/$asset_path" \
-    | cmp -s - "$asset_file"
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset fetch "$asset_digest" image.png --revision 1 \
+    --size-bytes "$asset_size" --media-type image/png >"$asset_fetch"
+cmp "$asset_source" "$asset_fetch"
 curl --fail-with-body --silent --show-error -H "$auth" "$api/settings" \
     | jq -e '.revision == 2 and .timezone == "Europe/Athens" and .day_boundary_hour == 4' \
         >/dev/null
 curl --fail-with-body --silent --show-error -H "$auth" "$api/review/history" \
     | jq -e --arg thema "$thema_id" '.items | any(.thema_id == $thema)' >/dev/null
+
+stage cleanup-content
+curl --fail-with-body --silent --show-error -H "$auth" \
+    -H 'Idempotency-Key: smoke-archive-thema' -H 'If-Match: "1"' \
+    -X POST "$api/themata/$thema_id/archive" \
+    | jq -e '.authoritative.value.archived == true' >/dev/null
+stage cleanup-note
+curl --fail-with-body --silent --show-error -H "$auth" \
+    -H 'Idempotency-Key: smoke-delete-document' -H 'If-Match: "1"' \
+    -X DELETE "$api/document-mutations/$document_id" \
+    | jq -e '.authoritative.active == false' >/dev/null
+
+stage cleanup-asset
+asset_deleted=$($gnosis --http-url "$http" --token-file "$token_file" \
+    asset tombstone "$asset_digest" image.png --operation-id smoke-delete-asset \
+    --if-revision 1)
+printf %s "$asset_deleted" | jq -e \
+    '.status == "applied" and .operation_id == "smoke-delete-asset" and
+     .authoritative.kind == "asset" and .authoritative.value.revision == 2 and
+     .authoritative.value.active == false and .authoritative.value.content_sha256 == null and
+     .authoritative.value.media_type == null' >/dev/null
+if $gnosis --http-url "$http" --token-file "$token_file" \
+    asset fetch "$asset_digest" image.png --revision 2 \
+    --size-bytes "$asset_size" --media-type image/png \
+    >"$asset_fetch" 2>/dev/null; then
+    echo "tombstoned asset remained accessible" >&2
+    exit 1
+fi
+$gnosis --http-url "$http" --token-file "$token_file" \
+    asset blob "$asset_digest" >"$asset_blob"
+cmp "$asset_source" "$asset_blob"
 $gnosis --socket "$socket" device-revoke "$device_id" >/dev/null
 
 kill -TERM "$daemon_pid"
