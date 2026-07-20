@@ -39,6 +39,7 @@ struct StoredAttemptOperationPayload<'a> {
 const ATTEMPT_OPERATION_REPLAY_SQL: &str =
     "SELECT payload_sha256, result_json FROM review_attempt_operation
      WHERE operation_id = ?1 AND actor_kind = ?2 AND actor_device_id IS ?3";
+const MAX_TOPIC_TRAVERSAL_ROWS: i64 = 1_024;
 
 impl SqliteStore {
     pub(crate) fn create_review_session(
@@ -1462,45 +1463,69 @@ fn select_topic(
     let mut statement = connection
         .prepare(
             "WITH RECURSIVE
-             forward(node_id, depth) AS (
-                 VALUES (?1, 0)
+             walk(node_id, depth, direction) AS (
+                 VALUES (?1, 0, 0), (?1, 0, 1)
                  UNION
-                 SELECT edge.target_id, forward.depth + 1
-                 FROM node_edge AS edge JOIN forward ON edge.source_id = forward.node_id
-                 WHERE forward.depth < ?2
+                 SELECT edge.target_id, walk.depth + 1, walk.direction
+                 FROM node_edge AS edge
+                 JOIN walk ON walk.direction = 0 AND edge.source_id = walk.node_id
+                 WHERE walk.depth < ?2
+                 UNION
+                 SELECT edge.source_id, walk.depth + 1, walk.direction
+                 FROM node_edge AS edge
+                 JOIN walk ON walk.direction = 1 AND edge.target_id = walk.node_id
+                 WHERE walk.depth < ?3
+                 LIMIT ?4
              ),
-             backward(node_id, depth) AS (
-                 VALUES (?1, 0)
-                 UNION
-                 SELECT edge.source_id, backward.depth + 1
-                 FROM node_edge AS edge JOIN backward ON edge.target_id = backward.node_id
-                 WHERE backward.depth < ?3
+             traversal(row_count) AS (
+                 SELECT COUNT(*) FROM walk
              ),
              graph(node_id) AS (
-                 SELECT node_id FROM forward UNION SELECT node_id FROM backward
+                 SELECT DISTINCT node_id FROM walk
+             ),
+             candidate(thema_id, reviewed, next_review_day, traversal_exceeded) AS (
+                 SELECT DISTINCT thema.thema_id, (state.review_count > 0),
+                                 state.next_review_day, 0
+                 FROM graph
+                 JOIN thema_concept AS link ON link.concept_id = graph.node_id
+                 JOIN thema ON thema.thema_id = link.thema_id
+                 JOIN review_state AS state ON state.thema_id = thema.thema_id
+                 CROSS JOIN traversal
+                 WHERE thema.archived_at_us IS NULL AND state.suspended = 0
+                   AND traversal.row_count <= ?5
+                 UNION ALL
+                 SELECT NULL, 0, 0, 1 FROM traversal WHERE row_count > ?5
              )
-         SELECT DISTINCT thema.thema_id FROM graph
-         JOIN thema_concept AS link ON link.concept_id = graph.node_id
-         JOIN thema ON thema.thema_id = link.thema_id
-         JOIN review_state AS state ON state.thema_id = thema.thema_id
-         WHERE thema.archived_at_us IS NULL AND state.suspended = 0
-         ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id
-         LIMIT ?4",
+         SELECT thema_id, traversal_exceeded FROM candidate
+         ORDER BY traversal_exceeded DESC, reviewed, next_review_day, thema_id
+         LIMIT ?6",
         )
         .map_err(StoreError::storage)?;
-    statement
+    let rows = statement
         .query_map(
             params![
                 node_id,
                 i64::from(forward_depth),
                 i64::from(backward_depth),
+                MAX_TOPIC_TRAVERSAL_ROWS + 1,
+                MAX_TOPIC_TRAVERSAL_ROWS,
                 limit
             ],
-            |row| row.get(0),
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
         )
         .map_err(StoreError::storage)?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(StoreError::storage)
+        .map_err(StoreError::storage)?;
+    if rows
+        .first()
+        .is_some_and(|(_, traversal_exceeded)| *traversal_exceeded)
+    {
+        return Err(StoreError::InvalidReviewState);
+    }
+    Ok(rows
+        .into_iter()
+        .filter_map(|(thema_id, _)| thema_id)
+        .collect())
 }
 
 fn select_filtered(
@@ -2770,6 +2795,150 @@ mod tests {
             topic_backward_depth: None,
             manual_ids: ids.iter().map(|id| (*id).into()).collect(),
         }
+    }
+
+    fn topic_source(node_id: &str, forward_depth: u32, backward_depth: u32) -> ReviewSource {
+        ReviewSource {
+            kind: ReviewSourceKind::Topic,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: Some(node_id.into()),
+            topic_forward_depth: Some(forward_depth),
+            topic_backward_depth: Some(backward_depth),
+            manual_ids: vec![],
+        }
+    }
+
+    fn add_topic_nodes(store: &mut SqliteStore, node_ids: &[String]) {
+        let transaction = store.connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO document(
+                     document_id, revision, title, file_tags_json, content_sha256
+                 ) VALUES ('topic-document', 1, 'Topics', '[]', 'digest')",
+                [],
+            )
+            .unwrap();
+        for (ordinal, node_id) in node_ids.iter().enumerate() {
+            transaction
+                .execute("INSERT INTO node_identity(node_id) VALUES (?1)", [node_id])
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO node(
+                         document_id, ordinal, node_id, title, title_path_json, level
+                     ) VALUES ('topic-document', ?1, ?2, ?2, '[]', 1)",
+                    params![ordinal as i64, node_id],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    #[test]
+    fn topic_queue_preserves_ordering_and_result_limit_below_traversal_budget() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_topic_nodes(
+            &mut store,
+            &["backward".into(), "root".into(), "forward".into()],
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO node_edge(document_id, ordinal, source_id, target_id)
+                 VALUES ('topic-document', 0, 'backward', 'root'),
+                        ('topic-document', 1, 'root', 'forward')",
+                [],
+            )
+            .unwrap();
+        for (thema_id, concept_id) in [
+            ("thema-c", "root"),
+            ("thema-b", "forward"),
+            ("thema-a", "backward"),
+        ] {
+            add_thema(&mut store, thema_id, "Question", None);
+            store
+                .connection
+                .execute(
+                    "INSERT INTO thema_concept(thema_id, concept_id, relation)
+                     VALUES (?1, ?2, 'primary')",
+                    params![thema_id, concept_id],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            super::select_queue(
+                &store.connection,
+                &topic_source("root", 1, 1),
+                20260715,
+                Some(2),
+            )
+            .unwrap(),
+            ["thema-a", "thema-b"]
+        );
+    }
+
+    #[test]
+    fn topic_queue_rejects_wide_traversal_and_remains_usable() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_topic_nodes(&mut store, &["root".into()]);
+        let transaction = store.connection.transaction().unwrap();
+        for ordinal in 0..1_200 {
+            transaction
+                .execute(
+                    "INSERT INTO node_edge(document_id, ordinal, source_id, target_id)
+                     VALUES ('topic-document', ?1, 'root', ?2)",
+                    params![ordinal, format!("target-{ordinal}")],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        assert!(matches!(
+            super::select_queue(
+                &store.connection,
+                &topic_source("root", 1, 0),
+                20260715,
+                Some(1),
+            ),
+            Err(StoreError::InvalidReviewState)
+        ));
+        store.settings().unwrap();
+    }
+
+    #[test]
+    fn topic_queue_rejects_dense_cyclic_traversal() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let node_ids = (0..40)
+            .map(|index| format!("node-{index}"))
+            .collect::<Vec<_>>();
+        add_topic_nodes(&mut store, &node_ids);
+        let transaction = store.connection.transaction().unwrap();
+        let mut ordinal = 0;
+        for source_id in &node_ids {
+            for target_id in &node_ids {
+                transaction
+                    .execute(
+                        "INSERT INTO node_edge(document_id, ordinal, source_id, target_id)
+                         VALUES ('topic-document', ?1, ?2, ?3)",
+                        params![ordinal, source_id, target_id],
+                    )
+                    .unwrap();
+                ordinal += 1;
+            }
+        }
+        transaction.commit().unwrap();
+
+        assert!(matches!(
+            super::select_queue(
+                &store.connection,
+                &topic_source("node-0", 32, 32),
+                20260715,
+                Some(1),
+            ),
+            Err(StoreError::InvalidReviewState)
+        ));
     }
 
     fn grade_and_commit(
