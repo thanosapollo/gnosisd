@@ -48,6 +48,11 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
   :type 'natnum
   :group 'gnosis-nodes)
 
+(defcustom gnosis-nodes-max-outbox-scan-per-pass 256
+  "Maximum durable outbox entries inspected by one synchronization pass."
+  :type 'natnum
+  :group 'gnosis-nodes)
+
 (define-error 'gnosis-nodes-error "Gnosis Org synchronization failed")
 (define-error 'gnosis-nodes-path-error "Unsafe Gnosis Org path" 'gnosis-nodes-error)
 (define-error 'gnosis-nodes-conflict "Gnosis Org conflict" 'gnosis-nodes-error)
@@ -59,6 +64,8 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 (defvar gnosis-nodes--pull-complete t)
 (defvar gnosis-nodes--preflight nil)
 (defvar gnosis-nodes--conflict-base-blobs nil)
+(defvar gnosis-nodes--pages-left nil)
+(defvar gnosis-nodes--mutation-sent nil)
 
 (defun gnosis-nodes--private-state-root ()
   "Return configured user's canonical private synchronization root."
@@ -523,6 +530,25 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
   "Reconcile document PROJECTION into working files and return STATE."
   (let* ((document-id (plist-get projection :document_id))
          (logical-path (plist-get projection :logical_path))
+         (conflict
+          (seq-find (lambda (item)
+                      (equal document-id (plist-get item :document-id)))
+                    (append (plist-get state :conflicts) nil)))
+         (remote-revision (plist-get projection :revision))
+         (_conflict-head
+          (when conflict
+            (let ((conflict-revision (plist-get conflict :remote-revision))
+                  (conflict-projection (plist-get conflict :projection)))
+              (when (or (< remote-revision conflict-revision)
+                        (and (= remote-revision conflict-revision)
+                             (not
+                              (equal
+                               (gnosis-nodes--projection-fingerprint projection)
+                               (and conflict-projection
+                                    (gnosis-nodes--projection-fingerprint
+                                     conflict-projection))))))
+                (signal 'gnosis-nodes-error
+                        '("Gnosis conflict head changed projection"))))))
          (remote-digest
           (gnosis-nodes--nullable (plist-get projection :content_sha256)))
          (active (not (equal "tombstone" (plist-get projection :operation))))
@@ -533,7 +559,6 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                                  (plist-get base :document-id))))
             (signal 'gnosis-nodes-error
                     '("Gnosis logical path changed document identity"))))
-         (remote-revision (plist-get projection :revision))
          (_stale
           (when (and base (< remote-revision (plist-get base :revision)))
             (signal 'gnosis-nodes-error
@@ -869,11 +894,15 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
 (defun gnosis-nodes--pull (state)
   "Pull every change after STATE cursor, committing each validated page."
   (let ((seen (list (plist-get state :cursor)))
-        (pages-left gnosis-nodes-max-pages-per-pass)
+        (pages-left (if (integerp gnosis-nodes--pages-left)
+                        gnosis-nodes--pages-left
+                      gnosis-nodes-max-pages-per-pass))
         page done)
     (setq gnosis-nodes--pull-complete t)
     (while (and (not done) (> pages-left 0))
       (cl-decf pages-left)
+      (when (integerp gnosis-nodes--pages-left)
+        (setq gnosis-nodes--pages-left pages-left))
       (setq page (gnosis-core-sync-changes (plist-get state :cursor)))
       (unless (gnosis-nodes--change-page-valid-p
                page (plist-get state :cursor))
@@ -1023,19 +1052,29 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
         document-id operation-id revision logical-path payload))
       (:rename
        (gnosis-core-document-rename
-        document-id operation-id revision logical-path))
+        document-id operation-id revision logical-path
+        (plist-get entry :digest)))
       (:delete
-       (gnosis-core-document-tombstone document-id operation-id revision))
+       (gnosis-core-document-tombstone
+        document-id operation-id revision logical-path))
       (_ (signal 'gnosis-nodes-error '("Invalid Gnosis pending operation"))))))
 
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
-  (let ((outbox (plist-get state :outbox)))
+  (let ((outbox (plist-get state :outbox))
+        (inspected 0)
+        (sent 0))
     (catch 'gnosis-nodes--stop-outbox
-      (dotimes (index (min (length outbox)
-                           gnosis-nodes-max-mutations-per-pass))
+      (dotimes (index (length outbox))
+        (when (>= inspected gnosis-nodes-max-outbox-scan-per-pass)
+          (throw 'gnosis-nodes--stop-outbox nil))
+        (cl-incf inspected)
         (let ((entry (aref outbox index)))
           (when (eq :pending (plist-get entry :status))
+            (when (>= sent gnosis-nodes-max-mutations-per-pass)
+              (throw 'gnosis-nodes--stop-outbox nil))
+            (cl-incf sent)
+            (setq gnosis-nodes--mutation-sent t)
             (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
             (gnosis-nodes--write-state state)
             (condition-case nil
@@ -1143,36 +1182,49 @@ Server identity and prior protocol fingerprint must still match."
   (interactive)
   (unless (yes-or-no-p "Discard local Gnosis sync metadata and rebootstrap? ")
     (user-error "Reset cancelled"))
-  (gnosis-nodes--with-lock
-    (let* ((trusted (gnosis-nodes--read-state))
-           (identity (gnosis-core-sync-identity))
-           (remote (gnosis-core-sync-state))
-           (original-file (gnosis-nodes--state-file))
-           (temporary-file (concat original-file ".reset"))
-           (fresh (list :version 1
-                        :server-id (plist-get remote :server_id)
-                        :device-id (plist-get identity :device_id)
-                        :cursor (plist-get remote :cursor)
-                        :bases [] :outbox [] :conflicts [])))
-      (unless (stringp (plist-get trusted :protocol-fingerprint))
-        (user-error "Gnosis trusted protocol fingerprint is missing"))
-      (unless (and (equal (plist-get trusted :server-id)
-                          (plist-get fresh :server-id))
-                   (equal (plist-get trusted :device-id)
-                          (plist-get fresh :device-id)))
-        (signal 'gnosis-nodes-error '("Gnosis reset identity changed")))
-      (let ((gnosis-nodes-state-file temporary-file))
-        (unwind-protect
-            (progn
-              (gnosis-nodes--write-state fresh)
-              (setq fresh
-                    (gnosis-nodes--snapshot
-                     fresh (plist-get trusted :protocol-fingerprint)))
-              (let ((gnosis-nodes-state-file original-file))
-                (gnosis-nodes--write-state fresh)))
-          (when (file-exists-p temporary-file)
-            (delete-file temporary-file))))))
-  (message "Gnosis Org synchronization metadata reset"))
+  (let (complete)
+    (gnosis-nodes--with-lock
+      (let* ((trusted (gnosis-nodes--read-state))
+             (identity (gnosis-core-sync-identity))
+             (remote (gnosis-core-sync-state))
+             (original-file (gnosis-nodes--state-file))
+             (temporary-file (concat original-file ".reset"))
+             (fresh (list :version 1
+                          :server-id (plist-get remote :server_id)
+                          :device-id (plist-get identity :device_id)
+                          :cursor (plist-get remote :cursor)
+                          :bases [] :outbox [] :conflicts []))
+             (staged
+              (if (file-exists-p temporary-file)
+                  (let ((gnosis-nodes-state-file temporary-file))
+                    (gnosis-nodes--read-state))
+                fresh)))
+        (unless (stringp (plist-get trusted :protocol-fingerprint))
+          (user-error "Gnosis trusted protocol fingerprint is missing"))
+        (unless (and (equal (plist-get trusted :server-id)
+                            (plist-get staged :server-id))
+                     (equal (plist-get trusted :device-id)
+                            (plist-get staged :device-id))
+                     (equal (plist-get fresh :server-id)
+                            (plist-get staged :server-id))
+                     (equal (plist-get fresh :device-id)
+                            (plist-get staged :device-id)))
+          (signal 'gnosis-nodes-error '("Gnosis reset identity changed")))
+        (let ((gnosis-nodes-state-file temporary-file))
+          (unless (file-exists-p temporary-file)
+            (gnosis-nodes--write-state staged))
+          (setq staged
+                (gnosis-nodes--snapshot
+                 staged (plist-get trusted :protocol-fingerprint)))
+          (gnosis-nodes--write-state staged))
+        (setq complete (null (plist-get staged :snapshot)))
+        (when complete
+          (let ((gnosis-nodes-state-file original-file))
+            (gnosis-nodes--write-state staged))
+          (delete-file temporary-file))))
+    (message (if complete
+                 "Gnosis Org synchronization metadata reset"
+               "Gnosis Org reset paused; run gnosis-nodes-reset again"))))
 
 ;;;###autoload
 (defun gnosis-nodes-sync ()
@@ -1180,7 +1232,9 @@ Server identity and prior protocol fingerprint must still match."
   (interactive)
   (when gnosis-nodes--busy
     (user-error "Gnosis synchronization is already running"))
-  (let ((gnosis-nodes--busy t))
+  (let ((gnosis-nodes--busy t)
+        (gnosis-nodes--pages-left gnosis-nodes-max-pages-per-pass)
+        (gnosis-nodes--mutation-sent nil))
     (setq gnosis-nodes--stop-requested nil)
     (gnosis-nodes--with-lock
       (let ((state (gnosis-nodes--read-state)))
@@ -1196,6 +1250,7 @@ Server identity and prior protocol fingerprint must still match."
           (gnosis-nodes--write-state state)
           (setq state (gnosis-nodes--send-outbox state)))
         (unless (or gnosis-nodes--stop-requested
+                    (not gnosis-nodes--mutation-sent)
                     (not gnosis-nodes--pull-complete))
           (setq state (gnosis-nodes--pull state))
           (gnosis-nodes--write-state state)))))
@@ -1613,6 +1668,8 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
            (conflicts (plist-get state :conflicts))
            (record (and (> (length conflicts) 0) (aref conflicts 0))))
       (unless record (user-error "No Gnosis Org conflicts"))
+      (unless (gnosis-nodes--remote-conflict-current-p state record)
+        (user-error "Remote head changed; synchronize before resolving"))
       (let* ((path (gnosis-nodes--safe-path
                     gnosis-nodes-directory
                     (or (plist-get record :local-path)

@@ -680,8 +680,9 @@ CONTENT-TYPE defaults to application/json."
                        :cursor "hint"))))))
       (gnosis-core-document-create "op:create" "note.org" bytes)
       (gnosis-core-document-replace "doc" "op:next" 1 "note.org" bytes)
-      (gnosis-core-document-rename "doc" "op:next" 1 "moved.org")
-      (gnosis-core-document-tombstone "doc" "op:next" 1))
+      (gnosis-core-document-rename
+       "doc" "op:next" 1 "moved.org" (secure-hash 'sha256 bytes))
+      (gnosis-core-document-tombstone "doc" "op:next" 1 "note.org"))
     (should
      (equal
       `(("post_document-mutations" nil nil
@@ -745,6 +746,40 @@ CONTENT-TYPE defaults to application/json."
                     (gnosis-core-document-replace
                      "doc" "expected" 7 "note.org" "body")
                     :status)))))
+
+(ert-deftest gnosis-core-document-mutation-rejects-impossible-heads ()
+  (let (result)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _) result)))
+      (setq result
+            '(:status "applied" :format_version 1 :operation_id "create"
+              :authoritative
+              (:document_id "doc" :logical_path "note.org" :revision 9
+               :content_sha256
+               "230d8358dc8e8890b4c58c5fbe2a2fca89b394e1003ede3c7e43cc9f0bb9a250"
+               :active t)
+              :cursor "hint"))
+      (should-error (gnosis-core-document-create "create" "note.org" "body")
+                    :type 'gnosis-core-mutation-uncertain)
+      (setq result
+            '(:status "applied" :format_version 1 :operation_id "rename"
+              :authoritative
+              (:document_id "doc" :logical_path "moved.org" :revision 2
+               :content_sha256 "wrong" :active t)
+              :cursor "hint"))
+      (should-error
+       (gnosis-core-document-rename "doc" "rename" 1 "moved.org" "digest")
+       :type 'gnosis-core-mutation-uncertain)
+      (setq result
+            `(:status "applied" :format_version 1 :operation_id "delete"
+              :authoritative
+              (:document_id "doc" :logical_path "other.org" :revision 2
+               :content_sha256 ,gnosis-core--json-null
+               :active ,gnosis-core--json-false)
+              :cursor "hint"))
+      (should-error
+       (gnosis-core-document-tombstone "doc" "delete" 1 "note.org")
+       :type 'gnosis-core-mutation-uncertain))))
 
 (provide 'gnosis-test-core)
 ;;; gnosis-test-core.el ends here

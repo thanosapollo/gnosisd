@@ -1066,12 +1066,20 @@ ACTIVE constrain an applied authoritative head when non-nil."
                     (integerp (plist-get head :revision))
                     (or (null document-id)
                         (equal document-id (plist-get head :document_id)))
-                    (or (null revision)
-                        (= (1+ revision) (plist-get head :revision)))
+                    (pcase revision
+                      (:create (= 1 (plist-get head :revision)))
+                      ((pred integerp)
+                       (= (1+ revision) (plist-get head :revision)))
+                      (_ t))
                     (or (null logical-path)
                         (equal logical-path (plist-get head :logical_path)))
-                    (or (null digest)
-                        (equal digest (plist-get head :content_sha256)))
+                    (pcase digest
+                      (:null
+                       (let ((value (plist-get head :content_sha256)))
+                         (or (null value) (eq value gnosis-core--json-null))))
+                      ((pred stringp)
+                       (equal digest (plist-get head :content_sha256)))
+                      (_ t))
                     (or (null active)
                         (pcase active
                           (:inactive
@@ -1117,7 +1125,7 @@ ACTIVE constrain an applied authoritative head when non-nil."
            (list :logical_path logical-path :org text)
            (gnosis-core--document-mutation-headers operation-id))))
     (gnosis-core--document-mutation-result
-     result operation-id nil nil logical-path digest t)))
+     result operation-id nil :create logical-path digest t)))
 
 (defun gnosis-core-document-replace
     (document-id operation-id revision logical-path bytes)
@@ -1134,23 +1142,24 @@ Use OPERATION-ID as stable mutation identity."
      result operation-id document-id revision logical-path digest t)))
 
 (defun gnosis-core-document-rename
-    (document-id operation-id revision logical-path)
+    (document-id operation-id revision logical-path expected-digest)
   "Rename DOCUMENT-ID at REVISION to LOGICAL-PATH.
-Use OPERATION-ID as stable mutation identity."
+Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
   (gnosis-core--document-mutation-result
    (gnosis-core--typed-request
     "post_document-mutations__id__rename" (list (cons "id" document-id)) nil
     (list :logical_path logical-path)
     (gnosis-core--document-mutation-headers operation-id revision))
-   operation-id document-id revision logical-path nil t))
+   operation-id document-id revision logical-path expected-digest t))
 
-(defun gnosis-core-document-tombstone (document-id operation-id revision)
-  "Tombstone DOCUMENT-ID at REVISION under OPERATION-ID."
+(defun gnosis-core-document-tombstone
+    (document-id operation-id revision logical-path)
+  "Tombstone DOCUMENT-ID at REVISION and LOGICAL-PATH under OPERATION-ID."
   (gnosis-core--document-mutation-result
    (gnosis-core--typed-request
     "delete_document-mutations__id_" (list (cons "id" document-id)) nil nil
     (gnosis-core--document-mutation-headers operation-id revision))
-   operation-id document-id revision nil nil :inactive))
+   operation-id document-id revision logical-path :null :inactive))
 
 (defun gnosis-core-dashboard (&optional days)
   "Return the server dashboard projection for optional window DAYS."
