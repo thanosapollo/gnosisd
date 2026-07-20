@@ -1146,7 +1146,13 @@
           (should (string-prefix-p (gnosis-nodes--state-directory) output))
           (should (equal output
                          (plist-get (aref (plist-get state :conflicts) 0)
-                                    :merge-file))))
+                                    :merge-file)))
+          (should (string-match-p
+                   "merge buffer"
+                   (documentation 'gnosis-nodes-resolve-conflict)))
+          (should (string-match-p
+                   "merge buffer"
+                   (documentation 'gnosis-nodes-accept-conflict))))
       (mapc (lambda (buffer)
               (when (buffer-live-p buffer) (kill-buffer buffer)))
             (mapcar #'get-file-buffer (list local base remote)))
@@ -1419,11 +1425,13 @@
                          :logical_path ,remote-path
                          :content_sha256 ,remote-digest
                          :operation ,operation))
-           (record `(:document-id "doc" :kind :content
+           (remote-file (expand-file-name "remote.org" directory))
+           (record `(:document-id "doc" :kind ,(intern (concat ":" operation))
                      :local-path ,local-path :logical-path ,remote-path
                      :local-digest ,(gnosis-nodes--digest "local")
                      :remote-digest ,remote-digest :remote-revision 2
-                     :projection ,projection))
+                     :remote-file ,remote-file :projection ,projection
+                     :resolution :accept-remote))
            (entry '(:operation-id "local" :status :rejected
                     :document-id "doc"))
            (state `(:bases [(:document-id "doc" :revision 1
@@ -1431,13 +1439,9 @@
                     :outbox [,entry] :conflicts [,record])))
       (unwind-protect
           (progn
-            (if remote-bytes
-                (gnosis-nodes--write-document remote-path remote-bytes)
-              (let ((backup (expand-file-name
-                             "local-backup.org"
-                             (gnosis-nodes--conflict-directory "doc"))))
-                (make-directory (file-name-directory backup) t)
-                (gnosis-nodes--write-bytes backup (string-to-unibyte "local"))))
+            (gnosis-nodes--write-document local-path (string-to-unibyte "local"))
+            (when remote-bytes
+              (gnosis-nodes--write-bytes remote-file remote-bytes))
             (setq state (gnosis-nodes--apply-document state projection))
             (should (= 0 (length (plist-get state :conflicts))))
             (should (eq :superseded
@@ -1463,6 +1467,19 @@
     (should (eq :blocked
                 (plist-get (aref (plist-get state :outbox) 1) :status)))))
 
+(ert-deftest gnosis-nodes-unchanged-save-preserves-lifecycle-intent ()
+  (let* ((bytes (string-to-unibyte "base"))
+         (digest (gnosis-nodes--digest bytes))
+         (base `(:document-id "doc" :revision 1 :logical-path "note.org"
+                 :digest ,digest :active t)))
+    (dolist (kind '(:rename :delete))
+      (let* ((entry (gnosis-nodes--outbox-entry
+                     kind "doc" 1 "note.org" digest "old.org"))
+             (state `(:outbox [,entry])))
+        (setq state (gnosis-nodes--queue-save state base bytes))
+        (should (= 1 (length (plist-get state :outbox))))
+        (should (eq :pending (plist-get entry :status)))))))
+
 (ert-deftest gnosis-nodes-unchanged-receipt-reconciles-outbox ()
   (let* ((digest (gnosis-nodes--digest "same"))
          (authoritative `(:document_id "doc" :revision 3
@@ -1474,7 +1491,12 @@
                  :fingerprint ,(gnosis-nodes--projection-fingerprint authoritative)))
          (entry (gnosis-nodes--outbox-entry
                  :replace "doc" 3 "note.org" digest nil "same"))
-         (state `(:bases [,base] :outbox [,entry] :conflicts [])))
+         (dependent (gnosis-nodes--outbox-entry
+                     :replace "doc" nil "note.org" digest nil "same"))
+         (state nil))
+    (setf (plist-get dependent :status) :blocked
+          (plist-get dependent :depends-on) (plist-get entry :operation-id)
+          state `(:bases [,base] :outbox [,entry ,dependent] :conflicts []))
     (cl-letf (((symbol-function 'gnosis-nodes--write-state) #'ignore)
               ((symbol-function 'gnosis-nodes--send-entry)
                (lambda (_)
@@ -1483,7 +1505,36 @@
                    :changed ,gnosis-core--json-false :cursor "same"
                    :authoritative ,(copy-tree authoritative)))))
       (setq state (gnosis-nodes--send-outbox state))
-      (should (= 0 (length (plist-get state :outbox)))))))
+      (should (= 1 (length (plist-get state :outbox))))
+      (let ((promoted (aref (plist-get state :outbox) 0)))
+        (should (eq :pending (plist-get promoted :status)))
+        (should (= 3 (plist-get promoted :revision)))
+        (should (equal (plist-get promoted :operation-id)
+                       (plist-get dependent :operation-id)))))))
+
+(ert-deftest gnosis-nodes-materializes-document-snapshot-projection ()
+  (let* ((directory (make-temp-file "gnosis-nodes-document-snapshot" t))
+         (gnosis-nodes-dir directory)
+         (bytes (string-to-unibyte "snapshot"))
+         (digest (gnosis-nodes--digest bytes))
+         (projection `(:document_id "doc" :revision 4
+                       :logical_path "note.org" :content_sha256 nil
+                       :blob_url nil :operation "snapshot"
+                       :projection (:document_id "doc" :revision 4
+                                    :logical_path "note.org"
+                                    :content_sha256 ,digest :active t)))
+         (state '(:bases [] :outbox [] :conflicts [])))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-blob)
+                   (lambda (requested)
+                     (should (equal digest requested))
+                     bytes)))
+          (setq state (gnosis-nodes--apply-document state projection))
+          (should (equal bytes (gnosis-nodes--read-bytes
+                                (expand-file-name "note.org" directory))))
+          (should (equal digest
+                         (plist-get (aref (plist-get state :bases) 0) :digest))))
+      (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-validates-document-operation-coupling ()
   (should-not

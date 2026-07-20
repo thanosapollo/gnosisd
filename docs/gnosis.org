@@ -37,9 +37,9 @@ File discovery never implies create, rename, or deletion.  Use
 lifecycle mutations; local files remain until the user moves or removes them.
 
 Conflicts leave local content untouched.  Run =M-x gnosis-nodes-resolve-conflict=
-for three-way Ediff, save the merge in the local file, then run
+for three-way Ediff, edit and save Ediff's separate merge buffer, then run
 =M-x gnosis-nodes-accept-conflict=.  Acceptance revalidates the current local
-merge and remote head, then queues a revision-checked replacement.
+merge buffer and remote head, then queues a revision-checked replacement.
 Use =M-x gnosis-nodes-keep-local-conflict= for explicit rename-back, recreate,
 replace, or tombstone intent.  Use =M-x gnosis-nodes-accept-remote-conflict= to
 accept the remote rename, content, missing-file restore, or tombstone; tombstone

@@ -443,6 +443,13 @@ PAYLOAD captures exact bytes at enqueue time."
   (vconcat (if old (delq old (append vector nil)) (append vector nil))
            (vector new)))
 
+(defun gnosis-nodes--projection-digest (projection)
+  "Return authoritative content digest from document PROJECTION."
+  (gnosis-nodes--nullable
+   (if (equal "snapshot" (plist-get projection :operation))
+       (plist-get (plist-get projection :projection) :content_sha256)
+     (plist-get projection :content_sha256))))
+
 (defun gnosis-nodes--record-base (state projection)
   "Record authoritative document PROJECTION in STATE."
   (let* ((document-id (plist-get projection :document_id))
@@ -450,8 +457,7 @@ PAYLOAD captures exact bytes at enqueue time."
          (base (list :document-id document-id
                      :revision (plist-get projection :revision)
                      :logical-path (plist-get projection :logical_path)
-                     :digest (gnosis-nodes--nullable
-                              (plist-get projection :content_sha256))
+                     :digest (gnosis-nodes--projection-digest projection)
                      :fingerprint (gnosis-nodes--projection-fingerprint projection)
                      :active (not (equal "tombstone"
                                          (plist-get projection :operation))))))
@@ -575,8 +581,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
          (local-path (plist-get record :local-path))
          (destination (gnosis-nodes--safe-path gnosis-nodes-dir remote-path))
          (remote-bytes (gnosis-nodes--working-bytes destination))
-         (remote-digest (gnosis-nodes--nullable
-                         (plist-get projection :content_sha256))))
+         (remote-digest (gnosis-nodes--projection-digest projection)))
     (if (equal operation "tombstone")
         (let ((backup (expand-file-name
                        "local-backup.org"
@@ -625,8 +630,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                                      conflict-projection))))))
                 (signal 'gnosis-nodes-error
                         '("Gnosis conflict head changed projection"))))))
-         (remote-digest
-          (gnosis-nodes--nullable (plist-get projection :content_sha256)))
+         (remote-digest (gnosis-nodes--projection-digest projection))
          (active (not (equal "tombstone" (plist-get projection :operation))))
          (base (gnosis-nodes--base state document-id logical-path))
          (_identity
@@ -653,6 +657,9 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
       (setf (plist-get state :conflicts)
             (vconcat (delq conflict (append (plist-get state :conflicts) nil))))
       (gnosis-nodes--record-base state projection))
+     ((and conflict
+           (eq :accept-remote (plist-get conflict :resolution)))
+      (gnosis-nodes--accept-remote-conflict state conflict))
      ((and base (= (plist-get base :revision)
                    (plist-get projection :revision)))
       (unless (equal (plist-get base :fingerprint) fingerprint)
@@ -744,8 +751,12 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                   (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest)))
          (pcase operation
            ("tombstone" (and (null digest) (null blob-url) (null parsed)))
-           ("snapshot" (and (listp parsed) parsed
-                            (null digest) (null blob-url)))
+           ("snapshot"
+            (let ((snapshot-digest (plist-get parsed :content_sha256)))
+              (and (listp parsed) parsed
+                   (stringp snapshot-digest)
+                   (string-match-p "\\`[0-9a-f]\\{64\\}\\'" snapshot-digest)
+                   (null digest) (null blob-url))))
            (_ (and (listp parsed) parsed
                    (stringp digest)
                    (equal blob-url (format "/v1/blobs/%s" digest))
@@ -1207,13 +1218,19 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
          (head (gnosis-nodes--outbox-entry-for state document-id logical-path)))
     (cond
      ((and (equal (gnosis-nodes--digest bytes) (plist-get base :digest))
-           (memq (plist-get head :status) '(:pending :blocked)))
+           (memq (plist-get head :status) '(:pending :blocked))
+           (memq (plist-get head :kind) '(:create :replace)))
       (dolist (entry (append (plist-get state :outbox) nil))
         (when (and (memq (plist-get entry :status) '(:pending :blocked))
+                   (memq (plist-get entry :kind) '(:create :replace))
                    (or (equal document-id (plist-get entry :document-id))
                        (equal logical-path (plist-get entry :logical-path))))
           (setf (plist-get entry :status) :superseded
                 (plist-get entry :depends-on) nil)))
+      state)
+     ((and (equal (gnosis-nodes--digest bytes) (plist-get base :digest))
+           (memq (plist-get head :status) '(:pending :blocked))
+           (memq (plist-get head :kind) '(:rename :delete)))
       state)
      ((seq-find (lambda (conflict)
                   (equal document-id (plist-get conflict :document-id)))
@@ -1413,6 +1430,7 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
                                                              :document_id))))
                                  (gnosis-nodes--unchanged-head-matches-base-p
                                   base authoritative)))
+                      (setq state (gnosis-nodes--promote-outbox state))
                       (setq state
                             (plist-put
                              state :outbox
@@ -1422,7 +1440,6 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
                                  (equal (plist-get item :operation-id)
                                         (plist-get entry :operation-id)))
                                (append (plist-get state :outbox) nil)))))
-                      (setq state (gnosis-nodes--promote-outbox state))
                       (gnosis-nodes--write-state state)
                       (throw 'gnosis-nodes--stop-outbox nil))
                     (gnosis-nodes--write-state state)
@@ -1877,7 +1894,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 ;;;###autoload
 (defun gnosis-nodes-resolve-conflict ()
   "Select a conflict and open Ediff with local, remote, and base buffers.
-Edit and save the first, local buffer; it is the accepted source of truth."
+Edit and save Ediff's merge buffer; acceptance reads that separate file."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
@@ -1955,9 +1972,8 @@ Edit and save the first, local buffer; it is the accepted source of truth."
 
 ;;;###autoload
 (defun gnosis-nodes-accept-conflict ()
-  "Select and accept current local merge as a revisioned replacement.
-Ediff does not write a separate merge result: edit and save its first,
-local buffer.  Revalidate those bytes and remote head before queueing."
+  "Select and accept saved merge buffer as a revisioned replacement.
+Revalidate merge-buffer bytes and remote head before queueing."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
@@ -2149,7 +2165,8 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
       (user-error "Local conflict file changed; synchronize again"))
     (setq state (gnosis-nodes--supersede-local-chain state record))
     (setf (plist-get record :resolution) :accept-remote)
-    (gnosis-nodes--write-state state)
+    (unless gnosis-nodes--preflight
+      (gnosis-nodes--write-state state))
     (if (eq :tombstone (plist-get record :kind))
         (gnosis-nodes--delete-local-conflict-file
          local-path
