@@ -620,7 +620,10 @@ fn target_lock_path(target: &Path) -> Result<PathBuf, ServerError> {
     let target = match fs::canonicalize(target) {
         Ok(target) => target,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = target.parent().ok_or(ServerError::InvalidConfig)?;
+            let parent = target
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
             let name = target.file_name().ok_or(ServerError::InvalidConfig)?;
             fs::canonicalize(parent)
                 .map_err(ServerError::TargetLock)?
@@ -785,13 +788,19 @@ impl ServerError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::net::UnixListener as StdUnixListener, time::Duration};
+    use std::{
+        fs,
+        os::unix::net::UnixListener as StdUnixListener,
+        path::{Path, PathBuf},
+        process::Command,
+        time::Duration,
+    };
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
         DaemonConfig, ServerError, StartupLock, bounded_success, remove_observed_socket,
-        validate_config,
+        target_lock_path, validate_config,
     };
     use crate::{
         application::{ApplicationError, generate_device},
@@ -907,6 +916,43 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ServerError::TargetLocked));
+        drop(server);
+    }
+
+    #[test]
+    fn relative_target_lock_resolves_beneath_current_directory() {
+        let current = fs::canonicalize(".").unwrap();
+        assert_eq!(
+            target_lock_path(Path::new("relative-lock.sqlite")).unwrap(),
+            current.join(".relative-lock.sqlite.gnosis-lock")
+        );
+    }
+
+    #[test]
+    fn daemon_binds_relative_database_and_blob_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("protocol::server::tests::relative_target_bind_child")
+            .arg("--nocapture")
+            .current_dir(directory.path())
+            .env(
+                "GNOSIS_TEST_RELATIVE_TARGET_SOCKET",
+                directory.path().join("daemon.socket"),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn relative_target_bind_child() {
+        let Ok(socket) = std::env::var("GNOSIS_TEST_RELATIVE_TARGET_SOCKET") else {
+            return;
+        };
+        let mut config = DaemonConfig::new(PathBuf::from(socket), "gnosis.sqlite");
+        config.blob_path = PathBuf::from("blobs");
+        let server = super::DaemonServer::bind(config).await.unwrap();
         drop(server);
     }
 

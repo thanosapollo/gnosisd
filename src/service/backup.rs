@@ -731,7 +731,10 @@ fn restore_bundle_path(
 }
 
 fn canonical_restore_target(path: &Path) -> Result<PathBuf, BackupError> {
-    let parent = path.parent().ok_or(BackupError::Destination)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     require_directory(parent)?;
     let parent = fs::canonicalize(parent)?;
     let name = path.file_name().ok_or(BackupError::Destination)?;
@@ -872,10 +875,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ActivationStep, BackupError, create_backup, ensure_restore_complete, read_manifest,
-        restore_backup, restore_backup_with_hook, restore_backup_with_hooks,
-        restore_backup_with_sync_hooks, restore_staging_path, sha256_file, snapshot_backup,
-        sqlite_sidecar_paths, sync_directory,
+        ActivationStep, BackupError, canonical_restore_target, create_backup,
+        ensure_restore_complete, read_manifest, restore_backup, restore_backup_with_hook,
+        restore_backup_with_hooks, restore_backup_with_sync_hooks, restore_staging_path,
+        sha256_file, snapshot_backup, sqlite_sidecar_paths, sync_directory,
     };
     use crate::{
         application::{canonical_asset_path, prepare_asset},
@@ -1197,6 +1200,15 @@ mod tests {
             },
         );
         panic!("restore reached unexpected result before interruption: {result:?}");
+    }
+
+    #[test]
+    fn relative_restore_target_resolves_beneath_current_directory() {
+        let current = fs::canonicalize(".").unwrap();
+        assert_eq!(
+            canonical_restore_target(Path::new("relative-restore.sqlite")).unwrap(),
+            current.join("relative-restore.sqlite")
+        );
     }
 
     #[test]
