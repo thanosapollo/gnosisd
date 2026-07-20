@@ -1059,22 +1059,43 @@ ACTIVE constrain an applied authoritative head when non-nil."
                (stringp (plist-get result :cursor)))
     (signal 'gnosis-core-mutation-uncertain
             '("Gnosis mutation response correlation failed")))
-  (when (equal "applied" (plist-get result :status))
-    (let ((head (plist-get result :authoritative)))
-      (unless (and head
-                   (or (null document-id)
-                       (equal document-id (plist-get head :document_id)))
-                   (or (null revision)
-                       (= (1+ revision) (plist-get head :revision)))
-                   (or (null logical-path)
-                       (equal logical-path (plist-get head :logical_path)))
-                   (or (null digest)
-                       (equal digest (plist-get head :content_sha256)))
-                   (or (null active)
-                       (eq (not (eq active :inactive))
-                           (not (null (plist-get head :active))))))
-        (signal 'gnosis-core-mutation-uncertain
-                '("Gnosis mutation authoritative head is invalid")))))
+  (pcase (plist-get result :status)
+    ("applied"
+     (let ((head (plist-get result :authoritative)))
+       (unless (and head
+                    (integerp (plist-get head :revision))
+                    (or (null document-id)
+                        (equal document-id (plist-get head :document_id)))
+                    (or (null revision)
+                        (= (1+ revision) (plist-get head :revision)))
+                    (or (null logical-path)
+                        (equal logical-path (plist-get head :logical_path)))
+                    (or (null digest)
+                        (equal digest (plist-get head :content_sha256)))
+                    (or (null active)
+                        (eq (not (eq active :inactive))
+                            (not (null (plist-get head :active))))))
+         (signal 'gnosis-core-mutation-uncertain
+                 '("Gnosis mutation authoritative head is invalid")))))
+    ("rejected"
+     (let ((rejection (plist-get result :rejection)))
+       (unless (and rejection
+                    (stringp (plist-get rejection :reason))
+                    (or (not (equal "revision_conflict"
+                                    (plist-get rejection :reason)))
+                        (let ((expected
+                               (let ((value (plist-get rejection :expected_revision)))
+                                 (unless (eq value gnosis-core--json-null) value)))
+                              (current
+                               (let ((value (plist-get rejection :current_revision)))
+                                 (unless (eq value gnosis-core--json-null) value))))
+                          (and (or (null revision) (equal revision expected))
+                               (or (null current) (integerp current))))))
+         (signal 'gnosis-core-mutation-uncertain
+                 '("Gnosis mutation rejection is invalid")))))
+    (_
+     (signal 'gnosis-core-mutation-uncertain
+             '("Gnosis mutation status is invalid"))))
   result)
 
 (defun gnosis-core--document-mutation-headers (operation-id &optional revision)

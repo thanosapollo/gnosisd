@@ -33,7 +33,7 @@
    (equal '(:action :conflict)
           (gnosis-nodes--plan-document "base" "local" "remote" t)))
   (should
-   (equal '(:action :delete)
+   (equal '(:action :conflict)
           (gnosis-nodes--plan-document "base" "base" nil nil)))
   (should
    (equal '(:action :conflict)
@@ -101,7 +101,7 @@
                    :status))))
       (delete-directory directory t))))
 
-(ert-deftest gnosis-nodes-scan-enqueues-replace-delete-and-create ()
+(ert-deftest gnosis-nodes-scan-only-enqueues-explicitly-tracked-edits ()
   (let* ((directory (make-temp-file "gnosis-nodes-scan" t))
          (gnosis-nodes-directory directory)
          (state
@@ -118,12 +118,12 @@
           (gnosis-nodes--write-document "fresh.org" "fresh")
           (setq state (gnosis-nodes--scan state))
           (should
-           (equal '(:replace :delete :create)
+           (equal '(:replace)
                   (mapcar (lambda (entry) (plist-get entry :kind))
                           (append (plist-get state :outbox) nil)))))
       (delete-directory directory t))))
 
-(ert-deftest gnosis-nodes-scan-recognizes-content-preserving-rename ()
+(ert-deftest gnosis-nodes-scan-never-infers-rename-from-file-layout ()
   (let* ((root (make-temp-file "gnosis-nodes-rename-" t))
          (gnosis-nodes-directory root)
          (bytes (string-to-unibyte "same"))
@@ -136,13 +136,204 @@
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "new.org" bytes)
-          (let* ((next (gnosis-nodes--scan state))
-                 (outbox (plist-get next :outbox)))
-            (should (= 1 (length outbox)))
-            (should (eq :rename (plist-get (aref outbox 0) :kind)))
-            (should (equal "new.org"
-                           (plist-get (aref outbox 0) :logical-path)))))
+          (should (= 0 (length (plist-get (gnosis-nodes--scan state)
+                                          :outbox)))))
       (delete-directory root t))))
+
+(ert-deftest gnosis-nodes-outbox-replays-captured-bytes-and-stops-on-uncertain ()
+  (let* ((directory (make-temp-file "gnosis-nodes-replay" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "state.json" directory))
+         (first (gnosis-nodes--outbox-entry
+                 :replace "one" 1 "one.org" "old" nil "captured"))
+         (second (gnosis-nodes--outbox-entry
+                  :replace "two" 1 "two.org" "old" nil "second"))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [,first ,second]
+                  :conflicts []))
+         calls)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (cl-letf (((symbol-function 'gnosis-core-document-replace)
+                     (lambda (_document _operation _revision _path bytes)
+                       (push bytes calls)
+                       (signal 'gnosis-core-mutation-uncertain '("timeout")))))
+            (gnosis-nodes--send-outbox state))
+          (should (equal '("captured") calls))
+          (should (equal "feed" (plist-get (gnosis-nodes--read-state) :cursor))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-rejected-mutation-stops-outbox ()
+  (let* ((directory (make-temp-file "gnosis-nodes-rejected" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "state.json" directory))
+         (first (gnosis-nodes--outbox-entry :replace "one" 1 "one.org" "d" nil "one"))
+         (second (gnosis-nodes--outbox-entry :replace "two" 1 "two.org" "d" nil "two"))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [,first ,second] :conflicts []))
+         (calls 0))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (cl-letf (((symbol-function 'gnosis-core-document-replace)
+                     (lambda (&rest _)
+                       (cl-incf calls)
+                       '(:status "rejected" :cursor "hint"))))
+            (gnosis-nodes--send-outbox state))
+          (should (= calls 1))
+          (should (equal "feed" (plist-get (gnosis-nodes--read-state) :cursor))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-pull-validates-whole-page-before-effects ()
+  (let ((state '(:version 1 :server-id "server" :device-id "device"
+                 :cursor "from" :bases [] :outbox [] :conflicts []))
+        applied)
+    (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+               (lambda (_)
+                 '(:version 1 :from "from" :next "next" :has_more nil
+                   :items [(:cursor "wrong" :entity_kind "document")])) )
+              ((symbol-function 'gnosis-nodes--apply-item)
+               (lambda (&rest _) (setq applied t))))
+      (should-error (gnosis-nodes--pull state) :type 'gnosis-nodes-error)
+      (should-not applied))))
+
+(ert-deftest gnosis-nodes-protects-modified-visiting-buffer ()
+  (let* ((directory (make-temp-file "gnosis-nodes-buffer" t))
+         (gnosis-nodes-directory directory)
+         (path (expand-file-name "note.org" directory))
+         buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" "old")
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer
+            (goto-char (point-max))
+            (insert "modified"))
+          (should-error (gnosis-nodes--write-document "note.org" "remote")
+                        :type 'gnosis-nodes-conflict)
+          (should (equal "old" (gnosis-nodes--read-bytes path))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-save-mode-only-queues-enrolled-file ()
+  (let* ((directory (make-temp-file "gnosis-nodes-mode" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "state.json" directory))
+         (path (expand-file-name "note.org" directory))
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [] :conflicts []))
+         http-called buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (gnosis-nodes--write-document "note.org" "body")
+          (setq buffer (find-file-noselect path))
+          (cl-letf (((symbol-function 'gnosis-core-sync-state)
+                     (lambda () (setq http-called t))))
+            (with-current-buffer buffer
+              (gnosis-nodes-mode 1)
+              (run-hooks 'after-save-hook)))
+          (should-not http-called)
+          (should (= 1 (length (plist-get (gnosis-nodes--read-state) :outbox)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-snapshot-fetches-all-pages-before-materializing ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "private/state.json" directory))
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "cut" :bases [] :outbox [] :conflicts []))
+         (calls 0) applied)
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-sync-snapshot)
+                   (lambda (_next)
+                     (cl-incf calls)
+                     (if (= calls 1)
+                         '(:version 1 :snapshot_id "snapshot" :cursor nil :next "page-2"
+                           :items [])
+                       '(:version 1 :snapshot_id "wrong" :cursor "cut" :next nil
+                         :items []))))
+                  ((symbol-function 'gnosis-nodes--apply-item)
+                   (lambda (&rest _) (setq applied t))))
+          (gnosis-nodes--write-state state)
+          (should-error (gnosis-nodes--snapshot state) :type 'gnosis-nodes-error)
+          (should-not applied))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-rejection-persists-server-evidence ()
+  (let* ((directory (make-temp-file "gnosis-nodes-evidence" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "state.json" directory))
+         (entry (gnosis-nodes--outbox-entry
+                 :replace "one" 1 "one.org" "d" nil "one"))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [,entry] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (cl-letf (((symbol-function 'gnosis-core-document-replace)
+                     (lambda (&rest _)
+                       '(:status "rejected" :cursor "hint"
+                         :rejection (:reason "revision_conflict"
+                                     :expected_revision 1
+                                     :current_revision 2)))))
+            (gnosis-nodes--send-outbox state))
+          (let ((stored (aref (plist-get (gnosis-nodes--read-state) :outbox) 0)))
+            (should (eq :rejected (plist-get stored :status)))
+            (should (equal 2 (plist-get (plist-get (plist-get stored :result)
+                                                   :rejection)
+                                        :current_revision)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-rejects-equal-revision-projection-collision ()
+  (let* ((directory (make-temp-file "gnosis-nodes-revision" t))
+         (gnosis-nodes-directory directory)
+         (old '(:document_id "doc" :logical_path "old.org" :revision 3
+                :content_sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+         (new '(:document_id "doc" :logical_path "new.org" :revision 3
+                :content_sha256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed"
+                  :bases [(:document-id "doc" :logical-path "old.org" :revision 3
+                           :digest "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                           :fingerprint ,(gnosis-nodes--projection-fingerprint old))]
+                  :outbox [] :conflicts [])))
+    (unwind-protect
+        (should-error (gnosis-nodes--apply-document state new)
+                      :type 'gnosis-nodes-error)
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-snapshot-spool-detects-tampering ()
+  (let* ((directory (make-temp-file "gnosis-nodes-spool" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "private/state.json" directory))
+         (file (expand-file-name "private/snapshot/page.json" directory)))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-bytes file "{}")
+          (should-error
+           (gnosis-nodes--read-snapshot-page
+            (list :file file :sha256 (secure-hash 'sha256 "different")))
+           :type 'gnosis-nodes-error))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-track-all-files-requires-explicit-enrollment ()
+  (let* ((directory (make-temp-file "gnosis-nodes-all" t))
+         (gnosis-nodes-directory directory)
+         (gnosis-nodes-state-file (expand-file-name "private/state.json" directory))
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (gnosis-nodes--write-document "a.org" "a")
+          (gnosis-nodes--write-document "nested/b.org" "b")
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+            (gnosis-nodes-track-all-files))
+          (should (= 2 (length (plist-get (gnosis-nodes--read-state) :outbox)))))
+      (delete-directory directory t))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here

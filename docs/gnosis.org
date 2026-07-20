@@ -22,15 +22,22 @@ and scheduling.
 * Org synchronization
 
 Customize =gnosis-nodes-directory= to a dedicated working directory, then run
-=M-x gnosis-nodes-bootstrap=.  Edit its Org files offline and run
-=M-x gnosis-nodes-sync= to pull before pushing.  Minimal private state records
-identity, cursor, document bases, pending operations, and conflicts; it is not a
-domain database.  Delivery-unknown mutations are never retried automatically.
+=M-x gnosis-nodes-bootstrap=.  Use =gnosis-nodes-mode= in selected Org buffers,
+or =M-x gnosis-nodes-track-file=, to enroll one file.  Use
+=M-x gnosis-nodes-track-all-files= to enroll every Org file after confirmation.
+Use =global-gnosis-nodes-mode= for periodic synchronization, or run
+=M-x gnosis-nodes-sync= manually.  Private state records identity, cursor,
+document bases, pending operations, and conflicts; it is not a domain database.
+Delivery-unknown mutations are never retried automatically.
+
+File discovery never implies create, rename, or deletion.  Use
+=M-x gnosis-nodes-rename-file= and =M-x gnosis-nodes-tombstone-file= for explicit
+lifecycle mutations; local files remain until the user moves or removes them.
 
 Conflicts leave local content untouched.  Run =M-x gnosis-nodes-resolve-conflict=
 for three-way Ediff, save the merge in the local file, then run
-=M-x gnosis-nodes-accept-conflict=.  Acceptance refuses changed local conflict
-content and sends with the captured authoritative revision.
+=M-x gnosis-nodes-accept-conflict=.  Acceptance revalidates the current local
+merge and remote head, then queues a revision-checked replacement.
 
 * Installation and setup
 
@@ -133,5 +140,5 @@ health and authenticated transport.  It does not seed or exercise provisional
 domain flows.
 
 Runtime package contains exactly =gnosis.el=, =gnosis-core.el=,
-=gnosis-core-assets.el=, =gnosis-edit.el=, =gnosis-review.el=, and
-=gnosis-completion.el=.
+=gnosis-core-assets.el=, =gnosis-edit.el=, =gnosis-review.el=,
+=gnosis-completion.el=, and =gnosis-nodes.el=.

@@ -29,19 +29,30 @@
 
 (defcustom gnosis-nodes-state-file nil
   "Synchronization state file.
-When nil, use `.gnosis-sync/state.json' below `gnosis-nodes-directory'."
-  :type '(choice (const :tag "Below synchronization root" nil) file)
+When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
+  :type '(choice (const :tag "Private user state" nil) file)
+  :group 'gnosis-nodes)
+
+(defcustom gnosis-nodes-idle-seconds 30
+  "Idle seconds between global synchronization attempts."
+  :type 'natnum
   :group 'gnosis-nodes)
 
 (define-error 'gnosis-nodes-error "Gnosis Org synchronization failed")
 (define-error 'gnosis-nodes-path-error "Unsafe Gnosis Org path" 'gnosis-nodes-error)
 (define-error 'gnosis-nodes-conflict "Gnosis Org conflict" 'gnosis-nodes-error)
 
+(defvar gnosis-nodes--idle-timer nil)
+(defvar gnosis-nodes--stop-requested nil)
+
 (defun gnosis-nodes--state-file ()
   "Return absolute synchronization state filename."
-  (expand-file-name
-   (or gnosis-nodes-state-file ".gnosis-sync/state.json")
-   gnosis-nodes-directory))
+  (or gnosis-nodes-state-file
+      (locate-user-emacs-file "gnosis/sync/state.json")))
+
+(defun gnosis-nodes--state-directory ()
+  "Return private synchronization state directory."
+  (file-name-directory (gnosis-nodes--state-file)))
 
 (defun gnosis-nodes--safe-path (root logical-path)
   "Return safe path below ROOT for relative Org LOGICAL-PATH."
@@ -77,10 +88,20 @@ When nil, use `.gnosis-sync/state.json' below `gnosis-nodes-directory'."
 
 (defun gnosis-nodes--write-bytes (path bytes)
   "Atomically write unibyte BYTES to PATH, rejecting symlinks."
-  (let ((root (file-name-as-directory (expand-file-name gnosis-nodes-directory))))
+  (let ((root (file-name-as-directory
+               (expand-file-name
+                (if (string-prefix-p (gnosis-nodes--state-directory)
+                                     (expand-file-name path))
+                    (gnosis-nodes--state-directory)
+                  gnosis-nodes-directory)))))
+    (when (file-symlink-p (directory-file-name root))
+      (signal 'gnosis-nodes-path-error (list root)))
     (when (gnosis-nodes--symlink-component-p root path)
       (signal 'gnosis-nodes-path-error (list path)))
     (make-directory (file-name-directory path) t)
+    (when (string-prefix-p (gnosis-nodes--state-directory)
+                           (expand-file-name path))
+      (set-file-modes (file-name-directory path) #o700))
     (let ((temporary (make-temp-file
                       (expand-file-name ".gnosis-write-"
                                         (file-name-directory path)))))
@@ -97,9 +118,14 @@ When nil, use `.gnosis-sync/state.json' below `gnosis-nodes-directory'."
 
 (defun gnosis-nodes--write-document (logical-path bytes)
   "Atomically materialize exact Org BYTES at LOGICAL-PATH."
-  (gnosis-nodes--write-bytes
-   (gnosis-nodes--safe-path gnosis-nodes-directory logical-path)
-   (string-to-unibyte bytes)))
+  (let* ((path (gnosis-nodes--safe-path gnosis-nodes-directory logical-path))
+         (buffer (get-file-buffer path)))
+    (when (and (buffer-live-p buffer) (buffer-modified-p buffer))
+      (signal 'gnosis-nodes-conflict (list logical-path)))
+    (gnosis-nodes--write-bytes path (string-to-unibyte bytes))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (revert-buffer :ignore-auto :noconfirm)))))
 
 (defun gnosis-nodes--read-bytes (path)
   "Return exact bytes from PATH."
@@ -120,7 +146,7 @@ When nil, use `.gnosis-sync/state.json' below `gnosis-nodes-directory'."
   "Plan reconciliation from BASE, LOCAL, REMOTE digests and ACTIVE state."
   (cond
    ((not active)
-    (list :action (if (equal local base) :delete :conflict)))
+    (list :action (if local :conflict :keep)))
    ((equal local base)
     (list :action (if (equal remote base) :keep :materialize)))
    ((equal remote base) '(:action :keep))
@@ -128,9 +154,11 @@ When nil, use `.gnosis-sync/state.json' below `gnosis-nodes-directory'."
    (t '(:action :conflict))))
 
 (cl-defun gnosis-nodes--outbox-entry
-    (kind document-id revision logical-path digest &optional previous-path)
+    (kind document-id revision logical-path digest
+          &optional previous-path payload)
   "Return durable pending operation for KIND and DOCUMENT-ID metadata.
-REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
+REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state.
+PAYLOAD captures exact bytes at enqueue time."
   (list :operation-id (gnosis-core-operation-id)
         :kind kind
         :document-id document-id
@@ -138,6 +166,8 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
         :logical-path logical-path
         :previous-path previous-path
         :digest digest
+        :payload (and payload
+                      (base64-encode-string (string-to-unibyte payload) t))
         :status :pending))
 
 (defun gnosis-nodes--outbox-mark (entry status)
@@ -161,6 +191,8 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
 (defun gnosis-nodes--read-state ()
   "Read and validate minimal durable synchronization state."
   (let ((file (gnosis-nodes--state-file)))
+    (when (file-symlink-p file)
+      (signal 'gnosis-nodes-path-error (list file)))
     (unless (file-readable-p file)
       (signal 'gnosis-nodes-error '("Gnosis synchronization is not bootstrapped")))
     (with-temp-buffer
@@ -182,7 +214,11 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
   "Atomically persist minimal synchronization STATE."
   (let* ((file (gnosis-nodes--state-file))
          (directory (file-name-directory file)))
+    (when (or (file-symlink-p file)
+              (file-symlink-p (directory-file-name directory)))
+      (signal 'gnosis-nodes-path-error (list file)))
     (make-directory directory t)
+    (set-file-modes directory #o700)
     (let ((temporary (make-temp-file (expand-file-name ".state-" directory))))
       (unwind-protect
           (progn
@@ -190,11 +226,57 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
               (insert
                (json-serialize
                 (gnosis-nodes--json-state state)
-                :null-object nil :false-object nil)))
+                :null-object nil
+                :false-object gnosis-core--json-false)))
             (set-file-modes temporary #o600)
             (rename-file temporary file t))
         (when (file-exists-p temporary)
           (delete-file temporary))))))
+
+(defun gnosis-nodes--json-value (value)
+  "Return VALUE with protocol nulls converted recursively for JSON."
+  (cond
+   ((eq value gnosis-core--json-null) nil)
+   ((vectorp value) (vconcat (mapcar #'gnosis-nodes--json-value value)))
+   ((consp value) (mapcar #'gnosis-nodes--json-value value))
+   (t value)))
+
+(defun gnosis-nodes--canonical-value (value)
+  "Return VALUE with recursively sorted plist keys."
+  (cond
+   ((vectorp value)
+    (vconcat (mapcar #'gnosis-nodes--canonical-value value)))
+   ((and (consp value) (keywordp (car value)))
+    (apply #'append
+           (mapcar (lambda (pair)
+                     (list (car pair)
+                           (gnosis-nodes--canonical-value (cdr pair))))
+                   (sort (cl-loop for (key item) on value by #'cddr
+                                  collect (cons key item))
+                         (lambda (left right)
+                           (string< (symbol-name (car left))
+                                    (symbol-name (car right))))))))
+   ((consp value) (mapcar #'gnosis-nodes--canonical-value value))
+   (t value)))
+
+(defun gnosis-nodes--projection-identity (projection)
+  "Return canonical document identity fields from PROJECTION."
+  (gnosis-nodes--canonical-value
+   (list :active (not (null (gnosis-nodes--nullable
+                             (plist-get projection :content_sha256))))
+         :content_sha256 (plist-get projection :content_sha256)
+         :document_id (plist-get projection :document_id)
+         :logical_path (plist-get projection :logical_path)
+         :revision (plist-get projection :revision))))
+
+(defun gnosis-nodes--projection-fingerprint (projection)
+  "Return canonical SHA-256 fingerprint for PROJECTION."
+  (secure-hash
+   'sha256
+   (json-serialize
+    (gnosis-nodes--json-value (gnosis-nodes--projection-identity projection))
+    :null-object nil
+    :false-object gnosis-core--json-false)))
 
 (defun gnosis-nodes--json-state (state)
   "Return copy of STATE containing only JSON values."
@@ -208,7 +290,7 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
                           ((keywordp value)))
                 (setf (plist-get entry key)
                       (substring (symbol-name value) 1))))))))
-    copy))
+    (gnosis-nodes--json-value copy)))
 
 (defun gnosis-nodes--base (state &optional document-id logical-path)
   "Return base in STATE matching DOCUMENT-ID or LOGICAL-PATH."
@@ -234,6 +316,7 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
                      :logical-path (plist-get projection :logical_path)
                      :digest (gnosis-nodes--nullable
                               (plist-get projection :content_sha256))
+                     :fingerprint (gnosis-nodes--projection-fingerprint projection)
                      :active (not (null
                                    (gnosis-nodes--nullable
                                     (plist-get projection :content_sha256)))))))
@@ -244,9 +327,8 @@ REVISION, LOGICAL-PATH, DIGEST, and PREVIOUS-PATH describe expected state."
 (defun gnosis-nodes--conflict-directory (document-id)
   "Return private sidecar directory for DOCUMENT-ID."
   (expand-file-name
-   (concat ".gnosis-sync/conflicts/"
-           (secure-hash 'sha256 document-id))
-   gnosis-nodes-directory))
+   (concat "conflicts/" (secure-hash 'sha256 document-id))
+   (gnosis-nodes--state-directory)))
 
 (defun gnosis-nodes--record-conflict (state base projection local-bytes remote-bytes)
   "Persist conflict sidecars and return updated STATE.
@@ -257,8 +339,11 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
          (base-file (expand-file-name "base.org" directory))
          (remote-file (expand-file-name "remote.org" directory))
          (record (list :document-id document-id
-                       :logical-path (plist-get base :logical-path)
-                       :local-digest (gnosis-nodes--digest local-bytes)
+                       :local-path (or (and base (plist-get base :logical-path))
+                                       (plist-get projection :logical_path))
+                       :logical-path (plist-get projection :logical_path)
+                       :local-digest (and local-bytes
+                                          (gnosis-nodes--digest local-bytes))
                        :remote-digest (plist-get projection :content_sha256)
                        :remote-revision (plist-get projection :revision)
                        :base-file base-file :remote-file remote-file)))
@@ -279,25 +364,34 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
           (gnosis-nodes--nullable (plist-get projection :content_sha256)))
          (active (not (null remote-digest)))
          (base (gnosis-nodes--base state document-id logical-path))
-         (path (gnosis-nodes--safe-path gnosis-nodes-directory logical-path))
+         (base-path (and base (plist-get base :logical-path)))
+         (working-path (or base-path logical-path))
+         (path (gnosis-nodes--safe-path gnosis-nodes-directory working-path))
          (local-bytes (and (file-exists-p path) (gnosis-nodes--read-bytes path)))
          (local-digest (and local-bytes (gnosis-nodes--digest local-bytes)))
-         (plan (gnosis-nodes--plan-document
-                (plist-get base :digest) local-digest remote-digest active)))
-    (pcase (plist-get plan :action)
-      (:materialize
-       (gnosis-nodes--write-document logical-path (gnosis-core-blob remote-digest))
-       (gnosis-nodes--record-base state projection))
-      (:delete
-       (when (file-exists-p path) (delete-file path))
-       (gnosis-nodes--record-base state projection))
-      (:conflict
-       (let ((remote (and remote-digest (gnosis-core-blob remote-digest))))
-         (gnosis-nodes--record-conflict state base projection local-bytes remote)))
-      (:keep
-       (if (equal local-digest remote-digest)
-           (gnosis-nodes--record-base state projection)
-         state)))))
+         (fingerprint (gnosis-nodes--projection-fingerprint projection))
+         (plan (if (and base-path (not (equal base-path logical-path)))
+                   '(:action :conflict)
+                 (gnosis-nodes--plan-document
+                  (plist-get base :digest) local-digest remote-digest active))))
+    (if (and base (= (plist-get base :revision)
+                     (plist-get projection :revision)))
+        (progn
+          (unless (equal (plist-get base :fingerprint) fingerprint)
+            (signal 'gnosis-nodes-error
+                    '("Gnosis equal document revision changed projection")))
+          state)
+      (pcase (plist-get plan :action)
+        (:materialize
+         (gnosis-nodes--write-document logical-path (gnosis-core-blob remote-digest))
+         (gnosis-nodes--record-base state projection))
+        (:conflict
+         (let ((remote (and remote-digest (gnosis-core-blob remote-digest))))
+           (gnosis-nodes--record-conflict state base projection local-bytes remote)))
+        (:keep
+         (if (equal local-digest remote-digest)
+             (gnosis-nodes--record-base state projection)
+           state))))))
 
 (defun gnosis-nodes--apply-item (state item)
   "Apply replica ITEM to STATE when it is a document projection."
@@ -305,41 +399,173 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
       (gnosis-nodes--apply-document state (plist-get item :projection))
     state))
 
-(defun gnosis-nodes--snapshot (state)
-  "Materialize full snapshot into STATE and return it."
-  (let ((next nil) page done)
+(defun gnosis-nodes--valid-document-p (projection)
+  "Return non-nil when document PROJECTION has required invariants."
+  (and (listp projection)
+       (stringp (plist-get projection :document_id))
+       (stringp (plist-get projection :logical_path))
+       (integerp (plist-get projection :revision))
+       (> (plist-get projection :revision) 0)
+       (let ((digest (gnosis-nodes--nullable
+                      (plist-get projection :content_sha256))))
+         (or (null digest)
+             (and (stringp digest)
+                  (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest))))))
+
+(defun gnosis-nodes--valid-item-p (item &optional change-p)
+  "Return non-nil when replica ITEM is valid; require cursor for CHANGE-P."
+  (and (listp item)
+       (or (not change-p) (stringp (plist-get item :cursor)))
+       (pcase (plist-get item :entity_kind)
+         ("document" (gnosis-nodes--valid-document-p
+                      (plist-get item :projection)))
+         ((or "asset" "thema" "settings" "review_state")
+          (listp (plist-get item :projection)))
+         (_ nil))))
+
+(defun gnosis-nodes--snapshot-page-valid-p (page snapshot-id)
+  "Return non-nil when snapshot PAGE continues SNAPSHOT-ID consistently."
+  (let ((cursor (gnosis-nodes--nullable (plist-get page :cursor)))
+        (next (gnosis-nodes--nullable (plist-get page :next)))
+        (items (plist-get page :items)))
+    (and (= (or (plist-get page :version) -1) 1)
+         (stringp (plist-get page :snapshot_id))
+         (or (null snapshot-id)
+             (equal snapshot-id (plist-get page :snapshot_id)))
+         (vectorp items)
+         (seq-every-p #'gnosis-nodes--valid-item-p items)
+         (not (eq (null cursor) (null next))))))
+
+(defun gnosis-nodes--change-page-valid-p (page from)
+  "Return non-nil when complete change PAGE consistently advances FROM."
+  (let ((items (plist-get page :items))
+        (next (plist-get page :next))
+        cursors)
+    (when (vectorp items)
+      (setq cursors (mapcar (lambda (item) (plist-get item :cursor))
+                            (append items nil))))
+    (and (= (or (plist-get page :version) -1) 1)
+         (equal from (plist-get page :from))
+         (stringp next)
+         (vectorp items)
+         (seq-every-p (lambda (item) (gnosis-nodes--valid-item-p item t)) items)
+         (or (= (length items) 0)
+             (equal next (plist-get (aref items (1- (length items))) :cursor)))
+         (not (member from cursors))
+         (= (length cursors) (length (delete-dups (copy-sequence cursors))))
+         (or (not (eq t (plist-get page :has_more)))
+             (> (length items) 0)))))
+
+(defun gnosis-nodes--snapshot-spool-file (index)
+  "Return private snapshot spool filename for INDEX."
+  (expand-file-name (format "snapshot/page-%06d.json" index)
+                    (gnosis-nodes--state-directory)))
+
+(defun gnosis-nodes--read-snapshot-page (record)
+  "Read checksummed snapshot page from spool RECORD."
+  (let* ((file (plist-get record :file))
+         (bytes (and (stringp file) (file-readable-p file)
+                     (gnosis-nodes--read-bytes file))))
+    (unless (and bytes
+                 (equal (plist-get record :sha256)
+                        (gnosis-nodes--digest bytes)))
+      (signal 'gnosis-nodes-error '("Gnosis snapshot spool checksum failed")))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert bytes)
+      (goto-char (point-min))
+      (json-parse-buffer :object-type 'plist :array-type 'array
+                         :null-object nil :false-object nil))))
+
+(defun gnosis-nodes--snapshot (state &optional expected-fingerprint)
+  "Durably fetch, validate, then materialize a full snapshot into STATE.
+When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
+  (let* ((resume (plist-get state :snapshot))
+         (next (and resume (plist-get resume :next)))
+         (pages (and resume (append (plist-get resume :pages) nil)))
+         (snapshot-id (and resume (plist-get resume :snapshot-id)))
+         (index (length pages))
+         (done (and resume (null next)))
+         page)
+    (when pages
+      (setq page (gnosis-nodes--read-snapshot-page (car (last pages)))))
     (while (not done)
       (setq page (gnosis-core-sync-snapshot next))
-      (mapc (lambda (item) (setq state (gnosis-nodes--apply-item state item)))
-            (append (plist-get page :items) nil))
+      (unless (gnosis-nodes--snapshot-page-valid-p page snapshot-id)
+        (signal 'gnosis-nodes-error '("Invalid Gnosis snapshot page")))
+      (setq snapshot-id (plist-get page :snapshot_id))
+      (let* ((file (gnosis-nodes--snapshot-spool-file index))
+             (bytes (encode-coding-string
+                     (json-serialize (gnosis-nodes--json-value page)
+                                     :null-object nil
+                                     :false-object gnosis-core--json-false)
+                     'utf-8 t))
+             (record (list :file file :sha256 (gnosis-nodes--digest bytes))))
+        (gnosis-nodes--write-bytes
+         file bytes)
+        (setq pages (append pages (list record)))
+        (setq state
+              (plist-put state :snapshot
+                         (list :snapshot-id snapshot-id
+                               :next (gnosis-nodes--nullable
+                                      (plist-get page :next))
+                               :pages (vconcat pages))))
+        (gnosis-nodes--write-state state))
       (setq next (gnosis-nodes--nullable (plist-get page :next))
-            done (null next)))
-    (plist-put state :cursor (plist-get page :cursor))))
+            done (null next)
+            index (1+ index)))
+    (let ((stored-pages (mapcar #'gnosis-nodes--read-snapshot-page pages)))
+      (let ((fingerprint (gnosis-nodes--snapshot-fingerprint stored-pages)))
+        (when (and expected-fingerprint
+                   (not (equal fingerprint expected-fingerprint)))
+          (signal 'gnosis-nodes-error
+                  '("Snapshot protocol fingerprint changed")))
+        (setq state (plist-put state :protocol-fingerprint fingerprint)))
+      (dolist (stored stored-pages)
+        (mapc (lambda (item)
+                (setq state (gnosis-nodes--apply-item state item)))
+              (append (plist-get stored :items) nil))))
+    (setq state (plist-put state :cursor (plist-get page :cursor)))
+    (plist-put state :snapshot nil)))
 
 (defun gnosis-nodes--pull (state)
   "Pull every change after STATE cursor, committing each validated page."
   (let (page done)
     (while (not done)
       (setq page (gnosis-core-sync-changes (plist-get state :cursor)))
-      (unless (equal (plist-get state :cursor) (plist-get page :from))
-        (signal 'gnosis-nodes-error '("Gnosis change cursor mismatch")))
-      (mapc
-       (lambda (change)
-         (setq state (gnosis-nodes--apply-item state change)))
-       (append (plist-get page :items) nil))
+      (unless (gnosis-nodes--change-page-valid-p
+               page (plist-get state :cursor))
+        (signal 'gnosis-nodes-error '("Invalid Gnosis change page")))
+      (mapc (lambda (change)
+              (setq state (gnosis-nodes--apply-item state change)))
+            (append (plist-get page :items) nil))
       (setq state (plist-put state :cursor (plist-get page :next)))
       (gnosis-nodes--write-state state)
-      (setq done (not (eq t (plist-get page :has_more)))))
+      (setq done (or gnosis-nodes--stop-requested
+                     (not (eq t (plist-get page :has_more))))))
     state))
 
 (defun gnosis-nodes--outbox-covers-p (state document-id logical-path)
   "Return non-nil when STATE already tracks DOCUMENT-ID or LOGICAL-PATH."
   (seq-some
    (lambda (entry)
-     (and (memq (plist-get entry :status) '(:pending :sending :uncertain))
-          (or (and document-id
-                   (equal document-id (plist-get entry :document-id)))
-              (equal logical-path (plist-get entry :logical-path)))))
+     (let* ((same (or (and document-id
+                           (equal document-id (plist-get entry :document-id)))
+                      (equal logical-path (plist-get entry :logical-path))))
+            (status (plist-get entry :status))
+            (authoritative (plist-get (plist-get entry :result) :authoritative))
+            (base (and same
+                       (gnosis-nodes--base
+                        state (plist-get authoritative :document_id)
+                        (plist-get authoritative :logical_path)))))
+       (and same
+            (pcase status
+              ((or :pending :sending :uncertain) t)
+              (:applied
+               (and authoritative
+                    (or (null base)
+                        (< (plist-get base :revision)
+                           (plist-get authoritative :revision)))))))))
    (append (plist-get state :outbox) nil)))
 
 (defun gnosis-nodes--enqueue (state entry)
@@ -348,101 +574,39 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
              (vconcat (plist-get state :outbox) (vector entry))))
 
 (defun gnosis-nodes--scan (state)
-  "Scan working Org files and enqueue local edits in STATE."
-  (let ((known-paths
-         (mapcar (lambda (base) (plist-get base :logical-path))
-                 (append (plist-get state :bases) nil)))
-        (consumed-paths nil)
-        (files nil))
-    (dolist (path (directory-files-recursively
-                   gnosis-nodes-directory "\\.org\\'" nil nil t))
-      (when (gnosis-nodes--symlink-component-p gnosis-nodes-directory path)
-        (signal 'gnosis-nodes-path-error (list path)))
-      (let ((logical-path (file-relative-name path gnosis-nodes-directory)))
-        (unless (string-prefix-p ".gnosis-sync/" logical-path)
-          (push (list :logical-path logical-path
-                      :digest (gnosis-nodes--digest
-                               (gnosis-nodes--read-bytes path)))
-                files))))
-    (mapc
-     (lambda (base)
-       (let* ((document-id (plist-get base :document-id))
-              (logical-path (plist-get base :logical-path))
-              (path (gnosis-nodes--safe-path
-                     gnosis-nodes-directory logical-path))
-              (rename-candidates
-               (and (not (file-exists-p path))
-                    (seq-filter
-                     (lambda (file)
-                       (and (equal (plist-get file :digest)
-                                   (plist-get base :digest))
-                            (not (member (plist-get file :logical-path)
-                                         consumed-paths))
-                            (not (member (plist-get file :logical-path)
-                                         known-paths))))
-                     files)))
-              (rename (and (= (length rename-candidates) 1)
-                           (car rename-candidates))))
-         (unless (gnosis-nodes--outbox-covers-p
-                  state document-id logical-path)
-           (cond
-            (rename
-             (push (plist-get rename :logical-path) consumed-paths)
-             (setq state
-                   (gnosis-nodes--enqueue
-                    state
-                    (gnosis-nodes--outbox-entry
-                     :rename document-id (plist-get base :revision)
-                     (plist-get rename :logical-path)
-                     (plist-get rename :digest)))))
-            ((file-exists-p path)
-               (let ((digest (gnosis-nodes--digest
-                              (gnosis-nodes--read-bytes path))))
-                 (unless (equal digest (plist-get base :digest))
-                   (setq state
-                         (gnosis-nodes--enqueue
-                          state
-                          (gnosis-nodes--outbox-entry
-                           :replace document-id (plist-get base :revision)
-                           logical-path digest))))))
-            ((plist-get base :active)
-             (setq state
-                   (gnosis-nodes--enqueue
-                    state
-                    (gnosis-nodes--outbox-entry
-                     :delete document-id (plist-get base :revision)
-                     logical-path nil))))))))
-     (append (plist-get state :bases) nil))
-    (dolist (file files)
-      (let ((logical-path (plist-get file :logical-path)))
-        (unless (or (member logical-path known-paths)
-                    (member logical-path consumed-paths)
-                    (gnosis-nodes--outbox-covers-p state nil logical-path))
-          (setq state
-                (gnosis-nodes--enqueue
-                 state
-                 (gnosis-nodes--outbox-entry
-                  :create nil nil logical-path
-                  (plist-get file :digest)))))))
-    state))
+  "Enqueue changed bytes only for explicitly tracked documents in STATE."
+  (dolist (base (append (plist-get state :bases) nil) state)
+    (let* ((document-id (plist-get base :document-id))
+           (logical-path (plist-get base :logical-path))
+           (path (gnosis-nodes--safe-path gnosis-nodes-directory logical-path)))
+      (when (and (file-exists-p path)
+                 (not (gnosis-nodes--outbox-covers-p
+                       state document-id logical-path)))
+        (let* ((bytes (gnosis-nodes--read-bytes path))
+               (digest (gnosis-nodes--digest bytes)))
+          (unless (equal digest (plist-get base :digest))
+            (setq state
+                  (gnosis-nodes--enqueue
+                   state
+                   (gnosis-nodes--outbox-entry
+                    :replace document-id (plist-get base :revision)
+                    logical-path digest nil bytes)))))))))
 
 (defun gnosis-nodes--send-entry (entry)
   "Send pending outbox ENTRY once and return mutation response."
   (let ((operation-id (plist-get entry :operation-id))
         (document-id (plist-get entry :document-id))
         (revision (plist-get entry :revision))
-        (logical-path (plist-get entry :logical-path)))
+        (logical-path (plist-get entry :logical-path))
+        (payload (and (plist-get entry :payload)
+                      (base64-decode-string (plist-get entry :payload)))))
     (pcase (plist-get entry :kind)
       (:create
        (gnosis-core-document-create
-        operation-id logical-path
-        (gnosis-nodes--read-bytes
-         (gnosis-nodes--safe-path gnosis-nodes-directory logical-path))))
+        operation-id logical-path payload))
       (:replace
        (gnosis-core-document-replace
-        document-id operation-id revision logical-path
-        (gnosis-nodes--read-bytes
-         (gnosis-nodes--safe-path gnosis-nodes-directory logical-path))))
+        document-id operation-id revision logical-path payload))
       (:rename
        (gnosis-core-document-rename
         document-id operation-id revision logical-path))
@@ -453,105 +617,411 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
   (let ((outbox (plist-get state :outbox)))
-    (dotimes (index (length outbox))
-      (let ((entry (aref outbox index)))
-        (when (eq :pending (plist-get entry :status))
-          (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
-          (gnosis-nodes--write-state state)
-          (condition-case nil
-              (let ((result (gnosis-nodes--send-entry entry)))
-                (if (equal "applied" (plist-get result :status))
-                    (progn
-                      (aset outbox index
-                            (gnosis-nodes--outbox-mark entry :applied))
-                      (setq state
-                            (gnosis-nodes--apply-document
-                             state (plist-get result :authoritative)))
-                      (setq state
-                            (plist-put state :cursor
-                                       (plist-get result :cursor))))
+    (catch 'gnosis-nodes--stop-outbox
+      (dotimes (index (length outbox))
+        (let ((entry (aref outbox index)))
+          (when (eq :pending (plist-get entry :status))
+            (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
+            (gnosis-nodes--write-state state)
+            (condition-case nil
+                (let ((result (gnosis-nodes--send-entry entry)))
+                  (setq entry (plist-put entry :result result))
                   (aset outbox index
-                        (gnosis-nodes--outbox-mark entry :rejected))))
-            (gnosis-core-mutation-uncertain
-             (aset outbox index (gnosis-nodes--outbox-mark entry :uncertain))))
-          (gnosis-nodes--write-state state))))
-  state))
+                        (gnosis-nodes--outbox-mark
+                         entry (if (equal "applied" (plist-get result :status))
+                                   :applied :rejected)))
+                  (when (gnosis-nodes--valid-document-p
+                         (plist-get result :authoritative))
+                    (setq state
+                          (gnosis-nodes--apply-document
+                           state (plist-get result :authoritative))))
+                  (gnosis-nodes--write-state state)
+                  (when (equal "rejected" (plist-get result :status))
+                    (throw 'gnosis-nodes--stop-outbox nil)))
+              (gnosis-core-mutation-uncertain
+               (aset outbox index
+                     (gnosis-nodes--outbox-mark entry :uncertain))
+               (gnosis-nodes--write-state state)
+               (throw 'gnosis-nodes--stop-outbox nil))))))))
+  state)
+
+(defmacro gnosis-nodes--with-lock (&rest body)
+  "Run BODY while holding exclusive private synchronization lock."
+  (declare (indent 0) (debug t))
+  `(let ((lock (expand-file-name "sync.lock" (gnosis-nodes--state-directory))))
+     (make-directory (file-name-directory lock) t)
+     (set-file-modes (file-name-directory lock) #o700)
+     (condition-case nil
+         (lock-file lock)
+       (file-locked
+        (signal 'gnosis-nodes-error '("Gnosis synchronization is busy"))))
+     (unwind-protect (progn ,@body)
+       (unlock-file lock))))
+
+(defun gnosis-nodes--value-shape (value)
+  "Return closed structural shape for protocol VALUE."
+  (cond
+   ((vectorp value)
+    (list :array (delete-dups
+                  (mapcar #'gnosis-nodes--value-shape (append value nil)))))
+   ((and (listp value) (keywordp (car value)))
+    (cl-loop for (key item) on value by #'cddr
+             collect key
+             collect (gnosis-nodes--value-shape item)))
+   (t :scalar)))
+
+(defun gnosis-nodes--snapshot-fingerprint (pages)
+  "Return protocol-shape fingerprint for complete snapshot PAGES."
+  (let ((shapes
+         (cl-loop for page in pages
+                  append (mapcar #'gnosis-nodes--value-shape
+                                 (append (plist-get page :items) nil)))))
+    (secure-hash
+     'sha256
+     (prin1-to-string
+      (sort (delete-dups shapes)
+            (lambda (left right)
+              (string< (prin1-to-string left) (prin1-to-string right))))))))
 
 ;;;###autoload
 (defun gnosis-nodes-bootstrap ()
-  "Bootstrap an empty Org synchronization directory from Gnosis."
+  "Initialize local synchronization from a complete authoritative snapshot."
   (interactive)
-  (when (file-exists-p (gnosis-nodes--state-file))
-    (user-error "Gnosis synchronization is already bootstrapped"))
   (make-directory gnosis-nodes-directory t)
-  (let* ((identity (gnosis-core-sync-identity))
-         (remote (gnosis-core-sync-state))
-         (state (list :version 1
+  (gnosis-nodes--with-lock
+    (let* ((existing (and (file-exists-p (gnosis-nodes--state-file))
+                          (gnosis-nodes--read-state)))
+           (identity (gnosis-core-sync-identity))
+           (remote (gnosis-core-sync-state))
+           (state
+            (or existing
+                (list :version 1
                       :server-id (plist-get remote :server_id)
                       :device-id (plist-get identity :device_id)
                       :cursor (plist-get remote :cursor)
-                      :bases [] :outbox [] :conflicts [])))
-    (setq state (gnosis-nodes--snapshot state))
-    (gnosis-nodes--write-state state)
-    (message "Gnosis Org synchronization bootstrapped")))
+                      :bases [] :outbox [] :conflicts []))))
+      (when (and existing (plist-get existing :protocol-fingerprint))
+        (user-error "Gnosis synchronization is already bootstrapped"))
+      (unless (and (equal (plist-get state :server-id)
+                          (plist-get remote :server_id))
+                   (equal (plist-get state :device-id)
+                          (plist-get identity :device_id)))
+        (signal 'gnosis-nodes-error '("Gnosis bootstrap identity changed")))
+      (unless existing (gnosis-nodes--write-state state))
+      (setq state (gnosis-nodes--snapshot state))
+      (gnosis-nodes--write-state state)))
+  (message "Gnosis Org synchronization bootstrapped"))
+
+(defun gnosis-nodes--assert-identity (state)
+  "Reject STATE when current server or device identity differs."
+  (let ((identity (gnosis-core-sync-identity))
+        (remote (gnosis-core-sync-state)))
+    (unless (and (equal (plist-get state :device-id)
+                        (plist-get identity :device_id))
+                 (equal (plist-get state :server-id)
+                        (plist-get remote :server_id)))
+      (signal 'gnosis-nodes-error '("Gnosis synchronization identity changed")))))
+
+;;;###autoload
+(defun gnosis-nodes-reset ()
+  "Replace local sync metadata from a trusted fresh snapshot.
+Server identity and prior protocol fingerprint must still match."
+  (interactive)
+  (unless (yes-or-no-p "Discard local Gnosis sync metadata and rebootstrap? ")
+    (user-error "Reset cancelled"))
+  (gnosis-nodes--with-lock
+    (let* ((trusted (gnosis-nodes--read-state))
+           (identity (gnosis-core-sync-identity))
+           (remote (gnosis-core-sync-state))
+           (original-file (gnosis-nodes--state-file))
+           (temporary-file (concat original-file ".reset"))
+           (fresh (list :version 1
+                        :server-id (plist-get remote :server_id)
+                        :device-id (plist-get identity :device_id)
+                        :cursor (plist-get remote :cursor)
+                        :bases [] :outbox [] :conflicts [])))
+      (unless (stringp (plist-get trusted :protocol-fingerprint))
+        (user-error "Gnosis trusted protocol fingerprint is missing"))
+      (unless (and (equal (plist-get trusted :server-id)
+                          (plist-get fresh :server-id))
+                   (equal (plist-get trusted :device-id)
+                          (plist-get fresh :device-id)))
+        (signal 'gnosis-nodes-error '("Gnosis reset identity changed")))
+      (let ((gnosis-nodes-state-file temporary-file))
+        (unwind-protect
+            (progn
+              (gnosis-nodes--write-state fresh)
+              (setq fresh
+                    (gnosis-nodes--snapshot
+                     fresh (plist-get trusted :protocol-fingerprint)))
+              (let ((gnosis-nodes-state-file original-file))
+                (gnosis-nodes--write-state fresh)))
+          (when (file-exists-p temporary-file)
+            (delete-file temporary-file))))))
+  (message "Gnosis Org synchronization metadata reset"))
 
 ;;;###autoload
 (defun gnosis-nodes-sync ()
   "Pull authoritative change pages, then send pending operations once."
   (interactive)
-  (let* ((state (gnosis-nodes--read-state))
-         (identity (gnosis-core-sync-identity))
-         (remote (gnosis-core-sync-state)))
-    (unless (and (equal (plist-get state :device-id)
-                        (plist-get identity :device_id))
-                 (equal (plist-get state :server-id)
-                        (plist-get remote :server_id)))
-      (signal 'gnosis-nodes-error '("Gnosis synchronization identity changed")))
-    (setq state (gnosis-nodes--pull state))
-    (setq state (gnosis-nodes--scan state))
-    (gnosis-nodes--write-state state)
-    (gnosis-nodes--send-outbox state)
-    (message "Gnosis Org synchronization complete")))
+  (setq gnosis-nodes--stop-requested nil)
+  (gnosis-nodes--with-lock
+    (let ((state (gnosis-nodes--read-state)))
+      (when (or (plist-get state :snapshot)
+                (null (plist-get state :protocol-fingerprint)))
+        (user-error "Gnosis bootstrap is incomplete; run gnosis-nodes-bootstrap"))
+      (gnosis-nodes--assert-identity state)
+      (unless gnosis-nodes--stop-requested
+        (setq state (gnosis-nodes--pull state)))
+      (unless gnosis-nodes--stop-requested
+        (setq state (gnosis-nodes--scan state))
+        (gnosis-nodes--write-state state)
+        (gnosis-nodes--send-outbox state))))
+  (message (if gnosis-nodes--stop-requested
+               "Gnosis Org synchronization stopped"
+             "Gnosis Org synchronization complete")))
+
+;;;###autoload
+(defun gnosis-nodes-retry-uncertain (operation-id)
+  "Explicitly requeue uncertain OPERATION-ID with its exact durable payload."
+  (interactive
+   (let* ((state (gnosis-nodes--read-state))
+          (ids (cl-loop for entry across (plist-get state :outbox)
+                        when (eq :uncertain (plist-get entry :status))
+                        collect (plist-get entry :operation-id))))
+     (unless ids (user-error "No uncertain Gnosis operations"))
+     (list (completing-read "Retry uncertain operation: " ids nil t))))
+  (unless (yes-or-no-p (format "Replay operation %s byte-identically? " operation-id))
+    (user-error "Gnosis replay cancelled"))
+  (gnosis-nodes--with-lock
+    (let* ((state (gnosis-nodes--read-state))
+           (outbox (plist-get state :outbox))
+           (entry (seq-find
+                   (lambda (item)
+                     (and (eq :uncertain (plist-get item :status))
+                          (equal operation-id (plist-get item :operation-id))))
+                   (append outbox nil))))
+      (unless entry (user-error "Uncertain Gnosis operation no longer exists"))
+      (setf (plist-get entry :status) :pending)
+      (gnosis-nodes--write-state state))))
+
+;;;###autoload
+(defun gnosis-nodes-stop ()
+  "Request stop at next durable synchronization boundary."
+  (interactive)
+  (setq gnosis-nodes--stop-requested t))
+
+(defun gnosis-nodes--queue-current-buffer ()
+  "Durably queue saved tracked buffer bytes."
+  (when (and gnosis-nodes-mode buffer-file-name
+             (file-in-directory-p buffer-file-name gnosis-nodes-directory))
+    (gnosis-nodes--with-lock
+      (let* ((state (gnosis-nodes--read-state))
+             (logical-path (file-relative-name buffer-file-name
+                                               gnosis-nodes-directory))
+             (base (gnosis-nodes--base state nil logical-path)))
+        (when (and base (not (gnosis-nodes--outbox-covers-p
+                             state (plist-get base :document-id) logical-path)))
+          (let* ((bytes (gnosis-nodes--read-bytes buffer-file-name))
+                 (digest (gnosis-nodes--digest bytes)))
+            (unless (equal digest (plist-get base :digest))
+              (setq state
+                    (gnosis-nodes--enqueue
+                     state
+                     (gnosis-nodes--outbox-entry
+                      :replace (plist-get base :document-id)
+                      (plist-get base :revision) logical-path digest nil bytes)))
+              (gnosis-nodes--write-state state))))))))
+
+;;;###autoload
+(define-minor-mode gnosis-nodes-mode
+  "Durably queue saves for one explicitly tracked Org document."
+  :lighter " Gnosis"
+  (if gnosis-nodes-mode
+      (progn
+        (unless (and buffer-file-name
+                     (file-in-directory-p buffer-file-name gnosis-nodes-directory))
+          (setq gnosis-nodes-mode nil)
+          (user-error "Buffer is outside `gnosis-nodes-directory'"))
+        (let* ((state (gnosis-nodes--read-state))
+               (logical-path (file-relative-name buffer-file-name
+                                                 gnosis-nodes-directory)))
+          (unless (or (gnosis-nodes--base state nil logical-path)
+                      (gnosis-nodes--outbox-covers-p state nil logical-path))
+            (gnosis-nodes-track-file buffer-file-name)))
+        (add-hook 'after-save-hook #'gnosis-nodes--queue-current-buffer nil t))
+    (remove-hook 'after-save-hook #'gnosis-nodes--queue-current-buffer t)))
+
+(defun gnosis-nodes--idle-sync ()
+  "Run idle synchronization without surfacing expected user errors."
+  (condition-case err
+      (gnosis-nodes-sync)
+    (error (message "%s" (error-message-string err)))))
+
+;;;###autoload
+(define-minor-mode global-gnosis-nodes-mode
+  "Synchronize Gnosis Org documents on idle timer."
+  :global t :lighter nil
+  (when (timerp gnosis-nodes--idle-timer)
+    (cancel-timer gnosis-nodes--idle-timer))
+  (setq gnosis-nodes--idle-timer
+        (and global-gnosis-nodes-mode
+             (run-with-idle-timer gnosis-nodes-idle-seconds t
+                                  #'gnosis-nodes--idle-sync))))
+
+;;;###autoload
+(defun gnosis-nodes-track-file (file)
+  "Explicitly enroll Org FILE as a new synchronized document."
+  (interactive "fTrack Org file: ")
+  (let* ((file (expand-file-name file))
+         (logical-path (file-relative-name file gnosis-nodes-directory)))
+    (unless (and (file-regular-p file)
+                 (file-in-directory-p file gnosis-nodes-directory))
+      (user-error "File must be below `gnosis-nodes-directory'"))
+    (gnosis-nodes--safe-path gnosis-nodes-directory logical-path)
+    (gnosis-nodes--with-lock
+      (let ((state (gnosis-nodes--read-state)))
+        (when (or (gnosis-nodes--base state nil logical-path)
+                  (gnosis-nodes--outbox-covers-p state nil logical-path))
+          (user-error "Org file is already tracked"))
+        (let* ((bytes (gnosis-nodes--read-bytes file))
+               (digest (gnosis-nodes--digest bytes)))
+          (setq state
+                (gnosis-nodes--enqueue
+                 state (gnosis-nodes--outbox-entry
+                        :create nil nil logical-path digest nil bytes)))
+          (gnosis-nodes--write-state state))))))
+
+;;;###autoload
+(defun gnosis-nodes-track-all-files ()
+  "Explicitly enroll every Org file below `gnosis-nodes-directory'."
+  (interactive)
+  (unless (yes-or-no-p "Track every Org file below Gnosis nodes directory? ")
+    (user-error "Gnosis all-file enrollment cancelled"))
+  (gnosis-nodes--with-lock
+    (let ((state (gnosis-nodes--read-state)))
+      (dolist (file (sort (directory-files-recursively
+                           gnosis-nodes-directory "\\.org\\'")
+                          #'string<))
+        (let* ((logical-path (file-relative-name file gnosis-nodes-directory))
+               (bytes (gnosis-nodes--read-bytes file)))
+          (unless (or (gnosis-nodes--base state nil logical-path)
+                      (gnosis-nodes--outbox-covers-p state nil logical-path))
+            (setq state
+                  (gnosis-nodes--enqueue
+                   state (gnosis-nodes--outbox-entry
+                          :create (gnosis-core-operation-id) nil logical-path
+                          (gnosis-nodes--digest bytes) nil bytes))))))
+      (gnosis-nodes--write-state state))))
+
+;;;###autoload
+(defun gnosis-nodes-rename-file (file new-logical-path)
+  "Explicitly queue tracked FILE rename to NEW-LOGICAL-PATH."
+  (interactive "fTracked Org file: \nsNew logical path: ")
+  (gnosis-nodes--safe-path gnosis-nodes-directory new-logical-path)
+  (gnosis-nodes--with-lock
+    (let* ((state (gnosis-nodes--read-state))
+           (old (file-relative-name (expand-file-name file)
+                                    gnosis-nodes-directory))
+           (base (gnosis-nodes--base state nil old)))
+      (unless base (user-error "Org file is not tracked"))
+      (setq state
+            (gnosis-nodes--enqueue
+             state (gnosis-nodes--outbox-entry
+                    :rename (plist-get base :document-id)
+                    (plist-get base :revision) new-logical-path
+                    (plist-get base :digest) old)))
+      (gnosis-nodes--write-state state))))
+
+;;;###autoload
+(defun gnosis-nodes-tombstone-file (file)
+  "Explicitly tombstone tracked FILE while keeping local bytes."
+  (interactive "fTracked Org file to tombstone: ")
+  (unless (yes-or-no-p "Tombstone remote document and keep local file? ")
+    (user-error "Tombstone cancelled"))
+  (gnosis-nodes--with-lock
+    (let* ((state (gnosis-nodes--read-state))
+           (logical-path (file-relative-name (expand-file-name file)
+                                             gnosis-nodes-directory))
+           (base (gnosis-nodes--base state nil logical-path)))
+      (unless base (user-error "Org file is not tracked"))
+      (setq state
+            (gnosis-nodes--enqueue
+             state (gnosis-nodes--outbox-entry
+                    :delete (plist-get base :document-id)
+                    (plist-get base :revision) logical-path nil)))
+      (gnosis-nodes--write-state state))))
 
 ;;;###autoload
 (defun gnosis-nodes-resolve-conflict ()
-  "Open first recorded conflict in Ediff without accepting it implicitly."
+  "Open first recorded conflict in three-way Ediff merge."
   (interactive)
   (let* ((state (gnosis-nodes--read-state))
          (record (and (> (length (plist-get state :conflicts)) 0)
                       (aref (plist-get state :conflicts) 0))))
     (unless record (user-error "No Gnosis Org conflicts"))
-    (let ((local (gnosis-nodes--safe-path
-                  gnosis-nodes-directory (plist-get record :logical-path))))
+    (let* ((local (gnosis-nodes--safe-path
+                   gnosis-nodes-directory
+                   (or (plist-get record :local-path)
+                       (plist-get record :logical-path))))
+           (local-buffer (find-file-noselect local))
+           (remote-buffer (find-file-noselect (plist-get record :remote-file)))
+           (base-buffer (find-file-noselect (plist-get record :base-file))))
       (require 'ediff)
-      (ediff-files3 local (plist-get record :remote-file)
-                    (plist-get record :base-file)))))
+      (ediff-merge-buffers-with-ancestor
+       local-buffer remote-buffer base-buffer nil nil local))))
+
+(defun gnosis-nodes--remote-conflict-current-p (state record)
+  "Return non-nil when RECORD remote head remains current after STATE cursor."
+  (let ((cursor (plist-get state :cursor)) (current t) page done)
+    (while (and current (not done))
+      (setq page (gnosis-core-sync-changes cursor))
+      (unless (gnosis-nodes--change-page-valid-p page cursor)
+        (signal 'gnosis-nodes-error '("Invalid Gnosis change page")))
+      (dolist (item (append (plist-get page :items) nil))
+        (when (and (equal "document" (plist-get item :entity_kind))
+                   (equal (plist-get record :document-id)
+                          (plist-get (plist-get item :projection) :document_id)))
+          (let ((projection (plist-get item :projection)))
+            (setq current
+                  (and (= (plist-get record :remote-revision)
+                          (plist-get projection :revision))
+                       (equal (gnosis-nodes--nullable
+                               (plist-get record :remote-digest))
+                              (gnosis-nodes--nullable
+                               (plist-get projection :content_sha256))))))))
+      (setq cursor (plist-get page :next)
+            done (not (eq t (plist-get page :has_more)))))
+    current))
 
 ;;;###autoload
 (defun gnosis-nodes-accept-conflict ()
   "Accept current local merge for first conflict as revisioned replacement.
-Refuse when local content changed since conflict capture.  Remote staleness is
-guarded by the mutation's exact If-Match revision."
+Revalidate local merged bytes and remote head before durable queueing."
   (interactive)
-  (let* ((state (gnosis-nodes--read-state))
-         (conflicts (plist-get state :conflicts))
-         (record (and (> (length conflicts) 0) (aref conflicts 0))))
-    (unless record (user-error "No Gnosis Org conflicts"))
-    (let* ((logical-path (plist-get record :logical-path))
-           (path (gnosis-nodes--safe-path gnosis-nodes-directory logical-path))
-           (digest (and (file-exists-p path)
-                        (gnosis-nodes--digest (gnosis-nodes--read-bytes path)))))
-      (unless (equal digest (plist-get record :local-digest))
-        (user-error "Local conflict content changed; synchronize again"))
-      (setq state
-            (gnosis-nodes--enqueue
-             state
-             (gnosis-nodes--outbox-entry
-              :replace (plist-get record :document-id)
-              (plist-get record :remote-revision) logical-path digest)))
-      (plist-put state :conflicts (vconcat (cdr (append conflicts nil))))
-      (gnosis-nodes--write-state state)
-      (message "Gnosis conflict merge queued"))))
+  (gnosis-nodes--with-lock
+    (let* ((state (gnosis-nodes--read-state))
+           (conflicts (plist-get state :conflicts))
+           (record (and (> (length conflicts) 0) (aref conflicts 0))))
+      (unless record (user-error "No Gnosis Org conflicts"))
+      (let* ((logical-path (plist-get record :logical-path))
+             (path (gnosis-nodes--safe-path
+                    gnosis-nodes-directory
+                    (or (plist-get record :local-path) logical-path)))
+             (bytes (and (file-exists-p path) (gnosis-nodes--read-bytes path)))
+             (digest (and bytes (gnosis-nodes--digest bytes))))
+        (unless bytes (user-error "Local merge file no longer exists"))
+        (unless (gnosis-nodes--remote-conflict-current-p state record)
+          (user-error "Remote conflict head changed; synchronize again"))
+        (setq state
+              (gnosis-nodes--enqueue
+               state
+               (gnosis-nodes--outbox-entry
+                :replace (plist-get record :document-id)
+                (plist-get record :remote-revision) logical-path digest nil bytes)))
+        (plist-put state :conflicts (vconcat (cdr (append conflicts nil))))
+        (gnosis-nodes--write-state state)
+        (message "Gnosis conflict merge queued")))))
 
 (provide 'gnosis-nodes)
 ;;; gnosis-nodes.el ends here

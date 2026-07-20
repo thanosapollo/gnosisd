@@ -91,7 +91,7 @@
   (gnosis-test-core-integration--with-client
     (let* ((root (make-temp-file "gnosis-org-sync-" t))
          (gnosis-nodes-directory root)
-         (gnosis-nodes-state-file nil)
+         (gnosis-nodes-state-file (expand-file-name "private/state.json" root))
          (path (format "integration/%s.org" (gnosis-core-operation-id)))
          (prefix ":PROPERTIES:\n:ID: integration-root\n:END:\n")
          (initial (string-to-unibyte (concat prefix "#+TITLE: Initial\n")))
@@ -123,8 +123,8 @@
           (gnosis-nodes--write-document
            "integration/restart.org"
            ":PROPERTIES:\n:ID: integration-restart\n:END:\n#+TITLE: Restart\n")
-          (gnosis-nodes--write-state
-           (gnosis-nodes--scan (gnosis-nodes--read-state)))
+          (gnosis-nodes-track-file
+           (gnosis-nodes--safe-path root "integration/restart.org"))
           (gnosis-nodes--send-outbox (gnosis-nodes--read-state))
           (should (seq-some
                    (lambda (entry) (eq :applied (plist-get entry :status)))

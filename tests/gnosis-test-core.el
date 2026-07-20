@@ -710,5 +710,41 @@ CONTENT-TYPE defaults to application/json."
      (gnosis-core-document-create "expected" "note.org" "body")
      :type 'gnosis-core-mutation-uncertain)))
 
+(ert-deftest gnosis-core-document-mutation-validates-rejected-result ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               '(:status "rejected" :format_version 1
+                 :operation_id "expected"
+                 :rejection (:reason "revision_conflict"
+                             :expected_revision 8 :current_revision 10)
+                 :cursor "hint"))))
+    (should-error
+     (gnosis-core-document-replace "doc" "expected" 7 "note.org" "body")
+     :type 'gnosis-core-mutation-uncertain)))
+
+(ert-deftest gnosis-core-document-mutation-rejects-unknown-status ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               '(:status "maybe" :format_version 1
+                 :operation_id "expected" :cursor "hint"))))
+    (should-error
+     (gnosis-core-document-create "expected" "note.org" "body")
+     :type 'gnosis-core-mutation-uncertain)))
+
+(ert-deftest gnosis-core-document-mutation-accepts-valid-nullable-rejection ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               `(:status "rejected" :format_version 1
+                 :operation_id "expected"
+                 :rejection (:reason "revision_conflict"
+                             :expected_revision 7
+                             :current_revision ,gnosis-core--json-null)
+                 :cursor "hint"))))
+    (should (equal "rejected"
+                   (plist-get
+                    (gnosis-core-document-replace
+                     "doc" "expected" 7 "note.org" "body")
+                    :status)))))
+
 (provide 'gnosis-test-core)
 ;;; gnosis-test-core.el ends here
