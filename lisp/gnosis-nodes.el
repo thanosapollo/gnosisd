@@ -1061,38 +1061,49 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
 
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
-  (let ((outbox (plist-get state :outbox))
-        (inspected 0)
-        (sent 0))
+  (let* ((outbox (plist-get state :outbox))
+         (length (length outbox))
+         (stored-start (plist-get state :outbox-scan-index))
+         (start (if (natnump stored-start) stored-start 0))
+         (inspected 0)
+         (sent 0))
+    (when (or (< start 0) (>= start (max length 1)))
+      (setq start 0))
     (catch 'gnosis-nodes--stop-outbox
-      (dotimes (index (length outbox))
-        (when (>= inspected gnosis-nodes-max-outbox-scan-per-pass)
-          (throw 'gnosis-nodes--stop-outbox nil))
-        (cl-incf inspected)
-        (let ((entry (aref outbox index)))
+      (while (and (< inspected length)
+                  (< inspected gnosis-nodes-max-outbox-scan-per-pass))
+        (let* ((index (mod (+ start inspected) length))
+               (entry (aref outbox index)))
+          (when (and (eq :pending (plist-get entry :status))
+                     (>= sent gnosis-nodes-max-mutations-per-pass))
+            (setq state (plist-put state :outbox-scan-index index))
+            (throw 'gnosis-nodes--stop-outbox nil))
+          (cl-incf inspected)
+          (setq state (plist-put state :outbox-scan-index
+                                 (mod (+ index 1) length)))
           (when (eq :pending (plist-get entry :status))
-            (when (>= sent gnosis-nodes-max-mutations-per-pass)
-              (throw 'gnosis-nodes--stop-outbox nil))
-            (cl-incf sent)
-            (setq gnosis-nodes--mutation-sent t)
-            (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
-            (gnosis-nodes--write-state state)
-            (condition-case nil
-                (let ((result (gnosis-nodes--send-entry entry)))
-                  (setq entry (plist-put entry :result result))
-                  (aset outbox index
-                        (gnosis-nodes--outbox-mark
-                         entry (if (equal "applied" (plist-get result :status))
-                                   :applied :rejected)))
-                  (gnosis-nodes--write-state state)
-                  (when (equal "rejected" (plist-get result :status))
-                    (throw 'gnosis-nodes--stop-outbox nil)))
-              (gnosis-core-mutation-uncertain
-               (aset outbox index
-                     (gnosis-nodes--outbox-mark entry :uncertain))
-               (gnosis-nodes--write-state state)
-               (throw 'gnosis-nodes--stop-outbox nil))))))))
-  state)
+              (cl-incf sent)
+              (setq gnosis-nodes--mutation-sent t)
+              (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
+              (gnosis-nodes--write-state state)
+              (condition-case nil
+                  (let ((result (gnosis-nodes--send-entry entry)))
+                    (setq entry (plist-put entry :result result))
+                    (aset outbox index
+                          (gnosis-nodes--outbox-mark
+                           entry (if (equal "applied" (plist-get result :status))
+                                     :applied :rejected)))
+                    (gnosis-nodes--write-state state)
+                    (when (equal "rejected" (plist-get result :status))
+                      (throw 'gnosis-nodes--stop-outbox nil)))
+                (gnosis-core-mutation-uncertain
+                 (aset outbox index
+                       (gnosis-nodes--outbox-mark entry :uncertain))
+                 (gnosis-nodes--write-state state)
+                 (throw 'gnosis-nodes--stop-outbox nil)))))))
+    (when (> inspected 0)
+      (gnosis-nodes--write-state state))
+    state))
 
 (defmacro gnosis-nodes--with-lock (&rest body)
   "Run BODY while holding exclusive private synchronization lock."
@@ -1523,9 +1534,12 @@ Revalidate local merged bytes and remote head before durable queueing."
              (path (gnosis-nodes--safe-path
                     gnosis-nodes-directory
                     (or (plist-get record :local-path) logical-path)))
+             (buffer (get-file-buffer path))
              (bytes (and (file-exists-p path) (gnosis-nodes--read-bytes path)))
              (digest (and bytes (gnosis-nodes--digest bytes))))
         (unless bytes (user-error "Local merge file no longer exists"))
+        (when (and (buffer-live-p buffer) (buffer-modified-p buffer))
+          (user-error "Save local merge before accepting it"))
         (unless (and (eq :editing (plist-get record :status))
                      (stringp (plist-get record :merge-start-digest)))
           (user-error "Open conflict in Ediff before accepting merge"))
@@ -1621,22 +1635,37 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
 (defun gnosis-nodes--accept-remote-conflict (state record)
   "Apply RECORD remote projection and clear it from STATE."
   (let* ((projection (plist-get record :projection))
+         (document-id (plist-get record :document-id))
          (local-path (or (plist-get record :local-path)
                          (plist-get record :logical-path)))
          (remote-path (plist-get record :logical-path))
          (path (gnosis-nodes--safe-path gnosis-nodes-directory local-path))
-         (head (gnosis-nodes--outbox-entry-for
-                state (plist-get record :document-id) local-path))
+         (related
+          (seq-filter
+           (lambda (entry)
+             (or (and document-id
+                      (equal document-id (plist-get entry :document-id)))
+                 (member local-path
+                         (list (plist-get entry :logical-path)
+                               (plist-get entry :previous-path)))
+                 (member remote-path
+                         (list (plist-get entry :logical-path)
+                               (plist-get entry :previous-path)))))
+           (append (plist-get state :outbox) nil)))
          (local-bytes (and (file-exists-p path) (gnosis-nodes--read-bytes path)))
          (local-digest (and local-bytes (gnosis-nodes--digest local-bytes))))
     (unless projection
       (user-error "Conflict predates explicit remote resolution; synchronize again"))
     (unless (equal local-digest (plist-get record :local-digest))
       (user-error "Local conflict file changed; synchronize again"))
-    (when (memq (plist-get head :status) '(:sending :uncertain :applied))
+    (when (seq-some (lambda (entry)
+                      (memq (plist-get entry :status)
+                            '(:sending :uncertain :applied)))
+                    related)
       (user-error "Pending delivery must reconcile before accepting remote"))
-    (when (memq (plist-get head :status) '(:pending :blocked :rejected))
-      (setf (plist-get head :status) :superseded))
+    (dolist (entry related)
+      (when (memq (plist-get entry :status) '(:pending :blocked :rejected))
+        (setf (plist-get entry :status) :superseded)))
     (if (eq :tombstone (plist-get record :kind))
         (gnosis-nodes--delete-local-conflict-file
          local-path

@@ -815,6 +815,99 @@
       (should (eq :pending
                   (plist-get (aref (plist-get state :outbox) 2) :status))))))
 
+(ert-deftest gnosis-nodes-outbox-scan-eventually-reaches-pending-tail ()
+  (let* ((terminal
+          (lambda (index)
+            (list :operation-id (format "old-%d" index) :status :superseded)))
+         (pending (gnosis-nodes--outbox-entry
+                   :create nil nil "pending.org"
+                   (secure-hash 'sha256 "pending") nil "pending"))
+         (state (list :outbox
+                      (vconcat (mapcar terminal (number-sequence 0 255))
+                               (vector pending))))
+         (calls 0))
+    (cl-letf (((symbol-function 'gnosis-nodes--write-state) #'ignore)
+              ((symbol-function 'gnosis-nodes--send-entry)
+               (lambda (entry)
+                 (cl-incf calls)
+                 (list :format_version 1 :status "applied"
+                       :operation_id (plist-get entry :operation-id)
+                       :cursor "opaque"
+                       :authoritative
+                       '(:document_id "doc" :revision 1
+                         :logical_path "pending.org"
+                         :content_sha256 nil :active t)))))
+      (setq state (gnosis-nodes--send-outbox state))
+      (should (= calls 0))
+      (setq state (gnosis-nodes--send-outbox state))
+      (should (= calls 1))
+      (should (eq :applied
+                  (plist-get (aref (plist-get state :outbox) 256) :status))))))
+
+(ert-deftest gnosis-nodes-accept-remote-supersedes-whole-local-chain ()
+  (let* ((first '(:operation-id "first" :status :pending :kind :replace
+                 :document-id "doc" :logical-path "note.org"))
+         (second '(:operation-id "second" :status :blocked :kind :rename
+                  :depends-on "first" :document-id "doc"
+                  :logical-path "other.org"))
+         (remote (string-to-unibyte "remote"))
+         (digest (gnosis-nodes--digest remote))
+         (projection `(:document_id "doc" :revision 2
+                       :logical_path "note.org" :content_sha256 ,digest
+                       :operation "update"))
+         (record `(:document-id "doc" :kind :content
+                   :local-path "note.org" :logical-path "note.org"
+                   :local-digest ,(gnosis-nodes--digest "local")
+                   :remote-digest ,digest :remote-revision 2
+                   :remote-file "remote-file" :projection ,projection))
+         (state `(:bases [(:document-id "doc" :revision 1
+                           :logical-path "note.org" :digest "old" :active t)]
+                  :outbox [,first ,second] :conflicts [,record])))
+    (cl-letf (((symbol-function 'gnosis-nodes--safe-path)
+               (lambda (&rest _) "/dev/null"))
+              ((symbol-function 'gnosis-nodes--read-bytes)
+               (lambda (path)
+                 (if (equal path "remote-file") remote
+                   (string-to-unibyte "local"))))
+              ((symbol-function 'gnosis-nodes--write-document) #'ignore))
+      (setq state (gnosis-nodes--accept-remote-conflict state record))
+      (should (equal '(:superseded :superseded)
+                     (mapcar (lambda (entry) (plist-get entry :status))
+                             (append (plist-get state :outbox) nil))))
+      (should (= 0 (length (plist-get state :conflicts)))))))
+
+(ert-deftest gnosis-nodes-accept-merge-refuses-modified-visiting-buffer ()
+  (let* ((directory (make-temp-file "gnosis-accept-modified" t))
+         (gnosis-nodes-directory directory)
+         (path (expand-file-name "note.org" directory))
+         (record '(:document-id "doc" :kind :content
+                   :local-path "note.org" :logical-path "note.org"
+                   :remote-revision 2 :remote-digest "remote"
+                   :status :editing :merge-start-digest "before"))
+         (state `(:bases [] :outbox [] :conflicts [,record]))
+         buffer written)
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "saved"))
+          (setq buffer (find-file-noselect path))
+          (with-current-buffer buffer (goto-char (point-max)) (insert "-merge"))
+          (cl-letf (((symbol-function 'gnosis-nodes--state-directory)
+                     (lambda () directory))
+                    ((symbol-function 'gnosis-nodes--read-state) (lambda () state))
+                    ((symbol-function 'gnosis-nodes--write-state)
+                     (lambda (value) (setq written value)))
+                    ((symbol-function 'gnosis-nodes--remote-conflict-current-p)
+                     (lambda (&rest _) t))
+                    ((symbol-function 'lock-file) #'ignore)
+                    ((symbol-function 'unlock-file) #'ignore))
+            (should-error (gnosis-nodes-accept-conflict) :type 'user-error)
+            (should-not written)
+            (should (= 0 (length (plist-get state :outbox))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-sync-shares-one-page-budget ()
   (let ((state '(:version 1 :server-id "server" :device-id "device"
                  :cursor "cursor" :protocol-fingerprint "fingerprint"
