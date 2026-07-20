@@ -926,6 +926,32 @@ mod tests {
             target_lock_path(Path::new("relative-lock.sqlite")).unwrap(),
             current.join(".relative-lock.sqlite.gnosis-lock")
         );
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            target_lock_path(&alias.join("gnosis.sqlite")).unwrap(),
+            target_lock_path(&real.join("gnosis.sqlite")).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_binds_targets_beneath_symlinked_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut config = DaemonConfig::new(
+            directory.path().join("daemon.socket"),
+            alias.join("gnosis.sqlite"),
+        );
+        config.blob_path = alias.join("blobs");
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        drop(server);
     }
 
     #[test]

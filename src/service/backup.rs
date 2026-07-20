@@ -735,8 +735,8 @@ fn canonical_restore_target(path: &Path) -> Result<PathBuf, BackupError> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    require_directory(parent)?;
     let parent = fs::canonicalize(parent)?;
+    require_directory(&parent)?;
     let name = path.file_name().ok_or(BackupError::Destination)?;
     Ok(parent.join(name))
 }
@@ -1209,6 +1209,30 @@ mod tests {
             canonical_restore_target(Path::new("relative-restore.sqlite")).unwrap(),
             current.join("relative-restore.sqlite")
         );
+
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        assert_eq!(
+            canonical_restore_target(&alias.join("gnosis.sqlite")).unwrap(),
+            real.join("gnosis.sqlite")
+        );
+    }
+
+    #[test]
+    fn restore_accepts_targets_beneath_symlinked_parent() {
+        let directory = tempdir().unwrap();
+        let (backup, _, _) = backup_fixture(directory.path());
+        let real = directory.path().join("real-targets");
+        let alias = directory.path().join("target-alias");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+
+        restore_backup(&backup, &alias.join("gnosis.sqlite"), &alias.join("blobs")).unwrap();
+        assert!(real.join("gnosis.sqlite").is_file());
+        assert!(real.join("blobs").is_dir());
     }
 
     #[test]
