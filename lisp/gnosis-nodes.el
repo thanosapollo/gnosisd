@@ -486,7 +486,18 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
               (and remote-digest
                    (or (cdr (assoc remote-digest blobs))
                        (gnosis-core-blob remote-digest))))
-             (plan (if (and base-path (not (equal base-path logical-path)))
+             (unresolved
+              (seq-find
+               (lambda (entry)
+                 (and (memq (plist-get entry :status)
+                            '(:pending :blocked :sending :uncertain))
+                      (or (equal document-id (plist-get entry :document-id))
+                          (equal logical-path (plist-get entry :logical-path))
+                          (equal logical-path (plist-get entry :old-logical-path)))))
+               (append (plist-get state :outbox) nil)))
+             (plan (if unresolved
+                       '(:action :conflict)
+                     (if (and base-path (not (equal base-path logical-path)))
                        (if (and active
                                 (equal local-digest base-digest)
                                 (not (file-exists-p
@@ -497,7 +508,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                      (if (and active (null remote-digest) local-bytes (null base))
                          '(:action :conflict)
                        (gnosis-nodes--plan-document
-                        base-digest local-digest remote-digest active)))))
+                        base-digest local-digest remote-digest active))))))
         (pcase (plist-get plan :action)
           (:materialize
            (gnosis-nodes--write-document logical-path remote-bytes)
@@ -1361,7 +1372,9 @@ Revalidate local merged bytes and remote head before durable queueing."
                (gnosis-nodes--outbox-entry
                 :replace (plist-get record :document-id)
                 (plist-get record :remote-revision) logical-path digest nil bytes)))
-          (setq state (gnosis-nodes--enqueue state entry))
+          (setq state
+                (gnosis-nodes--enqueue-after-head
+                 state entry (plist-get record :document-id) logical-path))
           (setf (plist-get record :accepted-digest) digest
                 (plist-get record :operation-id) (plist-get entry :operation-id)
                 (plist-get record :status) :queued)

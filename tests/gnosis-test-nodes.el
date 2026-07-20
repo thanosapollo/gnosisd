@@ -517,5 +517,46 @@
             (should (equal "op" (plist-get record :operation-id)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-pending-local-intent-blocks-remote-materialization ()
+  (let* ((directory (make-temp-file "gnosis-nodes-pending" t))
+         (gnosis-nodes-directory directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (bytes (string-to-unibyte "local"))
+         (digest (gnosis-nodes--digest bytes))
+         (entry (gnosis-nodes--outbox-entry
+                 :rename "doc" 1 "moved.org" digest "note.org"))
+         (state `(:bases [(:document-id "doc" :revision 1
+                           :logical-path "note.org" :digest ,digest :active t)]
+                  :outbox [,entry] :conflicts []))
+         (remote (string-to-unibyte "remote"))
+         (projection `(:document_id "doc" :revision 2 :logical_path "note.org"
+                       :content_sha256 ,(gnosis-nodes--digest remote)
+                       :operation "update")))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" bytes)
+          (cl-letf (((symbol-function 'gnosis-core-blob) (lambda (_) remote)))
+            (setq state (gnosis-nodes--apply-document state projection)))
+          (should (equal bytes (gnosis-nodes--read-bytes
+                                (expand-file-name "note.org" directory))))
+          (should (= 1 (length (plist-get state :conflicts)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-conflict-acceptance-waits-behind-uncertain-head ()
+  (let* ((head (gnosis-nodes--outbox-entry
+                :replace "doc" 1 "note.org" "old" nil
+                (string-to-unibyte "old")))
+         (entry (gnosis-nodes--outbox-entry
+                 :replace "doc" 2 "note.org" "merged" nil
+                 (string-to-unibyte "merged")))
+         (state `(:outbox [,head])))
+    (setf (plist-get head :status) :uncertain)
+    (setq state (gnosis-nodes--enqueue-after-head state entry "doc" "note.org"))
+    (should (= 2 (length (plist-get state :outbox))))
+    (let ((blocked (aref (plist-get state :outbox) 1)))
+      (should (eq :blocked (plist-get blocked :status)))
+      (should (equal (plist-get head :operation-id)
+                     (plist-get blocked :depends-on))))))
+
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
