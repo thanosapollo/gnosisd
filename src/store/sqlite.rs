@@ -1032,12 +1032,14 @@ impl SqliteStore {
         transaction.commit().map_err(StoreError::storage)
     }
 
-    pub(crate) fn backup_database(&self, path: &Path) -> Result<(), StoreError> {
-        self.connection
-            .backup(rusqlite::MAIN_DB, path, None)
+    pub(crate) fn backup_database(source: &Path, destination: &Path) -> Result<(), StoreError> {
+        Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(StoreError::storage)?
+            .backup(rusqlite::MAIN_DB, destination, None)
             .map_err(StoreError::storage)
     }
 
+    #[cfg(test)]
     pub(crate) fn referenced_blobs(&self) -> Result<Vec<(String, u64)>, StoreError> {
         load_blob_rows(&self.connection)
     }

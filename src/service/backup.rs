@@ -4,7 +4,6 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +20,6 @@ use crate::{
 const DATABASE_FILE: &str = "gnosis.sqlite";
 const MANIFEST_FILE: &str = "manifest.json";
 const BACKUP_FORMAT_VERSION: u32 = 1;
-static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackupSummary {
@@ -57,26 +55,22 @@ struct ManifestBlob {
 }
 
 pub(crate) fn snapshot_backup(
-    store: &SqliteStore,
+    source: &Path,
     destination: &Path,
 ) -> Result<BackupSnapshot, BackupError> {
     require_new_directory(destination)?;
     let parent = destination.parent().ok_or(BackupError::Destination)?;
-    let sequence = SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let database = parent.join(format!(
-        ".gnosis-backup-snapshot-{}-{sequence}.sqlite",
-        std::process::id()
-    ));
+    let database = parent.join(format!(".gnosis-backup-snapshot-{}.sqlite", Uuid::now_v7()));
     OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&database)?;
-    if let Err(error) = store.backup_database(&database) {
+    if let Err(error) = SqliteStore::backup_database(source, &database) {
         let _ = fs::remove_file(&database);
         return Err(error.into());
     }
-    let blobs = match store.referenced_blobs() {
+    let blobs = match SqliteStore::verify_database_file(&database) {
         Ok(blobs) => blobs,
         Err(error) => {
             let _ = fs::remove_file(&database);

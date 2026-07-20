@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, SyncSender, TrySendError},
@@ -19,8 +19,7 @@ mod import;
 
 pub(crate) use backup::BackupSummary;
 use backup::{
-    BackupError, BackupSnapshot, create_backup, prune_backups, snapshot_backup, validate_restore,
-    verify_backup,
+    BackupError, create_backup, prune_backups, snapshot_backup, validate_restore, verify_backup,
 };
 #[cfg(test)]
 use import::persist_server_import;
@@ -78,7 +77,7 @@ enum BackupCommand {
         release: mpsc::Receiver<()>,
     },
     Create {
-        snapshot: BackupSnapshot,
+        source: PathBuf,
         destination: PathBuf,
         created_at_us: u64,
         response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
@@ -1731,7 +1730,7 @@ fn store_actor(
     receiver: mpsc::Receiver<StoreCommand>,
     ready: SyncSender<Result<(), StoreError>>,
 ) {
-    let mut store = match SqliteStore::open(path) {
+    let mut store = match SqliteStore::open(&path) {
         Ok(store) => store,
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -1746,7 +1745,7 @@ fn store_actor(
         return;
     }
     for command in receiver {
-        run_store_command(&mut store, &blobs, &backup_sender, command);
+        run_store_command(&mut store, &path, &blobs, &backup_sender, command);
     }
 }
 
@@ -2122,6 +2121,7 @@ fn stage_blob_command(
 
 fn run_store_command(
     store: &mut SqliteStore,
+    database: &Path,
     blobs: &BlobStore,
     backup_sender: &SyncSender<BackupCommand>,
     command: StoreCommand,
@@ -2701,27 +2701,24 @@ fn run_store_command(
             destination,
             created_at_us,
             response,
-        } => match snapshot_backup(store, &destination) {
-            Ok(snapshot) => {
-                let command = BackupCommand::Create {
-                    snapshot,
-                    destination,
-                    created_at_us,
-                    response,
-                };
-                match backup_sender.try_send(command) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(BackupCommand::Create { response, .. })) => {
-                        send(response, Err(ServiceError::Busy));
-                    }
-                    Err(TrySendError::Disconnected(BackupCommand::Create { response, .. })) => {
-                        send(response, Err(ServiceError::Stopped));
-                    }
-                    Err(_) => unreachable!("backup command kind changed during send"),
+        } => {
+            let command = BackupCommand::Create {
+                source: database.to_owned(),
+                destination,
+                created_at_us,
+                response,
+            };
+            match backup_sender.try_send(command) {
+                Ok(()) => {}
+                Err(TrySendError::Full(BackupCommand::Create { response, .. })) => {
+                    send(response, Err(ServiceError::Busy));
                 }
+                Err(TrySendError::Disconnected(BackupCommand::Create { response, .. })) => {
+                    send(response, Err(ServiceError::Stopped));
+                }
+                Err(_) => unreachable!("backup command kind changed during send"),
             }
-            Err(error) => send(response, Err(ServiceError::Backup(error))),
-        },
+        }
     }
 }
 
@@ -2734,15 +2731,16 @@ fn backup_actor(blobs: Arc<BlobStore>, receiver: mpsc::Receiver<BackupCommand>) 
                 let _ = release.recv();
             }
             BackupCommand::Create {
-                snapshot,
+                source,
                 destination,
                 created_at_us,
                 response,
-            } => send(
-                response,
-                create_backup(snapshot, &blobs, &destination, created_at_us)
-                    .map_err(ServiceError::Backup),
-            ),
+            } => {
+                let result = snapshot_backup(&source, &destination).and_then(|snapshot| {
+                    create_backup(snapshot, &blobs, &destination, created_at_us)
+                });
+                send(response, result.map_err(ServiceError::Backup));
+            }
             BackupCommand::Verify { path, response } => {
                 send(response, verify_backup(&path).map_err(ServiceError::Backup))
             }
@@ -3345,6 +3343,14 @@ mod tests {
         .await
         .unwrap();
         let service = runtime.handle();
+        let note = prepare_note(
+            None,
+            "notes/snapshot.org".into(),
+            "#+TITLE: Snapshot\n".into(),
+            None,
+        )
+        .unwrap();
+        service.replace_note(note, 1, None).await.unwrap();
         let (started, started_receiver) = mpsc::sync_channel(1);
         let (release, release_receiver) = mpsc::sync_channel(1);
         service
@@ -3394,7 +3400,8 @@ mod tests {
         ));
 
         release.send(()).unwrap();
-        backup_result.await.unwrap().unwrap();
+        let summary = backup_result.await.unwrap().unwrap();
+        assert_eq!(summary.blob_count, 1);
         tokio::task::spawn_blocking(move || second_started_receiver.recv())
             .await
             .unwrap()
