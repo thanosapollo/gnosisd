@@ -883,6 +883,8 @@
                   :outbox [,first ,second] :conflicts [,record])))
     (cl-letf (((symbol-function 'gnosis-nodes--safe-path)
                (lambda (&rest _) "/dev/null"))
+              ((symbol-function 'gnosis-nodes--working-bytes)
+               (lambda (_) (string-to-unibyte "local")))
               ((symbol-function 'gnosis-nodes--read-bytes)
                (lambda (path)
                  (if (equal path "remote-file") remote
@@ -1289,6 +1291,157 @@
       (let ((selection (gnosis-nodes--select-conflict conflicts)))
         (should (= 1 (car selection)))
         (should (eq second (cdr selection)))))))
+
+(ert-deftest gnosis-nodes-corrected-save-supersedes-rejection ()
+  (let* ((rejected (gnosis-nodes--outbox-entry
+                    :replace "doc" 1 "note.org" "bad" nil "bad"))
+         (state `(:bases [(:document-id "doc" :revision 1
+                           :logical-path "note.org" :digest "old" :active t)]
+                  :outbox [,rejected] :conflicts [])))
+    (setf (plist-get rejected :status) :rejected
+          (plist-get rejected :result)
+          '(:status "rejected" :rejection (:reason "invalid_content")))
+    (setq state
+          (gnosis-nodes--queue-save
+           state (aref (plist-get state :bases) 0) "corrected"))
+    (let ((replacement (aref (plist-get state :outbox) 1)))
+      (should (eq :superseded (plist-get rejected :status)))
+      (should (eq :pending (plist-get replacement :status)))
+      (should-not (equal (plist-get rejected :operation-id)
+                         (plist-get replacement :operation-id)))
+      (should (equal "corrected"
+                     (base64-decode-string
+                      (plist-get replacement :payload)))))))
+
+(ert-deftest gnosis-nodes-rust-projection-confirms-applied-receipt ()
+  (let* ((projection '(:document_id "doc" :revision 2
+                       :logical_path "note.org"
+                       :content_sha256 "digest" :operation "update"))
+         (record `(:document-id "doc" :logical-path "note.org"
+                   :projection ,projection))
+         (entry '(:status :applied
+                  :result (:authoritative
+                           (:document_id "doc" :revision 2
+                            :logical_path "note.org"
+                            :content_sha256 "digest" :active t)))))
+    (should (gnosis-nodes--entry-confirms-conflict-p entry record))))
+
+(ert-deftest gnosis-nodes-reconciliation-rejects-non-regular-destination ()
+  (let* ((directory (make-temp-file "gnosis-nodes-nonregular" t))
+         (gnosis-nodes-dir directory)
+         (destination (expand-file-name "note.org" directory))
+         (projection '(:document_id "doc" :revision 1
+                       :logical_path "note.org" :content_sha256 nil
+                       :operation "tombstone")))
+    (unwind-protect
+        (progn
+          (make-directory destination)
+          (should-error
+           (gnosis-nodes--apply-document
+            '(:bases [] :outbox [] :conflicts []) projection)
+           :type 'gnosis-nodes-path-error)
+          (delete-directory destination)
+          (should (= 0 (call-process "mkfifo" nil nil nil destination)))
+          (should-error
+           (gnosis-nodes--apply-document
+            '(:bases [] :outbox [] :conflicts []) projection)
+           :type 'gnosis-nodes-path-error))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-snapshot-finalization-is-action-bounded ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot-budget" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (gnosis-nodes-max-snapshot-actions-per-pass 1)
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "before" :bases [] :outbox [] :conflicts []))
+         (page '(:version 1 :snapshot_id "snapshot" :cursor "cut" :next nil
+                 :items [(:entity_kind "settings" :projection (:version 1))
+                         (:entity_kind "settings" :projection (:version 1))]))
+         (original (symbol-function 'gnosis-nodes--apply-item))
+         (calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-sync-snapshot) (lambda (_) page))
+                  ((symbol-function 'gnosis-nodes--write-state) #'ignore)
+                  ((symbol-function 'gnosis-nodes--apply-item)
+                   (lambda (&rest arguments)
+                     (cl-incf calls)
+                     (apply original arguments))))
+          (setq state (gnosis-nodes--snapshot state))
+          (dotimes (_ 12)
+            (when (plist-get state :snapshot)
+              (let ((before calls))
+                (setq state (gnosis-nodes--snapshot state))
+                (should (<= (- calls before) 1)))))
+          (should-not (plist-get state :snapshot))
+          (should (equal "cut" (plist-get state :cursor))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-snapshot-finalization-resumes-from-durable-state ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot-resume" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (gnosis-core-base-url "http://127.0.0.1:8000")
+         (gnosis-nodes-max-snapshot-actions-per-pass 1)
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "before" :bases [] :outbox [] :conflicts []))
+         (page '(:version 1 :snapshot_id "snapshot" :cursor "cut" :next nil
+                 :items [(:entity_kind "settings" :projection (:version 1))])))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-sync-snapshot) (lambda (_) page)))
+          (setq state (gnosis-nodes--snapshot state))
+          (dotimes (_ 8)
+            (when (plist-get state :snapshot)
+              (setq state (gnosis-nodes--snapshot (gnosis-nodes--read-state)))))
+          (should-not (plist-get state :snapshot))
+          (should (equal "cut" (plist-get state :cursor))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-replays-accept-remote-after-state-write-crash ()
+  (dolist (case '(("update" "note.org" "note.org" "remote")
+                  ("rename" "old.org" "new.org" "remote")
+                  ("tombstone" "note.org" "note.org" nil)))
+    (let* ((directory (make-temp-file "gnosis-nodes-accept-replay" t))
+           (gnosis-nodes-dir directory)
+           (user-emacs-directory (file-name-as-directory directory))
+           (gnosis-nodes-state-file nil)
+           (operation (nth 0 case))
+           (local-path (nth 1 case))
+           (remote-path (nth 2 case))
+           (remote-bytes (and (nth 3 case) (string-to-unibyte (nth 3 case))))
+           (remote-digest (and remote-bytes (gnosis-nodes--digest remote-bytes)))
+           (projection `(:document_id "doc" :revision 2
+                         :logical_path ,remote-path
+                         :content_sha256 ,remote-digest
+                         :operation ,operation))
+           (record `(:document-id "doc" :kind :content
+                     :local-path ,local-path :logical-path ,remote-path
+                     :local-digest ,(gnosis-nodes--digest "local")
+                     :remote-digest ,remote-digest :remote-revision 2
+                     :projection ,projection))
+           (entry '(:operation-id "local" :status :rejected
+                    :document-id "doc"))
+           (state `(:bases [(:document-id "doc" :revision 1
+                             :logical-path ,local-path :digest "old" :active t)]
+                    :outbox [,entry] :conflicts [,record])))
+      (unwind-protect
+          (progn
+            (if remote-bytes
+                (gnosis-nodes--write-document remote-path remote-bytes)
+              (let ((backup (expand-file-name
+                             "local-backup.org"
+                             (gnosis-nodes--conflict-directory "doc"))))
+                (make-directory (file-name-directory backup) t)
+                (gnosis-nodes--write-bytes backup (string-to-unibyte "local"))))
+            (setq state (gnosis-nodes--apply-document state projection))
+            (should (= 0 (length (plist-get state :conflicts))))
+            (should (eq :superseded
+                        (plist-get (aref (plist-get state :outbox) 0) :status)))
+            (should (= 2 (plist-get (aref (plist-get state :bases) 0)
+                                    :revision))))
+        (delete-directory directory t)))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here

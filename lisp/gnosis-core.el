@@ -1061,15 +1061,18 @@ ACTIVE constrain an applied authoritative head when non-nil."
             '("Gnosis mutation response correlation failed")))
   (pcase (plist-get result :status)
     ("applied"
-     (let ((head (plist-get result :authoritative)))
-       (unless (and head
+     (let ((head (plist-get result :authoritative))
+           (changed (plist-get result :changed)))
+       (unless (and (memq changed (list t gnosis-core--json-false))
+                    head
                     (integerp (plist-get head :revision))
                     (or (null document-id)
                         (equal document-id (plist-get head :document_id)))
                     (pcase revision
                       (:create (= 1 (plist-get head :revision)))
                       ((pred integerp)
-                       (= (1+ revision) (plist-get head :revision)))
+                       (= (+ revision (if (eq changed t) 1 0))
+                          (plist-get head :revision)))
                       (_ t))
                     (or (null logical-path)
                         (equal logical-path (plist-get head :logical_path)))

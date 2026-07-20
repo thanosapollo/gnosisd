@@ -781,5 +781,32 @@ CONTENT-TYPE defaults to application/json."
        (gnosis-core-document-tombstone "doc" "delete" 1 "note.org")
        :type 'gnosis-core-mutation-uncertain))))
 
+(ert-deftest gnosis-core-document-mutation-validates-changed-revision ()
+  (let ((head '(:document_id "doc" :logical_path "note.org"
+                :revision 7
+                :content_sha256
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                :active t)))
+    (dolist (changed (list t gnosis-core--json-false))
+      (let ((result `(:status "applied" :format_version 1
+                      :operation_id "op" :changed ,changed
+                      :authoritative ,(copy-tree head) :cursor "hint")))
+        (setf (plist-get (plist-get result :authoritative) :revision)
+              (if (eq changed t) 8 7))
+        (should
+         (eq result
+             (gnosis-core--document-mutation-result
+              result "op" "doc" 7 "note.org"
+              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              t)))))
+    (dolist (changed '(nil "true" 1))
+      (should-error
+       (gnosis-core--document-mutation-result
+        `(:status "applied" :format_version 1 :operation_id "op"
+          :changed ,changed :authoritative ,head :cursor "hint")
+        "op" "doc" 7 "note.org"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" t)
+       :type 'gnosis-core-mutation-uncertain))))
+
 (provide 'gnosis-test-core)
 ;;; gnosis-test-core.el ends here
