@@ -808,5 +808,20 @@ CONTENT-TYPE defaults to application/json."
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" t)
        :type 'gnosis-core-mutation-uncertain))))
 
+(ert-deftest gnosis-core-document-create-cannot-be-an-unchanged-replay ()
+  (should-error
+   (gnosis-core--document-mutation-result
+    `(:status "applied" :format_version 1 :operation_id "op"
+      :changed ,gnosis-core--json-false
+      :authoritative (:document_id "doc" :logical_path "note.org"
+                      :revision 1
+                      :content_sha256
+                      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      :active t)
+      :cursor "hint")
+    "op" "doc" :create "note.org"
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" t)
+   :type 'gnosis-core-mutation-uncertain))
+
 (provide 'gnosis-test-core)
 ;;; gnosis-test-core.el ends here

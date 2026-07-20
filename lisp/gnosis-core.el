@@ -1069,7 +1069,8 @@ ACTIVE constrain an applied authoritative head when non-nil."
                     (or (null document-id)
                         (equal document-id (plist-get head :document_id)))
                     (pcase revision
-                      (:create (= 1 (plist-get head :revision)))
+                      (:create (and (eq changed t)
+                                    (= 1 (plist-get head :revision))))
                       ((pred integerp)
                        (= (+ revision (if (eq changed t) 1 0))
                           (plist-get head :revision)))

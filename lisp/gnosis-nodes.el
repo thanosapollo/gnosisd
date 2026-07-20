@@ -264,7 +264,7 @@ PAYLOAD captures exact bytes at enqueue time."
     (when (vectorp outbox)
       (dotimes (index (length outbox))
         (let ((entry (aref outbox index)))
-          (dolist (key '(:kind :status))
+          (dolist (key '(:kind :status :resolution))
             (when-let* ((value (plist-get entry key))
                         ((stringp value)))
               (setf (plist-get entry key) (intern (concat ":" value)))))
@@ -274,14 +274,14 @@ PAYLOAD captures exact bytes at enqueue time."
       (when (vectorp conflicts)
         (dotimes (index (length conflicts))
           (let ((entry (aref conflicts index)))
-            (dolist (key '(:kind :status))
+            (dolist (key '(:kind :status :resolution))
               (when-let* ((value (plist-get entry key))
                           ((stringp value)))
                 (setf (plist-get entry key)
                       (intern (concat ":" value))))))))))
   (when-let* ((snapshot (plist-get state :snapshot)))
-    (dolist (field '((:prepared-outbox :kind :status)
-                     (:prepared-conflicts :kind :status)))
+    (dolist (field '((:prepared-outbox :kind :status :resolution)
+                     (:prepared-conflicts :kind :status :resolution)))
       (let ((entries (plist-get snapshot (car field))))
         (when (vectorp entries)
           (dotimes (index (length entries))
@@ -400,7 +400,7 @@ PAYLOAD captures exact bytes at enqueue time."
       (when (vectorp outbox)
         (dotimes (index (length outbox))
           (let ((entry (aref outbox index)))
-            (dolist (key '(:kind :status))
+            (dolist (key '(:kind :status :resolution))
               (when-let* ((value (plist-get entry key))
                           ((keywordp value)))
                 (setf (plist-get entry key)
@@ -409,14 +409,14 @@ PAYLOAD captures exact bytes at enqueue time."
       (when (vectorp conflicts)
         (dotimes (index (length conflicts))
           (let ((entry (aref conflicts index)))
-            (dolist (key '(:kind :status))
+            (dolist (key '(:kind :status :resolution))
               (when-let* ((value (plist-get entry key))
                           ((keywordp value)))
                 (setf (plist-get entry key)
                       (substring (symbol-name value) 1))))))))
     (when-let* ((snapshot (plist-get copy :snapshot)))
-      (dolist (field '((:prepared-outbox :kind :status)
-                       (:prepared-conflicts :kind :status)))
+      (dolist (field '((:prepared-outbox :kind :status :resolution)
+                       (:prepared-conflicts :kind :status :resolution)))
         (let ((entries (plist-get snapshot (car field))))
           (when (vectorp entries)
             (dotimes (index (length entries))
@@ -572,6 +572,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
   "Return non-nil when RECORD's remote PROJECTION is already materialized."
   (let* ((operation (plist-get projection :operation))
          (remote-path (plist-get projection :logical_path))
+         (local-path (plist-get record :local-path))
          (destination (gnosis-nodes--safe-path gnosis-nodes-dir remote-path))
          (remote-bytes (gnosis-nodes--working-bytes destination))
          (remote-digest (gnosis-nodes--nullable
@@ -588,10 +589,18 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                        (gnosis-nodes--read-bytes backup)))))
       (and remote-bytes
            (equal remote-digest (gnosis-nodes--digest remote-bytes))
-           (or (equal (plist-get record :local-path) remote-path)
-               (not (file-exists-p
-                     (gnosis-nodes--safe-path
-                      gnosis-nodes-dir (plist-get record :local-path)))))))))
+           (or (equal local-path remote-path)
+               (let* ((local-file (gnosis-nodes--safe-path
+                                   gnosis-nodes-dir local-path))
+                      (local-bytes (gnosis-nodes--working-bytes local-file)))
+                 (or (null local-bytes)
+                     (and (eq :accept-remote (plist-get record :resolution))
+                          (equal (plist-get record :local-digest)
+                                 (gnosis-nodes--digest local-bytes))
+                          (progn
+                            (unless gnosis-nodes--preflight
+                              (delete-file local-file))
+                            t)))))))))
 
 (defun gnosis-nodes--apply-document (state projection &optional blobs)
   "Reconcile document PROJECTION into working files and return STATE."
@@ -733,11 +742,14 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
          (or (null digest)
              (and (stringp digest)
                   (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest)))
-         (if (equal operation "tombstone")
-             (and (null digest) (null blob-url) (null parsed))
-           (and (listp parsed)
-                (eq (null digest) (null blob-url))
-                (or (null blob-url) (stringp blob-url)))))))
+         (pcase operation
+           ("tombstone" (and (null digest) (null blob-url) (null parsed)))
+           ("snapshot" (and (listp parsed) parsed
+                            (null digest) (null blob-url)))
+           (_ (and (listp parsed) parsed
+                   (stringp digest)
+                   (equal blob-url (format "/v1/blobs/%s" digest))
+                   (equal digest (plist-get parsed :content_sha256))))))))
 
 (defun gnosis-nodes--valid-item-p (item &optional change-p)
   "Return non-nil when replica ITEM is valid; require cursor for CHANGE-P."
@@ -1041,15 +1053,19 @@ Reject a completed manifest that differs from EXPECTED-FINGERPRINT."
              (page-index (or (plist-get snapshot :page-index) 0))
              (item-index (or (plist-get snapshot :item-index) 0)))
         (if (>= page-index (length pages))
-            (setq state
-                  (gnosis-nodes--snapshot-finish-stage
-                   state snapshot expected-fingerprint))
+            (progn
+              (setq state
+                    (gnosis-nodes--snapshot-finish-stage
+                     state snapshot expected-fingerprint))
+              (cl-decf actions))
           (let* ((page (gnosis-nodes--read-snapshot-page
                         (aref pages page-index)))
                  (items (plist-get page :items)))
             (if (>= item-index (length items))
-                (setf (plist-get snapshot :page-index) (1+ page-index)
-                      (plist-get snapshot :item-index) 0)
+                (progn
+                  (setf (plist-get snapshot :page-index) (1+ page-index)
+                        (plist-get snapshot :item-index) 0)
+                  (cl-decf actions))
               (setq state
                     (gnosis-nodes--snapshot-process-item
                      state snapshot (aref items item-index)))
@@ -1190,6 +1206,15 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
          (logical-path (plist-get base :logical-path))
          (head (gnosis-nodes--outbox-entry-for state document-id logical-path)))
     (cond
+     ((and (equal (gnosis-nodes--digest bytes) (plist-get base :digest))
+           (memq (plist-get head :status) '(:pending :blocked)))
+      (dolist (entry (append (plist-get state :outbox) nil))
+        (when (and (memq (plist-get entry :status) '(:pending :blocked))
+                   (or (equal document-id (plist-get entry :document-id))
+                       (equal logical-path (plist-get entry :logical-path))))
+          (setf (plist-get entry :status) :superseded
+                (plist-get entry :depends-on) nil)))
+      state)
      ((seq-find (lambda (conflict)
                   (equal document-id (plist-get conflict :document-id)))
                 (append (plist-get state :conflicts) nil))
@@ -1293,12 +1318,14 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
         (when (and (plist-get base :active)
                    (or (null selected-path)
                        (equal selected-path logical-path)))
-          (let ((path (gnosis-nodes--safe-path
-                       gnosis-nodes-dir logical-path)))
-            (when (file-exists-p path)
-              (let* ((bytes (gnosis-nodes--read-bytes path))
-                     (digest (gnosis-nodes--digest bytes)))
-                (unless (equal digest (plist-get base :digest))
+          (let* ((path (gnosis-nodes--safe-path
+                        gnosis-nodes-dir logical-path))
+                 (bytes (gnosis-nodes--working-bytes path)))
+            (when bytes
+              (let ((digest (gnosis-nodes--digest bytes)))
+                (when (or (gnosis-nodes--outbox-entry-for
+                           state (plist-get base :document-id) logical-path)
+                          (not (equal digest (plist-get base :digest))))
                   (setq state
                         (gnosis-nodes--queue-save state base bytes)))))))))
     (unless selected-path
@@ -1357,12 +1384,34 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
               (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
               (gnosis-nodes--write-state state)
               (condition-case nil
-                  (let ((result (gnosis-nodes--send-entry entry)))
+                  (let* ((result (gnosis-nodes--send-entry entry))
+                         (authoritative
+                          (copy-tree (plist-get result :authoritative))))
+                    (when authoritative
+                      (setf (plist-get authoritative :operation)
+                            (pcase (plist-get entry :kind)
+                              (:rename "rename")
+                              (:tombstone "tombstone")
+                              (_ "update"))))
                     (setq entry (plist-put entry :result result))
                     (aset outbox index
                           (gnosis-nodes--outbox-mark
                            entry (if (equal "applied" (plist-get result :status))
                                      :applied :rejected)))
+                    (when (and (equal "applied" (plist-get result :status))
+                               (eq gnosis-core--json-false
+                                   (plist-get result :changed))
+                               authoritative
+                               (when-let* ((base (gnosis-nodes--base
+                                                  state
+                                                  (plist-get authoritative
+                                                             :document_id))))
+                                 (and (= (plist-get base :revision)
+                                         (plist-get authoritative :revision))
+                                      (equal (plist-get base :fingerprint)
+                                             (gnosis-nodes--projection-fingerprint
+                                              authoritative)))))
+                      (setq state (gnosis-nodes--record-base state authoritative)))
                     (gnosis-nodes--write-state state)
                     (when (equal "rejected" (plist-get result :status))
                       (throw 'gnosis-nodes--stop-outbox nil)))
@@ -2085,6 +2134,8 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
     (unless (equal local-digest (plist-get record :local-digest))
       (user-error "Local conflict file changed; synchronize again"))
     (setq state (gnosis-nodes--supersede-local-chain state record))
+    (setf (plist-get record :resolution) :accept-remote)
+    (gnosis-nodes--write-state state)
     (if (eq :tombstone (plist-get record :kind))
         (gnosis-nodes--delete-local-conflict-file
          local-path
@@ -2104,7 +2155,9 @@ LOCAL-BYTES contains exact current local intent when a working file exists."
     (plist-put
      state :conflicts
      (vconcat
-      (seq-remove (lambda (item) (eq item record))
+      (seq-remove (lambda (item)
+                    (equal (plist-get item :document-id)
+                           (plist-get record :document-id)))
                   (append (plist-get state :conflicts) nil))))))
 
 ;;;###autoload
