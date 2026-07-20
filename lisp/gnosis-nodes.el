@@ -129,6 +129,24 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
       (with-current-buffer buffer
         (revert-buffer :ignore-auto :noconfirm)))))
 
+(defun gnosis-nodes--move-document (old-logical-path logical-path bytes)
+  "Move clean OLD-LOGICAL-PATH to LOGICAL-PATH with authoritative BYTES."
+  (let* ((old-path (gnosis-nodes--safe-path
+                    gnosis-nodes-directory old-logical-path))
+         (path (gnosis-nodes--safe-path gnosis-nodes-directory logical-path))
+         (old-buffer (get-file-buffer old-path)))
+    (when (or (file-exists-p path)
+              (get-file-buffer path)
+              (and (buffer-live-p old-buffer)
+                   (buffer-modified-p old-buffer)))
+      (signal 'gnosis-nodes-conflict (list logical-path)))
+    (gnosis-nodes--write-document logical-path bytes)
+    (delete-file old-path)
+    (when (buffer-live-p old-buffer)
+      (with-current-buffer old-buffer
+        (set-visited-file-name path t)
+        (revert-buffer :ignore-auto :noconfirm)))))
+
 (defun gnosis-nodes--read-bytes (path)
   "Return exact bytes from PATH."
   (with-temp-buffer
@@ -386,6 +404,17 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
           (gnosis-nodes--nullable (plist-get projection :content_sha256)))
          (active (not (equal "tombstone" (plist-get projection :operation))))
          (base (gnosis-nodes--base state document-id logical-path))
+         (_identity
+          (when (and base
+                     (not (equal document-id
+                                 (plist-get base :document-id))))
+            (signal 'gnosis-nodes-error
+                    '("Gnosis logical path changed document identity"))))
+         (remote-revision (plist-get projection :revision))
+         (_stale
+          (when (and base (< remote-revision (plist-get base :revision)))
+            (signal 'gnosis-nodes-error
+                    '("Stale Gnosis document projection"))))
          (base-digest (and base (plist-get base :digest)))
          (base-path (and base (plist-get base :logical-path)))
          (working-path (or base-path logical-path))
@@ -405,7 +434,13 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                    (or (cdr (assoc remote-digest blobs))
                        (gnosis-core-blob remote-digest))))
              (plan (if (and base-path (not (equal base-path logical-path)))
-                       '(:action :conflict)
+                       (if (and active
+                                (equal local-digest base-digest)
+                                (not (file-exists-p
+                                      (gnosis-nodes--safe-path
+                                       gnosis-nodes-directory logical-path))))
+                           '(:action :move)
+                         '(:action :conflict))
                      (if (and active (null remote-digest) local-bytes (null base))
                          '(:action :conflict)
                        (gnosis-nodes--plan-document
@@ -413,6 +448,9 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
         (pcase (plist-get plan :action)
           (:materialize
            (gnosis-nodes--write-document logical-path remote-bytes)
+           (gnosis-nodes--record-base state projection))
+          (:move
+           (gnosis-nodes--move-document base-path logical-path remote-bytes)
            (gnosis-nodes--record-base state projection))
           (:conflict
            (gnosis-nodes--record-conflict

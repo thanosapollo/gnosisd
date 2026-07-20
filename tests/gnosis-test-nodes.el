@@ -401,5 +401,91 @@
       (gnosis-nodes--idle-sync)
       (should-not called))))
 
+(ert-deftest gnosis-nodes-rejects-stale-delta-and-snapshot-projections ()
+  (dolist (operation '("update" "snapshot"))
+    (let* ((directory (make-temp-file "gnosis-nodes-stale" t))
+           (gnosis-nodes-directory directory)
+           (bytes (string-to-unibyte "current"))
+           (digest (gnosis-nodes--digest bytes))
+           (remote-digest (gnosis-nodes--digest "older"))
+           (state `(:version 1 :cursor "feed"
+                    :bases [(:document-id "doc" :revision 5
+                             :logical-path "note.org" :digest ,digest
+                             :active t)]
+                    :outbox [] :conflicts [(:document-id "other")]))
+           (before (copy-tree state t))
+           (projection `(:document_id "doc" :revision 4
+                         :logical_path "note.org"
+                         :content_sha256 ,remote-digest
+                         :operation ,operation))
+           (blob-calls 0))
+      (unwind-protect
+          (progn
+            (gnosis-nodes--write-document "note.org" bytes)
+            (cl-letf (((symbol-function 'gnosis-core-blob)
+                       (lambda (_)
+                         (cl-incf blob-calls)
+                         "older")))
+              (should-error (gnosis-nodes--apply-document state projection)
+                            :type 'gnosis-nodes-error))
+            (should (= 0 blob-calls))
+            (should (equal state before))
+            (should (equal bytes
+                           (gnosis-nodes--read-bytes
+                            (expand-file-name "note.org" directory)))))
+        (delete-directory directory t)))))
+
+(ert-deftest gnosis-nodes-rejects-duplicate-logical-path-identity ()
+  (let* ((directory (make-temp-file "gnosis-nodes-identity" t))
+         (gnosis-nodes-directory directory)
+         (bytes (string-to-unibyte "one"))
+         (digest (gnosis-nodes--digest bytes))
+         (state `(:bases [(:document-id "doc-1" :revision 1
+                           :logical-path "same.org" :digest ,digest :active t)]
+                  :outbox [] :conflicts []))
+         (projection `(:document_id "doc-2" :revision 2
+                       :logical_path "same.org"
+                       :content_sha256 ,(gnosis-nodes--digest "two")
+                       :operation "update"))
+         (blob-called nil))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "same.org" bytes)
+          (cl-letf (((symbol-function 'gnosis-core-blob)
+                     (lambda (_) (setq blob-called t) "two")))
+            (should-error (gnosis-nodes--apply-document state projection)
+                          :type 'gnosis-nodes-error))
+          (should-not blob-called)
+          (should (equal bytes
+                         (gnosis-nodes--read-bytes
+                          (expand-file-name "same.org" directory)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-applies-clean-authoritative-rename ()
+  (let* ((directory (make-temp-file "gnosis-nodes-rename" t))
+         (gnosis-nodes-directory directory)
+         (bytes (string-to-unibyte "body"))
+         (digest (gnosis-nodes--digest bytes))
+         (state `(:bases [(:document-id "doc" :revision 1
+                           :logical-path "old.org" :digest ,digest :active t)]
+                  :outbox [] :conflicts []))
+         (projection `(:document_id "doc" :revision 2
+                       :logical_path "new.org" :content_sha256 ,digest
+                       :operation "rename")))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "old.org" bytes)
+          (cl-letf (((symbol-function 'gnosis-core-blob) (lambda (_) bytes)))
+            (setq state (gnosis-nodes--apply-document state projection)))
+          (should-not (file-exists-p (expand-file-name "old.org" directory)))
+          (should (equal bytes
+                         (gnosis-nodes--read-bytes
+                          (expand-file-name "new.org" directory))))
+          (should (equal "new.org"
+                         (plist-get (gnosis-nodes--base state "doc")
+                                    :logical-path)))
+          (should (= 0 (length (plist-get state :conflicts)))))
+      (delete-directory directory t))))
+
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
