@@ -3059,6 +3059,25 @@ mod tests {
         assert!(matches!(new_error, ServiceError::Store(_)));
         assert!(!blob_path.join(&new_digest[..2]).join(&new_digest).exists());
 
+        let preexisting_orphan = blobs
+            .put(b"preexisting orphan", "application/octet-stream")
+            .unwrap();
+        let orphan_error = stage_blob_command(
+            &mut store,
+            &blobs,
+            b"preexisting orphan",
+            "application/octet-stream",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(orphan_error, ServiceError::Store(_)));
+        assert!(
+            blob_path
+                .join(&preexisting_orphan.sha256[..2])
+                .join(&preexisting_orphan.sha256)
+                .exists()
+        );
+
         let existing_error = stage_blob_command(
             &mut store,
             &blobs,
