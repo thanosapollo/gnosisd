@@ -1356,6 +1356,17 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
         document-id operation-id revision logical-path))
       (_ (signal 'gnosis-nodes-error '("Invalid Gnosis pending operation"))))))
 
+(defun gnosis-nodes--unchanged-head-matches-base-p (base head)
+  "Return non-nil when reduced mutation HEAD exactly confirms BASE."
+  (and base head
+       (equal (plist-get base :document-id) (plist-get head :document_id))
+       (= (plist-get base :revision) (plist-get head :revision))
+       (equal (plist-get base :logical-path) (plist-get head :logical_path))
+       (equal (plist-get base :digest)
+              (gnosis-nodes--nullable (plist-get head :content_sha256)))
+       (eq (and (plist-get base :active) t)
+           (eq (plist-get head :active) t))))
+
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
   (let* ((outbox (plist-get state :outbox))
@@ -1387,12 +1398,6 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
                   (let* ((result (gnosis-nodes--send-entry entry))
                          (authoritative
                           (copy-tree (plist-get result :authoritative))))
-                    (when authoritative
-                      (setf (plist-get authoritative :operation)
-                            (pcase (plist-get entry :kind)
-                              (:rename "rename")
-                              (:tombstone "tombstone")
-                              (_ "update"))))
                     (setq entry (plist-put entry :result result))
                     (aset outbox index
                           (gnosis-nodes--outbox-mark
@@ -1406,12 +1411,20 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
                                                   state
                                                   (plist-get authoritative
                                                              :document_id))))
-                                 (and (= (plist-get base :revision)
-                                         (plist-get authoritative :revision))
-                                      (equal (plist-get base :fingerprint)
-                                             (gnosis-nodes--projection-fingerprint
-                                              authoritative)))))
-                      (setq state (gnosis-nodes--record-base state authoritative)))
+                                 (gnosis-nodes--unchanged-head-matches-base-p
+                                  base authoritative)))
+                      (setq state
+                            (plist-put
+                             state :outbox
+                             (vconcat
+                              (seq-remove
+                               (lambda (item)
+                                 (equal (plist-get item :operation-id)
+                                        (plist-get entry :operation-id)))
+                               (append (plist-get state :outbox) nil)))))
+                      (setq state (gnosis-nodes--promote-outbox state))
+                      (gnosis-nodes--write-state state)
+                      (throw 'gnosis-nodes--stop-outbox nil))
                     (gnosis-nodes--write-state state)
                     (when (equal "rejected" (plist-get result :status))
                       (throw 'gnosis-nodes--stop-outbox nil)))
@@ -1663,7 +1676,8 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
         (when base
           (let* ((bytes (gnosis-nodes--read-bytes buffer-file-name))
                  (digest (gnosis-nodes--digest bytes)))
-            (unless (equal digest (plist-get base :digest))
+            (when (or head
+                      (not (equal digest (plist-get base :digest))))
               (setq state (gnosis-nodes--queue-save state base bytes))
               (gnosis-nodes--write-state state))))))))
 
