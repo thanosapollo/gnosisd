@@ -465,23 +465,23 @@ pub struct ReviewStateV1 {
     pub state_revision: u64,
     pub review_count: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub last_reviewed_at_us: Option<u64>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub last_review_day: Option<u32>,
     pub next_review_day: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub interval_days: Option<u32>,
     pub total_successes: u64,
     pub total_failures: u64,
     pub suspended: bool,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<f32>", required)]
     pub stability: Option<f32>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<f32>", required)]
     pub difficulty: Option<f32>,
 }
 
@@ -536,14 +536,14 @@ pub struct ReviewSourceV1 {
     pub tags: Vec<String>,
     pub exclude_tags: Vec<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub topic_node_id: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     #[schemars(range(max = 32))]
     pub topic_forward_depth: Option<u32>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     #[schemars(range(max = 32))]
     pub topic_backward_depth: Option<u32>,
     #[schemars(length(max = 500))]
@@ -648,12 +648,12 @@ impl ReviewSessionStatusV1 {
 pub struct ReviewSessionV1 {
     pub session_id: String,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub owner_device_id: Option<String>,
     pub mode: ReviewSessionModeV1,
     pub source: ReviewSourceV1,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub target_count: Option<u32>,
     pub status: ReviewSessionStatusV1,
     pub current_position: u32,
@@ -704,7 +704,7 @@ impl ReviewSessionStatusV1 {
 #[serde(deny_unknown_fields)]
 pub struct ActiveReviewSessionV1 {
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<ReviewSessionV1>", required)]
     pub session: Option<ReviewSessionV1>,
 }
 
@@ -802,24 +802,27 @@ pub struct ReviewAttemptV1 {
     pub thema_id: String,
     pub presentation: ReviewPresentationV1,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<Vec<String>>", required)]
     pub revealed_answer: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub revealed_parathema: Option<String>,
     pub matcher_version: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<ReviewAnswerV1>", required)]
     pub response: Option<ReviewAnswerV1>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
     pub detected_success: Option<bool>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
     pub accepted_success: Option<bool>,
     pub override_count: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(
+        with = "crate::protocol::RequiredNullable<ReviewTransitionV1>",
+        required
+    )]
     pub proposed_transition: Option<ReviewTransitionV1>,
     pub desired_suspended: bool,
     pub status: ReviewAttemptStatusV1,
@@ -881,10 +884,10 @@ pub struct ReviewPresentationV1 {
     pub question: String,
     pub response: ReviewResponsePromptV1,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub source_guid: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub review_image: Option<String>,
     pub tags: Vec<String>,
 }
@@ -915,7 +918,7 @@ impl ReviewPresentationV1 {
 pub enum ReviewResponsePromptV1 {
     Text {
         #[serde(deserialize_with = "deserialize_required_option")]
-        #[schemars(schema_with = "nullable_string_schema", required)]
+        #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
         input_script: Option<String>,
     },
     Texts {
@@ -926,10 +929,6 @@ pub enum ReviewResponsePromptV1 {
         #[schemars(length(min = 2))]
         choices: Vec<String>,
     },
-}
-
-fn nullable_string_schema(generator: &mut SchemaGenerator) -> Schema {
-    Option::<String>::json_schema(generator)
 }
 
 impl ReviewResponsePromptV1 {
@@ -1113,7 +1112,7 @@ pub enum ApiErrorMetaV1 {
     Revision {
         expected_revision: u64,
         #[serde(deserialize_with = "deserialize_required_option")]
-        #[schemars(required)]
+        #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
         current_revision: Option<u64>,
     },
     DeviceSequence {
@@ -1296,7 +1295,7 @@ mod error_schema {
     #[serde(deny_unknown_fields)]
     struct RevisionErrorMetaSchemaV1 {
         expected_revision: u64,
-        #[schemars(required)]
+        #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
         current_revision: Option<u64>,
     }
 

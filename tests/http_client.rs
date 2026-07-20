@@ -30,7 +30,7 @@ use gnosis_core::{
         request,
     },
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::{
@@ -79,6 +79,31 @@ impl RunningDaemon {
 
 fn token() -> SecretToken {
     SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap()
+}
+
+fn schema_accepts_null(schema: &Value, components: &Value) -> bool {
+    if schema == &Value::Bool(true) {
+        return true;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let name = reference.strip_prefix("#/components/schemas/").unwrap();
+        return schema_accepts_null(&components[name], components);
+    }
+    if schema.get("type").is_some_and(|value| {
+        value == "null"
+            || value
+                .as_array()
+                .is_some_and(|types| types.iter().any(|item| item == "null"))
+    }) {
+        return true;
+    }
+    ["anyOf", "oneOf"].into_iter().any(|keyword| {
+        schema[keyword].as_array().is_some_and(|variants| {
+            variants
+                .iter()
+                .any(|variant| schema_accepts_null(variant, components))
+        })
+    })
 }
 
 #[test]
@@ -168,6 +193,50 @@ async fn client_authenticates_and_decodes_replica_bootstrap() {
     assert_eq!(assets.server_id, state.server_id);
     assert_eq!(device_id.len(), 36);
 
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn dashboard_null_response_matches_required_nullable_openapi_contract() {
+    let daemon = RunningDaemon::start().await;
+    let (_, raw_token) = create_device(&daemon.socket).await;
+    let _typed_client = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(raw_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let client = raw_http_client();
+    let dashboard_response = client
+        .get(format!("{}/v1/dashboard", daemon.base_url))
+        .bearer_auth(&raw_token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let dashboard: Value =
+        serde_json::from_slice(&dashboard_response.bytes().await.unwrap()).unwrap();
+    let openapi_response = client
+        .get(format!("{}/v1/openapi.json", daemon.base_url))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let openapi: Value = serde_json::from_slice(&openapi_response.bytes().await.unwrap()).unwrap();
+    let schemas = &openapi["components"]["schemas"];
+    let dashboard_schema = &schemas["DashboardV1"];
+    let active_session_schema = &dashboard_schema["properties"]["active_session"];
+
+    assert_eq!(dashboard["active_session"], Value::Null);
+    assert!(
+        dashboard_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "active_session")
+    );
+    assert!(schema_accepts_null(active_session_schema, schemas));
     daemon.stop().await;
 }
 

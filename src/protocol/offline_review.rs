@@ -311,13 +311,13 @@ pub struct OfflinePresentationV1 {
     pub hypothesis: Vec<Option<String>>,
     pub answer: Vec<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub source_guid: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub parathema: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub review_image: Option<String>,
     pub tags: Vec<String>,
 }
@@ -390,23 +390,23 @@ pub struct OfflineReviewStateV1 {
     pub state_revision: u64,
     pub review_count: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub last_reviewed_at_us: Option<u64>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub last_review_day: Option<u32>,
     pub next_review_day: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub interval_days: Option<u32>,
     pub total_successes: u64,
     pub total_failures: u64,
     pub suspended: bool,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<f32>", required)]
     pub stability: Option<f32>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<f32>", required)]
     pub difficulty: Option<f32>,
 }
 
@@ -628,7 +628,7 @@ pub struct ActiveReviewPackEnvelopeV2 {
     #[schemars(extend("const" = 2))]
     pub version: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<ReviewPackV2>", required)]
     pub pack: Option<ReviewPackV2>,
 }
 
@@ -1080,12 +1080,12 @@ pub struct OfflineReviewSessionV2 {
     #[schemars(length(min = 1, max = 128))]
     pub session_id: String,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub owner_device_id: Option<String>,
     pub mode: OfflineReviewSessionModeV2,
     pub source: OfflineReviewSourceV2,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub target_count: Option<u32>,
     pub status: OfflineReviewSessionStatusV2,
     pub current_position: u32,
@@ -1206,13 +1206,13 @@ pub struct OfflineReviewSourceV2 {
     pub tags: Vec<String>,
     pub exclude_tags: Vec<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub topic_node_id: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub topic_forward_depth: Option<u32>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u32>", required)]
     pub topic_backward_depth: Option<u32>,
     pub manual_ids: Vec<String>,
 }

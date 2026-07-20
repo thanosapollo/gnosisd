@@ -15,7 +15,7 @@ use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 pub struct DocumentImportRequestV1 {
     pub org: String,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub expected_revision: Option<u64>,
 }
 
@@ -60,7 +60,7 @@ pub struct ContentChangePageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<ContentChangeV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub next: Option<u64>,
 }
 
@@ -109,7 +109,7 @@ pub struct DocumentHeadV1 {
     pub logical_path: String,
     pub revision: u64,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub content_sha256: Option<String>,
     pub active: bool,
 }
@@ -131,10 +131,10 @@ impl DocumentHeadV1 {
 pub enum DocumentMutationRejectionV1 {
     RevisionConflict {
         #[serde(deserialize_with = "super::deserialize_required_option")]
-        #[schemars(required)]
+        #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
         expected_revision: Option<u64>,
         #[serde(deserialize_with = "super::deserialize_required_option")]
-        #[schemars(required)]
+        #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
         current_revision: Option<u64>,
     },
     NotFound,
@@ -324,12 +324,12 @@ pub struct DocumentRevisionSummaryV1 {
     pub revision: u64,
     pub logical_path: String,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub content_sha256: Option<String>,
     pub operation: DocumentOperationV1,
     pub created_at_us: u64,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub author_device_id: Option<String>,
 }
 
@@ -353,7 +353,7 @@ pub struct DocumentRevisionPageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<DocumentRevisionSummaryV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub next: Option<u64>,
 }
 
@@ -375,10 +375,10 @@ pub struct AssetHeadV1 {
     pub logical_path: String,
     pub revision: u64,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub content_sha256: Option<String>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub media_type: Option<String>,
     pub active: bool,
 }
@@ -439,13 +439,13 @@ pub struct ThemaV1 {
     pub hypothesis: Vec<Option<String>>,
     pub answer: Vec<String>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub source_guid: Option<String>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub parathema: Option<String>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub review_image: Option<String>,
     pub tags: Vec<String>,
     pub concepts: Vec<ThemaConceptV1>,
@@ -567,7 +567,7 @@ pub struct ThemaPageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<ThemaV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next: Option<String>,
 }
 
@@ -630,7 +630,7 @@ pub struct NodeThemaAssociationPageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<NodeThemaAssociationV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next: Option<String>,
 }
 
@@ -652,7 +652,7 @@ pub struct NodePageV1 {
     #[schemars(length(max = 500))]
     pub items: Vec<NodeV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
-    #[schemars(required)]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next: Option<String>,
 }
 
