@@ -2324,7 +2324,7 @@ Revalidate merge-buffer bytes and remote head before queueing."
           (user-error "Original local file changed; synchronize again"))
         (unless (gnosis-nodes--remote-conflict-current-p state record)
           (user-error "Remote conflict head changed; synchronize again"))
-        (let ((original-state (copy-tree state))
+        (let ((original-state (copy-tree state t))
               (session-id (plist-get record :merge-session-id))
               entry)
           (setq state (gnosis-nodes--supersede-local-chain state record t))
