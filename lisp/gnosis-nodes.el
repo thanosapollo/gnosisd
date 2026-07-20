@@ -1602,14 +1602,19 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
       (plist-put state :local-scan-index index)))
   state)
 
-(defun gnosis-nodes--send-entry (entry)
-  "Send pending outbox ENTRY once and return mutation response."
+(cl-defun gnosis-nodes--send-entry
+    (entry &optional (payload nil payload-supplied-p))
+  "Send pending outbox ENTRY once and return mutation response.
+Use already validated PAYLOAD when supplied."
   (let ((operation-id (plist-get entry :operation-id))
         (document-id (plist-get entry :document-id))
         (revision (plist-get entry :revision))
         (logical-path (plist-get entry :logical-path))
-        (payload (and (plist-get entry :payload)
-                      (base64-decode-string (plist-get entry :payload)))))
+        (payload
+         (if payload-supplied-p
+             payload
+           (and (plist-get entry :payload)
+                (base64-decode-string (plist-get entry :payload))))))
     (pcase (plist-get entry :kind)
       (:create
        (gnosis-core-document-create
@@ -1651,7 +1656,8 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
       (while (and (< inspected length)
                   (< inspected gnosis-nodes-max-outbox-scan-per-pass))
         (let* ((index (mod (+ start inspected) length))
-               (entry (aref outbox index)))
+               (entry (aref outbox index))
+               payload)
           (when (and (eq :pending (plist-get entry :status))
                      (>= sent gnosis-nodes-max-mutations-per-pass))
             (setq state (plist-put state :outbox-scan-index index))
@@ -1660,16 +1666,23 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
           (setq state (plist-put state :outbox-scan-index
                                  (mod (+ index 1) length)))
           (when (eq :pending (plist-get entry :status))
-              (when (and (memq (plist-get entry :kind) '(:create :replace))
-                         (plist-get entry :payload))
-                (gnosis-core--org-string
-                 (base64-decode-string (plist-get entry :payload))))
+            (when (memq (plist-get entry :kind) '(:create :replace))
+              (let ((encoded (plist-get entry :payload)))
+                (unless encoded
+                  (signal 'gnosis-nodes-error
+                          '("Outbox content payload missing")))
+                (setq payload (base64-decode-string encoded))
+                (unless (equal (plist-get entry :digest)
+                               (gnosis-nodes--digest payload))
+                  (signal 'gnosis-nodes-error
+                          '("Outbox payload digest mismatch")))
+                (gnosis-core--org-string payload)))
               (cl-incf sent)
               (setq gnosis-nodes--mutation-sent t)
               (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
               (gnosis-nodes--write-state state)
               (condition-case nil
-                  (let* ((result (gnosis-nodes--send-entry entry))
+                  (let* ((result (gnosis-nodes--send-entry entry payload))
                          (authoritative
                           (copy-tree (plist-get result :authoritative))))
                     (setq entry (plist-put entry :result result))

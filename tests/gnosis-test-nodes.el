@@ -116,7 +116,8 @@
          (user-emacs-directory (file-name-as-directory directory))
          (gnosis-nodes-state-file nil)
          (entry (gnosis-nodes--outbox-entry
-                 :replace "doc" 1 "note.org" "digest"))
+                 :replace "doc" 1 "note.org" (gnosis-nodes--digest "body")
+                 nil "body"))
          (state `(:version 1 :server-id "server" :device-id "device"
                   :cursor "cursor" :bases [] :outbox [,entry] :conflicts [])))
     (unwind-protect
@@ -190,9 +191,11 @@
          (user-emacs-directory (file-name-as-directory directory))
          (gnosis-nodes-state-file nil)
          (first (gnosis-nodes--outbox-entry
-                 :replace "one" 1 "one.org" "old" nil "captured"))
+                 :replace "one" 1 "one.org"
+                 (gnosis-nodes--digest "captured") nil "captured"))
          (second (gnosis-nodes--outbox-entry
-                  :replace "two" 1 "two.org" "old" nil "second"))
+                  :replace "two" 1 "two.org"
+                  (gnosis-nodes--digest "second") nil "second"))
          (state `(:version 1 :server-id "server" :device-id "device"
                   :cursor "feed" :bases [] :outbox [,first ,second]
                   :conflicts []))
@@ -214,8 +217,12 @@
          (gnosis-nodes-dir directory)
          (user-emacs-directory (file-name-as-directory directory))
          (gnosis-nodes-state-file nil)
-         (first (gnosis-nodes--outbox-entry :replace "one" 1 "one.org" "d" nil "one"))
-         (second (gnosis-nodes--outbox-entry :replace "two" 1 "two.org" "d" nil "two"))
+         (first (gnosis-nodes--outbox-entry
+                 :replace "one" 1 "one.org"
+                 (gnosis-nodes--digest "one") nil "one"))
+         (second (gnosis-nodes--outbox-entry
+                  :replace "two" 1 "two.org"
+                  (gnosis-nodes--digest "two") nil "two"))
          (state `(:version 1 :server-id "server" :device-id "device"
                   :cursor "feed" :bases [] :outbox [,first ,second] :conflicts []))
          (calls 0))
@@ -323,7 +330,8 @@
          (user-emacs-directory (file-name-as-directory directory))
          (gnosis-nodes-state-file nil)
          (entry (gnosis-nodes--outbox-entry
-                 :replace "one" 1 "one.org" "d" nil "one"))
+                 :replace "one" 1 "one.org"
+                 (gnosis-nodes--digest "one") nil "one"))
          (state `(:version 1 :server-id "server" :device-id "device"
                   :cursor "feed" :bases [] :outbox [,entry] :conflicts [])))
     (unwind-protect
@@ -935,7 +943,7 @@
     (cl-letf (((symbol-value 'gnosis-nodes-max-mutations-per-pass) 1)
               ((symbol-function 'gnosis-nodes--write-state) #'ignore)
               ((symbol-function 'gnosis-nodes--send-entry)
-               (lambda (entry)
+               (lambda (entry &optional _payload)
                  (cl-incf calls)
                  (list :format_version 1 :status "applied"
                        :operation_id (plist-get entry :operation-id)
@@ -953,9 +961,10 @@
                   (plist-get (aref (plist-get state :outbox) 2) :status))))))
 
 (ert-deftest gnosis-nodes-malformed-content-stays-pending-without-transport ()
-  (let* ((entry (gnosis-nodes--outbox-entry
-                 :create nil nil "note.org" "digest" nil
-                 (unibyte-string #xff)))
+  (let* ((bytes (unibyte-string #xff))
+         (entry (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" (gnosis-nodes--digest bytes)
+                 nil bytes))
          (state (list :bases [] :outbox (vector entry) :conflicts []))
          writes
          called)
@@ -967,6 +976,35 @@
                     :type 'gnosis-core-validation-error))
     (should-not called)
     (should-not writes)
+    (should (eq :pending (plist-get entry :status)))))
+
+(ert-deftest gnosis-nodes-outbox-rejects-payload-digest-mismatch-before-transport ()
+  (let* ((entry (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" (gnosis-nodes--digest "good")
+                 nil "good"))
+         (state (list :bases [] :outbox (vector entry) :conflicts []))
+         called)
+    (setf (plist-get entry :payload)
+          (base64-encode-string (string-to-unibyte "evil") t))
+    (cl-letf (((symbol-function 'gnosis-nodes--write-state) #'ignore)
+              ((symbol-function 'gnosis-core-document-create)
+               (lambda (&rest _) (setq called t))))
+      (should-error (gnosis-nodes--send-outbox state)
+                    :type 'gnosis-nodes-error))
+    (should-not called)
+    (should (eq :pending (plist-get entry :status)))))
+
+(ert-deftest gnosis-nodes-outbox-rejects-missing-content-payload-before-transport ()
+  (let* ((entry (gnosis-nodes--outbox-entry
+                 :replace "doc" 1 "note.org" (gnosis-nodes--digest "body")))
+         (state (list :bases [] :outbox (vector entry) :conflicts []))
+         called)
+    (cl-letf (((symbol-function 'gnosis-nodes--write-state) #'ignore)
+              ((symbol-function 'gnosis-core-document-replace)
+               (lambda (&rest _) (setq called t))))
+      (should-error (gnosis-nodes--send-outbox state)
+                    :type 'gnosis-nodes-error))
+    (should-not called)
     (should (eq :pending (plist-get entry :status)))))
 
 (ert-deftest gnosis-nodes-outbox-scan-eventually-reaches-pending-tail ()
@@ -982,7 +1020,7 @@
          (calls 0))
     (cl-letf (((symbol-function 'gnosis-nodes--write-state) #'ignore)
               ((symbol-function 'gnosis-nodes--send-entry)
-               (lambda (entry)
+               (lambda (entry &optional _payload)
                  (cl-incf calls)
                  (list :format_version 1 :status "applied"
                        :operation_id (plist-get entry :operation-id)
@@ -1651,7 +1689,7 @@
           state `(:bases [,base] :outbox [,entry ,dependent] :conflicts []))
     (cl-letf (((symbol-function 'gnosis-nodes--write-state) #'ignore)
               ((symbol-function 'gnosis-nodes--send-entry)
-               (lambda (_)
+               (lambda (_ &optional _payload)
                  `(:format_version 1 :status "applied"
                    :operation_id ,(plist-get entry :operation-id)
                    :changed ,gnosis-core--json-false :cursor "same"
