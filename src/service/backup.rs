@@ -212,16 +212,22 @@ fn restore_backup_with_hook<F>(
 where
     F: FnOnce(&Path) -> Result<(), BackupError>,
 {
-    let staging = restore_staging_path(database, blob_root)?;
-    let rollback = restore_rollback_path(database, blob_root)?;
+    let database = canonical_restore_target(database)?;
+    let blob_root = canonical_restore_target(blob_root)?;
+    let staging = restore_staging_path(&database, &blob_root)?;
+    let rollback = restore_rollback_path(&database, &blob_root)?;
+    validate_restore_targets(&database, &blob_root)?;
     if rollback.exists() {
         return Err(BackupError::RollbackExists);
     }
-    let manifest = verified_manifest(backup)?;
     let backup = fs::canonicalize(backup)?;
-    if backup.starts_with(&staging) || staging.starts_with(&backup) {
+    if [&database, &blob_root, &staging, &rollback]
+        .iter()
+        .any(|path| paths_overlap(&backup, path))
+    {
         return Err(BackupError::Destination);
     }
+    let manifest = verified_manifest(&backup)?;
     if staging.exists() {
         require_directory(&staging)?;
         fs::remove_dir_all(&staging)?;
@@ -235,7 +241,7 @@ where
     }
     File::open(&staging)?.sync_all()?;
     before_activation(&staging)?;
-    activate_restore(&staging, &rollback, database, blob_root)?;
+    activate_restore(&staging, &rollback, &database, &blob_root)?;
     Ok(rollback)
 }
 
@@ -320,21 +326,8 @@ fn activate_restore(
     database: &Path,
     blob_root: &Path,
 ) -> Result<(), BackupError> {
-    if database.exists() {
-        require_regular_file(database)?;
-    }
-    if blob_root.exists() {
-        require_directory(blob_root)?;
-    }
+    validate_restore_targets(database, blob_root)?;
     let sidecars = sqlite_sidecar_paths(database);
-    for sidecar in &sidecars {
-        match fs::symlink_metadata(sidecar) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => return Err(BackupError::Format),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
     fs::create_dir(rollback)?;
     fs::set_permissions(rollback, fs::Permissions::from_mode(0o700))?;
     let rollback_database = rollback.join(DATABASE_FILE);
@@ -532,19 +525,61 @@ fn restore_bundle_path(
     blob_root: &Path,
     suffix: &str,
 ) -> Result<PathBuf, BackupError> {
+    let database = canonical_restore_target(database)?;
+    let blob_root = canonical_restore_target(blob_root)?;
     let parent = database.parent().ok_or(BackupError::Destination)?;
     if blob_root.parent() != Some(parent) {
         return Err(BackupError::Destination);
     }
-    require_directory(parent)?;
     let database_name = database
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(BackupError::Destination)?;
-    if blob_root.file_name().is_none() {
+    let bundle = parent.join(format!(".{database_name}.restore-{suffix}"));
+    if paths_overlap(&bundle, &database) || paths_overlap(&bundle, &blob_root) {
         return Err(BackupError::Destination);
     }
-    Ok(parent.join(format!(".{database_name}.restore-{suffix}")))
+    Ok(bundle)
+}
+
+fn canonical_restore_target(path: &Path) -> Result<PathBuf, BackupError> {
+    let parent = path.parent().ok_or(BackupError::Destination)?;
+    require_directory(parent)?;
+    let parent = fs::canonicalize(parent)?;
+    let name = path.file_name().ok_or(BackupError::Destination)?;
+    Ok(parent.join(name))
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn validate_restore_targets(database: &Path, blob_root: &Path) -> Result<(), BackupError> {
+    validate_optional_target(database, false)?;
+    validate_optional_target(blob_root, true)?;
+    for sidecar in sqlite_sidecar_paths(database) {
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => return Err(BackupError::Format),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_target(path: &Path, directory: bool) -> Result<(), BackupError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if (directory && metadata.file_type().is_dir())
+                || (!directory && metadata.file_type().is_file()) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(BackupError::Format),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn require_directory(path: &Path) -> Result<(), BackupError> {
@@ -630,7 +665,11 @@ pub(crate) enum BackupError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, mem, os::unix::fs::PermissionsExt as _, path::Path};
+    use std::{
+        fs, mem,
+        os::unix::fs::{PermissionsExt as _, symlink},
+        path::Path,
+    };
 
     use rusqlite::Connection;
     use tempfile::tempdir;
@@ -815,7 +854,7 @@ mod tests {
 
     #[test]
     fn restore_rejects_backups_at_or_beneath_staging_without_mutation() {
-        for nested in [false, true] {
+        for alias in ["direct", "parent-components", "symlink"] {
             let directory = tempdir().unwrap();
             let (source, _, _) = backup_fixture(directory.path());
             let database = directory.path().join("target.sqlite");
@@ -828,16 +867,28 @@ mod tests {
                 fs::write(sidecar, b"old sidecar").unwrap();
             }
             let staging = restore_staging_path(&database, &blob_root).unwrap();
-            let backup = if nested {
-                fs::create_dir(&staging).unwrap();
-                staging.join("nested-backup")
-            } else {
-                staging.clone()
+            let (backup, backup_argument) = match alias {
+                "direct" => (staging.clone(), staging.clone()),
+                "parent-components" => {
+                    fs::create_dir(&staging).unwrap();
+                    fs::create_dir(staging.join("pivot")).unwrap();
+                    let backup = staging.join("nested-backup");
+                    let argument = staging.join("pivot/../nested-backup");
+                    (backup, argument)
+                }
+                "symlink" => {
+                    fs::create_dir(&staging).unwrap();
+                    let backup = staging.join("nested-backup");
+                    let argument = directory.path().join("backup-link");
+                    symlink(&backup, &argument).unwrap();
+                    (backup, argument)
+                }
+                _ => unreachable!(),
             };
             fs::rename(source, &backup).unwrap();
 
             assert!(matches!(
-                restore_backup(&backup, &database, &blob_root),
+                restore_backup(&backup_argument, &database, &blob_root),
                 Err(BackupError::Destination)
             ));
             assert!(backup.join("manifest.json").is_file());
