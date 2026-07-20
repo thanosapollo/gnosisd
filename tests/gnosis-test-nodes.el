@@ -5,6 +5,8 @@
 (require 'ert)
 (require 'gnosis-nodes)
 
+(defvar gnosis-nodes-max-pages-per-pass)
+
 (ert-deftest gnosis-nodes-rejects-unsafe-logical-paths ()
   (dolist (path '("/absolute.org" "../escape.org" "dir/../../escape.org"
                   "note.txt" "a//b.org" "./note.org"))
@@ -506,7 +508,8 @@
          (state '(:version 1 :server-id "server" :device-id "device"
                   :cursor "feed" :bases [] :outbox []
                   :conflicts [(:document-id "doc" :logical-path "note.org"
-                               :status :queued :operation-id "op")])))
+                               :kind :rename :status :queued
+                               :operation-id "op")])))
     (unwind-protect
         (progn
           (gnosis-nodes--write-state state)
@@ -514,6 +517,7 @@
                                          :conflicts)
                               0)))
             (should (eq :queued (plist-get record :status)))
+            (should (eq :rename (plist-get record :kind)))
             (should (equal "op" (plist-get record :operation-id)))))
       (delete-directory directory t))))
 
@@ -585,6 +589,220 @@
                 (plist-get (aref (plist-get state :outbox) 0) :status)))
     (should (eq :pending
                 (plist-get (aref (plist-get state :outbox) 1) :status)))))
+
+(ert-deftest gnosis-nodes-rejects-empty-change-cursor-advance ()
+  (should-not
+   (gnosis-nodes--change-page-valid-p
+    '(:version 1 :from "from" :next "next" :has_more nil :items [])
+    "from"))
+  (should
+   (gnosis-nodes--change-page-valid-p
+    '(:version 1 :from "same" :next "same" :has_more nil :items [])
+    "same")))
+
+(ert-deftest gnosis-nodes-snapshot-preflights-all-file-effects ()
+  (let* ((directory (make-temp-file "gnosis-nodes-preflight" t))
+         (gnosis-nodes-directory directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (old (string-to-unibyte "old"))
+         (new (string-to-unibyte "new"))
+         (old-digest (gnosis-nodes--digest old))
+         (new-digest (gnosis-nodes--digest new))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "before"
+                  :bases [(:document-id "b" :revision 1 :logical-path "b.org"
+                           :digest ,old-digest :active t)]
+                  :outbox [] :conflicts []))
+         (page `(:version 1 :snapshot_id "snapshot" :cursor "cut" :next nil
+                 :items [(:entity_kind "document"
+                          :projection (:document_id "a" :revision 1
+                                       :logical_path "a.org"
+                                       :content_sha256 ,new-digest
+                                       :blob_url "/blob"
+                                       :operation "snapshot" :projection (:title "a")))
+                         (:entity_kind "document"
+                          :projection (:document_id "b" :revision 2
+                                       :logical_path "b.org"
+                                       :content_sha256 ,new-digest
+                                       :blob_url "/blob"
+                                       :operation "snapshot" :projection (:title "b")))]))
+         buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "b.org" old)
+          (setq buffer (find-file-noselect (expand-file-name "b.org" directory)))
+          (with-current-buffer buffer
+            (goto-char (point-max))
+            (insert "modified"))
+          (cl-letf (((symbol-function 'gnosis-core-sync-snapshot) (lambda (_) page))
+                    ((symbol-function 'gnosis-core-blob) (lambda (_) new)))
+            (should-error (gnosis-nodes--snapshot state)
+                          :type 'gnosis-nodes-conflict))
+          (should-not (file-exists-p (expand-file-name "a.org" directory))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (set-buffer-modified-p nil))
+        (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-pull-stops-at-configured-page-budget ()
+  (let ((state '(:cursor "zero" :bases [] :outbox [] :conflicts []))
+        (calls 0))
+    (cl-letf (((symbol-value 'gnosis-nodes-max-pages-per-pass) 1)
+              ((symbol-function 'gnosis-core-sync-changes)
+               (lambda (cursor)
+                 (cl-incf calls)
+                 `(:version 1 :from ,cursor :next "one" :has_more t
+                   :items [(:cursor "one" :entity_kind "settings"
+                            :projection (:version 1))])))
+              ((symbol-function 'gnosis-nodes--write-state) #'ignore))
+      (setq state (gnosis-nodes--pull state))
+      (should (= calls 1))
+      (should (equal "one" (plist-get state :cursor)))
+      (should-not gnosis-nodes--pull-complete))))
+
+(ert-deftest gnosis-nodes-snapshot-stops-at-configured-page-budget ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot-budget" t))
+         (gnosis-nodes-directory directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (state '(:cursor "before" :bases [] :outbox [] :conflicts []))
+         (calls 0))
+    (unwind-protect
+        (cl-letf (((symbol-value 'gnosis-nodes-max-pages-per-pass) 1)
+                  ((symbol-function 'gnosis-core-sync-snapshot)
+                   (lambda (_)
+                     (cl-incf calls)
+                     '(:version 1 :snapshot_id "snapshot" :cursor nil
+                       :next "two" :items []))))
+          (setq state (gnosis-nodes--snapshot state))
+          (should (= calls 1))
+          (should (equal "before" (plist-get state :cursor)))
+          (should (equal "two" (plist-get (plist-get state :snapshot) :next))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-conflict-record-keeps-latest-remote-head ()
+  (let* ((directory (make-temp-file "gnosis-nodes-latest-conflict" t))
+         (gnosis-nodes-directory directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (state '(:conflicts []))
+         (base '(:logical-path "note.org" :digest nil)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-nodes--write-bytes) #'ignore))
+          (setq state
+                (gnosis-nodes--record-conflict
+                 state base
+                 '(:document_id "doc" :revision 2 :logical_path "note.org"
+                   :content_sha256 nil :operation "tombstone")
+                 "local" nil))
+          (setq state
+                (gnosis-nodes--record-conflict
+                 state base
+                 '(:document_id "doc" :revision 3 :logical_path "note.org"
+                   :content_sha256 nil :operation "tombstone")
+                 "local" nil))
+          (should (= 1 (length (plist-get state :conflicts))))
+          (should (= 3 (plist-get (aref (plist-get state :conflicts) 0)
+                                  :remote-revision))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-missing-local-conflict-queues-tombstone ()
+  (let* ((record '(:document-id "doc" :kind :missing-local
+                   :local-path "note.org" :logical-path "note.org"
+                   :remote-revision 2 :remote-digest "digest"))
+         (state `(:bases [(:document-id "doc" :logical-path "note.org"
+                           :revision 1 :digest "old" :active t)]
+                  :outbox [] :conflicts [,record])))
+    (setq state (gnosis-nodes--keep-local-conflict state record nil))
+    (let ((entry (aref (plist-get state :outbox) 0))
+          (resolved (aref (plist-get state :conflicts) 0)))
+      (should (eq :delete (plist-get entry :kind)))
+      (should (= 2 (plist-get entry :revision)))
+      (should (eq :queued (plist-get resolved :status)))
+      (should (equal (plist-get entry :operation-id)
+                     (plist-get resolved :operation-id))))))
+
+(ert-deftest gnosis-nodes-keep-local-conflict-recreates-or-renames-explicitly ()
+  (let* ((bytes (string-to-unibyte "local"))
+         (tombstone '(:document-id "old" :kind :tombstone
+                      :local-path "note.org" :logical-path "note.org"
+                      :remote-revision 2 :remote-digest nil))
+         (state `(:bases [(:document-id "old" :logical-path "note.org"
+                           :revision 1 :digest "old" :active t)]
+                  :outbox [] :conflicts [,tombstone])))
+    (setq state (gnosis-nodes--keep-local-conflict state tombstone bytes))
+    (should (eq :create (plist-get (aref (plist-get state :outbox) 0) :kind)))
+    (should (= 0 (length (plist-get state :bases)))))
+  (let* ((bytes (string-to-unibyte "edited"))
+         (rename '(:document-id "doc" :kind :rename
+                   :local-path "old.org" :logical-path "new.org"
+                   :remote-revision 2 :remote-digest "remote"))
+         (state `(:bases [] :outbox [] :conflicts [,rename])))
+    (setq state (gnosis-nodes--keep-local-conflict state rename bytes))
+    (should (equal '(:rename :replace)
+                   (mapcar (lambda (entry) (plist-get entry :kind))
+                           (append (plist-get state :outbox) nil))))
+    (should (equal (plist-get (aref (plist-get state :outbox) 0) :operation-id)
+                   (plist-get (aref (plist-get state :outbox) 1) :depends-on)))
+    (should (equal (plist-get (aref (plist-get state :outbox) 1) :operation-id)
+                   (plist-get (aref (plist-get state :conflicts) 0)
+                              :operation-id)))))
+
+(ert-deftest gnosis-nodes-accept-remote-tombstone-backs-up-local-bytes ()
+  (let* ((directory (make-temp-file "gnosis-nodes-accept-tombstone" t))
+         (gnosis-nodes-directory directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (bytes (string-to-unibyte "local"))
+         (projection '(:document_id "doc" :revision 2
+                       :logical_path "note.org" :content_sha256 nil
+                       :blob_url nil :operation "tombstone" :projection nil))
+         (record `(:document-id "doc" :kind :tombstone
+                   :local-path "note.org" :logical-path "note.org"
+                   :local-digest ,(gnosis-nodes--digest bytes)
+                   :remote-digest nil :remote-revision 2
+                   :projection ,projection))
+         (state `(:bases [(:document-id "doc" :logical-path "note.org"
+                           :revision 1 :digest "old" :active t)]
+                  :outbox [] :conflicts [,record])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" bytes)
+          (setq state (gnosis-nodes--accept-remote-conflict state record))
+          (should-not (file-exists-p (expand-file-name "note.org" directory)))
+          (should (= 0 (length (plist-get state :conflicts))))
+          (should (equal bytes
+                         (gnosis-nodes--read-bytes
+                          (expand-file-name
+                           "local-backup.org"
+                           (gnosis-nodes--conflict-directory "doc"))))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-outbox-stops-at-configured-mutation-budget ()
+  (let* ((first (gnosis-nodes--outbox-entry
+                 :create nil nil "one.org" (secure-hash 'sha256 "one") nil "one"))
+         (second (gnosis-nodes--outbox-entry
+                  :create nil nil "two.org" (secure-hash 'sha256 "two") nil "two"))
+         (state (list :outbox (vector first second)))
+         (calls 0))
+    (cl-letf (((symbol-value 'gnosis-nodes-max-mutations-per-pass) 1)
+              ((symbol-function 'gnosis-nodes--write-state) #'ignore)
+              ((symbol-function 'gnosis-nodes--send-entry)
+               (lambda (entry)
+                 (cl-incf calls)
+                 (list :format_version 1 :status "applied"
+                       :operation_id (plist-get entry :operation-id)
+                       :cursor "opaque"
+                       :authoritative
+                       '(:document_id "doc" :revision 1 :logical_path "one.org"
+                         :content_sha256 nil :active t)))))
+      (setq state (gnosis-nodes--send-outbox state))
+      (should (= calls 1))
+      (should (eq :applied
+                  (plist-get (aref (plist-get state :outbox) 0) :status)))
+      (should (eq :pending
+                  (plist-get (aref (plist-get state :outbox) 1) :status))))))
 
 (provide 'gnosis-test-nodes)
 ;;; gnosis-test-nodes.el ends here
