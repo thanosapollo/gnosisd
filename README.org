@@ -11,7 +11,7 @@ history, authoring rules, and persistence.
 ** Current scope
 
 Run =M-x gnosis= to inspect daemon health and served OpenAPI version.  For an
-offline-editable Org working tree, customize =gnosis-nodes-directory= and run
+offline-editable Org working tree, customize =gnosis-nodes-dir= and run
 =M-x gnosis-nodes-bootstrap=.  Edit Org files normally; =M-x gnosis-nodes-sync=
 pulls authoritative changes before sending durable local operations.  Conflicts
 preserve local content and require explicit Ediff resolution and acceptance.

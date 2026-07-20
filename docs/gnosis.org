@@ -21,13 +21,13 @@ and scheduling.
 
 * Org synchronization
 
-Customize =gnosis-nodes-directory= to a dedicated working directory, then run
-=M-x gnosis-nodes-bootstrap=.  Use =gnosis-nodes-mode= in selected Org buffers,
-or =M-x gnosis-nodes-track-file=, to enroll one file.  Use
-=M-x gnosis-nodes-track-all-files= to enroll every Org file after confirmation.
-Use =global-gnosis-nodes-mode= for periodic synchronization, or run
-=M-x gnosis-nodes-sync= manually.  Private state records identity, cursor,
-document bases, pending operations, and conflicts; it is not a domain database.
+Customize =gnosis-nodes-dir= to a dedicated working directory, then run
+=M-x gnosis-nodes-bootstrap=.  Use =M-x gnosis-nodes-sync= to enroll and
+synchronize one file or all eligible Org files.  A prefix argument completes
+all available pull and local scan work.  Enable =gnosis-nodes-auto-sync-mode=
+for save hooks and one idle synchronization timer.  Private state records
+identity, cursor, document bases, pending operations, and conflicts; it is not a
+domain database.
 Delivery-unknown mutations are never retried automatically.
 
 File discovery never implies create, rename, or deletion.  Use
