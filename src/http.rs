@@ -3756,8 +3756,48 @@ mod tests {
         }
 
         assert_eq!(
-            api["components"]["schemas"]["DocumentView"]["properties"]["compatibility_sha1"]["maxLength"],
-            40
+            api["components"]["schemas"]["DocumentView"]["properties"]["content_sha256"]["maxLength"],
+            64
+        );
+        assert_eq!(
+            schemas["DocumentView"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "content_sha256",
+                "document_id",
+                "file_node_id",
+                "file_tags",
+                "link_occurrences",
+                "nodes",
+                "revision",
+                "semantic_edges",
+                "title",
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            schemas["DocumentProjectionV1"]["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            [
+                "content_sha256",
+                "file_node_id",
+                "file_tags",
+                "link_occurrences",
+                "nodes",
+                "semantic_edges",
+                "title",
+            ]
+            .into_iter()
+            .collect()
         );
         for (name, field) in [
             ("DocumentView", "file_node_id"),

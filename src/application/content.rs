@@ -124,7 +124,6 @@ pub(crate) struct DocumentProjectionSnapshot {
     pub(crate) nodes: Vec<ProjectionNode>,
     pub(crate) link_occurrences: Vec<ProjectionLinkOccurrence>,
     pub(crate) semantic_edges: Vec<ProjectionEdge>,
-    pub(crate) compatibility_sha1: String,
     pub(crate) content_sha256: String,
 }
 
@@ -164,7 +163,6 @@ impl From<&DocumentProjection> for DocumentProjectionSnapshot {
                     target_id: edge.target().to_string(),
                 })
                 .collect(),
-            compatibility_sha1: value.compatibility_sha1().to_owned(),
             content_sha256: value.content_sha256().to_owned(),
         }
     }

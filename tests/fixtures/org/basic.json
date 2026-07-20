@@ -40,6 +40,5 @@
     {"source": "elisp-id", "target": "lisp-id"},
     {"source": "elisp-id", "target": "missing-id"}
   ],
-  "compatibility_sha1": "e8924b82b70b2793e4626adcadd5ccd8a5668347",
   "content_sha256": "0ac96950b838c5801c173e72b62e3973f916ba276763904d98bdc7aa584ce163"
 }

@@ -26,6 +26,5 @@
   "semantic_edges": [
     {"source": "knowledge-id", "target": "unicode-root"}
   ],
-  "compatibility_sha1": "afb1980550d0bebf81c3d8a05b11deb457ec56e2",
   "content_sha256": "508b67e37b5a5143756e4021968d13f172c374e7bf5c0645e7fd10babbd9aaa8"
 }

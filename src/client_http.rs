@@ -1204,7 +1204,6 @@ fn validate_document_view(
         || document.revision == 0
         || DocumentId::new(document.document_id.clone()).is_err()
         || !canonical_hex(&document.content_sha256, 64)
-        || !canonical_hex(&document.compatibility_sha1, 40)
         || !all_unique(&document.file_tags)
         || document.nodes.iter().any(|node| !all_unique(&node.tags))
     {
@@ -1252,7 +1251,6 @@ fn validate_document_view(
         file_tags: document.file_tags.clone(),
         nodes,
         link_occurrences: links,
-        compatibility_sha1: document.compatibility_sha1.clone(),
         content_sha256: document.content_sha256.clone(),
     })
     .map_err(|_| invalid_response())?;

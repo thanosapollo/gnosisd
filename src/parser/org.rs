@@ -4,8 +4,7 @@ use orgize::{
     Event, Org, ParseConfig,
     elements::{Element, Title},
 };
-use sha1::{Digest as _, Sha1};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::domain::{
@@ -220,7 +219,6 @@ impl<'a> ProjectionBuilder<'a> {
             file_tags,
             nodes: self.nodes,
             link_occurrences,
-            compatibility_sha1: format!("{:x}", Sha1::digest(self.input.as_bytes())),
             content_sha256: format!("{:x}", Sha256::digest(self.input.as_bytes())),
         };
         DocumentProjection::new(input).map_err(invalid_projection)

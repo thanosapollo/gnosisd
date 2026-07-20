@@ -1603,7 +1603,6 @@ async fn projection_clients_reject_non_strict_responses() {
         "nodes": [],
         "link_occurrences": [],
         "semantic_edges": [],
-        "compatibility_sha1": "0".repeat(40),
         "content_sha256": "0".repeat(64)
     });
     let mut document_missing = document.clone();
@@ -1781,7 +1780,6 @@ async fn projection_clients_reject_semantic_mismatches() {
             "nodes": [],
             "link_occurrences": [],
             "semantic_edges": [],
-            "compatibility_sha1": "0".repeat(40),
             "content_sha256": "0".repeat(64)
         }),
         json!({
@@ -1793,7 +1791,6 @@ async fn projection_clients_reject_semantic_mismatches() {
             "nodes": [],
             "link_occurrences": [],
             "semantic_edges": [],
-            "compatibility_sha1": "0".repeat(40),
             "content_sha256": "0".repeat(64)
         }),
         json!({
@@ -1805,7 +1802,6 @@ async fn projection_clients_reject_semantic_mismatches() {
             "nodes": [],
             "link_occurrences": [],
             "semantic_edges": [],
-            "compatibility_sha1": "0".repeat(40),
             "content_sha256": "0".repeat(64)
         }),
         json!({
@@ -1824,7 +1820,6 @@ async fn projection_clients_reject_semantic_mismatches() {
             }],
             "link_occurrences": [],
             "semantic_edges": [],
-            "compatibility_sha1": "0".repeat(40),
             "content_sha256": "0".repeat(64)
         }),
         json!({
@@ -1836,7 +1831,6 @@ async fn projection_clients_reject_semantic_mismatches() {
             "nodes": [],
             "link_occurrences": [],
             "semantic_edges": [],
-            "compatibility_sha1": "0".repeat(40),
             "content_sha256": "0".repeat(64)
         }),
     ] {

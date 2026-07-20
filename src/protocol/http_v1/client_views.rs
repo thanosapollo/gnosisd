@@ -388,9 +388,6 @@ pub struct DocumentView {
     pub nodes: Vec<NodeView>,
     pub link_occurrences: Vec<LinkOccurrenceView>,
     pub semantic_edges: Vec<NodeEdgeView>,
-    #[schemars(length(equal = 40))]
-    #[schemars(regex(pattern = "^[0-9a-f]{40}$"))]
-    pub compatibility_sha1: String,
     #[schemars(length(equal = 64))]
     #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
     pub content_sha256: String,
@@ -419,7 +416,6 @@ impl DocumentView {
                 .iter()
                 .map(NodeEdgeView::from)
                 .collect(),
-            compatibility_sha1: projection.compatibility_sha1().to_owned(),
             content_sha256: projection.content_sha256().to_owned(),
         }
     }

@@ -48,6 +48,5 @@
     {"source": "active-id", "target": "angle-id"},
     {"source": "active-id", "target": "same-id"}
   ],
-  "compatibility_sha1": "66041e1cb4b08a9d7bdc35147499dfa0a4c45570",
   "content_sha256": "3f71c26ebb051cff25eb9d72d165fa4d54740b75757b3afdcf4449108f56631c"
 }

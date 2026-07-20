@@ -166,7 +166,6 @@ pub struct DocumentProjection {
     nodes: Vec<Node>,
     link_occurrences: Vec<LinkOccurrence>,
     semantic_edges: Vec<NodeEdge>,
-    compatibility_sha1: String,
     content_sha256: String,
 }
 
@@ -184,7 +183,6 @@ impl DocumentProjection {
             nodes: input.nodes,
             link_occurrences: input.link_occurrences,
             semantic_edges,
-            compatibility_sha1: input.compatibility_sha1,
             content_sha256: input.content_sha256,
         })
     }
@@ -206,9 +204,6 @@ impl DocumentProjection {
     }
     pub fn semantic_edges(&self) -> &[NodeEdge] {
         &self.semantic_edges
-    }
-    pub fn compatibility_sha1(&self) -> &str {
-        &self.compatibility_sha1
     }
     pub fn content_sha256(&self) -> &str {
         &self.content_sha256
@@ -252,7 +247,6 @@ pub struct DocumentProjectionInput {
     pub file_tags: Vec<String>,
     pub nodes: Vec<Node>,
     pub link_occurrences: Vec<LinkOccurrence>,
-    pub compatibility_sha1: String,
     pub content_sha256: String,
 }
 
@@ -317,7 +311,6 @@ mod tests {
             file_tags: vec![],
             nodes: vec![node(), node()],
             link_occurrences: vec![],
-            compatibility_sha1: "sha1".into(),
             content_sha256: "sha256".into(),
         });
         assert_eq!(result, Err(DocumentError::DuplicateNodeId));
@@ -340,7 +333,6 @@ mod tests {
             file_tags: vec![],
             nodes: vec![node],
             link_occurrences: vec![],
-            compatibility_sha1: "sha1".into(),
             content_sha256: "sha256".into(),
         });
         assert_eq!(result, Err(DocumentError::MissingParentNode));

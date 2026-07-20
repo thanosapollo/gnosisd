@@ -772,7 +772,6 @@ impl From<&DocumentProjectionSnapshot> for DocumentProjectionV1 {
                 .iter()
                 .map(ProjectionEdgeV1::from)
                 .collect(),
-            compatibility_sha1: value.compatibility_sha1.clone(),
             content_sha256: value.content_sha256.clone(),
         }
     }
@@ -1122,7 +1121,6 @@ mod tests {
                     source_id: "node".into(),
                     target_id: "target".into(),
                 }],
-                compatibility_sha1: "b".repeat(40),
                 content_sha256: "a".repeat(64),
             }),
         })

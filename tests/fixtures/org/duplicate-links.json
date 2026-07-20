@@ -19,6 +19,5 @@
   "semantic_edges": [
     {"source": "duplicate-root", "target": "target-id"}
   ],
-  "compatibility_sha1": "5c0b04c74d97956404b1330d9d2332e86937692e",
   "content_sha256": "26bbe7cd4dc108ea8c736f11d7d7da4220c21654860fe3de09e46a7e7894995e"
 }

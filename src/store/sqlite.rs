@@ -3697,14 +3697,13 @@ fn insert_document(
         .execute(
             "INSERT INTO document (\
              document_id, revision, title, file_node_id, file_tags_json, \
-             compatibility_sha1, content_sha256\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             content_sha256\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(document_id) DO UPDATE SET
                  revision = excluded.revision,
                  title = excluded.title,
                  file_node_id = excluded.file_node_id,
                  file_tags_json = excluded.file_tags_json,
-                 compatibility_sha1 = excluded.compatibility_sha1,
                  content_sha256 = excluded.content_sha256",
             params![
                 document_id.as_str(),
@@ -3712,7 +3711,6 @@ fn insert_document(
                 projection.title(),
                 projection.file_node_id().map(NodeId::as_str),
                 file_tags,
-                projection.compatibility_sha1(),
                 projection.content_sha256(),
             ],
         )
@@ -4217,7 +4215,7 @@ fn load_document(
     let row = connection
         .query_row(
             "SELECT revision, title, file_node_id, file_tags_json, \
-             compatibility_sha1, content_sha256 \
+             content_sha256 \
              FROM document WHERE document_id = ?1",
             [document_id.as_str()],
             |row| {
@@ -4226,8 +4224,7 @@ fn load_document(
                     title: row.get(1)?,
                     file_node_id: row.get(2)?,
                     file_tags_json: row.get(3)?,
-                    compatibility_sha1: row.get(4)?,
-                    content_sha256: row.get(5)?,
+                    content_sha256: row.get(4)?,
                 })
             },
         )
@@ -4242,7 +4239,6 @@ struct DocumentRow {
     title: String,
     file_node_id: Option<String>,
     file_tags_json: String,
-    compatibility_sha1: String,
     content_sha256: String,
 }
 
@@ -4262,7 +4258,6 @@ fn materialize_document(
         file_tags: from_json(&row.file_tags_json, "file tags")?,
         nodes,
         link_occurrences,
-        compatibility_sha1: row.compatibility_sha1,
         content_sha256: row.content_sha256,
     })
     .map_err(|_| StoreError::CorruptData {
@@ -4541,7 +4536,6 @@ mod tests {
                     SourceSpan::from_offsets(8, 12).unwrap(),
                 ),
             ],
-            compatibility_sha1: "sha1".into(),
             content_sha256: digest.into(),
         })
         .unwrap()
@@ -4572,7 +4566,6 @@ mod tests {
             })
             .collect(),
             link_occurrences: vec![],
-            compatibility_sha1: "concept-sha1".into(),
             content_sha256: "concept-digest".into(),
         })
         .unwrap()

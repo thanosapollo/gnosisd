@@ -13,7 +13,6 @@ struct ExpectedProjection {
     nodes: Vec<ExpectedNode>,
     link_occurrences: Vec<ExpectedOccurrence>,
     semantic_edges: Vec<ExpectedEdge>,
-    compatibility_sha1: String,
     content_sha256: String,
 }
 
@@ -49,7 +48,6 @@ struct SharedProjection<'a> {
     nodes: Vec<SharedNode<'a>>,
     link_occurrences: Vec<SharedOccurrence<'a>>,
     semantic_edges: Vec<SharedEdge<'a>>,
-    compatibility_sha1: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,7 +297,6 @@ fn assert_fixture(name: &str) {
     assert_nodes(&actual, &expected);
     assert_occurrences(&input, &actual, &expected);
     assert_edges(&actual, &expected);
-    assert_eq!(actual.compatibility_sha1(), expected.compatibility_sha1);
     assert_eq!(actual.content_sha256(), expected.content_sha256);
 }
 
@@ -380,7 +377,6 @@ fn shared_projection(projection: &DocumentProjection) -> SharedProjection<'_> {
                 target: edge.target().as_str(),
             })
             .collect(),
-        compatibility_sha1: projection.compatibility_sha1(),
     }
 }
 

@@ -324,7 +324,6 @@ pub struct DocumentProjectionV1 {
     pub nodes: Vec<ProjectionNodeV1>,
     pub link_occurrences: Vec<ProjectionLinkV1>,
     pub semantic_edges: Vec<ProjectionEdgeV1>,
-    pub compatibility_sha1: String,
     pub content_sha256: String,
 }
 

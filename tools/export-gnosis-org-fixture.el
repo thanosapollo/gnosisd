@@ -82,8 +82,7 @@ headline IDs to local titles."
 
 (defun gnosis-parity--projection ()
   "Return the current buffer's shared Gnosis projection."
-  (let* ((hash (secure-hash 'sha1 (current-buffer)))
-         (parsed (org-element-parse-buffer))
+  (let* ((parsed (org-element-parse-buffer))
          (topic (gnosis-org-get-data--topic parsed))
          (title (nth 0 topic))
          (tags (nth 1 topic))
@@ -98,8 +97,7 @@ headline IDs to local titles."
                  entries file-id title
                  (gnosis-parity--local-titles parsed)))
       (link_occurrences . ,(vconcat (mapcar #'gnosis-parity--occurrence links)))
-      (semantic_edges . ,(vconcat (mapcar #'gnosis-parity--edge edges)))
-      (compatibility_sha1 . ,hash))))
+      (semantic_edges . ,(vconcat (mapcar #'gnosis-parity--edge edges))))))
 
 (defun gnosis-parity-export-file (filename)
   "Write the shared Gnosis projection for FILENAME to standard output."
