@@ -246,6 +246,29 @@ where
     F: FnOnce(&Path) -> Result<(), BackupError>,
     G: FnMut(ActivationStep),
 {
+    restore_backup_with_sync_hooks(
+        backup,
+        database,
+        blob_root,
+        before_activation,
+        after_step,
+        sync_directory,
+    )
+}
+
+fn restore_backup_with_sync_hooks<F, G, S>(
+    backup: &Path,
+    database: &Path,
+    blob_root: &Path,
+    before_activation: F,
+    after_step: G,
+    sync_rollback: S,
+) -> Result<PathBuf, BackupError>
+where
+    F: FnOnce(&Path) -> Result<(), BackupError>,
+    G: FnMut(ActivationStep),
+    S: FnMut(&Path) -> Result<(), BackupError>,
+{
     let database = canonical_restore_target(database)?;
     let blob_root = canonical_restore_target(blob_root)?;
     let staging = restore_staging_path(&database, &blob_root)?;
@@ -279,7 +302,14 @@ where
     }
     File::open(&staging)?.sync_all()?;
     before_activation(&staging)?;
-    activate_restore(&staging, &rollback, &database, &blob_root, after_step)?;
+    activate_restore(
+        &staging,
+        &rollback,
+        &database,
+        &blob_root,
+        after_step,
+        sync_rollback,
+    )?;
     Ok(rollback)
 }
 
@@ -375,15 +405,17 @@ fn materialize_restore(
     Ok(())
 }
 
-fn activate_restore<F>(
+fn activate_restore<F, S>(
     staging: &Path,
     rollback: &Path,
     database: &Path,
     blob_root: &Path,
     mut after_step: F,
+    mut sync_rollback: S,
 ) -> Result<(), BackupError>
 where
     F: FnMut(ActivationStep),
+    S: FnMut(&Path) -> Result<(), BackupError>,
 {
     validate_restore_targets(database, blob_root)?;
     let sidecars = sqlite_sidecar_paths(database);
@@ -404,11 +436,13 @@ where
         if state.had_database {
             fs::rename(database, &rollback_database)?;
             sync_parent(database)?;
+            sync_rollback(rollback)?;
             after_step(ActivationStep::DatabaseRelocated);
         }
         if state.had_blobs {
             fs::rename(blob_root, &rollback_blobs)?;
             sync_parent(blob_root)?;
+            sync_rollback(rollback)?;
             after_step(ActivationStep::BlobsRelocated);
         }
         for (index, sidecar) in sidecars.iter().enumerate() {
@@ -418,10 +452,10 @@ where
                     rollback.join(sidecar.file_name().ok_or(BackupError::Destination)?),
                 )?;
                 sync_parent(sidecar)?;
+                sync_rollback(rollback)?;
                 after_step(ActivationStep::SidecarRelocated(index));
             }
         }
-        File::open(rollback)?.sync_all()?;
         Ok(())
     })();
     if let Err(error) = relocation {
@@ -792,6 +826,11 @@ fn sync_parent(path: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 
+fn sync_directory(path: &Path) -> Result<(), BackupError> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum BackupError {
     #[error("backup destination is invalid or already exists")]
@@ -822,6 +861,7 @@ pub(crate) enum BackupError {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::{Cell, RefCell},
         fs, mem,
         os::unix::fs::{PermissionsExt as _, symlink},
         path::Path,
@@ -833,8 +873,9 @@ mod tests {
 
     use super::{
         ActivationStep, BackupError, create_backup, ensure_restore_complete, read_manifest,
-        restore_backup, restore_backup_with_hook, restore_backup_with_hooks, restore_staging_path,
-        sha256_file, snapshot_backup, sqlite_sidecar_paths,
+        restore_backup, restore_backup_with_hook, restore_backup_with_hooks,
+        restore_backup_with_sync_hooks, restore_staging_path, sha256_file, snapshot_backup,
+        sqlite_sidecar_paths, sync_directory,
     };
     use crate::{
         application::{canonical_asset_path, prepare_asset},
@@ -1077,6 +1118,60 @@ mod tests {
             assert_eq!(
                 BlobStore::open(&blob_root).unwrap().read(&digest).unwrap(),
                 restored_blob
+            );
+            ensure_restore_complete(&database, &blob_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn rollback_directory_sync_failure_prevents_relocation_step_advancement() {
+        for failed_sync in 0..5 {
+            let directory = tempdir().unwrap();
+            let (backup, _, _) = backup_fixture(directory.path());
+            let database = directory.path().join("gnosis.sqlite");
+            let blob_root = directory.path().join("blobs");
+            let sidecars = sqlite_sidecar_paths(&database);
+            fs::write(&database, b"old database").unwrap();
+            let old_database = fs::read(&database).unwrap();
+            fs::create_dir(&blob_root).unwrap();
+            fs::write(blob_root.join("old"), b"old blob").unwrap();
+            for (index, sidecar) in sidecars.iter().enumerate() {
+                fs::write(sidecar, format!("old sidecar {index}")).unwrap();
+            }
+
+            let reported = RefCell::new(Vec::new());
+            let sync_count = Cell::new(0_usize);
+            let error = restore_backup_with_sync_hooks(
+                &backup,
+                &database,
+                &blob_root,
+                |_| Ok(()),
+                |step| reported.borrow_mut().push(step),
+                |rollback| {
+                    let current = sync_count.get();
+                    sync_count.set(current + 1);
+                    if current == failed_sync {
+                        return Err(std::io::Error::other("injected rollback sync failure").into());
+                    }
+                    sync_directory(rollback)
+                },
+            )
+            .unwrap_err();
+
+            assert!(matches!(error, BackupError::Io(_)));
+            assert_eq!(reported.borrow().len(), failed_sync);
+            assert_eq!(fs::read(&database).unwrap(), old_database);
+            assert_eq!(fs::read(blob_root.join("old")).unwrap(), b"old blob");
+            for (index, sidecar) in sidecars.iter().enumerate() {
+                assert_eq!(
+                    fs::read(sidecar).unwrap(),
+                    format!("old sidecar {index}").as_bytes()
+                );
+            }
+            assert!(
+                !restore_staging_path(&database, &blob_root)
+                    .unwrap()
+                    .exists()
             );
             ensure_restore_complete(&database, &blob_root).unwrap();
         }
