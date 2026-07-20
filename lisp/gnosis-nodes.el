@@ -76,6 +76,7 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 (defvar gnosis-nodes--conflict-base-blobs nil)
 (defvar gnosis-nodes--pages-left nil)
 (defvar gnosis-nodes--mutation-sent nil)
+(defvar gnosis-nodes--ediff-sessions (make-hash-table :test #'equal))
 
 (defun gnosis-nodes--private-state-root ()
   "Return configured user's canonical private synchronization root."
@@ -617,17 +618,8 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
       (and remote-bytes
            (equal remote-digest (gnosis-nodes--digest remote-bytes))
            (or (equal local-path remote-path)
-               (let* ((local-file (gnosis-nodes--safe-path
-                                   gnosis-nodes-dir local-path))
-                      (local-bytes (gnosis-nodes--working-bytes local-file)))
-                 (or (null local-bytes)
-                     (and (eq :accept-remote (plist-get record :resolution))
-                          (equal (plist-get record :local-digest)
-                                 (gnosis-nodes--digest local-bytes))
-                          (progn
-                            (unless gnosis-nodes--preflight
-                              (delete-file local-file))
-                            t))))))))))
+               (null (gnosis-nodes--working-bytes
+                      (gnosis-nodes--safe-path gnosis-nodes-dir local-path)))))))))
 
 (defun gnosis-nodes--apply-document (state projection &optional blobs)
   "Reconcile document PROJECTION into working files and return STATE."
@@ -708,8 +700,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                    (null local-bytes)
                    (file-regular-p destination-path)
                    (not (file-symlink-p destination-path))
-                   (not (and (buffer-live-p destination-buffer)
-                             (buffer-modified-p destination-buffer)))
+                   (not (buffer-live-p destination-buffer))
                    (equal remote-digest
                           (gnosis-nodes--digest
                            (gnosis-nodes--working-bytes destination-path)))))
@@ -801,8 +792,69 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
           (listp (plist-get item :projection)))
          (_ nil))))
 
-(defun gnosis-nodes--snapshot-page-valid-p (page snapshot-id)
-  "Return non-nil when snapshot PAGE continues SNAPSHOT-ID consistently."
+(defun gnosis-nodes--decode-cursor (token &optional snapshot-p)
+  "Return validated decoded TOKEN, or nil.
+Require snapshot cursor shape when SNAPSHOT-P is non-nil."
+  (condition-case nil
+      (when (stringp token)
+        (let* ((translated
+                (replace-regexp-in-string
+                 "_" "/" (replace-regexp-in-string "-" "+" token t t) t t))
+               (remainder (% (length translated) 4))
+               (padded (concat translated
+                               (make-string (if (= remainder 0)
+                                                0
+                                              (- 4 remainder))
+                                            ?=)))
+               (decoded
+                (json-parse-string
+                 (decode-coding-string (base64-decode-string padded) 'utf-8)
+                 :object-type 'plist :array-type 'array
+                 :null-object nil :false-object nil))
+               (keys (cl-loop for (key _) on decoded by #'cddr collect key))
+               (expected (if snapshot-p
+                             '(:version :snapshot_id :server_id
+                               :cut_cursor :cut_token :after)
+                           '(:version :server_id :position :token))))
+          (and (/= remainder 1)
+               (= (length keys) (length expected))
+               (seq-every-p (lambda (key) (memq key expected)) keys)
+               (= (or (plist-get decoded :version) -1) 1)
+               (stringp (plist-get decoded :server_id))
+               (if snapshot-p
+                   (and (stringp (plist-get decoded :snapshot_id))
+                        (natnump (plist-get decoded :cut_cursor))
+                        (stringp (plist-get decoded :cut_token))
+                        (natnump (plist-get decoded :after)))
+                 (and (natnump (plist-get decoded :position))
+                      (stringp (plist-get decoded :token))))
+               decoded)))
+    (error nil)))
+
+(defun gnosis-nodes--cursor-advances-p (from next &optional snapshot-p)
+  "Return non-nil when NEXT strictly advances FROM on one server.
+When SNAPSHOT-P is non-nil, also require one snapshot identity."
+  (let ((from-data (gnosis-nodes--decode-cursor from snapshot-p))
+        (next-data (gnosis-nodes--decode-cursor next snapshot-p)))
+    (and from-data next-data
+         (equal (plist-get from-data :server_id)
+                (plist-get next-data :server_id))
+         (or (not snapshot-p)
+             (and (equal (plist-get from-data :snapshot_id)
+                         (plist-get next-data :snapshot_id))
+                  (equal (plist-get from-data :cut_cursor)
+                         (plist-get next-data :cut_cursor))
+                  (equal (plist-get from-data :cut_token)
+                         (plist-get next-data :cut_token))))
+         (< (plist-get from-data (if snapshot-p :after :position))
+            (plist-get next-data (if snapshot-p :after :position))))))
+
+(defun gnosis-nodes--snapshot-page-valid-p (page snapshot-id
+                                                 &optional requested-next
+                                                 expected-server)
+  "Return non-nil when snapshot PAGE continues SNAPSHOT-ID consistently.
+REQUESTED-NEXT is the continuation used to request PAGE.
+EXPECTED-SERVER, when non-nil, must own every returned cursor."
   (let ((cursor (gnosis-nodes--nullable (plist-get page :cursor)))
         (next (gnosis-nodes--nullable (plist-get page :next)))
         (items (plist-get page :items)))
@@ -812,16 +864,43 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
              (equal snapshot-id (plist-get page :snapshot_id)))
          (vectorp items)
          (seq-every-p #'gnosis-nodes--valid-item-p items)
-         (not (eq (null cursor) (null next))))))
+         (not (eq (null cursor) (null next)))
+         (if next
+             (let ((decoded (gnosis-nodes--decode-cursor next t)))
+               (and decoded
+                    (or (null expected-server)
+                        (equal expected-server
+                               (plist-get decoded :server_id)))
+                    (equal (plist-get decoded :snapshot_id)
+                           (plist-get page :snapshot_id))
+                    (or (null requested-next)
+                        (gnosis-nodes--cursor-advances-p
+                         requested-next next t))))
+           (let ((decoded (gnosis-nodes--decode-cursor cursor)))
+             (and decoded
+                  (or (null expected-server)
+                      (equal expected-server
+                             (plist-get decoded :server_id)))
+                  (or (null requested-next)
+                      (let ((requested
+                             (gnosis-nodes--decode-cursor requested-next t)))
+                        (and requested
+                             (equal (plist-get requested :server_id)
+                                    (plist-get decoded :server_id))
+                             (= (plist-get requested :cut_cursor)
+                                (plist-get decoded :position))
+                             (equal (plist-get requested :cut_token)
+                                    (plist-get decoded :token)))))))))))
 
 (defun gnosis-nodes--change-page-valid-p (page from)
   "Return non-nil when complete change PAGE consistently advances FROM."
   (let ((items (plist-get page :items))
         (next (plist-get page :next))
-        cursors)
+        cursors decoded-cursors)
     (when (vectorp items)
       (setq cursors (mapcar (lambda (item) (plist-get item :cursor))
-                            (append items nil))))
+                            (append items nil))
+            decoded-cursors (mapcar #'gnosis-nodes--decode-cursor cursors)))
     (and (= (or (plist-get page :version) -1) 1)
          (equal from (plist-get page :from))
          (stringp next)
@@ -832,6 +911,15 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
            (equal next (plist-get (aref items (1- (length items))) :cursor)))
          (not (member from cursors))
          (= (length cursors) (length (delete-dups (copy-sequence cursors))))
+         (gnosis-nodes--decode-cursor from)
+         (seq-every-p #'identity decoded-cursors)
+         (let ((previous from)
+               valid)
+           (setq valid t)
+           (dolist (cursor cursors valid)
+             (unless (gnosis-nodes--cursor-advances-p previous cursor)
+               (setq valid nil))
+             (setq previous cursor)))
          (or (not (eq t (plist-get page :has_more)))
              (> (length items) 0)))))
 
@@ -860,6 +948,7 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
 (defun gnosis-nodes--snapshot-pages-valid-p (pages)
   "Return non-nil when recovered PAGES form one complete prefix."
   (let ((snapshot-id nil)
+        (requested-next nil)
         (remaining pages)
         seen
         valid)
@@ -868,11 +957,13 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
       (let* ((page (car remaining))
              (next (gnosis-nodes--nullable (plist-get page :next))))
         (setq valid
-              (and (gnosis-nodes--snapshot-page-valid-p page snapshot-id)
+              (and (gnosis-nodes--snapshot-page-valid-p
+                    page snapshot-id requested-next)
                    (not (member next seen))
                    (or (null (cdr remaining)) next)))
         (when next (push next seen))
         (setq snapshot-id (plist-get page :snapshot_id)
+              requested-next next
               remaining (cdr remaining))))
     valid))
 
@@ -1134,14 +1225,21 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
                             (+ validated gnosis-nodes-max-pages-per-pass)))
                  (records (seq-subseq pages validated stop))
                  (decoded-pages
-                  (mapcar #'gnosis-nodes--read-snapshot-page records)))
-            (unless (seq-every-p
-                     (lambda (candidate)
-                       (gnosis-nodes--snapshot-page-valid-p
-                        candidate snapshot-id))
-                     decoded-pages)
+                  (mapcar #'gnosis-nodes--read-snapshot-page records))
+                 (requested-next (plist-get resume :validated-next))
+                 valid)
+            (setq valid t)
+            (dolist (candidate decoded-pages)
+              (unless (gnosis-nodes--snapshot-page-valid-p
+                       candidate snapshot-id requested-next
+                       (plist-get state :server-id))
+                (setq valid nil))
+              (setq requested-next
+                    (gnosis-nodes--nullable (plist-get candidate :next))))
+            (unless valid
               (signal 'gnosis-nodes-error '("Invalid recovered snapshot")))
-            (setf (plist-get resume :validated-pages) stop)
+            (setf (plist-get resume :validated-pages) stop
+                  (plist-get resume :validated-next) requested-next)
             (setq state (plist-put state :snapshot resume))
             (gnosis-nodes--write-state state)
             (when (< stop (length pages))
@@ -1161,7 +1259,8 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
     (while (and (not done) (> pages-left 0))
       (cl-decf pages-left)
       (setq page (gnosis-core-sync-snapshot next))
-      (unless (gnosis-nodes--snapshot-page-valid-p page snapshot-id)
+      (unless (gnosis-nodes--snapshot-page-valid-p
+               page snapshot-id next (plist-get state :server-id))
         (signal 'gnosis-nodes-error '("Invalid Gnosis snapshot page")))
       (when-let* ((continuation (gnosis-nodes--nullable (plist-get page :next))))
         (when (member continuation seen)
@@ -1382,14 +1481,34 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
                        (equal selected-path logical-path)))
           (let* ((path (gnosis-nodes--safe-path
                         gnosis-nodes-dir logical-path))
-                 (bytes (gnosis-nodes--working-bytes path)))
-            (when bytes
-              (let ((digest (gnosis-nodes--digest bytes)))
-                (when (or (gnosis-nodes--outbox-entry-for
-                           state (plist-get base :document-id) logical-path)
-                          (not (equal digest (plist-get base :digest))))
+                 (bytes (gnosis-nodes--working-bytes path))
+                 (document-id (plist-get base :document-id))
+                 (head (gnosis-nodes--outbox-entry-for
+                        state document-id logical-path))
+                 (conflict
+                  (seq-find
+                   (lambda (item)
+                     (equal document-id (plist-get item :document-id)))
+                   (append (plist-get state :conflicts) nil))))
+            (if bytes
+                (let ((digest (gnosis-nodes--digest bytes)))
+                  (when (or head (not (equal digest (plist-get base :digest))))
+                    (setq state
+                          (gnosis-nodes--queue-save state base bytes))))
+              (when (and (null head) (null conflict))
+                (let* ((digest (plist-get base :digest))
+                       (remote-bytes (gnosis-core-blob digest))
+                       (projection
+                        (list :document_id document-id
+                              :revision (plist-get base :revision)
+                              :logical_path logical-path
+                              :content_sha256 digest
+                              :blob_url (format "/v1/blobs/%s" digest)
+                              :operation "update"
+                              :projection (list :content_sha256 digest))))
                   (setq state
-                        (gnosis-nodes--queue-save state base bytes)))))))))
+                        (gnosis-nodes--record-conflict
+                         state base projection nil remote-bytes)))))))))
     (unless selected-path
       (plist-put state :local-scan-index index)))
   state)
@@ -1936,10 +2055,49 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
                  "No Gnosis Org conflicts\n"))))
     labels))
 
+(defun gnosis-nodes--abandon-ediff-session (session-id)
+  "Invalidate and remove abandoned Ediff SESSION-ID artifacts."
+  (when-let ((session (gethash session-id gnosis-nodes--ediff-sessions)))
+    (remhash session-id gnosis-nodes--ediff-sessions)
+    (let ((merge-file (plist-get session :merge-file)))
+      (when (and (stringp merge-file)
+                 (file-in-directory-p merge-file
+                                      (gnosis-nodes--state-directory))
+                 (file-regular-p merge-file))
+        (delete-file merge-file)))
+    (dolist (buffer (plist-get session :disposable-buffers))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))
+    (gnosis-nodes--with-lock
+      (let* ((state (gnosis-nodes--read-state))
+             (conflicts (plist-get state :conflicts))
+             changed)
+        (cl-loop for record across conflicts
+                 when (and (equal session-id
+                                  (plist-get record :merge-session-id))
+                           (eq :editing (plist-get record :status)))
+                 do (setf (plist-get record :status) :unresolved
+                          (plist-get record :merge-file) nil
+                          (plist-get record :merge-start-digest) nil
+                          (plist-get record :merge-session-id) nil
+                          changed t))
+        (when changed (gnosis-nodes--write-state state))))))
+
+(defun gnosis-nodes--ediff-session-active-p (record)
+  "Return non-nil when RECORD belongs to its matching live Ediff session."
+  (let* ((session-id (plist-get record :merge-session-id))
+         (session (and (stringp session-id)
+                       (gethash session-id gnosis-nodes--ediff-sessions))))
+    (and session
+         (equal (plist-get record :document-id)
+                (plist-get session :document-id))
+         (equal (plist-get record :merge-file)
+                (plist-get session :merge-file))
+         (buffer-live-p (plist-get session :control-buffer)))))
+
 ;;;###autoload
 (defun gnosis-nodes-resolve-conflict ()
   "Select a conflict and open Ediff with local, remote, and base buffers.
-Edit and save Ediff's merge buffer; acceptance reads that separate file."
+Edit and save Ediff's merge buffer; accept it before quitting Ediff."
   (interactive)
   (gnosis-nodes--with-lock
     (let* ((state (gnosis-nodes--read-state))
@@ -1962,21 +2120,45 @@ Edit and save Ediff's merge buffer; acceptance reads that separate file."
               (gnosis-nodes--managed-bytes conflict-directory remote-file))
              (_base-bytes
               (gnosis-nodes--managed-bytes conflict-directory base-file))
+             (remote-existing (get-file-buffer remote-file))
+             (base-existing (get-file-buffer base-file))
              (remote-buffer (find-file-noselect remote-file))
              (base-buffer (find-file-noselect base-file))
-             merge-file)
+             (session-id
+              (secure-hash
+               'sha256
+               (format "%s:%s:%s" (plist-get record :document-id)
+                       (float-time) (random))))
+             merge-file control-buffer)
         (unless bytes (user-error "Local conflict file no longer exists"))
         (make-directory conflict-directory t)
         (setq merge-file
               (make-temp-name (expand-file-name "merge-" conflict-directory)))
         (setf (plist-get record :merge-start-digest) (gnosis-nodes--digest bytes)
               (plist-get record :merge-file) merge-file
+              (plist-get record :merge-session-id) session-id
               (plist-get record :status) :editing)
         (aset conflicts index record)
         (gnosis-nodes--write-state state)
         (require 'ediff)
-        (ediff-merge-buffers-with-ancestor
-         local-buffer remote-buffer base-buffer nil nil merge-file)))))
+        (setq control-buffer
+              (ediff-merge-buffers-with-ancestor
+               local-buffer remote-buffer base-buffer nil nil merge-file))
+        (puthash session-id
+                 (list :document-id (plist-get record :document-id)
+                       :merge-file merge-file
+                       :control-buffer control-buffer
+                       :disposable-buffers
+                       (delq nil
+                             (list (unless remote-existing remote-buffer)
+                                   (unless base-existing base-buffer))))
+                 gnosis-nodes--ediff-sessions)
+        (when (buffer-live-p control-buffer)
+          (with-current-buffer control-buffer
+            (add-hook 'ediff-after-quit-hook-internal
+                      (lambda ()
+                        (gnosis-nodes--abandon-ediff-session session-id))
+                      nil t)))))))
 
 (defun gnosis-nodes--remote-conflict-current-p (state record)
   "Return non-nil when RECORD remote head remains current after STATE cursor."
@@ -2054,6 +2236,8 @@ Revalidate merge-buffer bytes and remote head before queueing."
         (unless (and (eq :editing (plist-get record :status))
                      (stringp (plist-get record :merge-start-digest)))
           (user-error "Open conflict in Ediff before accepting merge"))
+        (unless (gnosis-nodes--ediff-session-active-p record)
+          (user-error "Matching Ediff session is no longer active"))
         (unless (equal (and local-bytes (gnosis-nodes--digest local-bytes))
                        (plist-get record :merge-start-digest))
           (user-error "Original local file changed; synchronize again"))
@@ -2071,6 +2255,8 @@ Revalidate merge-buffer bytes and remote head before queueing."
                 (plist-get record :operation-id) (plist-get entry :operation-id)
                 (plist-get record :status) :queued)
           (aset conflicts index record))
+        (remhash (plist-get record :merge-session-id)
+                 gnosis-nodes--ediff-sessions)
         (gnosis-nodes--write-document local-path bytes)
         (gnosis-nodes--write-state state)
         (message "Gnosis conflict merge queued")))))
