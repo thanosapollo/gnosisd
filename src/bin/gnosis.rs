@@ -616,7 +616,6 @@ async fn run_asset(
     token_file: Option<PathBuf>,
     command: AssetCommand,
 ) -> Result<(), RunError> {
-    let client = http_client(base_url, token_file)?;
     match command {
         AssetCommand::Put {
             digest,
@@ -625,7 +624,12 @@ async fn run_asset(
             if_revision,
             media_type,
         } => {
-            let bytes = read_client_bytes()?;
+            let client = http_client(base_url, token_file).map_err(|source| {
+                asset_operation_error(operation_id.clone(), DeliveryStatus::NotSent, source)
+            })?;
+            let bytes = read_client_bytes().map_err(|source| {
+                asset_operation_error(operation_id.clone(), DeliveryStatus::NotSent, source)
+            })?;
             let result = client
                 .put_asset(
                     &digest,
@@ -648,6 +652,7 @@ async fn run_asset(
             size_bytes,
             media_type,
         } => {
+            let client = http_client(base_url, token_file)?;
             let head = AssetHeadV1 {
                 logical_path: format!("assets/{digest}/{name}"),
                 revision,
@@ -662,6 +667,7 @@ async fn run_asset(
             write_bytes(&bytes).map_err(Into::into)
         }
         AssetCommand::Blob { digest } => {
+            let client = http_client(base_url, token_file)?;
             let bytes = client.blob(&digest).await.map_err(CliError::from)?;
             write_bytes(&bytes).map_err(Into::into)
         }
@@ -671,6 +677,9 @@ async fn run_asset(
             operation_id,
             if_revision,
         } => {
+            let client = http_client(base_url, token_file).map_err(|source| {
+                asset_operation_error(operation_id.clone(), DeliveryStatus::NotSent, source)
+            })?;
             let result = client
                 .tombstone_asset(&digest, &name, &operation_id, if_revision)
                 .await
@@ -1290,10 +1299,11 @@ mod tests {
     use std::{fs, io::Cursor, os::unix::fs::PermissionsExt as _};
 
     use clap::Parser as _;
+    use gnosis_core::protocol::client_v1::{ClientDeliveryV1, ClientFailureCodeV1};
 
     use super::{
-        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, correlation_id,
-        read_device_token, read_org_from,
+        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, RunError, client_failure,
+        correlation_id, read_device_token, read_org_from, run_asset,
     };
 
     #[test]
@@ -1362,6 +1372,43 @@ mod tests {
                 }
             } if operation_id == "asset-put"
         ));
+    }
+
+    #[tokio::test]
+    async fn managed_asset_pre_dispatch_failures_retain_operation_identity() {
+        let digest = "a".repeat(64);
+        for (operation_id, command) in [
+            (
+                "asset-put",
+                AssetCommand::Put {
+                    digest: digest.clone(),
+                    name: "image.png".into(),
+                    operation_id: "asset-put".into(),
+                    if_revision: None,
+                    media_type: "image/png".into(),
+                },
+            ),
+            (
+                "asset-delete",
+                AssetCommand::Tombstone {
+                    digest: digest.clone(),
+                    name: "image.png".into(),
+                    operation_id: "asset-delete".into(),
+                    if_revision: 1,
+                },
+            ),
+        ] {
+            let error = run_asset("http://127.0.0.1:7842", None, command)
+                .await
+                .unwrap_err();
+            let RunError::Client(error) = error else {
+                panic!("asset command returned a protocol error");
+            };
+            let failure = client_failure(&error);
+            assert_eq!(failure.code, ClientFailureCodeV1::Credentials);
+            assert_eq!(failure.delivery, ClientDeliveryV1::NotSent);
+            assert_eq!(failure.operation_id.as_deref(), Some(operation_id));
+        }
     }
 
     #[test]
