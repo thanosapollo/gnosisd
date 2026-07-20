@@ -2310,7 +2310,9 @@ impl ApiError {
                 ApiErrorCodeV1::StaleAttempt,
                 "thema content or review state changed",
             ),
-            StoreError::InvalidReviewState => Self::bad_request("review operation is invalid"),
+            StoreError::InvalidReviewState | StoreError::TopicTraversalLimitExceeded => {
+                Self::bad_request("review operation is invalid")
+            }
             StoreError::InvalidReviewResponse => Self::bad_request("review response is invalid"),
             StoreError::ReviewOwnership => Self::forbidden(),
             StoreError::IdempotencyConflict => Self::new(
@@ -3535,6 +3537,13 @@ mod tests {
 
     #[test]
     fn service_errors_have_stable_http_contracts() {
+        assert_api_error(
+            ServiceError::Store(StoreError::TopicTraversalLimitExceeded),
+            StatusCode::BAD_REQUEST,
+            ApiErrorCodeV1::InvalidRequest,
+            "review operation is invalid",
+            None,
+        );
         assert_api_error(
             ServiceError::Store(StoreError::InvalidReviewResponse),
             StatusCode::BAD_REQUEST,

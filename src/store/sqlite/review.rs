@@ -1520,7 +1520,7 @@ fn select_topic(
         .first()
         .is_some_and(|(_, traversal_exceeded)| *traversal_exceeded)
     {
-        return Err(StoreError::InvalidReviewState);
+        return Err(StoreError::TopicTraversalLimitExceeded);
     }
     Ok(rows
         .into_iter()
@@ -2902,7 +2902,7 @@ mod tests {
                 20260715,
                 Some(1),
             ),
-            Err(StoreError::InvalidReviewState)
+            Err(StoreError::TopicTraversalLimitExceeded)
         ));
         store.settings().unwrap();
     }
@@ -2937,7 +2937,7 @@ mod tests {
                 20260715,
                 Some(1),
             ),
-            Err(StoreError::InvalidReviewState)
+            Err(StoreError::TopicTraversalLimitExceeded)
         ));
     }
 

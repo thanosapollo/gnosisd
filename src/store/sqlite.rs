@@ -55,6 +55,8 @@ pub(crate) enum StoreError {
     StaleAttempt,
     #[error("review operation is invalid in the current state")]
     InvalidReviewState,
+    #[error("topic traversal exceeded its work budget")]
+    TopicTraversalLimitExceeded,
     #[error("review response is invalid for the captured presentation")]
     InvalidReviewResponse,
     #[error("review operation belongs to another device")]

@@ -503,6 +503,7 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         StoreError::ActiveReviewSession
         | StoreError::StaleAttempt
         | StoreError::InvalidReviewState
+        | StoreError::TopicTraversalLimitExceeded
         | StoreError::ReviewOwnership
         | StoreError::IdempotencyConflict => {
             ProtocolError::new(ErrorCode::Conflict, "review state conflict")
@@ -819,6 +820,11 @@ mod tests {
 
     #[test]
     fn actor_errors_separate_client_faults_from_corruption() {
+        assert_actor_error(
+            ServiceError::Store(StoreError::TopicTraversalLimitExceeded),
+            ErrorCode::Conflict,
+            "review state conflict",
+        );
         assert_actor_error(
             ServiceError::Store(StoreError::InvalidReviewResponse),
             ErrorCode::MalformedRequest,
