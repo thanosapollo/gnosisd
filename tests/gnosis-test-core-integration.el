@@ -91,7 +91,8 @@
   (gnosis-test-core-integration--with-client
     (let* ((root (make-temp-file "gnosis-org-sync-" t))
          (gnosis-nodes-directory root)
-         (gnosis-nodes-state-file (expand-file-name "private/state.json" root))
+         (user-emacs-directory (file-name-as-directory root))
+         (gnosis-nodes-state-file nil)
          (path (format "integration/%s.org" (gnosis-core-operation-id)))
          (prefix ":PROPERTIES:\n:ID: integration-root\n:END:\n")
          (initial (string-to-unibyte (concat prefix "#+TITLE: Initial\n")))
@@ -111,8 +112,6 @@
           (should (equal initial (gnosis-nodes--read-bytes
                                   (gnosis-nodes--safe-path root path))))
           (gnosis-nodes--write-document path local)
-          (gnosis-nodes-sync)
-          ;; Mutation results never advance the feed-owned base; consume the feed.
           (gnosis-nodes-sync)
           (should (= 2 (plist-get (gnosis-nodes--base
                                    (gnosis-nodes--read-state) document-id path)
