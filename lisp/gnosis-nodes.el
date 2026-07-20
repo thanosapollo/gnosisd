@@ -893,8 +893,12 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
               (mapc (lambda (item)
                       (setq state (gnosis-nodes--apply-item state item blobs)))
                     (append (plist-get stored :items) nil))))))
-      (setq state (plist-put state :cursor (plist-get page :cursor)))
-      (plist-put state :snapshot nil))))
+      (setq state (plist-put state :cursor (plist-get page :cursor))
+            state (plist-put state :snapshot nil))
+      (gnosis-nodes--write-state state)
+      (delete-directory
+       (expand-file-name "snapshot" (gnosis-nodes--state-directory)) t)
+      state)))
 
 (defun gnosis-nodes--pull (state)
   "Pull every change after STATE cursor, committing each validated page."
@@ -1357,7 +1361,17 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
       (let* ((state (gnosis-nodes--read-state))
              (logical-path (file-relative-name buffer-file-name
                                                gnosis-nodes-dir))
-             (base (gnosis-nodes--base state nil logical-path)))
+             (head (gnosis-nodes--outbox-entry-for state nil logical-path))
+             (authoritative (plist-get (plist-get head :result) :authoritative))
+             (base
+              (or (gnosis-nodes--base state nil logical-path)
+                  (and head
+                       (eq :create (plist-get head :kind))
+                       (list :document-id (plist-get authoritative :document_id)
+                             :revision (plist-get authoritative :revision)
+                             :logical-path logical-path
+                             :digest (plist-get head :digest)
+                             :active t)))))
         (when base
           (let* ((bytes (gnosis-nodes--read-bytes buffer-file-name))
                  (digest (gnosis-nodes--digest bytes)))
@@ -1633,15 +1647,33 @@ Revalidate local merged bytes and remote head before durable queueing."
         (gnosis-nodes--write-state state)
         (message "Gnosis conflict merge queued")))))
 
+(defun gnosis-nodes--entry-confirms-conflict-p (entry record)
+  "Return non-nil when applied ENTRY confirms RECORD remote projection."
+  (let ((authoritative (plist-get (plist-get entry :result) :authoritative))
+        (projection (plist-get record :projection)))
+    (and (eq :applied (plist-get entry :status))
+         authoritative projection
+         (equal (plist-get authoritative :document_id)
+                (plist-get projection :document_id))
+         (= (plist-get authoritative :revision)
+            (plist-get projection :revision))
+         (equal (plist-get authoritative :logical_path)
+                (plist-get projection :logical_path))
+         (equal (gnosis-nodes--nullable
+                 (plist-get authoritative :content_sha256))
+                (gnosis-nodes--nullable
+                 (plist-get projection :content_sha256)))
+         (eq (plist-get authoritative :active)
+             (plist-get projection :active)))))
+
 (defun gnosis-nodes--supersede-local-chain (state record &optional retain-dispatched)
   "Supersede safe local intent in STATE related to RECORD.
 When RETAIN-DISPATCHED is non-nil, preserve the chain if it has sent intent."
-  (let ((document-id (plist-get record :document-id))
-        (paths (delq nil (list (plist-get record :local-path)
-                               (plist-get record :logical-path)
-                               (plist-get record :previous-path))))
-        related)
-    (setq related
+  (let* ((document-id (plist-get record :document-id))
+         (paths (delq nil (list (plist-get record :local-path)
+                                (plist-get record :logical-path)
+                                (plist-get record :previous-path))))
+         (related
           (seq-filter
            (lambda (entry)
              (or (and document-id
@@ -1650,14 +1682,21 @@ When RETAIN-DISPATCHED is non-nil, preserve the chain if it has sent intent."
                  (member (plist-get entry :previous-path) paths)
                  (member (plist-get entry :new-path) paths)))
            (append (plist-get state :outbox) nil)))
-    (if (seq-some (lambda (entry)
-                    (memq (plist-get entry :status)
-                          '(:sending :uncertain :applied)))
-                  related)
+         (dangerous
+          (seq-find (lambda (entry)
+                      (or (memq (plist-get entry :status)
+                                '(:sending :uncertain))
+                          (and (eq :applied (plist-get entry :status))
+                               (not (gnosis-nodes--entry-confirms-conflict-p
+                                     entry record)))))
+                    related)))
+    (if dangerous
         (unless retain-dispatched
           (user-error "Pending delivery must reconcile before resolution"))
       (dolist (entry related)
-        (when (memq (plist-get entry :status) '(:pending :blocked :rejected))
+        (when (or (memq (plist-get entry :status)
+                        '(:pending :blocked :rejected))
+                  (gnosis-nodes--entry-confirms-conflict-p entry record))
           (setf (plist-get entry :status) :superseded
                 (plist-get entry :depends-on) nil)))))
   state)
