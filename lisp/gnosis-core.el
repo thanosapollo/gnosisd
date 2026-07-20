@@ -1045,7 +1045,9 @@ PATH-VALUES fill path parameters and QUERY supplies query parameters."
     (signal 'gnosis-core-validation-error '("Invalid Gnosis Org bytes")))
   (let* ((raw (string-to-unibyte bytes))
          (text (decode-coding-string raw 'utf-8)))
-    (unless (equal raw (encode-coding-string text 'utf-8 t))
+    (unless (and (not (cl-loop for char across text
+                               thereis (eq 'eight-bit (char-charset char))))
+                 (equal raw (encode-coding-string text 'utf-8 t)))
       (signal 'gnosis-core-validation-error '("Invalid Gnosis UTF-8 content")))
     text))
 

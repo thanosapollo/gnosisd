@@ -735,6 +735,10 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                                (buffer-modified-p buffer)))
                         (list (get-file-buffer destination)
                               (and source (get-file-buffer source)))))
+                  (not (and source
+                            (not (equal source destination))
+                            (get-file-buffer source)
+                            (get-file-buffer destination)))
                   (if active
                       (equal remote-digest
                              (and (file-regular-p destination)
@@ -745,6 +749,21 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                   (or (null base-path)
                       (equal base-path logical-path)
                       (null local-bytes)))))
+      (unless gnosis-nodes--preflight
+        (when active
+          (let* ((destination
+                  (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
+                 (source (and base-path
+                              (gnosis-nodes--safe-path
+                               gnosis-nodes-dir base-path)))
+                 (source-buffer (and source (get-file-buffer source))))
+            (gnosis-nodes--write-document
+             logical-path (gnosis-nodes--working-bytes destination))
+            (when (and (buffer-live-p source-buffer)
+                       (not (equal source destination)))
+              (with-current-buffer source-buffer
+                (set-visited-file-name destination t)
+                (revert-buffer :ignore-auto :noconfirm))))))
       (gnosis-nodes--record-base state projection))
      ((and base (= (plist-get base :revision)
                    (plist-get projection :revision)))
@@ -1641,6 +1660,10 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
           (setq state (plist-put state :outbox-scan-index
                                  (mod (+ index 1) length)))
           (when (eq :pending (plist-get entry :status))
+              (when (and (memq (plist-get entry :kind) '(:create :replace))
+                         (plist-get entry :payload))
+                (gnosis-core--org-string
+                 (base64-decode-string (plist-get entry :payload))))
               (cl-incf sent)
               (setq gnosis-nodes--mutation-sent t)
               (aset outbox index (gnosis-nodes--outbox-mark entry :sending))

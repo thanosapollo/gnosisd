@@ -698,6 +698,21 @@ CONTENT-TYPE defaults to application/json."
          (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\""))))
       (nreverse calls)))))
 
+(ert-deftest gnosis-core-document-content-rejects-malformed-utf-8-before-transport ()
+  (let (called)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _)
+                 (setq called t))))
+      (dolist (call (list (lambda ()
+                            (gnosis-core-document-create
+                             "op:create" "note.org" (unibyte-string #xff)))
+                          (lambda ()
+                            (gnosis-core-document-replace
+                             "doc" "op:replace" 1 "note.org"
+                             (unibyte-string #xff)))))
+        (should-error (funcall call) :type 'gnosis-core-validation-error)))
+    (should-not called)))
+
 (ert-deftest gnosis-core-document-mutation-rejects-wrong-operation-id ()
   (cl-letf (((symbol-function 'gnosis-core--typed-request)
              (lambda (&rest _)

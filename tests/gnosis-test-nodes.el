@@ -952,6 +952,23 @@
       (should (eq :pending
                   (plist-get (aref (plist-get state :outbox) 2) :status))))))
 
+(ert-deftest gnosis-nodes-malformed-content-stays-pending-without-transport ()
+  (let* ((entry (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" "digest" nil
+                 (unibyte-string #xff)))
+         (state (list :bases [] :outbox (vector entry) :conflicts []))
+         writes
+         called)
+    (cl-letf (((symbol-function 'gnosis-nodes--write-state)
+               (lambda (new-state) (push (copy-tree new-state t) writes)))
+              ((symbol-function 'gnosis-core-document-create)
+               (lambda (&rest _) (setq called t))))
+      (should-error (gnosis-nodes--send-outbox state)
+                    :type 'gnosis-core-validation-error))
+    (should-not called)
+    (should-not writes)
+    (should (eq :pending (plist-get entry :status)))))
+
 (ert-deftest gnosis-nodes-outbox-scan-eventually-reaches-pending-tail ()
   (let* ((terminal
           (lambda (index)
@@ -1381,17 +1398,21 @@
                 :result (list :authoritative projection)))
          (state (list :version 1 :server-id "server" :device-id "device"
                       :cursor nil :bases (vector base)
-                      :outbox (vector receipt) :conflicts [])))
+                      :outbox (vector receipt) :conflicts []))
+         (destination (expand-file-name "new.org" root))
+         (buffer (find-file-noselect destination)))
     (unwind-protect
         (progn
-          (gnosis-nodes--write-document "new.org" bytes)
+          (gnosis-nodes--write-bytes destination bytes)
           (setq state
                 (gnosis-nodes--apply-document
                  state projection (list (cons digest bytes))))
           (should (= 0 (length (plist-get state :conflicts))))
+          (should (equal "body" (with-current-buffer buffer (buffer-string))))
           (let ((updated (gnosis-nodes--base state "doc" "new.org")))
             (should updated)
             (should (= 2 (plist-get updated :revision)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory root t))))
 
 (ert-deftest gnosis-nodes-track-file-enrolls-only-selected-file-offline ()
