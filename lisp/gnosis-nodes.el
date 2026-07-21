@@ -193,15 +193,22 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
   (let* ((old-path (gnosis-nodes--safe-path
                     gnosis-nodes-dir old-logical-path))
          (path (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
-         (old-buffer (get-file-buffer old-path)))
-    (when (or (file-exists-p path)
-              (get-file-buffer path)
+         (old-buffer (get-file-buffer old-path))
+         (old-bytes (gnosis-nodes--working-bytes old-path))
+         (new-bytes (gnosis-nodes--working-bytes path))
+         (expected (gnosis-nodes--digest bytes)))
+    (when (or (get-file-buffer path)
               (and (buffer-live-p old-buffer)
-                   (buffer-modified-p old-buffer)))
+                   (buffer-modified-p old-buffer))
+              (and new-bytes
+                   (not (equal expected (gnosis-nodes--digest new-bytes))))
+              (not (or old-bytes new-bytes)))
       (signal 'gnosis-nodes-conflict (list logical-path)))
     (unless gnosis-nodes--preflight
-      (gnosis-nodes--write-document logical-path bytes)
-      (delete-file old-path)
+      (unless new-bytes
+        (gnosis-nodes--write-document logical-path bytes))
+      (when old-bytes
+        (delete-file old-path))
       (when (buffer-live-p old-buffer)
         (with-current-buffer old-buffer
           (set-visited-file-name path t)
@@ -637,27 +644,44 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
                (null (gnosis-nodes--working-bytes
                       (gnosis-nodes--safe-path gnosis-nodes-dir local-path)))))))))
 
+(defun gnosis-nodes--authoritative-confirms-projection-p (authoritative projection)
+  "Return non-nil when AUTHORITATIVE exactly confirms PROJECTION."
+  (let ((active (not (equal "tombstone"
+                            (plist-get projection :operation)))))
+    (and authoritative projection
+         (equal (plist-get authoritative :document_id)
+                (plist-get projection :document_id))
+         (= (plist-get authoritative :revision)
+            (plist-get projection :revision))
+         (equal (plist-get authoritative :logical_path)
+                (plist-get projection :logical_path))
+         (equal (gnosis-nodes--nullable
+                 (plist-get authoritative :content_sha256))
+                (gnosis-nodes--projection-digest projection))
+         (eq (eq t (plist-get authoritative :active)) active))))
+
 (defun gnosis-nodes--confirmation-for-projection (state projection)
   "Return applied STATE entry that exactly confirms PROJECTION."
-  (let ((active (not (equal "tombstone"
-                            (plist-get projection :operation))))
-        (digest (gnosis-nodes--projection-digest projection)))
-    (seq-find
-     (lambda (entry)
-       (when-let* (((eq :applied (plist-get entry :status)))
-                   (result (plist-get entry :result))
-                   (authoritative (plist-get result :authoritative)))
-         (and (equal (plist-get authoritative :document_id)
-                     (plist-get projection :document_id))
-              (= (plist-get authoritative :revision)
-                 (plist-get projection :revision))
-              (equal (plist-get authoritative :logical_path)
-                     (plist-get projection :logical_path))
-              (equal (gnosis-nodes--nullable
-                      (plist-get authoritative :content_sha256))
-                     (gnosis-nodes--nullable digest))
-              (eq (eq t (plist-get authoritative :active)) active))))
-     (append (plist-get state :outbox) nil))))
+  (seq-find
+   (lambda (entry)
+     (and (eq :applied (plist-get entry :status))
+          (gnosis-nodes--authoritative-confirms-projection-p
+           (plist-get (plist-get entry :result) :authoritative)
+           projection)))
+   (append (plist-get state :outbox) nil)))
+
+(defun gnosis-nodes--accepted-merge-effect-p (record projection)
+  "Return non-nil when accepted merge RECORD exactly materializes PROJECTION."
+  (let* ((logical-path (plist-get projection :logical_path))
+         (path (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
+         (buffer (get-file-buffer path))
+         (bytes (gnosis-nodes--working-bytes path))
+         (digest (gnosis-nodes--projection-digest projection)))
+    (and (eq :accept-merged (plist-get record :resolution))
+         (equal digest (plist-get record :accepted-digest))
+         (not (and (buffer-live-p buffer) (buffer-modified-p buffer)))
+         bytes
+         (equal digest (gnosis-nodes--digest bytes)))))
 
 (defun gnosis-nodes--apply-document (state projection &optional blobs)
   "Reconcile document PROJECTION into working files and return STATE."
@@ -705,6 +729,11 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
          (confirmation
           (gnosis-nodes--confirmation-for-projection state projection)))
     (cond
+     ((and conflict confirmation
+           (equal (plist-get conflict :operation-id)
+                  (plist-get confirmation :operation-id))
+           (gnosis-nodes--accepted-merge-effect-p conflict projection))
+      (gnosis-nodes--record-base state projection))
      ((and conflict confirmation
            (equal (plist-get conflict :operation-id)
                   (plist-get confirmation :operation-id))
@@ -1642,8 +1671,99 @@ Use already validated PAYLOAD when supplied."
        (eq (and (plist-get base :active) t)
            (eq (plist-get head :active) t))))
 
+(defun gnosis-nodes--entry-confirms-authoritative-p (entry authoritative)
+  "Return non-nil when applied ENTRY intent exactly matches AUTHORITATIVE."
+  (let* ((kind (plist-get entry :kind))
+         (active (eq t (plist-get authoritative :active)))
+         (digest (gnosis-nodes--nullable
+                  (plist-get authoritative :content_sha256))))
+    (and (eq :applied (plist-get entry :status))
+         (memq kind '(:create :replace :rename :delete))
+         (or (eq kind :create)
+             (equal (plist-get entry :document-id)
+                    (plist-get authoritative :document_id)))
+         (equal (plist-get entry :logical-path)
+                (plist-get authoritative :logical_path))
+         (or (eq kind :delete)
+             (equal (gnosis-nodes--nullable (plist-get entry :digest)) digest))
+         (eq active (not (eq kind :delete))))))
+
+(defun gnosis-nodes--reconcile-applied-effect-p (entry record projection)
+  "Reconcile exact local effect for applied ENTRY and return non-nil.
+RECORD and PROJECTION describe the confirming feed conflict."
+  (let* ((kind (plist-get entry :kind))
+         (logical-path (plist-get projection :logical_path))
+         (local-path (or (plist-get record :local-path) logical-path))
+         (destination (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
+         (source (gnosis-nodes--safe-path gnosis-nodes-dir local-path))
+         (destination-buffer (get-file-buffer destination))
+         (source-buffer (get-file-buffer source))
+         (digest (gnosis-nodes--projection-digest projection)))
+    (pcase kind
+      (:delete
+       (and (equal local-path logical-path)
+            (not (and (buffer-live-p source-buffer)
+                      (buffer-modified-p source-buffer)))
+            (null (gnosis-nodes--working-bytes source))))
+      (:rename
+       (and (equal local-path (plist-get entry :previous-path))
+            (not (equal local-path logical-path))
+            (not (buffer-live-p destination-buffer))
+            (not (and (buffer-live-p source-buffer)
+                      (buffer-modified-p source-buffer)))
+            (let ((source-bytes (gnosis-nodes--working-bytes source))
+                  (destination-bytes
+                   (gnosis-nodes--working-bytes destination)))
+              (and (or source-bytes destination-bytes)
+                   (or (null source-bytes)
+                       (equal digest (gnosis-nodes--digest source-bytes)))
+                   (or (null destination-bytes)
+                       (equal digest (gnosis-nodes--digest destination-bytes)))
+                   (progn
+                     (gnosis-nodes--move-document
+                      local-path logical-path
+                      (or source-bytes destination-bytes))
+                     t)))))
+      (_
+       (let ((bytes (gnosis-nodes--working-bytes destination)))
+         (and (not (and (buffer-live-p destination-buffer)
+                        (buffer-modified-p destination-buffer)))
+              bytes
+              (equal digest (gnosis-nodes--digest bytes))))))))
+
+(defun gnosis-nodes--reconcile-applied-result (state entry authoritative)
+  "In STATE reconcile exact applied ENTRY result against AUTHORITATIVE."
+  (when (gnosis-nodes--entry-confirms-authoritative-p entry authoritative)
+    (when-let* ((record
+                 (seq-find
+                  (lambda (candidate)
+                    (gnosis-nodes--authoritative-confirms-projection-p
+                     authoritative (plist-get candidate :projection)))
+                  (append (plist-get state :conflicts) nil)))
+                (projection (plist-get record :projection))
+                ((gnosis-nodes--reconcile-applied-effect-p
+                  entry record projection)))
+      (setf (plist-get state :conflicts)
+            (vconcat (delq record (append (plist-get state :conflicts) nil))))
+      (setq state (gnosis-nodes--record-base state projection))))
+  state)
+
+(defun gnosis-nodes--reconcile-applied-results (state)
+  "Reconcile durable applied results already present in STATE."
+  (dolist (entry (append (plist-get state :outbox) nil) state)
+    (when (eq :applied (plist-get entry :status))
+      (when-let ((authoritative
+                  (plist-get (plist-get entry :result) :authoritative)))
+        (setq state
+              (gnosis-nodes--reconcile-applied-result
+               state entry authoritative))))))
+
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
+  (let ((before (length (plist-get state :outbox))))
+    (setq state (gnosis-nodes--reconcile-applied-results state))
+    (when (< (length (plist-get state :outbox)) before)
+      (gnosis-nodes--write-state state)))
   (let* ((outbox (plist-get state :outbox))
          (length (length outbox))
          (stored-start (plist-get state :outbox-scan-index))
@@ -1690,6 +1810,14 @@ Use already validated PAYLOAD when supplied."
                           (gnosis-nodes--outbox-mark
                            entry (if (equal "applied" (plist-get result :status))
                                      :applied :rejected)))
+                    (when (equal "applied" (plist-get result :status))
+                      (let ((before (length (plist-get state :outbox))))
+                        (setq state
+                              (gnosis-nodes--reconcile-applied-result
+                               state (aref outbox index) authoritative))
+                        (when (< (length (plist-get state :outbox)) before)
+                          (gnosis-nodes--write-state state)
+                          (throw 'gnosis-nodes--stop-outbox nil))))
                     (when (and (equal "applied" (plist-get result :status))
                                (eq gnosis-core--json-false
                                    (plist-get result :changed))
@@ -2344,6 +2472,8 @@ Revalidate merge-buffer bytes and remote head before queueing."
                          (gnosis-nodes--managed-bytes
                           conflict-directory merge-file)))
              (digest (and bytes (gnosis-nodes--digest bytes))))
+        (unless (equal local-path logical-path)
+          (user-error "Choose local or remote resolution for rename conflicts"))
         (unless bytes (user-error "Local merge file no longer exists"))
         (when (or (and (buffer-live-p local-buffer)
                        (buffer-modified-p local-buffer))
@@ -2373,6 +2503,7 @@ Revalidate merge-buffer bytes and remote head before queueing."
                  state entry (plist-get record :document-id) logical-path))
           (setf (plist-get record :accepted-digest) digest
                 (plist-get record :operation-id) (plist-get entry :operation-id)
+                (plist-get record :resolution) :accept-merged
                 (plist-get record :status) :queued
                 (plist-get record :merge-file) nil
                 (plist-get record :merge-start-digest) nil
