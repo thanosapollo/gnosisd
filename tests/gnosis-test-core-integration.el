@@ -6,6 +6,7 @@
 (require 'ert)
 (require 'gnosis-core)
 (require 'gnosis-nodes)
+(require 'gnosis-review)
 
 (defvar gnosis-core--generated-openapi-operations)
 (defvar gnosis-core--generated-openapi-operation-count)
@@ -124,7 +125,15 @@
                      (plist-get
                       (plist-get (gnosis-core-review-attempt-state attempt-id)
                                  :attempt)
-                      :status))))))
+                      :status)))
+      (let ((gnosis-review--session session)
+            killed)
+        (cl-letf (((symbol-function 'kill-buffer)
+                   (lambda (&rest _) (setq killed t)))
+                  ((symbol-function 'message) #'ignore))
+          (gnosis-review--next)
+          (should killed)
+          (should-not gnosis-review--session))))))
 
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
