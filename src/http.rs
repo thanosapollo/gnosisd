@@ -55,7 +55,7 @@ use crate::{
             DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1,
             NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
-            OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
+            OfflineContentOperationEnvelopeV2, OfflineContentResultEnvelopeV1,
             OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
             ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
@@ -739,14 +739,17 @@ async fn create_document_mutation(
 ) -> Result<(StatusCode, Json<DocumentMutationResultV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let operation_id = idempotency_key(&headers)?;
-    let prepared = prepare_document(
-        None,
-        input.logical_path,
-        input.content_type,
-        input.source,
-        None,
-    )
-    .map_err(ApiError::invalid_content)?;
+    let prepared = run_blocking(move || {
+        prepare_document(
+            None,
+            input.logical_path,
+            input.content_type,
+            input.source,
+            None,
+        )
+        .map_err(ApiError::invalid_content)
+    })
+    .await?;
     let result = apply_document_mutation(&state, principal, operation_id, prepared).await?;
     Ok((StatusCode::OK, Json(result)))
 }
@@ -761,14 +764,17 @@ async fn replace_document_mutation(
     require(&principal, DeviceScope::ContentWrite)?;
     let operation_id = idempotency_key(&headers)?;
     let revision = if_match(&headers)?;
-    let prepared = prepare_document(
-        Some(id.clone()),
-        input.logical_path,
-        input.content_type,
-        input.source,
-        Some(revision),
-    )
-    .map_err(ApiError::invalid_content)?;
+    let prepared = run_blocking(move || {
+        prepare_document(
+            Some(id),
+            input.logical_path,
+            input.content_type,
+            input.source,
+            Some(revision),
+        )
+        .map_err(ApiError::invalid_content)
+    })
+    .await?;
     let result = apply_document_mutation(&state, principal, operation_id, prepared).await?;
     Ok(Json(result))
 }
@@ -2624,7 +2630,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
         )),
         ("/v1/content/offline-operations", "post") => Some(json_contract(
             "content:write",
-            Some("OfflineContentOperationEnvelopeV1"),
+            Some("OfflineContentOperationEnvelopeV2"),
             "200",
             "OfflineContentResultEnvelopeV1",
             &[
@@ -3360,7 +3366,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
     requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
-    requests.subschema_for::<OfflineContentOperationEnvelopeV1>();
+    requests.subschema_for::<OfflineContentOperationEnvelopeV2>();
     requests.subschema_for::<OfflineAssetOperationEnvelopeV1>();
     definitions.extend(requests.take_definitions(true));
     definitions
@@ -4315,7 +4321,7 @@ mod tests {
         assert_schema_ref(
             operation,
             "requestBody",
-            "OfflineContentOperationEnvelopeV1",
+            "OfflineContentOperationEnvelopeV2",
         );
         assert_response_schema(operation, "200", "OfflineContentResultEnvelopeV1");
         assert_response_statuses(
@@ -4326,15 +4332,15 @@ mod tests {
         );
         let schemas = &api["components"]["schemas"];
         assert_eq!(
-            schemas["OfflineContentOperationEnvelopeV1"]["properties"]["version"]["const"],
-            1
+            schemas["OfflineContentOperationEnvelopeV2"]["properties"]["version"]["const"],
+            2
         );
         assert_eq!(
             schemas["OfflineContentResultEnvelopeV1"]["properties"]["version"]["const"],
             1
         );
         assert_tagged_variants(
-            &schemas["OfflineContentMutationV1"],
+            &schemas["OfflineContentMutationV2"],
             "kind",
             &["put_document", "rename_document", "tombstone_document"],
         );
@@ -8159,7 +8165,7 @@ mod tests {
         source: &str,
     ) -> serde_json::Value {
         json!({
-            "version": 1,
+            "version": 2,
             "operation": {
                 "operation_id": operation_id,
                 "device_id": device_id,

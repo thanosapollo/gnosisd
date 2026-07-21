@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub(crate) const OFFLINE_CONTENT_VERSION: u32 = 1;
+pub(crate) const OFFLINE_CONTENT_OPERATION_VERSION: u32 = 2;
 const OFFLINE_CONTENT_CAPABILITIES_VERSION: u32 = 2;
 pub(crate) const MAX_OFFLINE_CONTENT_OPERATION_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_OFFLINE_CONTENT_RESULT_BYTES: usize = 128 * 1024;
@@ -45,6 +46,18 @@ where
     }
 }
 
+fn deserialize_version_2<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let version = u32::deserialize(deserializer)?;
+    if version == OFFLINE_CONTENT_OPERATION_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom("protocol version is unsupported"))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OfflineContentSubmission {
@@ -59,6 +72,15 @@ pub struct OfflineContentOperationEnvelopeV1 {
     #[schemars(extend("const" = 1))]
     pub version: u32,
     pub operation: OfflineContentOperationV1,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineContentOperationEnvelopeV2 {
+    #[serde(deserialize_with = "deserialize_version_2")]
+    #[schemars(extend("const" = 2))]
+    pub version: u32,
+    pub operation: OfflineContentOperationV2,
 }
 
 pub(crate) struct DecodedOfflineContent {
@@ -91,25 +113,39 @@ pub(crate) enum OfflineContentWireError {
 
 impl OfflineContentSubmission {
     pub(crate) fn decode(self) -> Result<DecodedOfflineContent, OfflineContentWireError> {
-        if self.version != OFFLINE_CONTENT_VERSION {
-            return Err(OfflineContentWireError::Version);
+        match self.version {
+            OFFLINE_CONTENT_VERSION => {
+                let wire: OfflineContentOperationV1 =
+                    serde_json::from_value(self.operation).map_err(invalid_operation)?;
+                let typed = OfflineContentOperationV2::from(&wire);
+                validate_operation(&typed)?;
+                let canonical_payload = encode_operation_v1(&wire)?;
+                Ok(DecodedOfflineContent {
+                    version: self.version,
+                    operation: wire.into(),
+                    canonical_payload,
+                })
+            }
+            OFFLINE_CONTENT_OPERATION_VERSION => {
+                let wire: OfflineContentOperationV2 =
+                    serde_json::from_value(self.operation).map_err(invalid_operation)?;
+                validate_operation(&wire)?;
+                let canonical_payload = encode_operation(&wire)?;
+                Ok(DecodedOfflineContent {
+                    version: self.version,
+                    operation: wire.into(),
+                    canonical_payload,
+                })
+            }
+            _ => Err(OfflineContentWireError::Version),
         }
-        let wire: OfflineContentOperationV1 =
-            serde_json::from_value(self.operation).map_err(invalid_operation)?;
-        validate_operation(&wire)?;
-        let canonical_payload = encode_operation(&wire)?;
-        Ok(DecodedOfflineContent {
-            version: self.version,
-            operation: wire.into(),
-            canonical_payload,
-        })
     }
 }
 
 pub(crate) fn canonical_content_operation(
     operation: &OfflineContentOperation,
 ) -> Result<String, OfflineContentWireError> {
-    let wire = OfflineContentOperationV1::from(operation);
+    let wire = OfflineContentOperationV2::from(operation);
     validate_operation(&wire)?;
     encode_operation(&wire)
 }
@@ -227,6 +263,20 @@ fn require_response_version(value: &Value) -> Result<(), OfflineContentWireError
 }
 
 fn encode_operation(
+    operation: &OfflineContentOperationV2,
+) -> Result<String, OfflineContentWireError> {
+    let encoded = serde_json::to_string(&VersionedOperationV2 {
+        version: OFFLINE_CONTENT_OPERATION_VERSION,
+        operation,
+    })
+    .map_err(invalid_operation)?;
+    if encoded.len() > MAX_OFFLINE_CONTENT_OPERATION_BYTES {
+        return Err(OfflineContentWireError::Operation);
+    }
+    Ok(encoded)
+}
+
+fn encode_operation_v1(
     operation: &OfflineContentOperationV1,
 ) -> Result<String, OfflineContentWireError> {
     let encoded = serde_json::to_string(&VersionedOperationV1 {
@@ -240,7 +290,7 @@ fn encode_operation(
     Ok(encoded)
 }
 
-fn validate_operation(value: &OfflineContentOperationV1) -> Result<(), OfflineContentWireError> {
+fn validate_operation(value: &OfflineContentOperationV2) -> Result<(), OfflineContentWireError> {
     require_identity(&value.operation_id)?;
     require_identity(&value.device_id)?;
     if value.device_sequence == 0
@@ -252,7 +302,7 @@ fn validate_operation(value: &OfflineContentOperationV1) -> Result<(), OfflineCo
     }
     validate_cursor(&value.cursor)?;
     match &value.mutation {
-        OfflineContentMutationV1::Put {
+        OfflineContentMutationV2::Put {
             document_id,
             logical_path,
             content_sha256,
@@ -267,12 +317,12 @@ fn validate_operation(value: &OfflineContentOperationV1) -> Result<(), OfflineCo
             source,
             base,
         ),
-        OfflineContentMutationV1::Rename {
+        OfflineContentMutationV2::Rename {
             document_id,
             logical_path,
             base,
         } => validate_document_rename(document_id, logical_path, base),
-        OfflineContentMutationV1::Tombstone { document_id, base } => {
+        OfflineContentMutationV2::Tombstone { document_id, base } => {
             validate_document_tombstone(document_id, base)
         }
     }
@@ -489,6 +539,12 @@ struct VersionedOperationV1<'a> {
     operation: &'a OfflineContentOperationV1,
 }
 
+#[derive(Serialize)]
+struct VersionedOperationV2<'a> {
+    version: u32,
+    operation: &'a OfflineContentOperationV2,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfflineContentOperationV1 {
@@ -508,6 +564,46 @@ pub struct OfflineContentOperationV1 {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OfflineContentMutationV1 {
+    #[serde(rename = "put_document")]
+    Put {
+        document_id: String,
+        logical_path: String,
+        content_sha256: String,
+        org: String,
+        base: OfflineContentBaseV1,
+    },
+    #[serde(rename = "rename_document")]
+    Rename {
+        document_id: String,
+        logical_path: String,
+        base: OfflineContentBaseV1,
+    },
+    #[serde(rename = "tombstone_document")]
+    Tombstone {
+        document_id: String,
+        base: OfflineContentBaseV1,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OfflineContentOperationV2 {
+    #[schemars(length(min = 1, max = 4096))]
+    pub operation_id: String,
+    #[schemars(length(min = 1, max = 4096))]
+    pub device_id: String,
+    #[schemars(range(min = 1))]
+    pub device_sequence: u64,
+    #[schemars(length(min = 1, max = 512))]
+    pub cursor: String,
+    #[schemars(range(min = 1))]
+    pub authored_at_us: u64,
+    pub mutation: OfflineContentMutationV2,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OfflineContentMutationV2 {
     #[serde(rename = "put_document")]
     Put {
         document_id: String,
@@ -541,8 +637,61 @@ pub enum OfflineContentBaseV1 {
     },
 }
 
+impl From<&OfflineContentOperationV1> for OfflineContentOperationV2 {
+    fn from(value: &OfflineContentOperationV1) -> Self {
+        Self {
+            operation_id: value.operation_id.clone(),
+            device_id: value.device_id.clone(),
+            device_sequence: value.device_sequence,
+            cursor: value.cursor.clone(),
+            authored_at_us: value.authored_at_us,
+            mutation: (&value.mutation).into(),
+        }
+    }
+}
+
+impl From<&OfflineContentMutationV1> for OfflineContentMutationV2 {
+    fn from(value: &OfflineContentMutationV1) -> Self {
+        match value {
+            OfflineContentMutationV1::Put {
+                document_id,
+                logical_path,
+                content_sha256,
+                org,
+                base,
+            } => Self::Put {
+                document_id: document_id.clone(),
+                logical_path: logical_path.clone(),
+                content_sha256: content_sha256.clone(),
+                content_type: "text/org; charset=utf-8".to_owned(),
+                source: org.clone(),
+                base: base.clone(),
+            },
+            OfflineContentMutationV1::Rename {
+                document_id,
+                logical_path,
+                base,
+            } => Self::Rename {
+                document_id: document_id.clone(),
+                logical_path: logical_path.clone(),
+                base: base.clone(),
+            },
+            OfflineContentMutationV1::Tombstone { document_id, base } => Self::Tombstone {
+                document_id: document_id.clone(),
+                base: base.clone(),
+            },
+        }
+    }
+}
+
 impl From<OfflineContentOperationV1> for OfflineContentOperation {
     fn from(value: OfflineContentOperationV1) -> Self {
+        OfflineContentOperationV2::from(&value).into()
+    }
+}
+
+impl From<OfflineContentOperationV2> for OfflineContentOperation {
+    fn from(value: OfflineContentOperationV2) -> Self {
         let (server_id, cursor, token) =
             decode_cursor(&value.cursor).expect("validated content cursor");
         Self {
@@ -558,7 +707,7 @@ impl From<OfflineContentOperationV1> for OfflineContentOperation {
     }
 }
 
-impl From<&OfflineContentOperation> for OfflineContentOperationV1 {
+impl From<&OfflineContentOperation> for OfflineContentOperationV2 {
     fn from(value: &OfflineContentOperation) -> Self {
         Self {
             operation_id: value.operation_id.clone(),
@@ -572,10 +721,10 @@ impl From<&OfflineContentOperation> for OfflineContentOperationV1 {
     }
 }
 
-impl From<OfflineContentMutationV1> for OfflineContentMutation {
-    fn from(value: OfflineContentMutationV1) -> Self {
+impl From<OfflineContentMutationV2> for OfflineContentMutation {
+    fn from(value: OfflineContentMutationV2) -> Self {
         match value {
-            OfflineContentMutationV1::Put {
+            OfflineContentMutationV2::Put {
                 document_id,
                 logical_path,
                 content_sha256,
@@ -590,7 +739,7 @@ impl From<OfflineContentMutationV1> for OfflineContentMutation {
                 source,
                 base: base.into(),
             },
-            OfflineContentMutationV1::Rename {
+            OfflineContentMutationV2::Rename {
                 document_id,
                 logical_path,
                 base,
@@ -599,7 +748,7 @@ impl From<OfflineContentMutationV1> for OfflineContentMutation {
                 logical_path,
                 base: base.into(),
             },
-            OfflineContentMutationV1::Tombstone { document_id, base } => Self::Tombstone {
+            OfflineContentMutationV2::Tombstone { document_id, base } => Self::Tombstone {
                 document_id,
                 base: base.into(),
             },
@@ -607,7 +756,7 @@ impl From<OfflineContentMutationV1> for OfflineContentMutation {
     }
 }
 
-impl From<&OfflineContentMutation> for OfflineContentMutationV1 {
+impl From<&OfflineContentMutation> for OfflineContentMutationV2 {
     fn from(value: &OfflineContentMutation) -> Self {
         match value {
             OfflineContentMutation::Put {
@@ -800,7 +949,7 @@ mod tests {
         let org = "* [invalid";
         let digest = format!("{:x}", sha2::Sha256::digest(org.as_bytes()));
         let submission: OfflineContentSubmission = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "operation": {
                 "operation_id": "operation",
                 "device_id": "device",
@@ -823,6 +972,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_v1_org_operation_replays_with_its_original_payload() {
+        let org = "#+title: Legacy\n";
+        let digest = format!("{:x}", sha2::Sha256::digest(org.as_bytes()));
+        let mut value = json!({
+            "version": 1,
+            "operation": {
+                "operation_id": "operation",
+                "device_id": "device",
+                "device_sequence": 1,
+                "cursor": "eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiJzZXJ2ZXIiLCJjdXJzb3IiOjAsInRva2VuIjoiY3Vyc29yLXRva2VuIn0",
+                "authored_at_us": 1,
+                "mutation": {
+                    "kind": "put_document",
+                    "document_id": "document",
+                    "logical_path": "legacy.org",
+                    "content_sha256": digest,
+                    "org": org,
+                    "base": {"kind": "absent"}
+                }
+            }
+        });
+        value["operation"]["cursor"] =
+            json!(super::encode_cursor(&"a".repeat(32), 0, &"b".repeat(32)).unwrap());
+        let submission: OfflineContentSubmission = serde_json::from_value(value.clone()).unwrap();
+        let decoded = submission.decode().unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&decoded.canonical_payload).unwrap(),
+            value
+        );
+        match decoded.operation.mutation {
+            crate::application::OfflineContentMutation::Put {
+                content_type,
+                source,
+                ..
+            } => {
+                assert_eq!(content_type, "text/org; charset=utf-8");
+                assert_eq!(source, org);
+            }
+            _ => panic!("expected put operation"),
+        }
+    }
+
+    #[test]
     fn result_decoder_classifies_unknown_versions() {
         let value = json!({"version":2,"result":{}});
         assert!(matches!(
@@ -834,7 +1027,7 @@ mod tests {
     #[test]
     fn rejects_changed_content_digest() {
         let submission: OfflineContentSubmission = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "operation": {
                 "operation_id": "operation",
                 "device_id": "device",
@@ -887,7 +1080,7 @@ mod tests {
         let org = "x".repeat(super::MAX_OFFLINE_CONTENT_OPERATION_BYTES);
         let digest = format!("{:x}", sha2::Sha256::digest(org.as_bytes()));
         let submission: OfflineContentSubmission = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "operation": {
                 "operation_id": "operation",
                 "device_id": "device",
@@ -918,7 +1111,7 @@ mod tests {
         let org = "#+title: Note\n";
         let digest = format!("{:x}", sha2::Sha256::digest(org.as_bytes()));
         let submission: OfflineContentSubmission = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "operation": {
                 "operation_id": "operation",
                 "device_id": "device",
@@ -975,7 +1168,7 @@ mod tests {
             }),
         ] {
             let submission: OfflineContentSubmission = serde_json::from_value(json!({
-                "version": 1,
+                "version": 2,
                 "operation": {
                     "operation_id": "operation",
                     "device_id": "device",
@@ -990,7 +1183,7 @@ mod tests {
         }
 
         let absent: OfflineContentSubmission = serde_json::from_value(json!({
-            "version": 1,
+            "version": 2,
             "operation": {
                 "operation_id": "operation",
                 "device_id": "device",

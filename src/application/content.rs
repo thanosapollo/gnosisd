@@ -507,10 +507,11 @@ pub(crate) fn prepare_document(
     }))
     .map_err(|_| ContentError::DocumentParser)?
     .map_err(|error| match error {
-        DocumentParseError::UnsupportedContentType(_) => ContentError::UnsupportedType,
+        DocumentParseError::UnsupportedContentType(_) | DocumentParseError::InvalidReference => {
+            ContentError::UnsupportedType
+        }
         DocumentParseError::Org(error) => ContentError::Org(error),
     })?;
-    asset_paths_in_org(&source)?;
     let asset_paths = parsed.asset_paths().to_vec();
     let projection = parsed.into_projection();
     let projection_bytes = serde_json::to_vec(&DocumentProjectionSnapshot::from(&projection))
@@ -614,57 +615,25 @@ pub(crate) fn path_key(value: &str) -> String {
 }
 
 pub(crate) fn asset_paths_in_org(org: &str) -> Result<Vec<String>, ContentError> {
-    let mut assets = BTreeSet::new();
-    for expression in file_link_expressions() {
-        for captures in expression.captures_iter(org) {
-            let target = captures.get(1).ok_or(ContentError::Path)?.as_str();
-            let target = target.split("::").next().ok_or(ContentError::Path)?;
-            validate_reference(target)?;
-            if target.starts_with("assets/") {
-                assets.insert(target.to_owned());
-            }
-        }
-    }
-    Ok(assets.into_iter().collect())
+    parse_document(crate::parser::ORG_CONTENT_TYPE, org)
+        .map(|parsed| parsed.asset_paths().to_vec())
+        .map_err(|error| match error {
+            DocumentParseError::UnsupportedContentType(_)
+            | DocumentParseError::InvalidReference => ContentError::UnsupportedType,
+            DocumentParseError::Org(error) => ContentError::Org(error),
+        })
 }
 
 pub(crate) fn retained_asset_paths_in_org(org: &str) -> Vec<String> {
-    let mut assets = BTreeSet::new();
-    for expression in file_link_expressions() {
-        for captures in expression.captures_iter(org) {
-            let Some(target) = captures.get(1).map(|value| value.as_str()) else {
-                continue;
-            };
-            let target = target.split("::").next().unwrap_or(target);
-            if target.starts_with("assets/") && validate_asset_path(target).is_ok() {
-                assets.insert(target.to_owned());
-            }
-        }
-    }
-    assets.into_iter().collect()
-}
-
-pub(crate) fn file_link_expressions() -> [&'static Regex; 2] {
-    [&FILE_LINK, &PLAIN_FILE_LINK]
-}
-
-fn validate_reference(target: &str) -> Result<(), ContentError> {
-    if external_reference(target) {
-        return Ok(());
-    }
-    validate_logical_path(target)?;
-    if target.starts_with("assets/") {
-        return validate_asset_path(target);
-    }
-    if target.ends_with(".org") {
-        Ok(())
-    } else {
-        Err(ContentError::UnsupportedType)
-    }
+    crate::parser::retained_asset_paths(crate::parser::ORG_CONTENT_TYPE, org)
 }
 
 fn external_reference(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
+}
+
+pub(crate) fn file_link_expressions() -> [&'static Regex; 2] {
+    [&FILE_LINK, &PLAIN_FILE_LINK]
 }
 
 pub(crate) fn supported_asset(value: &str) -> bool {

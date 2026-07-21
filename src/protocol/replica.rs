@@ -7,9 +7,12 @@ use crate::application::{
     FsrsImplementationSnapshot, FsrsModelSnapshot, ProjectionEdge, ProjectionLinkOccurrence,
     ProjectionNode, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateSnapshot,
     SettingsInput, SnapshotPage, SnapshotPosition, prepare_thema, thema_content,
-    validate_asset_path, validate_org_path,
+    validate_asset_path,
 };
-use crate::is_canonical_sha256;
+use crate::{
+    is_canonical_sha256,
+    parser::{supported_content_type, validate_document_path},
+};
 
 use super::http_v1::{
     AssetOperationV1, AssetRevisionV1, DocumentOperationV1, DocumentProjectionV1,
@@ -494,7 +497,11 @@ fn projection_identity(
 
 fn document_identity(value: &DocumentRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
     require_identity(&value.document_id)?;
-    validate_org_path(&value.logical_path).map_err(|_| ReplicaWireError::Response)?;
+    if !supported_content_type(&value.content_type) {
+        return Err(ReplicaWireError::Response);
+    }
+    validate_document_path(&value.content_type, &value.logical_path)
+        .map_err(|_| ReplicaWireError::Response)?;
     validate_blob_reference(value.content_sha256.as_deref(), value.blob_url.as_deref())?;
     let tombstone = value.operation == DocumentOperationV1::Tombstone;
     let invalid_tombstone =

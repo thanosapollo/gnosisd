@@ -44,6 +44,7 @@ const TOKEN_FILE_READ_LIMIT: u64 = 131;
 const CLIENT_INPUT_LIMIT: u64 = 1024 * 1024;
 const MANIFEST_ENTRY_LIMIT: usize = 1024;
 const MANIFEST_SOURCE_LIMIT: usize = 64 * 1024 * 1024;
+const MAX_IMPORT_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "gnosis")]
@@ -787,6 +788,7 @@ async fn run_http_import_manifest(
     {
         return Err(CliError::BulkImport.into());
     }
+    persist_journal(journal_path, &journal)?;
     let client = http_client(base_url, token_file)?;
 
     for entry in &entries {
@@ -1392,29 +1394,15 @@ fn preflight_manifest(
         {
             return Err(CliError::BulkImport);
         }
-        let source_path = root.join(&entry.source_path);
-        let mut current = root.clone();
-        for component in entry.source_path.components() {
-            let Component::Normal(component) = component else {
-                return Err(CliError::BulkImport);
-            };
-            current.push(component);
-            if current
-                .symlink_metadata()
-                .map_err(CliError::BulkIo)?
-                .file_type()
-                .is_symlink()
-            {
-                return Err(CliError::BulkImport);
-            }
+        let source_file = open_confined_file(&root, &entry.source_path)?;
+        let mut source_bytes = Vec::new();
+        source_file
+            .take(CLIENT_INPUT_LIMIT + 1)
+            .read_to_end(&mut source_bytes)
+            .map_err(CliError::BulkIo)?;
+        if source_bytes.len() > CLIENT_INPUT_LIMIT as usize {
+            return Err(CliError::ClientInputTooLarge);
         }
-        let canonical = source_path.canonicalize().map_err(CliError::BulkIo)?;
-        if !canonical.starts_with(&root)
-            || !canonical.metadata().map_err(CliError::BulkIo)?.is_file()
-        {
-            return Err(CliError::BulkImport);
-        }
-        let source_bytes = read_bounded_file(&canonical)?;
         total_source_bytes = total_source_bytes
             .checked_add(source_bytes.len())
             .filter(|total| *total <= MANIFEST_SOURCE_LIMIT)
@@ -1449,6 +1437,38 @@ fn import_manifest_sha256(manifest_bytes: &[u8], entries: &[PreparedImportEntry]
     format!("{:x}", digest.finalize())
 }
 
+fn open_confined_file(root: &Path, relative: &Path) -> Result<File, CliError> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(CliError::BulkImport);
+    }
+    let mut current = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| CliError::BulkIo(error.into()))?;
+    for (index, component) in components.into_iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(CliError::BulkImport);
+        };
+        let last = index + 1 == relative.components().count();
+        let flags = if last {
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        } else {
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW
+        };
+        current = openat(&current, name, flags, Mode::empty()).map_err(|_| CliError::BulkImport)?;
+    }
+    let file = File::from(current);
+    if !file.metadata().map_err(CliError::BulkIo)?.is_file() {
+        return Err(CliError::BulkImport);
+    }
+    Ok(file)
+}
+
 fn relative_normal_path(path: &Path) -> bool {
     !path.as_os_str().is_empty()
         && path
@@ -1464,13 +1484,17 @@ fn safe_logical_path(path: &str) -> bool {
 }
 
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>, CliError> {
+    read_file_with_limit(path, CLIENT_INPUT_LIMIT)
+}
+
+fn read_file_with_limit(path: &Path, limit: u64) -> Result<Vec<u8>, CliError> {
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(CliError::BulkIo)?
-        .take(CLIENT_INPUT_LIMIT + 1)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(CliError::BulkIo)?;
-    if bytes.len() > CLIENT_INPUT_LIMIT as usize {
+    if bytes.len() > limit as usize {
         return Err(CliError::ClientInputTooLarge);
     }
     Ok(bytes)
@@ -1484,7 +1508,11 @@ fn load_journal(path: &Path, manifest_sha256: &str) -> Result<ImportJournal, Cli
             completed: BTreeMap::new(),
         });
     }
-    let bytes = read_bounded_file(path)?;
+    let metadata = path.symlink_metadata().map_err(CliError::BulkIo)?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(CliError::BulkImport);
+    }
+    let bytes = read_file_with_limit(path, MAX_IMPORT_JOURNAL_BYTES)?;
     let journal: ImportJournal =
         serde_json::from_slice(&bytes).map_err(|_| CliError::BulkImport)?;
     if journal.version != 1 || journal.manifest_sha256 != manifest_sha256 {
@@ -1495,23 +1523,32 @@ fn load_journal(path: &Path, manifest_sha256: &str) -> Result<ImportJournal, Cli
 
 fn persist_journal(path: &Path, journal: &ImportJournal) -> Result<(), CliError> {
     let body = serde_json::to_vec(journal).map_err(CliError::Encode)?;
+    if body.len() > MAX_IMPORT_JOURNAL_BYTES as usize {
+        return Err(CliError::ClientInputTooLarge);
+    }
     let temporary = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)
-        .map_err(CliError::BulkIo)?;
-    file.write_all(&body).map_err(CliError::BulkIo)?;
-    file.sync_all().map_err(CliError::BulkIo)?;
-    fs::rename(&temporary, path).map_err(CliError::BulkIo)?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(CliError::BulkIo)
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(CliError::BulkIo)?;
+        file.write_all(&body).map_err(CliError::BulkIo)?;
+        file.sync_all().map_err(CliError::BulkIo)?;
+        fs::rename(&temporary, path).map_err(CliError::BulkIo)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(CliError::BulkIo)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn read_source() -> Result<String, CliError> {

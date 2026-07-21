@@ -1409,8 +1409,8 @@ pub fn validate_note_input(input: &NoteWriteRequestV1) -> Result<(), HttpClientE
         input.source.clone(),
         None,
     )
-    .map(|_| ())
-    .map_err(|_| HttpClientError::InvalidMutation)
+    .map_err(|_| HttpClientError::InvalidMutation)?;
+    encode_document_mutation(input).map(|_| ())
 }
 
 fn validate_document_mutation_request(

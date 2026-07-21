@@ -4,7 +4,8 @@ use gnosis_core::protocol::http_v1::{
     DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1,
     NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
     OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
-    OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
+    OfflineContentOperationEnvelopeV1, OfflineContentOperationEnvelopeV2,
+    OfflineContentResultEnvelopeV1,
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
@@ -395,8 +396,9 @@ fn public_offline_review_dtos_preserve_v1_requests_and_v2_responses() {
 }
 
 #[test]
-fn public_offline_content_dtos_preserve_strict_v1_shapes() {
+fn public_offline_content_dtos_preserve_strict_versioned_shapes() {
     let operation = offline_content_operation();
+    assert_round_trip::<OfflineContentOperationEnvelopeV2>(offline_content_operation_v2());
     let accepted = offline_content_result("accepted");
     let conflict = offline_content_result("conflict");
     assert_round_trip::<OfflineContentOperationEnvelopeV1>(operation.clone());
@@ -508,6 +510,20 @@ fn assert_invalid_offline_asset_results(mut accepted: Value, mut conflict: Value
 fn offline_content_operation() -> Value {
     json!({
         "version":1,
+        "operation":{
+            "operation_id":"operation","device_id":"device","device_sequence":1,
+            "cursor":"cursor","authored_at_us":1,
+            "mutation":{"kind":"put_document","document_id":"document",
+                "logical_path":"note.org","content_sha256":"a".repeat(64),
+                "org":"#+title: Note\n",
+                "base":{"kind":"absent"}}
+        }
+    })
+}
+
+fn offline_content_operation_v2() -> Value {
+    json!({
+        "version":2,
         "operation":{
             "operation_id":"operation","device_id":"device","device_sequence":1,
             "cursor":"cursor","authored_at_us":1,

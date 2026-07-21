@@ -2005,8 +2005,13 @@ fn reconcile_content_command(
     blobs: &BlobStore,
     command: ContentCommand<'_>,
 ) -> StoreResult<OfflineContentResult> {
+    if !matches!(command.format_version, 1 | 2) {
+        return Err(StoreError::InvalidReviewState);
+    }
+    // Wire v1 and v2 share one normalized operation/result journal shape.
+    let journal_format_version = 1;
     let needs_blob = store.content_operation_needs_blob(
-        command.format_version,
+        journal_format_version,
         command.operation,
         command.canonical_payload,
         command.device_id,
@@ -2030,7 +2035,7 @@ fn reconcile_content_command(
         None
     };
     store.reconcile_content_operation(
-        command.format_version,
+        journal_format_version,
         command.operation,
         command.canonical_payload,
         command.device_id,

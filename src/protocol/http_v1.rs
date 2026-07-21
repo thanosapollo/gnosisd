@@ -14,7 +14,8 @@ pub use super::offline_asset::{
 };
 pub use super::offline_content::{
     OfflineContentBaseV1, OfflineContentConflictReasonV1, OfflineContentDocumentV1,
-    OfflineContentMutationV1, OfflineContentOperationEnvelopeV1, OfflineContentOperationV1,
+    OfflineContentMutationV1, OfflineContentMutationV2, OfflineContentOperationEnvelopeV1,
+    OfflineContentOperationEnvelopeV2, OfflineContentOperationV1, OfflineContentOperationV2,
     OfflineContentResultEnvelopeV1, OfflineContentResultV1,
 };
 pub use super::offline_review::{
