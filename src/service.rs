@@ -2,9 +2,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -19,9 +21,12 @@ mod import;
 
 pub(crate) use backup::BackupSummary;
 use backup::{
-    BackupError, create_backup, ensure_restore_complete, prune_backups, restore_backup,
-    snapshot_backup, validate_restore, verify_backup,
+    BackupError, create_backup_cancellable, ensure_restore_complete, prune_backups, restore_backup,
+    snapshot_backup_cancellable, validate_restore, verify_backup,
 };
+
+const SERVICE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+const SERVICE_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 #[cfg(test)]
 use import::persist_server_import;
 pub(crate) use import::protocol_logical_path;
@@ -86,9 +91,6 @@ pub(crate) struct ServiceHandle {
 }
 
 enum BackupCommand {
-    Shutdown {
-        response: SyncSender<()>,
-    },
     #[cfg(test)]
     Block {
         started: SyncSender<()>,
@@ -1263,6 +1265,7 @@ pub(crate) struct ServiceRuntime {
     handle: ServiceHandle,
     store_thread: thread::JoinHandle<()>,
     backup_thread: thread::JoinHandle<()>,
+    backup_cancelled: Arc<AtomicBool>,
 }
 
 impl ServiceRuntime {
@@ -1289,9 +1292,11 @@ impl ServiceRuntime {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let actor_blobs = blobs.clone();
         let backup_blobs = blobs.clone();
+        let backup_cancelled = Arc::new(AtomicBool::new(false));
+        let actor_backup_cancelled = backup_cancelled.clone();
         let backup_thread = thread::Builder::new()
             .name("gnosis-backup".into())
-            .spawn(move || backup_actor(backup_blobs, backup_receiver))
+            .spawn(move || backup_actor(backup_blobs, backup_receiver, actor_backup_cancelled))
             .map_err(ServiceStartError::Thread)?;
         let actor_backup_sender = backup_sender.clone();
         let store_thread = thread::Builder::new()
@@ -1318,6 +1323,7 @@ impl ServiceRuntime {
             },
             store_thread,
             backup_thread,
+            backup_cancelled,
         })
     }
 
@@ -1326,25 +1332,63 @@ impl ServiceRuntime {
     }
 
     pub(crate) async fn finish(self) -> Result<(), ServiceError> {
+        self.finish_with_deadline(SERVICE_SHUTDOWN_DEADLINE).await
+    }
+
+    async fn finish_with_deadline(self, deadline: Duration) -> Result<(), ServiceError> {
         let Self {
             handle,
             store_thread,
             backup_thread,
+            backup_cancelled,
         } = self;
+        backup_cancelled.store(true, Ordering::Release);
         tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
             let (response, receiver) = mpsc::sync_channel(0);
-            handle
-                .sender
-                .send(StoreCommand::Shutdown { response })
-                .map_err(|_| ServiceError::Stopped)?;
-            receiver.recv().map_err(|_| ServiceError::Stopped)?;
+            let mut command = StoreCommand::Shutdown { response };
+            loop {
+                match handle.sender.try_send(command) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(returned)) => {
+                        command = returned;
+                        sleep_until_next_shutdown_poll(started, deadline)?;
+                    }
+                    Err(TrySendError::Disconnected(_)) => return Err(ServiceError::Stopped),
+                }
+            }
+            let remaining = shutdown_remaining(started, deadline)?;
+            receiver
+                .recv_timeout(remaining)
+                .map_err(|error| match error {
+                    mpsc::RecvTimeoutError::Timeout => ServiceError::ShutdownDeadlineExceeded,
+                    mpsc::RecvTimeoutError::Disconnected => ServiceError::Stopped,
+                })?;
             drop(handle);
+            while !store_thread.is_finished() || !backup_thread.is_finished() {
+                sleep_until_next_shutdown_poll(started, deadline)?;
+            }
             store_thread.join().map_err(|_| ServiceError::Stopped)?;
             backup_thread.join().map_err(|_| ServiceError::Stopped)
         })
         .await
         .map_err(|_| ServiceError::Stopped)?
     }
+}
+
+fn shutdown_remaining(started: Instant, deadline: Duration) -> Result<Duration, ServiceError> {
+    deadline
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(ServiceError::ShutdownDeadlineExceeded)
+}
+
+fn sleep_until_next_shutdown_poll(
+    started: Instant,
+    deadline: Duration,
+) -> Result<(), ServiceError> {
+    thread::sleep(SERVICE_SHUTDOWN_POLL.min(shutdown_remaining(started, deadline)?));
+    Ok(())
 }
 
 type StoreResult<T> = Result<T, StoreError>;
@@ -1774,15 +1818,6 @@ fn store_actor(
     for command in receiver {
         match command {
             StoreCommand::Shutdown { response } => {
-                let (backup_response, backup_receiver) = mpsc::sync_channel(0);
-                if backup_sender
-                    .send(BackupCommand::Shutdown {
-                        response: backup_response,
-                    })
-                    .is_ok()
-                {
-                    let _ = backup_receiver.recv();
-                }
                 let _ = response.send(());
                 break;
             }
@@ -2778,13 +2813,13 @@ fn run_store_command(
     }
 }
 
-fn backup_actor(blobs: Arc<BlobStore>, receiver: mpsc::Receiver<BackupCommand>) {
+fn backup_actor(
+    blobs: Arc<BlobStore>,
+    receiver: mpsc::Receiver<BackupCommand>,
+    cancelled: Arc<AtomicBool>,
+) {
     for command in receiver {
         match command {
-            BackupCommand::Shutdown { response } => {
-                let _ = response.send(());
-                break;
-            }
             #[cfg(test)]
             BackupCommand::Block { started, release } => {
                 let _ = started.send(());
@@ -2796,9 +2831,16 @@ fn backup_actor(blobs: Arc<BlobStore>, receiver: mpsc::Receiver<BackupCommand>) 
                 created_at_us,
                 response,
             } => {
-                let result = snapshot_backup(&source, &destination).and_then(|snapshot| {
-                    create_backup(snapshot, &blobs, &destination, created_at_us)
-                });
+                let result = snapshot_backup_cancellable(&source, &destination, &cancelled)
+                    .and_then(|snapshot| {
+                        create_backup_cancellable(
+                            snapshot,
+                            &blobs,
+                            &destination,
+                            created_at_us,
+                            &cancelled,
+                        )
+                    });
                 send(response, result.map_err(ServiceError::Backup));
             }
             BackupCommand::Verify { path, response } => {
@@ -2853,6 +2895,8 @@ pub(crate) enum ServiceError {
     Busy,
     #[error("store service stopped")]
     Stopped,
+    #[error("service shutdown exceeded its deadline")]
+    ShutdownDeadlineExceeded,
     #[error("repair batch size is invalid")]
     InvalidRepairBatchSize,
     #[error("stored content is corrupt")]
@@ -2921,7 +2965,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        BackupCommand, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
+        BackupCommand, BackupError, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
         repair_canonical_state, stage_blob_command, store_actor,
     };
     use crate::application::{
@@ -3594,7 +3638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_drains_an_accepted_backup_after_response_is_dropped() {
+    async fn shutdown_deadline_cancels_an_accepted_backup_without_publication() {
         let directory = tempfile::tempdir().unwrap();
         let backup = directory.path().join("backup");
         let runtime = ServiceRuntime::start(
@@ -3638,18 +3682,33 @@ mod tests {
         .await
         .expect("store actor accepted readiness after backup dispatch")
         .unwrap();
-        drop(backup_result);
         drop(service);
 
-        let mut finish = tokio::spawn(runtime.finish());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut finish)
-                .await
-                .is_err()
-        );
+        let started = std::time::Instant::now();
+        let finish = runtime
+            .finish_with_deadline(Duration::from_millis(50))
+            .await;
+        assert!(matches!(
+            finish,
+            Err(ServiceError::ShutdownDeadlineExceeded)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
         release.send(()).unwrap();
-        finish.await.unwrap().unwrap();
-        assert!(super::verify_backup(&backup).is_ok());
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), backup_result)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ServiceError::Backup(BackupError::Cancelled))
+        ));
+        assert!(!backup.exists());
+        assert!(std::fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".gnosis-backup-")
+        }));
     }
 
     #[tokio::test]

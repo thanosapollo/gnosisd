@@ -470,6 +470,7 @@ fn actor_error(error: ServiceError) -> ProtocolError {
         ServiceError::Store(error) => actor_store_error(error),
         ServiceError::Stopped
         | ServiceError::Corrupt
+        | ServiceError::ShutdownDeadlineExceeded
         | ServiceError::AssetDigest
         | ServiceError::InvalidBlobMetadata
         | ServiceError::InvalidRepairBatchSize
@@ -522,6 +523,8 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::PathConflict
         | StoreError::InvalidProjection { .. }
         | StoreError::CorruptData { .. }
+        | StoreError::BackupDeadlineExceeded
+        | StoreError::BackupCancelled
         | StoreError::UnsupportedSchemaVersion { .. }
         | StoreError::UnsupportedSchemaLayout
         | StoreError::UnsupportedApplicationId { .. }

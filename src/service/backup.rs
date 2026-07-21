@@ -4,7 +4,11 @@ use std::{
     io::{self, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+#[cfg(test)]
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -73,9 +77,45 @@ enum ActivationStep {
     BlobsActivated,
 }
 
+#[cfg(test)]
 pub(crate) fn snapshot_backup(
     source: &Path,
     destination: &Path,
+) -> Result<BackupSnapshot, BackupError> {
+    snapshot_backup_with(source, destination, SqliteStore::backup_database)
+}
+
+pub(crate) fn snapshot_backup_cancellable(
+    source: &Path,
+    destination: &Path,
+    cancelled: &AtomicBool,
+) -> Result<BackupSnapshot, BackupError> {
+    snapshot_backup_with(source, destination, |source, database| {
+        SqliteStore::backup_database_cancellable(source, database, cancelled)
+    })
+}
+
+#[cfg(test)]
+fn snapshot_backup_with_deadline(
+    source: &Path,
+    destination: &Path,
+    retry_budget: Duration,
+    cancelled: &AtomicBool,
+) -> Result<BackupSnapshot, BackupError> {
+    snapshot_backup_with(source, destination, |source, database| {
+        SqliteStore::backup_database_cancellable_with_deadline(
+            source,
+            database,
+            retry_budget,
+            cancelled,
+        )
+    })
+}
+
+fn snapshot_backup_with(
+    source: &Path,
+    destination: &Path,
+    backup_database: impl FnOnce(&Path, &Path) -> Result<(), StoreError>,
 ) -> Result<BackupSnapshot, BackupError> {
     require_new_directory(destination)?;
     let parent = destination.parent().ok_or(BackupError::Destination)?;
@@ -85,9 +125,12 @@ pub(crate) fn snapshot_backup(
         .create_new(true)
         .mode(0o600)
         .open(&database)?;
-    if let Err(error) = SqliteStore::backup_database(source, &database) {
+    if let Err(error) = backup_database(source, &database) {
         let _ = fs::remove_file(&database);
-        return Err(error.into());
+        return Err(match error {
+            StoreError::BackupCancelled => BackupError::Cancelled,
+            error => error.into(),
+        });
     }
     let blobs = match SqliteStore::verify_database_file(&database) {
         Ok(blobs) => blobs,
@@ -99,13 +142,25 @@ pub(crate) fn snapshot_backup(
     Ok(BackupSnapshot { database, blobs })
 }
 
+#[cfg(test)]
 pub(crate) fn create_backup(
     snapshot: BackupSnapshot,
     blobs: &BlobStore,
     destination: &Path,
     created_at_us: u64,
 ) -> Result<BackupSummary, BackupError> {
-    let result = create_backup_inner(&snapshot, blobs, destination, created_at_us);
+    let cancelled = AtomicBool::new(false);
+    create_backup_cancellable(snapshot, blobs, destination, created_at_us, &cancelled)
+}
+
+pub(crate) fn create_backup_cancellable(
+    snapshot: BackupSnapshot,
+    blobs: &BlobStore,
+    destination: &Path,
+    created_at_us: u64,
+    cancelled: &AtomicBool,
+) -> Result<BackupSummary, BackupError> {
+    let result = create_backup_inner(&snapshot, blobs, destination, created_at_us, cancelled);
     let cleanup = fs::remove_file(&snapshot.database);
     result.and_then(|summary| {
         cleanup?;
@@ -118,12 +173,14 @@ fn create_backup_inner(
     blobs: &BlobStore,
     destination: &Path,
     created_at_us: u64,
+    cancelled: &AtomicBool,
 ) -> Result<BackupSummary, BackupError> {
+    ensure_not_cancelled(cancelled)?;
     require_new_directory(destination)?;
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
     fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
-    let result = create_staging_backup(snapshot, blobs, &staging, created_at_us);
+    let result = create_staging_backup(snapshot, blobs, &staging, created_at_us, cancelled);
     let summary = match result {
         Ok(summary) => summary,
         Err(error) => {
@@ -135,7 +192,15 @@ fn create_backup_inner(
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
+    if let Err(error) = ensure_not_cancelled(cancelled) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
     File::open(&staging)?.sync_all()?;
+    if let Err(error) = ensure_not_cancelled(cancelled) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
     fs::rename(&staging, destination)?;
     sync_parent(destination)?;
     Ok(BackupSummary {
@@ -149,12 +214,15 @@ fn create_staging_backup(
     blobs: &BlobStore,
     staging: &Path,
     created_at_us: u64,
+    cancelled: &AtomicBool,
 ) -> Result<BackupSummary, BackupError> {
+    ensure_not_cancelled(cancelled)?;
     let database = staging.join(DATABASE_FILE);
     fs::copy(&snapshot.database, &database)?;
     fs::set_permissions(&database, fs::Permissions::from_mode(0o600))?;
     let rows = snapshot.blobs.clone();
     for (digest, size) in &rows {
+        ensure_not_cancelled(cancelled)?;
         blobs.copy_to(digest, *size, &staging.join("blobs"))?;
     }
     let manifest = BackupManifest {
@@ -834,8 +902,18 @@ fn sync_directory(path: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), BackupError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(BackupError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum BackupError {
+    #[error("backup was cancelled")]
+    Cancelled,
     #[error("backup destination is invalid or already exists")]
     Destination,
     #[error("backup format is invalid")]
@@ -869,6 +947,8 @@ mod tests {
         os::unix::fs::{PermissionsExt as _, symlink},
         path::Path,
         process::Command,
+        sync::atomic::AtomicBool,
+        time::Duration,
     };
 
     use rusqlite::Connection;
@@ -1053,6 +1133,42 @@ mod tests {
             snapshot_backup(&database, &directory.path().join("conflict-backup")),
             Err(BackupError::Store(StoreError::BlobMetadata))
         ));
+    }
+
+    #[test]
+    fn contended_snapshot_deadline_removes_incomplete_file() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("source.sqlite");
+        let destination = directory.path().join("backup");
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE content (value TEXT NOT NULL);
+                 BEGIN EXCLUSIVE;
+                 INSERT INTO content VALUES ('locked');",
+            )
+            .unwrap();
+
+        let result = super::snapshot_backup_with_deadline(
+            &database,
+            &destination,
+            Duration::from_millis(50),
+            &AtomicBool::new(false),
+        );
+
+        assert!(matches!(
+            result,
+            Err(BackupError::Store(StoreError::BackupDeadlineExceeded))
+        ));
+        assert!(!destination.exists());
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".gnosis-backup-snapshot-")
+        }));
+        writer.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]

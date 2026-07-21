@@ -2289,6 +2289,7 @@ impl ApiError {
             ServiceError::Settings(_) => Self::invalid_content("settings"),
             ServiceError::Stopped
             | ServiceError::Corrupt
+            | ServiceError::ShutdownDeadlineExceeded
             | ServiceError::InvalidRepairBatchSize
             | ServiceError::StageBlobReferenceCheck { .. }
             | ServiceError::StageBlobCleanup { .. }
@@ -2354,6 +2355,8 @@ impl ApiError {
             StoreError::PathConflict => Self::invalid_content("stored projection"),
             StoreError::InvalidProjection { .. } => Self::invalid_content("stored projection"),
             StoreError::CorruptData { .. }
+            | StoreError::BackupDeadlineExceeded
+            | StoreError::BackupCancelled
             | StoreError::UnsupportedSchemaVersion { .. }
             | StoreError::UnsupportedSchemaLayout
             | StoreError::UnsupportedApplicationId { .. }

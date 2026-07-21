@@ -1,6 +1,11 @@
 use std::{
-    collections::HashSet, error::Error, fs, os::unix::fs::PermissionsExt, path::Path,
-    time::Duration,
+    collections::HashSet,
+    error::Error,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use rusqlite::{
@@ -40,6 +45,8 @@ pub(crate) use mutation::DeviceMutationExecution;
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
 const SCHEMA_VERSION: u32 = 1;
+const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
+const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -57,6 +64,10 @@ pub(crate) enum StoreError {
     InvalidReviewState,
     #[error("topic traversal exceeded its work budget")]
     TopicTraversalLimitExceeded,
+    #[error("database backup exceeded its retry deadline")]
+    BackupDeadlineExceeded,
+    #[error("database backup was cancelled")]
+    BackupCancelled,
     #[error("review response is invalid for the captured presentation")]
     InvalidReviewResponse,
     #[error("review operation belongs to another device")]
@@ -1031,8 +1042,32 @@ impl SqliteStore {
         transaction.commit().map_err(StoreError::storage)
     }
 
+    #[cfg(test)]
     pub(crate) fn backup_database(source: &Path, destination: &Path) -> Result<(), StoreError> {
-        backup_database_with_step(source, destination, |_| {})
+        let cancelled = AtomicBool::new(false);
+        Self::backup_database_cancellable(source, destination, &cancelled)
+    }
+
+    pub(crate) fn backup_database_cancellable(
+        source: &Path,
+        destination: &Path,
+        cancelled: &AtomicBool,
+    ) -> Result<(), StoreError> {
+        Self::backup_database_cancellable_with_deadline(
+            source,
+            destination,
+            BACKUP_STEP_DEADLINE,
+            cancelled,
+        )
+    }
+
+    pub(crate) fn backup_database_cancellable_with_deadline(
+        source: &Path,
+        destination: &Path,
+        retry_budget: Duration,
+        cancelled: &AtomicBool,
+    ) -> Result<(), StoreError> {
+        backup_database_with_step(source, destination, retry_budget, cancelled, |_| {})
     }
 
     #[cfg(test)]
@@ -4447,6 +4482,8 @@ fn node_id(value: String) -> Result<NodeId, StoreError> {
 fn backup_database_with_step(
     source: &Path,
     destination: &Path,
+    retry_budget: Duration,
+    cancelled: &AtomicBool,
     mut after_step: impl FnMut(StepResult),
 ) -> Result<(), StoreError> {
     let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -4456,13 +4493,21 @@ fn backup_database_with_step(
         .map_err(StoreError::storage)?;
     let mut destination = Connection::open(destination).map_err(StoreError::storage)?;
     let backup = Backup::new(&source, &mut destination).map_err(StoreError::storage)?;
+    let started = Instant::now();
     loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(StoreError::BackupCancelled);
+        }
         let result = backup.step(100).map_err(StoreError::storage)?;
         after_step(result);
         if result == StepResult::Done {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let elapsed = started.elapsed();
+        if elapsed >= retry_budget {
+            return Err(StoreError::BackupDeadlineExceeded);
+        }
+        std::thread::sleep(BACKUP_RETRY_DELAY.min(retry_budget - elapsed));
     }
 }
 
@@ -4484,7 +4529,13 @@ fn to_usize(value: i64, field: &'static str) -> Result<usize, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, sync::mpsc, thread, time::Duration};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, atomic::AtomicBool, mpsc},
+        thread,
+        time::Duration,
+    };
 
     use rusqlite::{Connection, backup::StepResult};
     use sha2::Digest as _;
@@ -4527,13 +4578,20 @@ mod tests {
         let (release_sender, release_receiver) = mpsc::sync_channel(0);
         let backup = thread::spawn(move || {
             let mut saw_busy = false;
-            let result = backup_database_with_step(&source_path, &destination_path, |result| {
-                if matches!(result, StepResult::Busy | StepResult::Locked) && !saw_busy {
-                    saw_busy = true;
-                    busy_sender.send(()).unwrap();
-                    release_receiver.recv().unwrap();
-                }
-            });
+            let cancelled = AtomicBool::new(false);
+            let result = backup_database_with_step(
+                &source_path,
+                &destination_path,
+                Duration::from_secs(1),
+                &cancelled,
+                |result| {
+                    if matches!(result, StepResult::Busy | StepResult::Locked) && !saw_busy {
+                        saw_busy = true;
+                        busy_sender.send(()).unwrap();
+                        release_receiver.recv().unwrap();
+                    }
+                },
+            );
             (result, destination_path)
         });
 
@@ -4554,6 +4612,38 @@ mod tests {
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .unwrap();
         assert_eq!(integrity, "ok");
+    }
+
+    #[test]
+    fn backup_stops_after_persistent_contention() {
+        let directory = tempdir().unwrap();
+        let source_path = directory.path().join("source.sqlite3");
+        let destination_path = directory.path().join("backup.sqlite3");
+        let writer = Connection::open(&source_path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE content (value TEXT NOT NULL);
+                 BEGIN EXCLUSIVE;
+                 INSERT INTO content VALUES ('locked');",
+            )
+            .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let backup_cancelled = cancelled.clone();
+
+        let result = thread::spawn(move || {
+            backup_database_with_step(
+                &source_path,
+                &destination_path,
+                Duration::from_millis(50),
+                &backup_cancelled,
+                |_| {},
+            )
+        })
+        .join()
+        .unwrap();
+
+        assert!(matches!(result, Err(StoreError::BackupDeadlineExceeded)));
+        writer.execute_batch("ROLLBACK;").unwrap();
     }
 
     fn projection(title: &str, digest: &str) -> DocumentProjection {
