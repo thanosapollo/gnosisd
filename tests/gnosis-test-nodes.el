@@ -1557,6 +1557,26 @@
           (should (= 0 (length (plist-get state :conflicts)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-applied-recovery-scan-is-bounded-and-fair ()
+  (let* ((gnosis-nodes-max-outbox-scan-per-pass 1)
+         (entries
+          [(:operation-id "a" :status :applied
+            :result (:authoritative (:document_id "a")))
+           (:operation-id "b" :status :applied
+            :result (:authoritative (:document_id "b")))
+           (:operation-id "c" :status :applied
+            :result (:authoritative (:document_id "c")))])
+         (state `(:outbox ,entries :conflicts [] :bases []))
+         calls)
+    (cl-letf (((symbol-function 'gnosis-nodes--reconcile-applied-result)
+               (lambda (value entry _authoritative)
+                 (push (plist-get entry :operation-id) calls)
+                 value)))
+      (dotimes (_ 3)
+        (setq state (gnosis-nodes--reconcile-applied-results state))))
+    (should (equal '("c" "b" "a") calls))
+    (should (= 0 (plist-get state :applied-scan-index)))))
+
 (ert-deftest gnosis-nodes-uncertain-create-clears-consumed-tombstone-conflict ()
   (let* ((directory (make-temp-file "gnosis-nodes-create-tombstone-" t))
          (gnosis-nodes-dir directory)
@@ -1565,6 +1585,10 @@
          (authoritative `(:document_id "new" :revision 1
                           :logical_path "note.org" :content_sha256 ,digest
                           :active t))
+         (feed `(:document_id "new" :revision 1
+                 :logical_path "note.org" :content_sha256 ,digest
+                 :blob_url ,(concat "/v1/blobs/" digest) :operation "create"
+                 :projection (:content_sha256 ,digest)))
          (entry (gnosis-nodes--outbox-entry
                  :create nil nil "note.org" digest nil bytes))
          (conflict `(:operation-id ,(plist-get entry :operation-id)
@@ -1575,7 +1599,9 @@
                       :logical_path "note.org" :content_sha256 nil
                       :operation "tombstone")))
          (state `(:bases [(:document-id "new" :revision 1
-                           :logical-path "note.org" :digest ,digest :active t)]
+                           :logical-path "note.org" :digest ,digest
+                           :fingerprint ,(gnosis-nodes--projection-fingerprint feed)
+                           :active t)]
                   :outbox [,entry] :conflicts [,conflict])))
     (unwind-protect
         (progn
@@ -1587,6 +1613,7 @@
             (setq state (gnosis-nodes--send-outbox state)))
           (should (= 0 (length (plist-get state :outbox))))
           (should (= 0 (length (plist-get state :conflicts))))
+          (setq state (gnosis-nodes--apply-document state feed))
           (should (equal "new"
                          (plist-get (gnosis-nodes--base state "new")
                                     :document-id))))
@@ -1707,11 +1734,14 @@
          destination-buffer)
     (unwind-protect
         (progn
+          (gnosis-nodes--write-document "old.org" bytes)
           (gnosis-nodes--write-document "new.org" bytes)
           (setq destination-buffer
                 (find-file-noselect (expand-file-name "new.org" directory)))
           (should (gnosis-nodes--reconcile-applied-effect-p
                    entry conflict projection))
+          (should-not (file-exists-p (expand-file-name "old.org" directory)))
+          (should (buffer-live-p destination-buffer))
           (with-current-buffer destination-buffer
             (set-buffer-modified-p t))
           (should-not (gnosis-nodes--reconcile-applied-effect-p

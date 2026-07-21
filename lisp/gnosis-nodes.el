@@ -1688,8 +1688,8 @@ Use already validated PAYLOAD when supplied."
              (equal (gnosis-nodes--nullable (plist-get entry :digest)) digest))
          (eq active (not (eq kind :delete))))))
 
-(defun gnosis-nodes--entry-authoritative-projection (entry authoritative)
-  "Return document projection for confirmed ENTRY and AUTHORITATIVE."
+(defun gnosis-nodes--entry-effect-projection (entry authoritative)
+  "Return local-effect projection for confirmed ENTRY and AUTHORITATIVE."
   (let ((projection (copy-sequence authoritative)))
     (plist-put projection :operation
                (pcase (plist-get entry :kind)
@@ -1749,13 +1749,18 @@ the durable dependent local intent when present."
                        (and dependent
                             (equal (plist-get dependent :digest)
                                    (gnosis-nodes--digest destination-bytes))))
-                   (if source-bytes
-                       (and (not (buffer-live-p destination-buffer))
-                            (progn
-                              (gnosis-nodes--move-document
-                               source-path logical-path source-bytes)
-                              t))
-                     t)))))
+                   (cond
+                    ((null source-bytes) t)
+                    ((buffer-live-p destination-buffer)
+                     (and (not (buffer-live-p source-buffer))
+                          (progn
+                            (unless gnosis-nodes--preflight
+                              (delete-file source))
+                            t)))
+                    (t
+                     (gnosis-nodes--move-document
+                      source-path logical-path source-bytes)
+                     t))))))
       (_
        (let ((bytes (gnosis-nodes--working-bytes destination)))
          (and (not (and (buffer-live-p destination-buffer)
@@ -1766,37 +1771,70 @@ the durable dependent local intent when present."
 (defun gnosis-nodes--reconcile-applied-result (state entry authoritative)
   "In STATE reconcile exact applied ENTRY result against AUTHORITATIVE."
   (when (gnosis-nodes--entry-confirms-authoritative-p entry authoritative)
-    (when-let* ((record
-                 (seq-find
-                  (lambda (candidate)
-                    (or (gnosis-nodes--authoritative-confirms-projection-p
-                         authoritative (plist-get candidate :projection))
-                        (and (plist-get entry :operation-id)
-                             (equal (plist-get entry :operation-id)
-                                    (plist-get candidate :operation-id)))))
-                  (append (plist-get state :conflicts) nil)))
-                (projection
-                 (if (gnosis-nodes--authoritative-confirms-projection-p
-                      authoritative (plist-get record :projection))
-                     (plist-get record :projection)
-                   (gnosis-nodes--entry-authoritative-projection
-                    entry authoritative)))
-                ((gnosis-nodes--reconcile-applied-effect-p
-                  entry record projection state)))
-      (setf (plist-get state :conflicts)
-            (vconcat (delq record (append (plist-get state :conflicts) nil))))
-      (setq state (gnosis-nodes--record-base state projection))))
+    (when-let ((record
+                (seq-find
+                 (lambda (candidate)
+                   (or (gnosis-nodes--authoritative-confirms-projection-p
+                        authoritative (plist-get candidate :projection))
+                       (and (plist-get entry :operation-id)
+                            (equal (plist-get entry :operation-id)
+                                   (plist-get candidate :operation-id)))))
+                 (append (plist-get state :conflicts) nil))))
+      (let* ((record-projection (plist-get record :projection))
+             (feed-confirmed
+              (gnosis-nodes--authoritative-confirms-projection-p
+               authoritative record-projection))
+             (base (and (not feed-confirmed)
+                        (gnosis-nodes--base
+                         state (plist-get authoritative :document_id))))
+             (projection
+              (if feed-confirmed record-projection
+                (gnosis-nodes--entry-effect-projection entry authoritative))))
+        (when (and (or feed-confirmed
+                       (and base
+                            (gnosis-nodes--unchanged-head-matches-base-p
+                             base authoritative)))
+                   (gnosis-nodes--reconcile-applied-effect-p
+                    entry record projection state))
+          (setf (plist-get state :conflicts)
+                (vconcat
+                 (delq record (append (plist-get state :conflicts) nil))))
+          (if feed-confirmed
+              (setq state (gnosis-nodes--record-base state projection))
+            (setq state (gnosis-nodes--promote-outbox state))
+            (setf (plist-get state :outbox)
+                  (vconcat
+                   (seq-remove
+                    (lambda (item)
+                      (equal (plist-get item :operation-id)
+                             (plist-get entry :operation-id)))
+                    (append (plist-get state :outbox) nil)))))))))
   state)
 
 (defun gnosis-nodes--reconcile-applied-results (state)
-  "Reconcile durable applied results already present in STATE."
-  (dolist (entry (append (plist-get state :outbox) nil) state)
-    (when (eq :applied (plist-get entry :status))
-      (when-let ((authoritative
-                  (plist-get (plist-get entry :result) :authoritative)))
+  "Reconcile a bounded fair scan of durable applied results in STATE."
+  (let* ((entries (plist-get state :outbox))
+         (length (length entries))
+         (stored-start (plist-get state :applied-scan-index))
+         (start (if (natnump stored-start) stored-start 0))
+         (inspected 0))
+    (when (or (< start 0) (>= start (max length 1)))
+      (setq start 0))
+    (while (and (< inspected length)
+                (< inspected gnosis-nodes-max-outbox-scan-per-pass))
+      (let* ((index (mod (+ start inspected) length))
+             (entry (aref entries index)))
+        (cl-incf inspected)
         (setq state
-              (gnosis-nodes--reconcile-applied-result
-               state entry authoritative))))))
+              (plist-put state :applied-scan-index
+                         (mod (+ index 1) length)))
+        (when (eq :applied (plist-get entry :status))
+          (when-let ((authoritative
+                      (plist-get (plist-get entry :result) :authoritative)))
+            (setq state
+                  (gnosis-nodes--reconcile-applied-result
+                   state entry authoritative))))))
+    state))
 
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
