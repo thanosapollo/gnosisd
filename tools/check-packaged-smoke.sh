@@ -36,6 +36,26 @@ gnosis=$package/bin/gnosis
 test -x "$gnosisd"
 test -x "$gnosis"
 
+stage ingestion-dry-run
+corpus=$temporary/ingestion-corpus
+manifest=$temporary/ingestion-manifest.json
+journal=$temporary/ingestion-journal.jsonl
+first_report=$temporary/ingestion-first.json
+second_report=$temporary/ingestion-second.json
+mkdir -p "$corpus"
+printf '#+TITLE: Packaged ingestion smoke\n* Node\n' >"$corpus/note.org"
+cat >"$manifest" <<'EOF'
+{"version":1,"root":"ingestion-corpus","entries":[{"operation_id":"packaged-ingestion-smoke","document_id":null,"expected_revision":null,"logical_path":"note.org","content_type":"text/org; charset=utf-8","source_path":"note.org"}]}
+EOF
+$gnosis --http-url http://127.0.0.1:1 import-manifest "$manifest" \
+    --journal "$journal" --dry-run >"$first_report"
+$gnosis --http-url http://127.0.0.1:1 import-manifest "$manifest" \
+    --journal "$journal" --dry-run >"$second_report"
+cmp "$first_report" "$second_report"
+test ! -e "$journal"
+grep -q '"version":1' "$first_report"
+grep -q '"entry_count":1' "$first_report"
+
 runtime=$temporary/runtime
 socket=$runtime/gnosis/gnosis.sock
 database=$temporary/data/gnosis.sqlite

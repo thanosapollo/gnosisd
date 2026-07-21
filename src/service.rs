@@ -1164,10 +1164,18 @@ impl ServiceHandle {
         device_id: Option<String>,
         received_at_us: u64,
     ) -> Result<OfflineContentResult, ServiceError> {
-        let prepared = match prepare_offline_document(&operation) {
-            Ok(note) => PreparedContentOperation::Ready(note.map(Box::new)),
-            Err(reason) => PreparedContentOperation::Conflict(reason),
-        };
+        if format_version != 1 {
+            return Err(ServiceError::Store(StoreError::InvalidReviewState));
+        }
+        let (operation, prepared) = tokio::task::spawn_blocking(move || {
+            let prepared = match prepare_offline_document(&operation) {
+                Ok(note) => PreparedContentOperation::Ready(note.map(Box::new)),
+                Err(reason) => PreparedContentOperation::Conflict(reason),
+            };
+            (operation, prepared)
+        })
+        .await
+        .map_err(|_| ServiceError::Stopped)?;
         request(&self.sender, |response| {
             StoreCommand::ReconcileContentOperation {
                 format_version,
@@ -2005,13 +2013,11 @@ fn reconcile_content_command(
     blobs: &BlobStore,
     command: ContentCommand<'_>,
 ) -> StoreResult<OfflineContentResult> {
-    if !matches!(command.format_version, 1 | 2) {
+    if command.format_version != 1 {
         return Err(StoreError::InvalidReviewState);
     }
-    // Wire v1 and v2 share one normalized operation/result journal shape.
-    let journal_format_version = 1;
     let needs_blob = store.content_operation_needs_blob(
-        journal_format_version,
+        command.format_version,
         command.operation,
         command.canonical_payload,
         command.device_id,
@@ -2035,7 +2041,7 @@ fn reconcile_content_command(
         None
     };
     store.reconcile_content_operation(
-        journal_format_version,
+        command.format_version,
         command.operation,
         command.canonical_payload,
         command.device_id,
@@ -3015,8 +3021,9 @@ mod tests {
         stage_blob_command, store_actor,
     };
     use crate::application::{
-        AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
-        ImportDocument, OfflineAssetConflictReason, OfflineAssetOperation, ReplicaProjection,
+        AssetReconciliationStatus, ContentBase, DeviceDesiredStateMutation, DeviceMutationResult,
+        ImportDocument, MAX_DOCUMENT_SOURCE_BYTES, OfflineAssetConflictReason,
+        OfflineAssetOperation, OfflineContentMutation, OfflineContentOperation, ReplicaProjection,
         SettingsInput, canonical_asset_path, generate_device, prepare_asset,
         prepare_device_desired_state_mutation, prepare_device_document_mutation, prepare_note,
         prepare_thema, thema_content,
@@ -3033,6 +3040,31 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    fn offline_put(
+        device_id: String,
+        operation_id: &str,
+        source: String,
+    ) -> OfflineContentOperation {
+        let content_sha256 = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        OfflineContentOperation {
+            operation_id: operation_id.into(),
+            device_id,
+            device_sequence: 1,
+            cursor_server_id: "server".into(),
+            cursor: 0,
+            cursor_token: "cursor".into(),
+            authored_at_us: 1,
+            mutation: OfflineContentMutation::Put {
+                document_id: "offline-document".into(),
+                logical_path: "offline.org".into(),
+                content_sha256,
+                content_type: "text/org; charset=utf-8".into(),
+                source,
+                base: ContentBase::Absent,
+            },
+        }
     }
 
     #[tokio::test]
@@ -3077,6 +3109,96 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ServiceError::Busy)));
+        assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn maximum_content_preparation_keeps_the_runtime_schedulable() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let device = generate_device("Device".into(), vec!["content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let mut source = "* Node\n".repeat(MAX_DOCUMENT_SOURCE_BYTES / 7);
+        source.push_str(&"x".repeat(MAX_DOCUMENT_SOURCE_BYTES - source.len()));
+        assert_eq!(source.len(), MAX_DOCUMENT_SOURCE_BYTES);
+        let operation = offline_put(device_id.clone(), "maximum-content", source);
+        let (started_sender, started_receiver) = oneshot::channel();
+        let reconcile = tokio::spawn(async move {
+            started_sender.send(()).unwrap();
+            service
+                .reconcile_content_operation(
+                    1,
+                    operation,
+                    "maximum-content-payload".into(),
+                    Some(device_id),
+                    2,
+                )
+                .await
+        });
+
+        let started_at = Instant::now();
+        started_receiver.await.unwrap();
+        assert!(started_at.elapsed() < Duration::from_millis(100));
+        let _ = reconcile.await.unwrap();
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsupported_content_format_has_no_durable_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let blob_path = directory.path().join("blobs");
+        let runtime = ServiceRuntime::start(database.clone(), blob_path.clone(), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("Device".into(), vec!["content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service.create_device(device, 1).await.unwrap();
+        let source = "#+TITLE: Unsupported\n".to_owned();
+        let digest = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        let result = service
+            .reconcile_content_operation(
+                2,
+                offline_put(device_id.clone(), "unsupported-content", source),
+                "unsupported-content-payload".into(),
+                Some(device_id.clone()),
+                2,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ServiceError::Store(StoreError::InvalidReviewState))
+        ));
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let connection = rusqlite::Connection::open(database).unwrap();
+        let device_operations: u64 = connection
+            .query_row("SELECT count(*) FROM device_operation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let content_operations: u64 = connection
+            .query_row(
+                "SELECT count(*) FROM offline_content_operation",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let device_sequence: u64 = connection
+            .query_row(
+                "SELECT last_device_sequence FROM device WHERE device_id = ?1",
+                [device_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (device_operations, content_operations, device_sequence),
+            (0, 0, 0)
+        );
         assert!(!blob_path.join(&digest[..2]).join(digest).exists());
     }
 
