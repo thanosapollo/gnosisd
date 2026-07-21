@@ -248,9 +248,9 @@
        (if (and session
                 (equal source (plist-get session :source))
                 (let ((effective (plist-get session :target_count)))
-                  (if expected-count
-                      (equal effective expected-count)
-                    (and (integerp effective) (> effective 0)))))
+                  (equal effective
+                         (or expected-count
+                             gnosis-core--default-online-review-target-count))))
            (gnosis-review--open session)
          (signal (car condition) (cdr condition)))))))
 

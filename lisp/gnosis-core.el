@@ -61,6 +61,8 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 (defconst gnosis-core--json-null :gnosis-json-null)
 (defconst gnosis-core--json-false :gnosis-json-false)
 
+(defconst gnosis-core--default-online-review-target-count 100)
+
 (defconst gnosis-core--http-methods
   '("delete" "get" "head" "options" "patch" "post" "put" "trace"))
 
@@ -1234,11 +1236,18 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
 
 (defun gnosis-core--review-session-valid-p (session expected-status)
   "Return non-nil when SESSION is a valid online EXPECTED-STATUS projection."
-  (let ((status (plist-get session :status))
+  (let ((session-id (plist-get session :session_id))
+        (status (plist-get session :status))
         (position (plist-get session :current_position))
-        (length (plist-get session :queue_length)))
-    (and (equal "online" (plist-get session :mode))
+        (length (plist-get session :queue_length))
+        (started-at (plist-get session :started_at_us)))
+    (and (stringp session-id)
+         (not (string-empty-p session-id))
+         (<= (string-bytes session-id) 128)
+         (not (string-search "\0" session-id))
+         (equal "online" (plist-get session :mode))
          (equal expected-status status)
+         (integerp started-at) (> started-at 0)
          (integerp position) (>= position 0)
          (integerp length) (>= length 0)
          (pcase status
@@ -1256,10 +1265,9 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
                 :target_count (or target-count gnosis-core--json-null)))))
     (unless (and (gnosis-core--review-session-valid-p session "active")
                  (equal source (plist-get session :source))
-                 (if target-count
-                     (equal target-count (plist-get session :target_count))
-                   (let ((effective (plist-get session :target_count)))
-                     (and (integerp effective) (> effective 0)))))
+                 (equal (or target-count
+                            gnosis-core--default-online-review-target-count)
+                        (plist-get session :target_count)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review session response is not correlated")))
     session))

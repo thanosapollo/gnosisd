@@ -855,15 +855,15 @@ CONTENT-TYPE defaults to application/json."
                         "post_review_sessions__id__resume")
                     `(:session_id "session" :mode "online" :status "active"
                       :source ,source :target_count 12
-                      :current_position 0 :queue_length 1))
+                      :current_position 0 :queue_length 1 :started_at_us 1))
                    ("post_review_sessions__id__quit"
                     `(:session_id "session" :mode "online" :status "quit"
                       :source ,source :target_count 12
-                      :current_position 0 :queue_length 1))
+                      :current_position 0 :queue_length 1 :started_at_us 1))
                    ("post_review_sessions__id__abort"
                     `(:session_id "session" :mode "online" :status "aborted"
                       :source ,source :target_count 12
-                      :current_position 0 :queue_length 1))
+                      :current_position 0 :queue_length 1 :started_at_us 1))
                    ("post_review_sessions__id__attempts"
                     '(:attempt_id "attempt" :session_id "session"))
                    ("post_review_attempts__id__answer"
@@ -901,21 +901,50 @@ CONTENT-TYPE defaults to application/json."
 
 (ert-deftest gnosis-core-review-session-rejects-invalid-status-position ()
   (let ((invalid '(:session_id "session" :mode "online" :status "active"
-                   :current_position 1 :queue_length 1)))
+                   :current_position 1 :queue_length 1 :started_at_us 1)))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _arguments) `(:session ,invalid))))
       (should-error (gnosis-core-review-session-active)
                     :type 'gnosis-core-protocol-error))
     (should-not
      (gnosis-core--review-session-valid-p
-      '(:mode "offline" :status "active"
-        :current_position 0 :queue_length 1)
+      '(:session_id "session" :mode "offline" :status "active"
+        :current_position 0 :queue_length 1 :started_at_us 1)
       "active"))
     (should
      (gnosis-core--review-session-valid-p
-      '(:mode "online" :status "completed"
-        :current_position 1 :queue_length 1)
+      '(:session_id "session" :mode "online" :status "completed"
+        :current_position 1 :queue_length 1 :started_at_us 1)
       "completed"))))
+
+(ert-deftest gnosis-core-review-session-rejects-invalid-id-or-start-time ()
+  (dolist (session
+           '((:session_id "" :mode "online" :status "active"
+              :current_position 0 :queue_length 1 :started_at_us 1)
+             (:session_id "session" :mode "online" :status "active"
+              :current_position 0 :queue_length 1 :started_at_us 0)
+             (:session_id "bad\0session" :mode "online" :status "active"
+              :current_position 0 :queue_length 1 :started_at_us 1)
+             (:session_id
+              "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              :mode "online" :status "active" :current_position 0
+              :queue_length 1 :started_at_us 1)))
+    (should-not (gnosis-core--review-session-valid-p session "active")))
+  (should
+   (gnosis-core--review-session-valid-p
+    '(:session_id "session0" :mode "online" :status "active"
+      :current_position 0 :queue_length 1 :started_at_us 1)
+    "active")))
+
+(ert-deftest gnosis-core-review-session-create-correlates-default-target-count ()
+  (let ((source '(:kind "due")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _arguments)
+                 `(:session_id "session" :mode "online" :status "active"
+                   :source ,source :target_count 1 :current_position 0
+                   :queue_length 1 :started_at_us 1))))
+      (should-error (gnosis-core-review-session-create source)
+                    :type 'gnosis-core-mutation-uncertain))))
 
 (ert-deftest gnosis-core-review-desired-state-correlates-response ()
   (let (calls result)
