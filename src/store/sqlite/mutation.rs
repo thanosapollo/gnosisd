@@ -290,11 +290,11 @@ fn validate_document_operation(
     blob: Option<&BlobMeta>,
 ) -> Result<(), StoreError> {
     let prepared = &operation.prepared;
-    let digest = format!("{:x}", Sha256::digest(prepared.org.as_bytes()));
+    let digest = format!("{:x}", Sha256::digest(prepared.source.as_bytes()));
     let blob_matches = blob.is_none_or(|blob| {
         blob.sha256 == digest
-            && blob.size_bytes == prepared.org.len() as u64
-            && blob.media_type == "text/org; charset=utf-8"
+            && blob.size_bytes == prepared.source.len() as u64
+            && blob.media_type == prepared.content_type
     });
     if operation.validate().is_ok() && prepared.blob_sha256 == digest && blob_matches {
         Ok(())
@@ -1437,8 +1437,8 @@ mod tests {
 
     fn blob(operation: &PreparedDeviceDocumentMutation) -> BlobMeta {
         BlobMeta {
-            sha256: format!("{:x}", Sha256::digest(operation.prepared.org.as_bytes())),
-            size_bytes: operation.prepared.org.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(operation.prepared.source.as_bytes())),
+            size_bytes: operation.prepared.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         }
     }

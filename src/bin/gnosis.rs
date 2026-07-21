@@ -1,14 +1,15 @@
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use gnosis_core::{
-    client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
+    client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken, validate_note_input},
     client_replica::{
         Error as LocalReplicaError, LocalReplica, OfflineAnswer, OfflineResponse,
         OfflineReviewOutcome, ReconciledOfflineReview, ReviewConflictReason,
@@ -28,18 +29,21 @@ use gnosis_core::{
             ReviewPackCurrentV1, ReviewPackReceiptV1, valid_client_operation_id,
         },
         http_v1::{
-            AssetHeadV1, DocumentImportRequestV1, OfflineAnswerV1, SetAcceptedSuccessRequestV1,
-            SetSuspensionRequestV1,
+            AssetHeadV1, DocumentImportRequestV1, NoteWriteRequestV1, OfflineAnswerV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
         },
         request,
     },
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
 const TOKEN_FILE_READ_LIMIT: u64 = 131;
 const CLIENT_INPUT_LIMIT: u64 = 1024 * 1024;
+const MANIFEST_ENTRY_LIMIT: usize = 1024;
+const MANIFEST_SOURCE_LIMIT: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "gnosis")]
@@ -71,12 +75,21 @@ enum Command {
         command: AssetCommand,
     },
     SystemInfo,
-    ImportOrg {
+    Import {
         document_id: String,
         #[arg(long)]
         operation_id: String,
+        #[arg(long)]
+        content_type: String,
         #[arg(long, value_name = "N")]
         if_revision: Option<u64>,
+    },
+    ImportManifest {
+        manifest: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        journal: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
     },
     GetDocument {
         document_id: String,
@@ -314,6 +327,10 @@ enum CliError {
     WriteOutput(#[source] io::Error),
     #[error("backup path is not valid UTF-8")]
     Path,
+    #[error("bulk import manifest or journal is invalid")]
+    BulkImport,
+    #[error("could not read or persist bulk import state")]
+    BulkIo(#[source] io::Error),
 }
 
 impl From<ReplicaSyncError> for CliError {
@@ -404,14 +421,15 @@ fn client_failure(error: &CliError) -> ClientFailureV1 {
         | CliError::ReadClientInput(_)
         | CliError::ClientInputTooLarge
         | CliError::DecodeClientInput(_)
-        | CliError::InvalidClientInput => local_failure(ClientFailureCodeV1::Input),
+        | CliError::InvalidClientInput
+        | CliError::BulkImport => local_failure(ClientFailureCodeV1::Input),
         CliError::Client(_) | CliError::MissingSocket | CliError::SocketReservedForOperator => {
             local_failure(ClientFailureCodeV1::Protocol)
         }
         CliError::Encode(_) | CliError::WriteOutput(_) => {
             local_failure(ClientFailureCodeV1::Output)
         }
-        CliError::Path => local_failure(ClientFailureCodeV1::Path),
+        CliError::Path | CliError::BulkIo(_) => local_failure(ClientFailureCodeV1::Path),
     }
 }
 
@@ -559,9 +577,10 @@ async fn run(cli: Cli) -> Result<(), RunError> {
             )
             .await
         }
-        Command::ImportOrg {
+        Command::Import {
             document_id,
             operation_id,
+            content_type,
             if_revision,
         } => {
             run_http_import(
@@ -569,9 +588,18 @@ async fn run(cli: Cli) -> Result<(), RunError> {
                 cli.token_file,
                 document_id,
                 operation_id,
+                content_type,
                 if_revision,
             )
             .await
+        }
+        Command::ImportManifest {
+            manifest,
+            journal,
+            dry_run,
+        } => {
+            run_http_import_manifest(&cli.http_url, cli.token_file, &manifest, &journal, dry_run)
+                .await
         }
         Command::GetDocument { document_id } => {
             let client = http_client(&cli.http_url, cli.token_file)?;
@@ -709,11 +737,13 @@ async fn run_http_import(
     token_file: Option<PathBuf>,
     document_id: String,
     operation_id: String,
+    content_type: String,
     expected_revision: Option<u64>,
 ) -> Result<(), RunError> {
     let client = http_client(base_url, token_file)?;
     let input = DocumentImportRequestV1 {
-        org: read_org()?,
+        content_type,
+        source: read_source()?,
         expected_revision,
     };
     let result = client
@@ -721,6 +751,76 @@ async fn run_http_import(
         .await
         .map_err(CliError::from)?;
     write_json(&result).map_err(Into::into)
+}
+
+async fn run_http_import_manifest(
+    base_url: &str,
+    token_file: Option<PathBuf>,
+    manifest_path: &Path,
+    journal_path: &Path,
+    dry_run: bool,
+) -> Result<(), RunError> {
+    let manifest_bytes = read_bounded_file(manifest_path)?;
+    let manifest: ImportManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|_| CliError::BulkImport)?;
+    let entries = preflight_manifest(manifest_path, manifest)?;
+    let manifest_sha256 = import_manifest_sha256(&manifest_bytes, &entries);
+    if dry_run {
+        return write_json(&ImportReport {
+            version: 1,
+            manifest_sha256,
+            entry_count: entries.len(),
+            completed_count: 0,
+            path_hashes: entries.into_iter().map(|entry| entry.path_hash).collect(),
+        })
+        .map_err(Into::into);
+    }
+    let mut journal = load_journal(journal_path, &manifest_sha256)?;
+    let operation_ids: BTreeSet<&str> = entries
+        .iter()
+        .map(|entry| entry.operation_id.as_str())
+        .collect();
+    if journal
+        .completed
+        .keys()
+        .any(|operation_id| !operation_ids.contains(operation_id.as_str()))
+    {
+        return Err(CliError::BulkImport.into());
+    }
+    let client = http_client(base_url, token_file)?;
+
+    for entry in &entries {
+        if journal.completed.contains_key(&entry.operation_id) {
+            continue;
+        }
+        let input = NoteWriteRequestV1 {
+            logical_path: entry.logical_path.clone(),
+            content_type: entry.content_type.clone(),
+            source: entry.source.clone(),
+        };
+        let result = match (&entry.document_id, entry.expected_revision) {
+            (None, None) => client.create_note(&entry.operation_id, &input).await,
+            (Some(document_id), Some(revision)) => {
+                client
+                    .replace_note(document_id, &entry.operation_id, revision, &input)
+                    .await
+            }
+            _ => return Err(CliError::BulkImport.into()),
+        }
+        .map_err(CliError::from)?;
+        let value = serde_json::to_value(result).map_err(CliError::Encode)?;
+        journal.completed.insert(entry.operation_id.clone(), value);
+        persist_journal(journal_path, &journal)?;
+    }
+
+    write_json(&ImportReport {
+        version: 1,
+        manifest_sha256,
+        entry_count: entries.len(),
+        completed_count: journal.completed.len(),
+        path_hashes: entries.into_iter().map(|entry| entry.path_hash).collect(),
+    })
+    .map_err(Into::into)
 }
 
 async fn run_http_sync(
@@ -1134,7 +1234,8 @@ fn command_request(command: Command) -> Result<Request, CliError> {
         Command::ReviewPack { .. } => unreachable!("HTTP command reached socket"),
         Command::Asset { .. } => unreachable!("HTTP command reached socket"),
         Command::SystemInfo => Ok(Request::SystemInfo {}),
-        Command::ImportOrg { .. }
+        Command::Import { .. }
+        | Command::ImportManifest { .. }
         | Command::GetDocument { .. }
         | Command::GetThema { .. }
         | Command::DueThemata { .. }
@@ -1200,11 +1301,224 @@ fn utf8_path(path: PathBuf) -> Result<String, CliError> {
         .map_err(|_| CliError::Path)
 }
 
-fn read_org() -> Result<String, CliError> {
-    read_org_from(io::stdin())
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportManifest {
+    version: u32,
+    root: PathBuf,
+    entries: Vec<ImportManifestEntry>,
 }
 
-fn read_org_from(reader: impl Read) -> Result<String, CliError> {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportManifestEntry {
+    operation_id: String,
+    document_id: Option<String>,
+    expected_revision: Option<u64>,
+    logical_path: String,
+    content_type: String,
+    source_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PreparedImportEntry {
+    operation_id: String,
+    document_id: Option<String>,
+    expected_revision: Option<u64>,
+    logical_path: String,
+    content_type: String,
+    source: String,
+    path_hash: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ImportJournal {
+    version: u32,
+    manifest_sha256: String,
+    completed: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ImportReport {
+    version: u32,
+    manifest_sha256: String,
+    entry_count: usize,
+    completed_count: usize,
+    path_hashes: Vec<String>,
+}
+
+fn preflight_manifest(
+    manifest_path: &Path,
+    manifest: ImportManifest,
+) -> Result<Vec<PreparedImportEntry>, CliError> {
+    if manifest.version != 1
+        || manifest.entries.is_empty()
+        || manifest.entries.len() > MANIFEST_ENTRY_LIMIT
+    {
+        return Err(CliError::BulkImport);
+    }
+    let parent = manifest_path.parent().ok_or(CliError::BulkImport)?;
+    let root_input = if manifest.root.is_absolute() {
+        manifest.root
+    } else {
+        parent.join(manifest.root)
+    };
+    let root = root_input.canonicalize().map_err(CliError::BulkIo)?;
+    let mut operation_ids = BTreeSet::new();
+    let mut document_ids = BTreeSet::new();
+    let mut logical_paths = BTreeSet::new();
+    let mut source_paths = BTreeSet::new();
+    let mut prepared = Vec::with_capacity(manifest.entries.len());
+    let mut total_source_bytes = 0_usize;
+
+    for entry in manifest.entries {
+        if !valid_client_operation_id(&entry.operation_id)
+            || !operation_ids.insert(entry.operation_id.clone())
+            || !safe_logical_path(&entry.logical_path)
+            || !logical_paths.insert(entry.logical_path.to_lowercase())
+            || entry.content_type != "text/org; charset=utf-8"
+            || !relative_normal_path(&entry.source_path)
+            || !source_paths.insert(entry.source_path.to_string_lossy().to_lowercase())
+            || entry.document_id.is_some() != entry.expected_revision.is_some()
+            || entry.document_id.as_deref().is_some_and(|document_id| {
+                document_id.trim().is_empty()
+                    || document_id.len() > 128
+                    || !document_ids.insert(document_id.to_owned())
+            })
+            || entry
+                .expected_revision
+                .is_some_and(|revision| i64::try_from(revision).is_err())
+        {
+            return Err(CliError::BulkImport);
+        }
+        let source_path = root.join(&entry.source_path);
+        let mut current = root.clone();
+        for component in entry.source_path.components() {
+            let Component::Normal(component) = component else {
+                return Err(CliError::BulkImport);
+            };
+            current.push(component);
+            if current
+                .symlink_metadata()
+                .map_err(CliError::BulkIo)?
+                .file_type()
+                .is_symlink()
+            {
+                return Err(CliError::BulkImport);
+            }
+        }
+        let canonical = source_path.canonicalize().map_err(CliError::BulkIo)?;
+        if !canonical.starts_with(&root)
+            || !canonical.metadata().map_err(CliError::BulkIo)?.is_file()
+        {
+            return Err(CliError::BulkImport);
+        }
+        let source_bytes = read_bounded_file(&canonical)?;
+        total_source_bytes = total_source_bytes
+            .checked_add(source_bytes.len())
+            .filter(|total| *total <= MANIFEST_SOURCE_LIMIT)
+            .ok_or(CliError::ClientInputTooLarge)?;
+        let source = String::from_utf8(source_bytes).map_err(|_| CliError::BulkImport)?;
+        validate_note_input(&NoteWriteRequestV1 {
+            logical_path: entry.logical_path.clone(),
+            content_type: entry.content_type.clone(),
+            source: source.clone(),
+        })
+        .map_err(|_| CliError::BulkImport)?;
+        prepared.push(PreparedImportEntry {
+            operation_id: entry.operation_id,
+            document_id: entry.document_id,
+            expected_revision: entry.expected_revision,
+            path_hash: format!("{:x}", Sha256::digest(entry.logical_path.as_bytes())),
+            logical_path: entry.logical_path,
+            content_type: entry.content_type,
+            source,
+        });
+    }
+    Ok(prepared)
+}
+
+fn import_manifest_sha256(manifest_bytes: &[u8], entries: &[PreparedImportEntry]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(manifest_bytes);
+    for entry in entries {
+        digest.update((entry.source.len() as u64).to_be_bytes());
+        digest.update(entry.source.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn relative_normal_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn safe_logical_path(path: &str) -> bool {
+    let path = Path::new(path);
+    relative_normal_path(path)
+        && path.extension().is_some_and(|extension| extension == "org")
+        && path.to_str().is_some_and(|value| value.len() <= 1024)
+}
+
+fn read_bounded_file(path: &Path) -> Result<Vec<u8>, CliError> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .map_err(CliError::BulkIo)?
+        .take(CLIENT_INPUT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(CliError::BulkIo)?;
+    if bytes.len() > CLIENT_INPUT_LIMIT as usize {
+        return Err(CliError::ClientInputTooLarge);
+    }
+    Ok(bytes)
+}
+
+fn load_journal(path: &Path, manifest_sha256: &str) -> Result<ImportJournal, CliError> {
+    if !path.exists() {
+        return Ok(ImportJournal {
+            version: 1,
+            manifest_sha256: manifest_sha256.to_owned(),
+            completed: BTreeMap::new(),
+        });
+    }
+    let bytes = read_bounded_file(path)?;
+    let journal: ImportJournal =
+        serde_json::from_slice(&bytes).map_err(|_| CliError::BulkImport)?;
+    if journal.version != 1 || journal.manifest_sha256 != manifest_sha256 {
+        return Err(CliError::BulkImport);
+    }
+    Ok(journal)
+}
+
+fn persist_journal(path: &Path, journal: &ImportJournal) -> Result<(), CliError> {
+    let body = serde_json::to_vec(journal).map_err(CliError::Encode)?;
+    let temporary = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(CliError::BulkIo)?;
+    file.write_all(&body).map_err(CliError::BulkIo)?;
+    file.sync_all().map_err(CliError::BulkIo)?;
+    fs::rename(&temporary, path).map_err(CliError::BulkIo)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(CliError::BulkIo)
+}
+
+fn read_source() -> Result<String, CliError> {
+    read_source_from(io::stdin())
+}
+
+fn read_source_from(reader: impl Read) -> Result<String, CliError> {
     let mut input = Vec::new();
     reader
         .take(CLIENT_INPUT_LIMIT + 1)
@@ -1296,23 +1610,174 @@ enum RunError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, os::unix::fs::PermissionsExt as _};
+    use std::{
+        fs,
+        io::Cursor,
+        os::unix::fs::{PermissionsExt as _, symlink},
+    };
 
     use clap::Parser as _;
     use gnosis_core::protocol::client_v1::{ClientDeliveryV1, ClientFailureCodeV1};
 
     use super::{
-        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, RunError, client_failure,
-        correlation_id, read_device_token, read_org_from, run_asset,
+        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, ImportManifest,
+        ImportManifestEntry, RunError, client_failure, correlation_id, preflight_manifest,
+        read_device_token, read_source_from, run_asset, run_http_import_manifest,
     };
 
     #[test]
-    fn org_input_is_bounded() {
+    fn source_input_is_bounded() {
         let input = vec![b'x'; CLIENT_INPUT_LIMIT as usize + 1];
         assert!(matches!(
-            read_org_from(Cursor::new(input)),
+            read_source_from(Cursor::new(input)),
             Err(CliError::ClientInputTooLarge)
         ));
+    }
+
+    #[test]
+    fn single_import_requires_an_explicit_content_type() {
+        let cli = Cli::try_parse_from([
+            "gnosis",
+            "import",
+            "document",
+            "--operation-id",
+            "import-document",
+            "--content-type",
+            "text/org; charset=utf-8",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Import {
+                document_id,
+                operation_id,
+                content_type,
+                if_revision: None,
+            } if document_id == "document"
+                && operation_id == "import-document"
+                && content_type == "text/org; charset=utf-8"
+        ));
+    }
+
+    #[test]
+    fn manifest_preflight_reads_confined_sources_before_dispatch() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.org"), "#+title: Note\n").unwrap();
+        let entries = preflight_manifest(
+            &directory.path().join("manifest.json"),
+            ImportManifest {
+                version: 1,
+                root: directory.path().to_owned(),
+                entries: vec![ImportManifestEntry {
+                    operation_id: "bulk-note".into(),
+                    document_id: None,
+                    expected_revision: None,
+                    logical_path: "notes/note.org".into(),
+                    content_type: "text/org; charset=utf-8".into(),
+                    source_path: "note.org".into(),
+                }],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(entries[0].source, "#+title: Note\n");
+        assert_eq!(entries[0].path_hash.len(), 64);
+    }
+
+    #[test]
+    fn manifest_preflight_rejects_casefold_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("first.org"), "#+title: First\n").unwrap();
+        fs::write(directory.path().join("second.org"), "#+title: Second\n").unwrap();
+        let entry =
+            |operation_id: &str, logical_path: &str, source_path: &str| ImportManifestEntry {
+                operation_id: operation_id.into(),
+                document_id: None,
+                expected_revision: None,
+                logical_path: logical_path.into(),
+                content_type: "text/org; charset=utf-8".into(),
+                source_path: source_path.into(),
+            };
+        let manifest = ImportManifest {
+            version: 1,
+            root: directory.path().to_owned(),
+            entries: vec![
+                entry("bulk-first", "Notes/Note.org", "first.org"),
+                entry("bulk-second", "notes/note.org", "second.org"),
+            ],
+        };
+
+        assert!(matches!(
+            preflight_manifest(&directory.path().join("manifest.json"), manifest),
+            Err(CliError::BulkImport)
+        ));
+    }
+
+    #[test]
+    fn manifest_preflight_rejects_symlink_and_oversized_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("target.org"), "#+title: Target\n").unwrap();
+        symlink(
+            directory.path().join("target.org"),
+            directory.path().join("link.org"),
+        )
+        .unwrap();
+        let entry = |source_path: &str| ImportManifest {
+            version: 1,
+            root: directory.path().to_owned(),
+            entries: vec![ImportManifestEntry {
+                operation_id: "bulk-note".into(),
+                document_id: None,
+                expected_revision: None,
+                logical_path: "notes/note.org".into(),
+                content_type: "text/org; charset=utf-8".into(),
+                source_path: source_path.into(),
+            }],
+        };
+
+        assert!(matches!(
+            preflight_manifest(&directory.path().join("manifest.json"), entry("link.org")),
+            Err(CliError::BulkImport)
+        ));
+
+        fs::write(
+            directory.path().join("large.org"),
+            vec![b'x'; 1024 * 1024 + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            preflight_manifest(&directory.path().join("manifest.json"), entry("large.org")),
+            Err(CliError::ClientInputTooLarge)
+        ));
+
+        fs::write(directory.path().join("invalid.org"), "* Missing title\n").unwrap();
+        assert!(matches!(
+            preflight_manifest(
+                &directory.path().join("manifest.json"),
+                entry("invalid.org")
+            ),
+            Err(CliError::BulkImport)
+        ));
+    }
+
+    #[tokio::test]
+    async fn manifest_dry_run_needs_no_token_or_network_and_writes_no_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("note.org"), "#+title: Note\n").unwrap();
+        let manifest_path = directory.path().join("manifest.json");
+        fs::write(
+            &manifest_path,
+            r#"{"version":1,"root":".","entries":[{"operation_id":"op","document_id":null,"expected_revision":null,"logical_path":"note.org","content_type":"text/org; charset=utf-8","source_path":"note.org"}]}"#,
+        )
+        .unwrap();
+        let journal_path = directory.path().join("journal.json");
+
+        run_http_import_manifest("not a URL", None, &manifest_path, &journal_path, true)
+            .await
+            .unwrap();
+
+        assert!(!journal_path.exists());
     }
 
     #[test]

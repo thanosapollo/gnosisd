@@ -11,9 +11,10 @@ use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Complete Org source for an explicit document projection.
+/// Complete typed source for an explicit document projection.
 pub struct DocumentImportRequestV1 {
-    pub org: String,
+    pub content_type: String,
+    pub source: String,
     #[serde(deserialize_with = "super::deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
     pub expected_revision: Option<u64>,
@@ -93,7 +94,8 @@ impl ContentChangeV1 {
 #[serde(deny_unknown_fields)]
 pub struct NoteWriteRequestV1 {
     pub logical_path: String,
-    pub org: String,
+    pub content_type: String,
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -107,6 +109,7 @@ pub struct NoteRenameRequestV1 {
 pub struct DocumentHeadV1 {
     pub document_id: String,
     pub logical_path: String,
+    pub content_type: String,
     pub revision: u64,
     #[serde(deserialize_with = "super::deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
@@ -119,6 +122,7 @@ impl DocumentHeadV1 {
         Self {
             document_id: value.document_id.clone(),
             logical_path: value.logical_path.clone(),
+            content_type: value.content_type.clone(),
             revision: value.revision,
             content_sha256: value.blob_sha256.clone(),
             active: value.active,
@@ -323,6 +327,7 @@ pub struct DocumentRevisionSummaryV1 {
     pub document_id: String,
     pub revision: u64,
     pub logical_path: String,
+    pub content_type: String,
     #[serde(deserialize_with = "super::deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub content_sha256: Option<String>,
@@ -339,6 +344,7 @@ impl DocumentRevisionSummaryV1 {
             document_id: value.document_id.clone(),
             revision: value.revision,
             logical_path: value.logical_path.clone(),
+            content_type: value.content_type.clone(),
             content_sha256: value.blob_sha256.clone(),
             operation: document_operation(&value.operation)?,
             created_at_us: value.created_at_us,

@@ -695,7 +695,8 @@ mod tests {
                 document_id: "document".into(),
                 logical_path: "note.org".into(),
                 content_sha256: format!("{:x}", Sha256::digest(org.as_bytes())),
-                org: org.into(),
+                content_type: "text/org; charset=utf-8".into(),
+                source: org.into(),
                 base,
             },
         }
@@ -704,7 +705,7 @@ mod tests {
     fn blob(operation: &OfflineContentOperation) -> BlobMeta {
         let OfflineContentMutation::Put {
             content_sha256,
-            org,
+            source,
             ..
         } = &operation.mutation
         else {
@@ -712,7 +713,7 @@ mod tests {
         };
         BlobMeta {
             sha256: content_sha256.clone(),
-            size_bytes: org.len() as u64,
+            size_bytes: source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         }
     }
@@ -1019,7 +1020,7 @@ mod tests {
             .unwrap();
             let blob = BlobMeta {
                 sha256: note.blob_sha256.clone(),
-                size_bytes: note.org.len() as u64,
+                size_bytes: note.source.len() as u64,
                 media_type: "text/org; charset=utf-8".into(),
             };
             store.replace_note(&note, &blob, 1, None).unwrap();
@@ -1077,7 +1078,7 @@ mod tests {
         .unwrap();
         let original_blob = BlobMeta {
             sha256: original.blob_sha256.clone(),
-            size_bytes: original.org.len() as u64,
+            size_bytes: original.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store
@@ -1151,7 +1152,7 @@ mod tests {
         assert_eq!(stored_payload, canonical_payload);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&stored_payload).unwrap()["operation"]["mutation"]
-                ["org"],
+                ["source"],
             "* [[id:broken\n"
         );
         assert_eq!(
@@ -1229,7 +1230,7 @@ mod tests {
         .unwrap();
         let online_blob = BlobMeta {
             sha256: online.blob_sha256.clone(),
-            size_bytes: online.org.len() as u64,
+            size_bytes: online.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store.replace_note(&online, &online_blob, 50, None).unwrap();
@@ -1302,7 +1303,7 @@ mod tests {
         .unwrap();
         let online_blob = BlobMeta {
             sha256: online.blob_sha256.clone(),
-            size_bytes: online.org.len() as u64,
+            size_bytes: online.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store
@@ -1344,7 +1345,7 @@ mod tests {
                 &original,
                 &BlobMeta {
                     sha256: original.blob_sha256.clone(),
-                    size_bytes: original.org.len() as u64,
+                    size_bytes: original.source.len() as u64,
                     media_type: "text/org; charset=utf-8".into(),
                 },
                 1,

@@ -93,12 +93,18 @@ pub struct ReplicaStateV1 {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentCapabilitiesV1 {
-    #[schemars(extend("const" = 1))]
+    #[schemars(extend("const" = 2))]
     pub version: u32,
     #[schemars(regex(pattern = "^[0-9a-f]{32}$"))]
     pub server_id: String,
     #[schemars(extend("const" = 1))]
     pub document_lifecycle: u32,
+    #[schemars(length(min = 1, max = 16))]
+    pub supported_content_types: Vec<String>,
+    #[schemars(extend("const" = 1048576))]
+    pub max_source_bytes: u64,
+    #[schemars(extend("const" = 1048576))]
+    pub max_projection_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -307,6 +313,7 @@ pub struct DocumentRevisionV1 {
     #[schemars(range(min = 1))]
     pub revision: u64,
     pub logical_path: String,
+    pub content_type: String,
     pub content_sha256: Option<String>,
     pub blob_url: Option<String>,
     pub operation: DocumentOperationV1,

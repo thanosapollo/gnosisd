@@ -1,4 +1,4 @@
-use super::{PreparedNote, prepare_note};
+use super::{PreparedNote, prepare_document};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ContentBase {
@@ -16,7 +16,8 @@ pub(crate) enum OfflineContentMutation {
         document_id: String,
         logical_path: String,
         content_sha256: String,
-        org: String,
+        content_type: String,
+        source: String,
         base: ContentBase,
     },
     Rename {
@@ -156,16 +157,18 @@ pub(crate) fn prepare_offline_document(
         document_id,
         logical_path,
         content_sha256,
-        org,
+        content_type,
+        source,
         ..
     } = &operation.mutation
     else {
         return Ok(None);
     };
-    let prepared = prepare_note(
+    let prepared = prepare_document(
         Some(document_id.clone()),
         logical_path.clone(),
-        org.clone(),
+        content_type.clone(),
+        source.clone(),
         None,
     )
     .map_err(|_| OfflineContentConflictReason::InvalidContent)?;

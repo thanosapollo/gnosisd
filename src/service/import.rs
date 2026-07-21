@@ -30,7 +30,8 @@ pub(super) fn persist_server_import(
         logical_path_is_request_input: false,
         path_key: path_key(&logical_path),
         logical_path,
-        org: server_import.org.clone(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: server_import.org.clone(),
         blob_sha256: blob.sha256.clone(),
         asset_paths: server_import.asset_paths.clone(),
         projection: prepared.projection.clone(),
@@ -144,7 +145,7 @@ mod tests {
     fn note_blob(note: &crate::application::PreparedNote) -> BlobMeta {
         BlobMeta {
             sha256: note.blob_sha256.clone(),
-            size_bytes: note.org.len() as u64,
+            size_bytes: note.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         }
     }

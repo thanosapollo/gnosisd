@@ -65,6 +65,14 @@ install -m 600 /dev/null "$HOME/.config/gnosis/client.token"
 
 gnosis --token-file "$HOME/.config/gnosis/client.token" \
   get-document DOCUMENT_ID
+printf '#+title: Note\n' | \
+  gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  import DOCUMENT_ID --operation-id OPERATION_ID \
+  --content-type 'text/org; charset=utf-8'
+gnosis import-manifest /path/to/manifest.json \
+  --journal /path/to/import.journal --dry-run
+gnosis --token-file "$HOME/.config/gnosis/client.token" \
+  import-manifest /path/to/manifest.json --journal /path/to/import.journal
 gnosis --token-file "$HOME/.config/gnosis/client.token" \
   review-attempt-state ATTEMPT_ID
 gnosis --token-file "$HOME/.config/gnosis/client.token" \
@@ -82,6 +90,16 @@ with the same operation ID and captured revision. ~sync~ resumes the same local
 replica after restart and prints its snapshot, delta, blob, and outbox counts.
 The durable replica identity comes from the authenticated token and is checked
 again before synchronization changes local state.
+
+Manifest dry-run reads and validates every source before opening the HTTP client.
+Apply records each immutable operation result in the mode-0600 journal; reruns
+skip completed operation IDs. Documents are not imported as one transaction.
+Keep manifest, source files, and journal unchanged when resuming; journal binds
+both manifest and source bytes.
+
+#+begin_src json
+{"version":1,"root":"/path/to/export","entries":[{"operation_id":"stable-operation-id","document_id":null,"expected_revision":null,"logical_path":"notes/example.org","content_type":"text/org; charset=utf-8","source_path":"notes/example.org"}]}
+#+end_src
 
 Offline review packs use typed JSON on standard input and output. Acquire or
 resume a pack while connected:
@@ -233,7 +251,7 @@ immutable. Normal replica synchronization never creates a review pack.
 
 * Storage
 
-The server's canonical schema v1 stores native themata, tags, node associations,
+The server's canonical schema v2 stores native themata, tags, node associations,
 scheduling state, exact review history, sessions, attempts, devices, settings,
 documents, and the node graph. It also stores replica snapshots and feed
 revisions, review packs, immutable offline operations and results, device
@@ -249,9 +267,11 @@ replica databases use distinct SQLite application IDs. Startup creates the
 applicable schema only for an empty database and rejects every other version or
 database identity.
 
-Org documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
+Documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
 tracks logical paths, heads, revisions, renames, tombstones, and the monotonic
-change cursor. Paths are relative and case-unique. Only Org files and supported
+change cursor. Paths are relative and case-unique. Imports carry an explicit
+content type and source; capabilities publish supported types and source and
+projection byte limits. Currently supported documents are Org files. Supported
 files below ~assets/<sha256>/<original-name>~ enter the canonical tree.
 
 Accepted Org revisions are parsed and indexed in the same transaction that

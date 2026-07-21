@@ -37,7 +37,7 @@ use crate::{
         ReviewHistoryQuery, ReviewOperationAuthority, ReviewSessionQuery, SettingsRecord,
         canonical_asset_path, prepare_asset, prepare_device_desired_state_mutation,
         prepare_device_document_mutation, prepare_device_document_rename,
-        prepare_device_document_tombstone, prepare_note, prepare_thema, review_day_at,
+        prepare_device_document_tombstone, prepare_document, prepare_thema, review_day_at,
         thema_content, validate_org_path,
     },
     domain::{DocumentId, DueThema, NodeId, ThemaId},
@@ -395,10 +395,11 @@ async fn import_document_projection(
         .map(|(head, _)| head.logical_path)
         .unwrap_or_else(|| protocol_logical_path(&document_id));
     let prepared = run_blocking(move || {
-        let mut prepared = prepare_note(
+        let mut prepared = prepare_document(
             Some(document_id.to_string()),
             logical_path,
-            input.org,
+            input.content_type,
+            input.source,
             input.expected_revision,
         )
         .map_err(ApiError::invalid_content)?;
@@ -738,8 +739,14 @@ async fn create_document_mutation(
 ) -> Result<(StatusCode, Json<DocumentMutationResultV1>), ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let operation_id = idempotency_key(&headers)?;
-    let prepared = prepare_note(None, input.logical_path, input.org, None)
-        .map_err(ApiError::invalid_content)?;
+    let prepared = prepare_document(
+        None,
+        input.logical_path,
+        input.content_type,
+        input.source,
+        None,
+    )
+    .map_err(ApiError::invalid_content)?;
     let result = apply_document_mutation(&state, principal, operation_id, prepared).await?;
     Ok((StatusCode::OK, Json(result)))
 }
@@ -754,10 +761,11 @@ async fn replace_document_mutation(
     require(&principal, DeviceScope::ContentWrite)?;
     let operation_id = idempotency_key(&headers)?;
     let revision = if_match(&headers)?;
-    let prepared = prepare_note(
+    let prepared = prepare_document(
         Some(id.clone()),
         input.logical_path,
-        input.org,
+        input.content_type,
+        input.source,
         Some(revision),
     )
     .map_err(ApiError::invalid_content)?;
@@ -6627,7 +6635,8 @@ mod tests {
         let digest = format!("{:x}", Sha256::digest(org.as_bytes()));
         let body = serde_json::to_vec(&json!({
             "logical_path": "note.org",
-            "org": org
+            "content_type": "text/org; charset=utf-8",
+            "source": org
         }))
         .unwrap();
 
@@ -7372,7 +7381,8 @@ mod tests {
 
         let note = json!({
             "logical_path": "note.org",
-            "org": "#+title: Note\n\n* Heading\n:PROPERTIES:\n:ID: node\n:END:\nBody\n"
+            "content_type": "text/org; charset=utf-8",
+            "source": "#+title: Note\n\n* Heading\n:PROPERTIES:\n:ID: node\n:END:\nBody\n"
         });
         let created = app
             .clone()
@@ -7415,9 +7425,15 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(capabilities.version, 1);
+        assert_eq!(capabilities.version, 2);
         assert_eq!(capabilities.server_id, server_id);
         assert_eq!(capabilities.document_lifecycle, 1);
+        assert_eq!(
+            capabilities.supported_content_types,
+            ["text/org; charset=utf-8"]
+        );
+        assert_eq!(capabilities.max_source_bytes, 1024 * 1024);
+        assert_eq!(capabilities.max_projection_bytes, 1024 * 1024);
 
         let first_request = app.clone().oneshot(authorized(
             "GET",
@@ -8112,7 +8128,8 @@ mod tests {
     fn note_body(logical_path: &str, title: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "logical_path":logical_path,
-            "org":format!("#+title: {title}\n")
+            "content_type":"text/org; charset=utf-8",
+            "source":format!("#+title: {title}\n")
         }))
         .unwrap()
     }
@@ -8139,7 +8156,7 @@ mod tests {
         device_sequence: u64,
         cursor: &str,
         document_id: &str,
-        org: &str,
+        source: &str,
     ) -> serde_json::Value {
         json!({
             "version": 1,
@@ -8153,8 +8170,9 @@ mod tests {
                     "kind": "put_document",
                     "document_id": document_id,
                     "logical_path": format!("{document_id}.org"),
-                    "content_sha256": format!("{:x}", Sha256::digest(org.as_bytes())),
-                    "org": org,
+                    "content_sha256": format!("{:x}", Sha256::digest(source.as_bytes())),
+                    "content_type": "text/org; charset=utf-8",
+                    "source": source,
                     "base": {"kind": "absent"}
                 }
             }

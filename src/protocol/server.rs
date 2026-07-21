@@ -1118,7 +1118,8 @@ mod tests {
 
         let body = serde_json::to_vec(&serde_json::json!({
             "logical_path": "shutdown.org",
-            "org": "#+title: Shutdown\n",
+            "content_type": "text/org; charset=utf-8",
+            "source": "#+title: Shutdown\n",
         }))
         .unwrap();
         let mut mutation = tokio::net::TcpStream::connect(address).await.unwrap();

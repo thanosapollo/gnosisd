@@ -812,7 +812,8 @@ impl LocalReplica {
                 document_id,
                 logical_path: edit.logical_path,
                 content_sha256: format!("{:x}", Sha256::digest(edit.org.as_bytes())),
-                org: edit.org,
+                content_type: "text/org; charset=utf-8".into(),
+                source: edit.org,
                 base,
             }
         })
@@ -1344,7 +1345,8 @@ fn replayed_document_edit(
     let OfflineContentMutation::Put {
         document_id,
         logical_path,
-        org,
+        content_type,
+        source,
         ..
     } = &operation.mutation
     else {
@@ -1353,7 +1355,8 @@ fn replayed_document_edit(
     if operation.operation_id != edit.operation_id
         || document_id != &edit.document_id
         || logical_path != &edit.logical_path
-        || org != &edit.org
+        || content_type != "text/org; charset=utf-8"
+        || source != &edit.org
         || operation.authored_at_us != edit.authored_at_us
     {
         return Err(Error::Content);

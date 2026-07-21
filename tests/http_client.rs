@@ -1584,7 +1584,8 @@ async fn projection_clients_reject_non_strict_responses() {
                     "document",
                     "operation",
                     &DocumentImportRequestV1 {
-                        org: "#+TITLE: Document\n".into(),
+                        content_type: "text/org; charset=utf-8".into(),
+                        source: "#+TITLE: Document\n".into(),
                         expected_revision: None,
                     },
                 )
@@ -1752,7 +1753,8 @@ async fn review_session_client_enforces_request_and_normalized_response_targets(
 #[tokio::test]
 async fn projection_clients_reject_semantic_mismatches() {
     let input = DocumentImportRequestV1 {
-        org: "#+TITLE: Expected\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+TITLE: Expected\n".into(),
         expected_revision: None,
     };
     for response in [
@@ -2165,7 +2167,8 @@ async fn client_creates_and_replays_a_direct_document_mutation() {
     let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
     let note = NoteWriteRequestV1 {
         logical_path: "note.org".into(),
-        org: "#+title: Direct\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Direct\n".into(),
     };
 
     let first = client.create_note("direct-create", &note).await.unwrap();
@@ -2184,7 +2187,8 @@ async fn client_creates_and_replays_a_direct_document_mutation() {
     assert_eq!(authoritative.revision, 1);
 
     let changed = NoteWriteRequestV1 {
-        org: "#+title: Changed\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Changed\n".into(),
         ..note
     };
     let error = client
@@ -2209,7 +2213,8 @@ async fn client_replaces_documents_against_an_explicit_base_revision() {
     let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
     let original = NoteWriteRequestV1 {
         logical_path: "note.org".into(),
-        org: "#+title: Original\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Original\n".into(),
     };
     let created = client
         .create_note("create-replace", &original)
@@ -2219,7 +2224,8 @@ async fn client_replaces_documents_against_an_explicit_base_revision() {
         panic!("expected applied document mutation");
     };
     let replacement = NoteWriteRequestV1 {
-        org: "#+title: Replacement\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Replacement\n".into(),
         ..original
     };
 
@@ -2398,7 +2404,8 @@ async fn lost_direct_document_response_replays_without_duplication() {
     let uncertain = HttpClient::new(&proxy.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
     let note = NoteWriteRequestV1 {
         logical_path: "note.org".into(),
-        org: "#+title: Once\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Once\n".into(),
     };
 
     assert!(matches!(
@@ -2421,7 +2428,8 @@ async fn direct_document_client_rejects_invalid_operation_ids_before_transport()
     let client = HttpClient::new("http://127.0.0.1:9", token()).unwrap();
     let note = NoteWriteRequestV1 {
         logical_path: "note.org".into(),
-        org: "#+title: Note\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Note\n".into(),
     };
 
     assert!(matches!(
@@ -2450,7 +2458,8 @@ async fn direct_document_client_rejects_another_operation_result() {
     let client = HttpClient::new(&raw.base_url, token()).unwrap();
     let note = NoteWriteRequestV1 {
         logical_path: "note.org".into(),
-        org: "#+title: Note\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Note\n".into(),
     };
 
     assert!(matches!(
@@ -2745,7 +2754,8 @@ async fn replica_sync_resumes_an_interrupted_snapshot_after_replica_restart() {
                 &format!("snapshot-seed-{index}"),
                 &NoteWriteRequestV1 {
                     logical_path: format!("snapshot-{index}.org"),
-                    org: format!("#+title: Snapshot {index}\n"),
+                    content_type: "text/org; charset=utf-8".into(),
+                    source: format!("#+title: Snapshot {index}\n"),
                 },
             )
             .await
@@ -3052,7 +3062,8 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         serde_json::from_slice(&invalid_document.bytes().await.unwrap()).unwrap();
     assert_eq!(invalid_document["error"]["code"], "invalid_content");
     let input = DocumentImportRequestV1 {
-        org: include_str!("fixtures/org/no-file-id.org").to_owned(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: include_str!("fixtures/org/no-file-id.org").to_owned(),
         expected_revision: None,
     };
 
@@ -3075,7 +3086,8 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
             "http-only-doc",
             "unchanged-http-only-doc",
             &DocumentImportRequestV1 {
-                org: input.org.clone(),
+                content_type: input.content_type.clone(),
+                source: input.source.clone(),
                 expected_revision: Some(1),
             },
         )
@@ -3106,7 +3118,8 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         .unwrap();
     assert_eq!(retry_after_rename, imported);
     let changed_input = DocumentImportRequestV1 {
-        org: "#+TITLE: Changed\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+TITLE: Changed\n".into(),
         expected_revision: None,
     };
     assert!(matches!(
@@ -3222,10 +3235,12 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         &daemon.base_url,
         &token_path,
         &[
-            "import-org",
+            "import",
             "http-only-doc",
             "--operation-id",
             "cli-import",
+            "--content-type",
+            "text/org; charset=utf-8",
             "--if-revision",
             "1",
         ],
@@ -3273,10 +3288,12 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
         !run_cli_without_token_with_input(
             &daemon.base_url,
             &[
-                "import-org",
+                "import",
                 "unauthenticated-doc",
                 "--operation-id",
                 "unauthenticated-import",
+                "--content-type",
+                "text/org; charset=utf-8",
             ],
             include_bytes!("fixtures/org/no-file-id.org"),
         )
@@ -3289,10 +3306,12 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
             &daemon.base_url,
             &read_only_token_path,
             &[
-                "import-org",
+                "import",
                 "forbidden-doc",
                 "--operation-id",
                 "forbidden-cli-import",
+                "--content-type",
+                "text/org; charset=utf-8",
             ],
             include_bytes!("fixtures/org/no-file-id.org"),
         )
@@ -3336,7 +3355,8 @@ async fn oversized_http_projection_is_rejected_before_commit() {
             "oversized",
             "oversized-import",
             &DocumentImportRequestV1 {
-                org: deeply_nested_org(),
+                content_type: "text/org; charset=utf-8".into(),
+                source: deeply_nested_org(),
                 expected_revision: None,
             },
         )
@@ -3915,7 +3935,8 @@ fn document_mutation_json(
 fn note_request() -> NoteWriteRequestV1 {
     NoteWriteRequestV1 {
         logical_path: "note.org".into(),
-        org: "#+title: Note\n".into(),
+        content_type: "text/org; charset=utf-8".into(),
+        source: "#+title: Note\n".into(),
     }
 }
 

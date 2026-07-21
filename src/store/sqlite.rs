@@ -46,8 +46,17 @@ mod review;
 pub(crate) use mutation::DeviceMutationExecution;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
+const MIGRATE_SCHEMA_1_TO_2: &str = "
+BEGIN IMMEDIATE;
+ALTER TABLE document ADD COLUMN content_type TEXT NOT NULL
+    DEFAULT 'text/org; charset=utf-8';
+ALTER TABLE document_revision ADD COLUMN content_type TEXT NOT NULL
+    DEFAULT 'text/org; charset=utf-8';
+PRAGMA user_version = 2;
+COMMIT;
+";
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -692,7 +701,7 @@ impl SqliteStore {
     ) -> Result<Option<DocumentHead>, StoreError> {
         self.connection
             .query_row(
-                "SELECT document_id, logical_path, revision, head_blob_sha256, active
+                "SELECT document_id, logical_path, content_type, revision, head_blob_sha256, active
                  FROM document WHERE document_id = ?1",
                 [document_id.as_str()],
                 document_head_row,
@@ -710,8 +719,8 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT document_id, revision, logical_path, blob_sha256, operation,
-                        created_at_us, author_device_id
+                "SELECT document_id, revision, logical_path, content_type, blob_sha256, operation,
+                       created_at_us, author_device_id
                  FROM document_revision
                  WHERE document_id = ?1 AND revision > ?2
                  ORDER BY revision LIMIT ?3",
@@ -738,8 +747,8 @@ impl SqliteStore {
     ) -> Result<Option<DocumentRevision>, StoreError> {
         self.connection
             .query_row(
-                "SELECT document_id, revision, logical_path, blob_sha256, operation,
-                        created_at_us, author_device_id
+                "SELECT document_id, revision, logical_path, content_type, blob_sha256, operation,
+                       created_at_us, author_device_id
                  FROM document_revision WHERE document_id = ?1 AND revision = ?2",
                 params![
                     document_id.as_str(),
@@ -1739,9 +1748,10 @@ fn document_head_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentHead> 
     Ok(DocumentHead {
         document_id: row.get(0)?,
         logical_path: row.get(1)?,
-        revision: row_u64(row, 2)?,
-        blob_sha256: row.get(3)?,
-        active: row.get::<_, i64>(4)? != 0,
+        content_type: row.get(2)?,
+        revision: row_u64(row, 3)?,
+        blob_sha256: row.get(4)?,
+        active: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -1750,10 +1760,11 @@ fn document_revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentRe
         document_id: row.get(0)?,
         revision: row_u64(row, 1)?,
         logical_path: row.get(2)?,
-        blob_sha256: row.get(3)?,
-        operation: row.get(4)?,
-        created_at_us: row_u64(row, 5)?,
-        author_device_id: row.get(6)?,
+        content_type: row.get(3)?,
+        blob_sha256: row.get(4)?,
+        operation: row.get(5)?,
+        created_at_us: row_u64(row, 6)?,
+        author_device_id: row.get(7)?,
     })
 }
 
@@ -2069,8 +2080,8 @@ fn load_document_replica_revision(
     })?;
     let revision_record = connection
         .query_row(
-            "SELECT document_id, revision, logical_path, blob_sha256, operation,
-                    created_at_us, author_device_id
+            "SELECT document_id, revision, logical_path, content_type, blob_sha256, operation,
+                       created_at_us, author_device_id
              FROM document_revision WHERE document_id = ?1 AND revision = ?2",
             params![
                 document_id.as_str(),
@@ -2544,7 +2555,7 @@ fn load_document_head(
 ) -> Result<Option<DocumentHead>, StoreError> {
     connection
         .query_row(
-            "SELECT document_id, logical_path, revision, head_blob_sha256, active
+            "SELECT document_id, logical_path, content_type, revision, head_blob_sha256, active
              FROM document WHERE document_id = ?1",
             [document_id.as_str()],
             document_head_row,
@@ -2789,9 +2800,13 @@ fn insert_document_history(
     transaction
         .execute(
             "INSERT INTO document_revision(
-                 document_id, revision, logical_path, blob_sha256, operation,
+                 document_id, revision, logical_path, content_type, blob_sha256, operation,
                  created_at_us, author_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             ) VALUES (
+                 ?1, ?2, ?3,
+                 (SELECT content_type FROM document WHERE document_id = ?1),
+                 ?4, ?5, ?6, ?7
+             )",
             params![
                 document_id.as_str(),
                 u64_to_i64(revision, "document revision")?,
@@ -3554,15 +3569,25 @@ enum FailPoint {
 }
 
 fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
-    let found = schema_version(connection)?;
+    let mut found = schema_version(connection)?;
+    if found == 0 && user_schema_is_empty(connection)? {
+        connection
+            .execute_batch(CURRENT_SCHEMA)
+            .map_err(StoreError::storage)?;
+        found = schema_version(connection)?;
+    }
+    if found == 1 {
+        require_application_id(connection)?;
+        connection
+            .execute_batch(MIGRATE_SCHEMA_1_TO_2)
+            .map_err(StoreError::storage)?;
+        found = schema_version(connection)?;
+    }
     match found {
         SCHEMA_VERSION => {
             require_application_id(connection)?;
             require_current_schema_layout(connection)
         }
-        0 if user_schema_is_empty(connection)? => connection
-            .execute_batch(CURRENT_SCHEMA)
-            .map_err(StoreError::storage),
         _ => Err(StoreError::UnsupportedSchemaVersion {
             found,
             supported: SCHEMA_VERSION,
@@ -3574,6 +3599,9 @@ fn require_current_schema_layout(connection: &Connection) -> Result<(), StoreErr
     let expected = Connection::open_in_memory().map_err(StoreError::storage)?;
     expected
         .execute_batch(CURRENT_SCHEMA)
+        .map_err(StoreError::storage)?;
+    expected
+        .execute_batch(MIGRATE_SCHEMA_1_TO_2)
         .map_err(StoreError::storage)?;
     if schema_objects(connection)? == schema_objects(&expected)? {
         Ok(())
@@ -4064,7 +4092,8 @@ fn update_note_head(
     transaction
         .execute(
             "UPDATE document SET logical_path = ?2, path_key = ?3,
-                 head_blob_sha256 = ?4, active = 1, updated_at_us = ?5,
+                 head_blob_sha256 = ?4, content_type = ?7,
+                 active = 1, updated_at_us = ?5,
                  revision = ?6 WHERE document_id = ?1",
             params![
                 prepared.document_id.as_str(),
@@ -4073,6 +4102,7 @@ fn update_note_head(
                 blob.sha256,
                 updated_at_us,
                 u64_to_i64(revision, "document revision")?,
+                prepared.content_type,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -4090,13 +4120,14 @@ fn insert_document_revision(
     transaction
         .execute(
             "INSERT INTO document_revision(
-                 document_id, revision, logical_path, blob_sha256, operation,
+                 document_id, revision, logical_path, content_type, blob_sha256, operation,
                  created_at_us, author_device_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 prepared.document_id.as_str(),
                 u64_to_i64(revision, "document revision")?,
                 prepared.logical_path,
+                prepared.content_type,
                 prepared.blob_sha256,
                 if existed { "update" } else { "create" },
                 created_at_us,
@@ -4592,9 +4623,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION,
-        SqliteStore, StoreError, application_id, backup_database_with_step, initialize_schema,
-        replace_rows, retire_removed_nodes, schema_version,
+        APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, MIGRATE_SCHEMA_1_TO_2,
+        SCHEMA_VERSION, SqliteStore, StoreError, application_id, backup_database_with_step,
+        initialize_schema, replace_rows, retire_removed_nodes, schema_version,
     };
     use crate::application::{
         NodeThemaAssociation, PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind,
@@ -4998,6 +5029,38 @@ mod tests {
     }
 
     #[test]
+    fn migrates_v1_documents_with_the_org_media_type() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gnosis.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection.execute_batch(CURRENT_SCHEMA).unwrap();
+        connection
+            .execute(
+                "INSERT INTO document(
+                     document_id, revision, title, file_tags_json, content_sha256,
+                     logical_path, path_key, head_blob_sha256
+                 ) VALUES ('document', 1, 'Title', '[]', 'digest',
+                           'note.org', 'note.org', 'digest')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteStore::open(&path).unwrap();
+        let content_type: String = store
+            .connection
+            .query_row(
+                "SELECT content_type FROM document WHERE document_id = 'document'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(content_type, "text/org; charset=utf-8");
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
     fn rejects_noncurrent_schema_without_changes() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection
@@ -5102,6 +5165,7 @@ mod tests {
         let database = directory.path().join("backup.sqlite3");
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection.execute_batch(CURRENT_SCHEMA).unwrap();
+        connection.execute_batch(MIGRATE_SCHEMA_1_TO_2).unwrap();
         connection
             .execute_batch("CREATE TABLE stale_table(value TEXT) STRICT;")
             .unwrap();
@@ -5338,7 +5402,7 @@ mod tests {
         .unwrap();
         let first_blob = BlobMeta {
             sha256: first.blob_sha256.clone(),
-            size_bytes: first.org.len() as u64,
+            size_bytes: first.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store.replace_note(&first, &first_blob, 2, None).unwrap();
@@ -5351,7 +5415,7 @@ mod tests {
         .unwrap();
         let second_blob = BlobMeta {
             sha256: second.blob_sha256.clone(),
-            size_bytes: second.org.len() as u64,
+            size_bytes: second.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store.replace_note(&second, &second_blob, 3, None).unwrap();
@@ -5390,6 +5454,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(documents.len(), 3);
+        assert!(
+            documents
+                .iter()
+                .all(|document| { document.revision.content_type == "text/org; charset=utf-8" })
+        );
         assert_eq!(documents[0].projection.as_ref().unwrap().title, "First");
         assert_eq!(documents[1].projection.as_ref().unwrap().title, "Second");
         assert_eq!(documents[2].revision.operation, "tombstone");
@@ -5517,7 +5586,8 @@ mod tests {
             logical_path_is_request_input: true,
             logical_path: "concepts.org".into(),
             path_key: "concepts.org".into(),
-            org: String::new(),
+            content_type: "text/org; charset=utf-8".into(),
+            source: String::new(),
             blob_sha256: "replacement".into(),
             asset_paths: vec![],
             projection: replacement,
@@ -5746,7 +5816,7 @@ mod tests {
         let first = note_with_asset_link("document", &digest_one, None);
         let first_blob = BlobMeta {
             sha256: first.blob_sha256.clone(),
-            size_bytes: first.org.len() as u64,
+            size_bytes: first.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store.replace_note(&first, &first_blob, 2, None).unwrap();
@@ -5755,13 +5825,13 @@ mod tests {
         let second = note_with_asset_link("document", &digest_two, Some(1));
         let second_blob = BlobMeta {
             sha256: second.blob_sha256.clone(),
-            size_bytes: second.org.len() as u64,
+            size_bytes: second.source.len() as u64,
             media_type: "text/org; charset=utf-8".into(),
         };
         store.replace_note(&second, &second_blob, 3, None).unwrap();
 
-        let first_assets = retained_asset_paths_in_org(&first.org);
-        let second_assets = retained_asset_paths_in_org(&second.org);
+        let first_assets = retained_asset_paths_in_org(&first.source);
+        let second_assets = retained_asset_paths_in_org(&second.source);
         let document_id = DocumentId::new("document").unwrap();
         store.tombstone_document(&document_id, 2, 4, None).unwrap();
         store
@@ -5817,8 +5887,8 @@ mod tests {
                 document_id: sources[0].document_id.clone(),
                 revision: sources[0].revision,
                 asset_paths: match sources[0].revision {
-                    1 => retained_asset_paths_in_org(&first.org),
-                    2 => retained_asset_paths_in_org(&second.org),
+                    1 => retained_asset_paths_in_org(&first.source),
+                    2 => retained_asset_paths_in_org(&second.source),
                     _ => Vec::new(),
                 },
                 active_head: sources[0].active_head,

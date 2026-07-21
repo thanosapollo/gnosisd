@@ -2023,7 +2023,7 @@ fn reconcile_content_command(
             })?;
         Some(
             blobs
-                .put(note.org.as_bytes(), "text/org; charset=utf-8")
+                .put(note.source.as_bytes(), &note.content_type)
                 .map_err(|error| StoreError::Storage(Box::new(error)))?,
         )
     } else {
@@ -2067,7 +2067,7 @@ fn replace_note_command(
     created_at_us: i64,
     author_device_id: Option<&str>,
 ) -> Result<DocumentHead, ServiceError> {
-    let blob = blobs.put(prepared.org.as_bytes(), "text/org; charset=utf-8")?;
+    let blob = blobs.put(prepared.source.as_bytes(), &prepared.content_type)?;
     store
         .replace_note(prepared, &blob, created_at_us, author_device_id)
         .map_err(ServiceError::Store)?;
@@ -2090,7 +2090,10 @@ fn apply_device_document_mutation_command(
         let digest = &operation.prepared.blob_sha256;
         let existed = blobs.contains(digest)?;
         Some((
-            blobs.put(operation.prepared.org.as_bytes(), "text/org; charset=utf-8")?,
+            blobs.put(
+                operation.prepared.source.as_bytes(),
+                &operation.prepared.content_type,
+            )?,
             !existed,
         ))
     } else {

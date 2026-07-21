@@ -7,11 +7,13 @@ use thiserror::Error;
 use crate::{
     application::{
         AuthoritativeDocument, ContentBase, ContentReconciliationStatus,
-        OfflineContentConflictReason, OfflineContentMutation, OfflineContentOperation,
-        OfflineContentResult, validate_org_path,
+        MAX_DOCUMENT_PROJECTION_BYTES, MAX_DOCUMENT_SOURCE_BYTES, OfflineContentConflictReason,
+        OfflineContentMutation, OfflineContentOperation, OfflineContentResult,
+        validate_document_path,
     },
     domain::DocumentId,
     is_canonical_sha256,
+    parser::SUPPORTED_CONTENT_TYPES,
     protocol::{
         http_v1::ContentCapabilitiesV1,
         replica::{decode_cursor, encode_cursor},
@@ -19,7 +21,7 @@ use crate::{
 };
 
 pub(crate) const OFFLINE_CONTENT_VERSION: u32 = 1;
-const OFFLINE_CONTENT_CAPABILITIES_VERSION: u32 = 1;
+const OFFLINE_CONTENT_CAPABILITIES_VERSION: u32 = 2;
 pub(crate) const MAX_OFFLINE_CONTENT_OPERATION_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_OFFLINE_CONTENT_RESULT_BYTES: usize = 128 * 1024;
 
@@ -122,6 +124,12 @@ pub(crate) fn offline_content_capabilities(
         version: OFFLINE_CONTENT_CAPABILITIES_VERSION,
         server_id: server_id.to_owned(),
         document_lifecycle: 1,
+        supported_content_types: SUPPORTED_CONTENT_TYPES
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+        max_source_bytes: MAX_DOCUMENT_SOURCE_BYTES as u64,
+        max_projection_bytes: MAX_DOCUMENT_PROJECTION_BYTES as u64,
     })
 }
 
@@ -130,6 +138,9 @@ pub(crate) fn decode_offline_content_capabilities(
 ) -> Result<DecodedOfflineContentCapabilities, OfflineContentWireError> {
     if capabilities.version != OFFLINE_CONTENT_CAPABILITIES_VERSION
         || capabilities.document_lifecycle != 1
+        || capabilities.supported_content_types != SUPPORTED_CONTENT_TYPES
+        || capabilities.max_source_bytes != MAX_DOCUMENT_SOURCE_BYTES as u64
+        || capabilities.max_projection_bytes != MAX_DOCUMENT_PROJECTION_BYTES as u64
         || !is_hex_identity(&capabilities.server_id)
     {
         return Err(OfflineContentWireError::Operation);
@@ -245,9 +256,17 @@ fn validate_operation(value: &OfflineContentOperationV1) -> Result<(), OfflineCo
             document_id,
             logical_path,
             content_sha256,
-            org,
+            content_type,
+            source,
             base,
-        } => validate_document_put(document_id, logical_path, content_sha256, org, base),
+        } => validate_document_put(
+            document_id,
+            logical_path,
+            content_sha256,
+            content_type,
+            source,
+            base,
+        ),
         OfflineContentMutationV1::Rename {
             document_id,
             logical_path,
@@ -263,16 +282,20 @@ fn validate_document_put(
     document_id: &str,
     logical_path: &str,
     content_sha256: &str,
-    org: &str,
+    content_type: &str,
+    source: &str,
     base: &OfflineContentBaseV1,
 ) -> Result<(), OfflineContentWireError> {
     DocumentId::new(document_id.to_owned()).map_err(invalid_operation)?;
     if logical_path.len() > 4096 {
         return Err(OfflineContentWireError::Operation);
     }
-    validate_org_path(logical_path).map_err(invalid_operation)?;
+    validate_document_path(logical_path).map_err(invalid_operation)?;
+    if !SUPPORTED_CONTENT_TYPES.contains(&content_type) {
+        return Err(OfflineContentWireError::Operation);
+    }
     require_digest(content_sha256)?;
-    let actual = format!("{:x}", Sha256::digest(org.as_bytes()));
+    let actual = format!("{:x}", Sha256::digest(source.as_bytes()));
     if actual != content_sha256 || !valid_content_base(base) {
         return Err(OfflineContentWireError::Operation);
     }
@@ -288,7 +311,7 @@ fn validate_document_rename(
     if logical_path.len() > 4096 {
         return Err(OfflineContentWireError::Operation);
     }
-    validate_org_path(logical_path).map_err(invalid_operation)?;
+    validate_document_path(logical_path).map_err(invalid_operation)?;
     require_revision_base(base)
 }
 
@@ -383,7 +406,7 @@ fn decode_result(
 
 fn validate_authoritative(document: &AuthoritativeDocument) -> Result<(), OfflineContentWireError> {
     DocumentId::new(document.document_id.clone()).map_err(invalid_operation)?;
-    validate_org_path(&document.logical_path).map_err(invalid_operation)?;
+    validate_document_path(&document.logical_path).map_err(invalid_operation)?;
     if document.revision == 0
         || document.revision > i64::MAX as u64
         || document.active != document.content_sha256.is_some()
@@ -490,7 +513,8 @@ pub enum OfflineContentMutationV1 {
         document_id: String,
         logical_path: String,
         content_sha256: String,
-        org: String,
+        content_type: String,
+        source: String,
         base: OfflineContentBaseV1,
     },
     #[serde(rename = "rename_document")]
@@ -555,13 +579,15 @@ impl From<OfflineContentMutationV1> for OfflineContentMutation {
                 document_id,
                 logical_path,
                 content_sha256,
-                org,
+                content_type,
+                source,
                 base,
             } => Self::Put {
                 document_id,
                 logical_path,
                 content_sha256,
-                org,
+                content_type,
+                source,
                 base: base.into(),
             },
             OfflineContentMutationV1::Rename {
@@ -588,13 +614,15 @@ impl From<&OfflineContentMutation> for OfflineContentMutationV1 {
                 document_id,
                 logical_path,
                 content_sha256,
-                org,
+                content_type,
+                source,
                 base,
             } => Self::Put {
                 document_id: document_id.clone(),
                 logical_path: logical_path.clone(),
                 content_sha256: content_sha256.clone(),
-                org: org.clone(),
+                content_type: content_type.clone(),
+                source: source.clone(),
                 base: base.clone().into(),
             },
             OfflineContentMutation::Rename {
@@ -784,7 +812,8 @@ mod tests {
                     "document_id": "document",
                     "logical_path": "note.org",
                     "content_sha256": digest,
-                    "org": org,
+                    "content_type": "text/org; charset=utf-8",
+                    "source": org,
                     "base": {"kind": "absent"}
                 }
             }
@@ -870,7 +899,8 @@ mod tests {
                     "document_id": "document",
                     "logical_path": "note.org",
                     "content_sha256": digest,
-                    "org": org,
+                    "content_type": "text/org; charset=utf-8",
+                    "source": org,
                     "base": {"kind": "absent"}
                 }
             }
@@ -992,17 +1022,24 @@ mod tests {
             server_id
         );
         for invalid in [
-            json!({"version":1,"server_id":"bad","document_lifecycle":1}),
-            json!({"version":1,"server_id":"a".repeat(32),"document_lifecycle":0}),
+            json!({"version":2,"server_id":"bad","document_lifecycle":1,
+                   "supported_content_types":["text/org; charset=utf-8"],
+                   "max_source_bytes":1_048_576,"max_projection_bytes":1_048_576}),
+            json!({"version":2,"server_id":"a".repeat(32),"document_lifecycle":0,
+                   "supported_content_types":["text/org; charset=utf-8"],
+                   "max_source_bytes":1_048_576,"max_projection_bytes":1_048_576}),
         ] {
             let invalid = serde_json::from_value(invalid).unwrap();
             assert!(decode_offline_content_capabilities(invalid).is_err());
         }
         assert!(
             serde_json::from_value::<crate::protocol::http_v1::ContentCapabilitiesV1>(json!({
-                "version":1,
+                "version":2,
                 "server_id":"a".repeat(32),
                 "document_lifecycle":1,
+                "supported_content_types":["text/org; charset=utf-8"],
+                "max_source_bytes":1_048_576,
+                "max_projection_bytes":1_048_576,
                 "extra":true
             }))
             .is_err()

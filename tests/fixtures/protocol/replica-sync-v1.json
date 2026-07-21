@@ -18,6 +18,7 @@
           "document_id": "document",
           "revision": 2,
           "logical_path": "note.org",
+          "content_type": "text/org; charset=utf-8",
           "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "blob_url": "/v1/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "operation": "update",

@@ -22,8 +22,9 @@ use thiserror::Error;
 use crate::{
     application::{
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES,
-        MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path, prepare_thema, thema_content,
-        valid_operation_id, validate_asset_path, validate_blob_metadata, validate_org_path,
+        MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path, prepare_document, prepare_thema,
+        thema_content, valid_operation_id, validate_asset_path, validate_blob_metadata,
+        validate_org_path,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
@@ -290,6 +291,7 @@ impl HttpClient {
         input: &NoteWriteRequestV1,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
         require_operation_id(operation_id)?;
+        validate_note_input(input)?;
         let body = encode_document_mutation(input)?;
         let url = self.endpoint("v1/document-mutations")?;
         let request = self
@@ -306,7 +308,7 @@ impl HttpClient {
                 document_id: None,
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
-                content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
+                content_sha256: Some(format!("{:x}", Sha256::digest(input.source.as_bytes()))),
                 prior_revision: None,
             },
         )
@@ -322,6 +324,7 @@ impl HttpClient {
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
         validate_document_mutation_request(document_id, Some(expected_revision))?;
         require_operation_id(operation_id)?;
+        validate_note_input(input)?;
         let body = encode_document_mutation(input)?;
         let url = self.document_mutation_endpoint(document_id)?;
         let request = self
@@ -339,7 +342,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
-                content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
+                content_sha256: Some(format!("{:x}", Sha256::digest(input.source.as_bytes()))),
                 prior_revision: Some(expected_revision),
             },
         )
@@ -680,7 +683,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: true,
                 logical_path: None,
-                content_sha256: Some(format!("{:x}", Sha256::digest(input.org.as_bytes()))),
+                content_sha256: Some(format!("{:x}", Sha256::digest(input.source.as_bytes()))),
                 prior_revision: input.expected_revision,
             },
         )
@@ -1396,6 +1399,18 @@ fn require_operation_id(operation_id: &str) -> Result<(), HttpClientError> {
     valid_operation_id(operation_id)
         .then_some(())
         .ok_or(HttpClientError::InvalidOperationId)
+}
+
+pub fn validate_note_input(input: &NoteWriteRequestV1) -> Result<(), HttpClientError> {
+    prepare_document(
+        None,
+        input.logical_path.clone(),
+        input.content_type.clone(),
+        input.source.clone(),
+        None,
+    )
+    .map(|_| ())
+    .map_err(|_| HttpClientError::InvalidMutation)
 }
 
 fn validate_document_mutation_request(
@@ -2465,6 +2480,7 @@ mod tests {
         let mut head = crate::protocol::http_v1::DocumentHeadV1 {
             document_id: "document".into(),
             logical_path: "note.org".into(),
+            content_type: "text/org; charset=utf-8".into(),
             revision: 1,
             content_sha256: Some(digest),
             active: true,
@@ -2777,7 +2793,8 @@ mod tests {
         let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
         let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
         let input = DocumentImportRequestV1 {
-            org: "\\".repeat(MAX_FRAME_SIZE / 2 + 1),
+            content_type: "text/org; charset=utf-8".into(),
+            source: "\\".repeat(MAX_FRAME_SIZE / 2 + 1),
             expected_revision: None,
         };
 
@@ -2794,7 +2811,8 @@ mod tests {
         let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
         let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
         let input = DocumentImportRequestV1 {
-            org: "* Note".into(),
+            content_type: "text/org; charset=utf-8".into(),
+            source: "* Note".into(),
             expected_revision: None,
         };
 
@@ -2833,13 +2851,19 @@ mod tests {
         let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
         let note = NoteWriteRequestV1 {
             logical_path: "note.org".into(),
-            org: "* Note".into(),
+            content_type: "text/org; charset=utf-8".into(),
+            source: "* Note".into(),
         };
         let rename = NoteRenameRequestV1 {
             logical_path: "renamed.org".into(),
         };
         let invalid_id = "x".repeat(129);
+        let unsupported = NoteWriteRequestV1 {
+            content_type: "text/markdown; charset=utf-8".into(),
+            ..note.clone()
+        };
         for result in [
+            client.create_note("operation", &unsupported).await,
             client
                 .replace_note(&invalid_id, "operation", 1, &note)
                 .await,
@@ -2861,7 +2885,8 @@ mod tests {
                     "document",
                     "operation",
                     &DocumentImportRequestV1 {
-                        org: "* Note".into(),
+                        content_type: "text/org; charset=utf-8".into(),
+                        source: "* Note".into(),
                         expected_revision: Some(u64::MAX),
                     },
                 )

@@ -78,9 +78,12 @@ fn replica_state_rejects_retired_sequence_name() {
 #[test]
 fn public_capability_and_error_dtos_preserve_http_shapes() {
     let content_wire = json!({
-        "version":1,
+        "version":2,
         "server_id":"a".repeat(32),
-        "document_lifecycle":1
+        "document_lifecycle":1,
+        "supported_content_types":["text/org; charset=utf-8"],
+        "max_source_bytes":1048576,
+        "max_projection_bytes":1048576
     });
     let asset_wire = json!({
         "version":1,
@@ -165,6 +168,7 @@ fn public_document_mutation_results_are_exclusive_and_strict() {
         "authoritative":{
             "document_id":"document",
             "logical_path":"note.org",
+            "content_type":"text/org; charset=utf-8",
             "revision":2,
             "content_sha256":"a".repeat(64),
             "active":true
@@ -509,7 +513,8 @@ fn offline_content_operation() -> Value {
             "cursor":"cursor","authored_at_us":1,
             "mutation":{"kind":"put_document","document_id":"document",
                 "logical_path":"note.org","content_sha256":"a".repeat(64),
-                "org":"#+title: Note\n","base":{"kind":"absent"}}
+                "content_type":"text/org; charset=utf-8","source":"#+title: Note\n",
+                "base":{"kind":"absent"}}
         }
     })
 }
@@ -637,12 +642,14 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
         "next":2
     }));
     assert_round_trip::<DocumentHeadV1>(json!({
-        "document_id":"document","logical_path":"notes/example.org","revision":2,
+        "document_id":"document","logical_path":"notes/example.org",
+        "content_type":"text/org; charset=utf-8","revision":2,
         "content_sha256":null,"active":false
     }));
     assert_round_trip::<DocumentRevisionPageV1>(json!({
         "items":[{"document_id":"document","revision":2,
-            "logical_path":"notes/example.org","content_sha256":null,
+            "logical_path":"notes/example.org","content_type":"text/org; charset=utf-8",
+            "content_sha256":null,
             "operation":"tombstone","created_at_us":3,"author_device_id":null}],
         "next":2
     }));
@@ -681,7 +688,11 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
 
 #[test]
 fn public_content_requests_are_strict_and_preserve_defaults() {
-    let note = json!({"logical_path":"notes/example.org","org":"#+title: Example\n"});
+    let note = json!({
+        "logical_path":"notes/example.org",
+        "content_type":"text/org; charset=utf-8",
+        "source":"#+title: Example\n"
+    });
     assert_round_trip::<NoteWriteRequestV1>(note.clone());
     let mut future = note;
     future["future"] = json!(true);
@@ -739,7 +750,8 @@ fn public_content_requests_are_strict_and_preserve_defaults() {
 #[test]
 fn public_content_responses_require_explicit_nullable_fields() {
     let mut head = json!({
-        "document_id":"document","logical_path":"notes/example.org","revision":2,
+        "document_id":"document","logical_path":"notes/example.org",
+        "content_type":"text/org; charset=utf-8","revision":2,
         "content_sha256":null,"active":false
     });
     head.as_object_mut().unwrap().remove("content_sha256");

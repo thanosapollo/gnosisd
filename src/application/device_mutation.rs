@@ -431,7 +431,8 @@ struct DocumentMutationPayload<'a> {
     mutation_kind: DeviceMutationKind,
     document_id: Option<&'a str>,
     logical_path: Option<&'a str>,
-    org: &'a str,
+    content_type: &'a str,
+    source: &'a str,
     blob_sha256: &'a str,
     expected_revision: Option<u64>,
 }
@@ -752,7 +753,8 @@ fn document_request_json(
         logical_path: prepared
             .logical_path_is_request_input
             .then_some(prepared.logical_path.as_str()),
-        org: &prepared.org,
+        content_type: &prepared.content_type,
+        source: &prepared.source,
         blob_sha256: &prepared.blob_sha256,
         expected_revision: prepared.expected_revision,
     })
@@ -825,7 +827,8 @@ mod tests {
         let expected = format!(
             "{{\"format_version\":1,\"mutation_kind\":\"document_create\",\
              \"document_id\":null,\"logical_path\":\"note.org\",\
-             \"org\":\"#+title: Stable\\n\",\"blob_sha256\":\"{digest}\",\
+             \"content_type\":\"text/org; charset=utf-8\",\
+             \"source\":\"#+title: Stable\\n\",\"blob_sha256\":\"{digest}\",\
              \"expected_revision\":null}}"
         );
 
@@ -996,6 +999,7 @@ mod tests {
             DeviceMutationProjection::Document(DocumentHead {
                 document_id: "document".into(),
                 logical_path: "note.org".into(),
+                content_type: "text/org; charset=utf-8".into(),
                 revision: 1,
                 blob_sha256: Some("a".repeat(64)),
                 active: true,

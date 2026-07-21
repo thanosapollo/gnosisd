@@ -13,8 +13,11 @@ use crate::{
         ThemaContentError, ThemaId, ThemaKind,
     },
     is_canonical_sha256,
-    parser::org::{OrgParseError, parse_org},
+    parser::{DocumentParseError, org::OrgParseError, parse_document},
 };
+
+pub(crate) const MAX_DOCUMENT_SOURCE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_DOCUMENT_PROJECTION_BYTES: usize = 1024 * 1024;
 
 static FILE_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[{1,2}file:([^]\n]+)").expect("file-link regex is valid"));
@@ -30,7 +33,8 @@ pub(crate) struct PreparedNote {
     pub(crate) logical_path_is_request_input: bool,
     pub(crate) logical_path: String,
     pub(crate) path_key: String,
-    pub(crate) org: String,
+    pub(crate) content_type: String,
+    pub(crate) source: String,
     pub(crate) blob_sha256: String,
     pub(crate) asset_paths: Vec<String>,
     pub(crate) projection: DocumentProjection,
@@ -72,6 +76,7 @@ pub(crate) struct ContentChange {
 pub(crate) struct DocumentHead {
     pub(crate) document_id: String,
     pub(crate) logical_path: String,
+    pub(crate) content_type: String,
     pub(crate) revision: u64,
     pub(crate) blob_sha256: Option<String>,
     pub(crate) active: bool,
@@ -82,6 +87,7 @@ pub(crate) struct DocumentRevision {
     pub(crate) document_id: String,
     pub(crate) revision: u64,
     pub(crate) logical_path: String,
+    pub(crate) content_type: String,
     pub(crate) blob_sha256: Option<String>,
     pub(crate) operation: String,
     pub(crate) created_at_us: u64,
@@ -468,6 +474,7 @@ pub(crate) fn prepare_asset(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_note(
     document_id: Option<String>,
     logical_path: String,
@@ -475,10 +482,42 @@ pub(crate) fn prepare_note(
     expected_revision: Option<u64>,
 ) -> Result<PreparedNote, ContentError> {
     validate_org_path(&logical_path)?;
-    let asset_paths = asset_paths_in_org(&org)?;
-    let projection = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parse_org(&org)))
-        .map_err(|_| ContentError::OrgParser)?
-        .map_err(ContentError::Org)?;
+    prepare_document(
+        document_id,
+        logical_path,
+        crate::parser::ORG_CONTENT_TYPE.to_owned(),
+        org,
+        expected_revision,
+    )
+}
+
+pub(crate) fn prepare_document(
+    document_id: Option<String>,
+    logical_path: String,
+    content_type: String,
+    source: String,
+    expected_revision: Option<u64>,
+) -> Result<PreparedNote, ContentError> {
+    validate_document_path(&logical_path)?;
+    if source.len() > MAX_DOCUMENT_SOURCE_BYTES {
+        return Err(ContentError::SourceTooLarge);
+    }
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse_document(&content_type, &source)
+    }))
+    .map_err(|_| ContentError::DocumentParser)?
+    .map_err(|error| match error {
+        DocumentParseError::UnsupportedContentType(_) => ContentError::UnsupportedType,
+        DocumentParseError::Org(error) => ContentError::Org(error),
+    })?;
+    asset_paths_in_org(&source)?;
+    let asset_paths = parsed.asset_paths().to_vec();
+    let projection = parsed.into_projection();
+    let projection_bytes = serde_json::to_vec(&DocumentProjectionSnapshot::from(&projection))
+        .map_err(|_| ContentError::Serialization)?;
+    if projection_bytes.len() > MAX_DOCUMENT_PROJECTION_BYTES {
+        return Err(ContentError::ProjectionTooLarge);
+    }
     let explicit_document_id = document_id.is_some();
     let document_id = document_id.unwrap_or_else(|| Uuid::now_v7().to_string());
     Ok(PreparedNote {
@@ -486,13 +525,22 @@ pub(crate) fn prepare_note(
         explicit_document_id,
         logical_path_is_request_input: true,
         path_key: path_key(&logical_path),
-        blob_sha256: format!("{:x}", Sha256::digest(org.as_bytes())),
+        blob_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
         logical_path,
-        org,
+        content_type,
+        source,
         asset_paths,
         projection,
         expected_revision,
     })
+}
+
+pub(crate) fn validate_document_path(value: &str) -> Result<(), ContentError> {
+    validate_logical_path(value)?;
+    if value.starts_with("assets/") {
+        return Err(ContentError::UnsupportedType);
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_logical_path(value: &str) -> Result<(), ContentError> {
@@ -649,12 +697,16 @@ pub(crate) enum ContentError {
     BlobMetadata,
     #[error("file type is not supported")]
     UnsupportedType,
+    #[error("document source exceeds the size limit")]
+    SourceTooLarge,
+    #[error("document projection exceeds the size limit")]
+    ProjectionTooLarge,
     #[error("thema content references an asset that is not attached")]
     UnmanagedAsset,
     #[error("invalid Org document")]
     Org(#[from] OrgParseError),
-    #[error("Org parser rejected the document")]
-    OrgParser,
+    #[error("document parser rejected the document")]
+    DocumentParser,
     #[error("thema content is invalid")]
     Thema(#[from] ThemaContentError),
     #[error("content serialization failed")]
@@ -666,9 +718,47 @@ mod tests {
     use crate::domain::ThemaConceptRelation;
 
     use super::{
-        ContentError, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_note, prepare_thema,
-        thema_content, validate_asset_path, validate_blob_metadata,
+        ContentError, MAX_DOCUMENT_SOURCE_BYTES, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path,
+        prepare_document, prepare_note, prepare_thema, thema_content, validate_asset_path,
+        validate_blob_metadata,
     };
+
+    #[test]
+    fn document_preparation_is_content_type_driven_and_source_bounded() {
+        let document = prepare_document(
+            None,
+            "notes/note.org".into(),
+            "text/org; charset=utf-8".into(),
+            "#+title: Note\n".into(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(document.content_type, "text/org; charset=utf-8");
+        assert_eq!(document.source, "#+title: Note\n");
+
+        assert_eq!(
+            prepare_document(
+                None,
+                "notes/note.md".into(),
+                "text/markdown; charset=utf-8".into(),
+                "# Note".into(),
+                None,
+            )
+            .unwrap_err(),
+            ContentError::UnsupportedType
+        );
+        assert_eq!(
+            prepare_document(
+                None,
+                "notes/note.org".into(),
+                "text/org; charset=utf-8".into(),
+                "x".repeat(MAX_DOCUMENT_SOURCE_BYTES + 1),
+                None,
+            )
+            .unwrap_err(),
+            ContentError::SourceTooLarge
+        );
+    }
 
     #[test]
     fn blob_metadata_matches_canonical_asset_limits() {
