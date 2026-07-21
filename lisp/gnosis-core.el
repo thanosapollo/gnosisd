@@ -1232,39 +1232,70 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
               '("Gnosis mutation response identity is invalid")))
     projection))
 
+(defun gnosis-core--review-session-valid-p (session expected-status)
+  "Return non-nil when SESSION is a valid online EXPECTED-STATUS projection."
+  (let ((status (plist-get session :status))
+        (position (plist-get session :current_position))
+        (length (plist-get session :queue_length)))
+    (and (equal "online" (plist-get session :mode))
+         (equal expected-status status)
+         (integerp position) (>= position 0)
+         (integerp length) (>= length 0)
+         (pcase status
+           ("active" (< position length))
+           ("completed" (= position length))
+           ((or "quit" "aborted") (<= position length))
+           (_ nil)))))
+
 (defun gnosis-core-review-session-create (source &optional target-count)
   "Create and return a review session from SOURCE and TARGET-COUNT."
-  (gnosis-core--typed-request
-   "post_review_sessions" nil nil
-   (list :source source
-         :target_count (or target-count gnosis-core--json-null))))
+  (let ((session
+         (gnosis-core--typed-request
+          "post_review_sessions" nil nil
+          (list :source source
+                :target_count (or target-count gnosis-core--json-null)))))
+    (unless (and (gnosis-core--review-session-valid-p session "active")
+                 (equal source (plist-get session :source))
+                 (if target-count
+                     (equal target-count (plist-get session :target_count))
+                   (let ((effective (plist-get session :target_count)))
+                     (and (integerp effective) (> effective 0)))))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis review session response is not correlated")))
+    session))
 
 (defun gnosis-core-review-session-active ()
   "Return the active review-session envelope."
-  (gnosis-core--typed-request "get_review_sessions_active"))
+  (let* ((envelope (gnosis-core--typed-request "get_review_sessions_active"))
+         (session (plist-get envelope :session)))
+    (unless (or (eq session gnosis-core--json-null)
+                (gnosis-core--review-session-valid-p session "active"))
+      (gnosis-core--invalid "Gnosis active review session is invalid"))
+    envelope))
 
-(defun gnosis-core--review-session-action (session-id action)
+(defun gnosis-core--review-session-action (session-id action expected-status)
   "Apply review session ACTION to SESSION-ID."
   (let ((session
          (gnosis-core--typed-request
           (format "post_review_sessions__id__%s" action)
           (list (cons "id" session-id)))))
-    (unless (equal session-id (plist-get session :session_id))
+    (unless (and (equal session-id (plist-get session :session_id))
+                 (gnosis-core--review-session-valid-p session expected-status))
       (signal 'gnosis-core-mutation-uncertain
-              '("Gnosis review session response identity is invalid")))
+              '("Gnosis review session response is invalid")))
     session))
 
 (defun gnosis-core-review-session-resume (session-id)
   "Resume review SESSION-ID."
-  (gnosis-core--review-session-action session-id "resume"))
+  (gnosis-core--review-session-action session-id "resume" "active"))
 
 (defun gnosis-core-review-session-quit (session-id)
   "Quit review SESSION-ID."
-  (gnosis-core--review-session-action session-id "quit"))
+  (gnosis-core--review-session-action session-id "quit" "quit"))
 
 (defun gnosis-core-review-session-abort (session-id)
   "Abort review SESSION-ID."
-  (gnosis-core--review-session-action session-id "abort"))
+  (gnosis-core--review-session-action session-id "abort" "aborted"))
 
 (defun gnosis-core-review-attempt-begin (session-id)
   "Begin or return the active attempt for review SESSION-ID."

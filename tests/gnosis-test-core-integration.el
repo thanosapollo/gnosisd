@@ -89,7 +89,7 @@
                   :topic_forward_depth gnosis-core--json-null
                   :topic_backward_depth gnosis-core--json-null
                   :manual_ids (vector thema-id)))
-           (session (gnosis-core-review-session-create source 1))
+           (session (gnosis-core-review-session-create source))
            (attempt
             (gnosis-core-review-attempt-begin
              (plist-get session :session_id)))

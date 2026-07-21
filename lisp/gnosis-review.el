@@ -64,10 +64,8 @@
           (plist-get gnosis-review--session :queue_length)))
 
 (defun gnosis-review--session-complete-p (session)
-  "Return non-nil when SESSION has no remaining attempt."
-  (or (equal (plist-get session :status) "completed")
-      (>= (plist-get session :current_position)
-          (plist-get session :queue_length))))
+  "Return non-nil when SESSION has no remaining review item."
+  (equal (plist-get session :status) "completed"))
 
 (defun gnosis-review--insert-image (reference)
   "Insert managed image REFERENCE when display support exists."
@@ -242,6 +240,8 @@
   (condition-case condition
       (gnosis-review--open
        (gnosis-core-review-session-create source target-count))
+    (gnosis-core-not-found
+     (message "No Gnosis review items are available"))
     (gnosis-core-mutation-uncertain
      (let ((session (gnosis-review--active-session))
            (expected-count (or target-count gnosis-core--json-null)))
@@ -379,9 +379,8 @@
       (condition-case condition
           (gnosis-core-review-session-quit session-id)
         (gnosis-core-mutation-uncertain
-         (when-let* ((session (gnosis-review--active-session)))
-           (when (equal session-id (plist-get session :session_id))
-             (signal (car condition) (cdr condition)))))))
+         (gnosis-review--active-session)
+         (signal (car condition) (cdr condition)))))
     (kill-buffer (current-buffer))))
 
 (provide 'gnosis-review)

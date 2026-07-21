@@ -852,10 +852,18 @@ CONTENT-TYPE defaults to application/json."
                    ("get_review_sessions_active"
                     `(:session ,gnosis-core--json-null))
                    ((or "post_review_sessions"
-                        "post_review_sessions__id__resume"
-                        "post_review_sessions__id__quit"
-                        "post_review_sessions__id__abort")
-                    '(:session_id "session"))
+                        "post_review_sessions__id__resume")
+                    `(:session_id "session" :mode "online" :status "active"
+                      :source ,source :target_count 12
+                      :current_position 0 :queue_length 1))
+                   ("post_review_sessions__id__quit"
+                    `(:session_id "session" :mode "online" :status "quit"
+                      :source ,source :target_count 12
+                      :current_position 0 :queue_length 1))
+                   ("post_review_sessions__id__abort"
+                    `(:session_id "session" :mode "online" :status "aborted"
+                      :source ,source :target_count 12
+                      :current_position 0 :queue_length 1))
                    ((or "post_review_sessions__id__attempts"
                         "post_review_attempts__id__answer")
                     '(:attempt_id "attempt" :session_id "session"))
@@ -888,6 +896,24 @@ CONTENT-TYPE defaults to application/json."
         ("get_review_attempt_state" (("id" . "attempt")))
         ("post_review_attempts__id__commit" (("id" . "attempt"))))
       (nreverse calls)))))
+
+(ert-deftest gnosis-core-review-session-rejects-invalid-status-position ()
+  (let ((invalid '(:session_id "session" :mode "online" :status "active"
+                   :current_position 1 :queue_length 1)))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _arguments) `(:session ,invalid))))
+      (should-error (gnosis-core-review-session-active)
+                    :type 'gnosis-core-protocol-error))
+    (should-not
+     (gnosis-core--review-session-valid-p
+      '(:mode "offline" :status "active"
+        :current_position 0 :queue_length 1)
+      "active"))
+    (should
+     (gnosis-core--review-session-valid-p
+      '(:mode "online" :status "completed"
+        :current_position 1 :queue_length 1)
+      "completed"))))
 
 (ert-deftest gnosis-core-review-desired-state-correlates-response ()
   (let (calls result)
