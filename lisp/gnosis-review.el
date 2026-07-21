@@ -219,13 +219,14 @@
   "Open a review buffer for active SESSION."
   (if (gnosis-review--session-complete-p session)
       (message "No Gnosis review items are available")
-    (let ((buffer (get-buffer-create gnosis-review-buffer-name)))
+    (let ((attempt
+           (gnosis-core-review-attempt-begin
+            (plist-get session :session_id)))
+          (buffer (get-buffer-create gnosis-review-buffer-name)))
       (pop-to-buffer buffer)
       (gnosis-review-mode)
       (setq gnosis-review--session session
-            gnosis-review--attempt
-            (gnosis-core-review-attempt-begin
-             (plist-get session :session_id))
+            gnosis-review--attempt attempt
             gnosis-review--attempt-revision nil)
       (gnosis-review--render))))
 

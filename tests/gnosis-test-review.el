@@ -45,6 +45,27 @@
       (gnosis-review--open session)
       (should-not began))))
 
+(ert-deftest gnosis-review-open-preserves-buffer-when-begin-fails ()
+  (let ((buffer (get-buffer-create gnosis-review-buffer-name))
+        popped)
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (erase-buffer)
+            (insert "keep"))
+          (cl-letf (((symbol-function 'gnosis-core-review-attempt-begin)
+                     (lambda (&rest _)
+                       (signal 'gnosis-core-unavailable '("down"))))
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (&rest _) (setq popped t))))
+            (should-error
+             (gnosis-review--open (gnosis-test-review--session))
+             :type 'gnosis-core-unavailable))
+          (should-not popped)
+          (with-current-buffer buffer
+            (should (equal "keep" (buffer-string)))))
+      (kill-buffer buffer))))
+
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
   (let ((gnosis-review--attempt
          (gnosis-test-review--attempt
