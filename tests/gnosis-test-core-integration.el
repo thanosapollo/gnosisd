@@ -69,6 +69,57 @@
       (should (proper-list-p (plist-get projection :queue)))
       (should (proper-list-p (plist-get projection :content))))))
 
+(ert-deftest gnosis-core-integration-review-journey ()
+  (skip-unless (gnosis-test-core-integration--available-p))
+  (gnosis-test-core-integration--with-client
+    (let* ((gnosis-core--contract-cache nil)
+           (thema
+            (gnosis-core--typed-request
+             "post_themata" nil nil
+             '(:kind "basic" :keimenon "Question" :answer ["Answer"])
+             (list (gnosis-core--idempotency-key-header
+                    (gnosis-core-operation-id)))))
+           (thema-id
+            (plist-get (plist-get (plist-get thema :authoritative) :value)
+                       :thema_id))
+           (source
+            (list :kind "manual" :tags [] :exclude_tags []
+                  :topic_node_id gnosis-core--json-null
+                  :topic_forward_depth gnosis-core--json-null
+                  :topic_backward_depth gnosis-core--json-null
+                  :manual_ids (vector thema-id)))
+           (session (gnosis-core-review-session-create source 1))
+           (attempt
+            (gnosis-core-review-attempt-begin
+             (plist-get session :session_id)))
+           (attempt-id (plist-get attempt :attempt_id))
+           state result)
+      (setq attempt
+            (gnosis-core-review-attempt-answer
+             attempt-id '(:kind "text" :value "Answer")))
+      (should (equal "graded" (plist-get attempt :status)))
+      (setq state (gnosis-core-review-attempt-state attempt-id)
+            result
+            (gnosis-core-review-attempt-set-accepted-success
+             attempt-id (plist-get state :attempt_revision)
+             gnosis-core--json-false))
+      (should (eq gnosis-core--json-false
+                  (plist-get (plist-get result :attempt) :accepted_success)))
+      (setq result
+            (gnosis-core-review-attempt-set-suspension
+             attempt-id (plist-get result :attempt_revision) t))
+      (should (eq t
+                  (plist-get (plist-get result :attempt)
+                             :desired_suspended)))
+      (should (stringp
+               (plist-get (gnosis-core-review-attempt-commit attempt-id)
+                          :event_id)))
+      (should (equal "committed"
+                     (plist-get
+                      (plist-get (gnosis-core-review-attempt-state attempt-id)
+                                 :attempt)
+                      :status))))))
+
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
   (load-file (getenv "GNOSIS_OPENAPI_GENERATED"))

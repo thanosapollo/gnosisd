@@ -16,8 +16,11 @@ offline-editable Org working tree, customize =gnosis-nodes-dir= and run
 pulls authoritative changes before sending durable local operations.  Conflicts
 preserve local content and require explicit Ediff resolution and acceptance.
 
-The client does not contain handwritten Gnosis DTOs or temporary route
-bindings.  There is no SQLite access and no local fallback.
+The client resolves operation identities and strict schemas from the daemon's
+live OpenAPI document; it has no handwritten Gnosis DTOs or direct route
+bindings.  There is no SQLite access and no local fallback.  Run =M-x
+gnosis-review= for due review or =M-x gnosis-review-resume= to recover the
+daemon's active session.
 
 ** Requirements
 

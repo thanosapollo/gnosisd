@@ -84,16 +84,18 @@ Run =M-x gnosis= to open the foundation dashboard.  It checks public =/health=
 readiness and displays the OpenAPI version and path count from
 =/v1/openapi.json=.  Press =g= to refresh and =q= to close the buffer.
 
-The following public commands remain defined, but their operations are not yet
-available:
+* Review
 
-+ =gnosis-add-thema=
-+ =gnosis-edit-thema=
-+ =gnosis-review=
-+ =gnosis-review-topic=
-+ =gnosis-review-resume=
+Run =M-x gnosis-review= for the daemon's due queue, =M-x
+gnosis-review-topic= for one server topic node, or =M-x gnosis-review-resume=
+to inspect an active durable session.  The UI renders the server presentation
+and submits structured text, text-vector, or choice responses.  The daemon
+alone grades, reveals answers, applies accepted-result overrides and desired
+suspension, schedules, persists, and commits.
 
-They do not call provisional routes or mutate local state.
+Review writes are single-shot.  Revision conflicts refresh the authoritative
+attempt.  If delivery is unknown, Gnosis reads the active session or attempt
+state and never repeats the mutation automatically.
 
 * Managed assets
 

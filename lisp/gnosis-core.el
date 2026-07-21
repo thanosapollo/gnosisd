@@ -1232,6 +1232,117 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
               '("Gnosis mutation response identity is invalid")))
     projection))
 
+(defun gnosis-core-review-session-create (source &optional target-count)
+  "Create and return a review session from SOURCE and TARGET-COUNT."
+  (gnosis-core--typed-request
+   "post_review_sessions" nil nil
+   (list :source source
+         :target_count (or target-count gnosis-core--json-null))))
+
+(defun gnosis-core-review-session-active ()
+  "Return the active review-session envelope."
+  (gnosis-core--typed-request "get_review_sessions_active"))
+
+(defun gnosis-core--review-session-action (session-id action)
+  "Apply review session ACTION to SESSION-ID."
+  (let ((session
+         (gnosis-core--typed-request
+          (format "post_review_sessions__id__%s" action)
+          (list (cons "id" session-id)))))
+    (unless (equal session-id (plist-get session :session_id))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis review session response identity is invalid")))
+    session))
+
+(defun gnosis-core-review-session-resume (session-id)
+  "Resume review SESSION-ID."
+  (gnosis-core--review-session-action session-id "resume"))
+
+(defun gnosis-core-review-session-quit (session-id)
+  "Quit review SESSION-ID."
+  (gnosis-core--review-session-action session-id "quit"))
+
+(defun gnosis-core-review-session-abort (session-id)
+  "Abort review SESSION-ID."
+  (gnosis-core--review-session-action session-id "abort"))
+
+(defun gnosis-core-review-attempt-begin (session-id)
+  "Begin or return the active attempt for review SESSION-ID."
+  (let ((attempt
+         (gnosis-core--typed-request
+          "post_review_sessions__id__attempts"
+          (list (cons "id" session-id)))))
+    (unless (equal session-id (plist-get attempt :session_id))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis review attempt session identity is invalid")))
+    attempt))
+
+(defun gnosis-core-review-attempt-answer (attempt-id answer)
+  "Submit structured ANSWER for ATTEMPT-ID without automatic retry."
+  (let ((attempt
+         (gnosis-core--typed-request
+          "post_review_attempts__id__answer"
+          (list (cons "id" attempt-id)) nil answer)))
+    (unless (equal attempt-id (plist-get attempt :attempt_id))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis review answer response identity is invalid")))
+    attempt))
+
+(defun gnosis-core-review-attempt-state (attempt-id)
+  "Return authoritative revisioned state for ATTEMPT-ID."
+  (let ((state
+         (gnosis-core--typed-request
+          "get_review_attempt_state" (list (cons "id" attempt-id)))))
+    (unless (equal attempt-id
+                   (plist-get (plist-get state :attempt) :attempt_id))
+      (gnosis-core--invalid "Gnosis review attempt state identity mismatch"))
+    state))
+
+(defun gnosis-core--review-desired-state
+    (identity attempt-id expected-revision key desired operation-id)
+  "Set ATTEMPT-ID's desired review KEY through IDENTITY.
+Correlate the response with EXPECTED-REVISION and OPERATION-ID."
+  (let* ((operation-id (or operation-id (gnosis-core-operation-id)))
+         (result
+          (gnosis-core--typed-request
+           identity (list (cons "id" attempt-id)) nil
+           (list :version 1 :operation_id operation-id
+                 :expected_attempt_revision expected-revision key desired)))
+         (changed (plist-get result :changed))
+         (expected-result-revision
+          (+ expected-revision (if (eq changed t) 1 0))))
+    (unless (and (integerp expected-revision)
+                 (integerp (plist-get result :attempt_revision))
+                 (equal 1 (plist-get result :version))
+                 (equal operation-id (plist-get result :operation_id))
+                 (memq changed (list t gnosis-core--json-false))
+                 (= expected-result-revision
+                    (plist-get result :attempt_revision))
+                 (equal attempt-id
+                        (plist-get (plist-get result :attempt) :attempt_id)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis review mutation response correlation failed")))
+    result))
+
+(defun gnosis-core-review-attempt-set-accepted-success
+    (attempt-id expected-revision accepted-success &optional operation-id)
+  "Set ATTEMPT-ID's ACCEPTED-SUCCESS at EXPECTED-REVISION."
+  (gnosis-core--review-desired-state
+   "put_review_attempt_accepted_success" attempt-id expected-revision
+   :accepted_success accepted-success operation-id))
+
+(defun gnosis-core-review-attempt-set-suspension
+    (attempt-id expected-revision desired-suspended &optional operation-id)
+  "Set ATTEMPT-ID's DESIRED-SUSPENDED at EXPECTED-REVISION."
+  (gnosis-core--review-desired-state
+   "put_review_attempt_suspension" attempt-id expected-revision
+   :desired_suspended desired-suspended operation-id))
+
+(defun gnosis-core-review-attempt-commit (attempt-id)
+  "Commit ATTEMPT-ID without automatic retry and return its event identity."
+  (gnosis-core--typed-request
+   "post_review_attempts__id__commit" (list (cons "id" attempt-id))))
+
 (defun gnosis-core-api-unavailable (operation)
   "Signal that generated bindings for OPERATION are not available."
   (signal 'gnosis-core-api-unavailable

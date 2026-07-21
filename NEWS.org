@@ -19,11 +19,13 @@
   and strict loopback/HTTPS authority validation.
 + Added a deterministic OpenAPI 3.1 operation-manifest generator and isolated
   live contract harness.  Generated manifests remain build artifacts and do
-  do not add another runtime module.
-+ Removed handwritten success DTOs and provisional dashboard, authoring, and
-  review route bindings while the official API is changing.  Public domain
-  commands fail before transport or local mutation until generated bindings
-  are available.
+  not add another runtime module.
++ Removed handwritten success DTOs and direct route bindings.  Dashboard,
+  authoring, and review operations resolve through the live OpenAPI contract.
++ Restored server-authoritative review creation, resume, structured response,
+  accepted-result override, suspension, commit, and quit/abort.  Revision
+  conflicts refresh authoritative attempt state; delivery-unknown mutations
+  are never retried automatically and recover through server reads.
 + Added a foundation dashboard for daemon health and OpenAPI visibility.
 + Fetch managed review assets through authenticated HTTP and publish only
   private SHA-256-verified cache entries.

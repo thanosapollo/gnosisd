@@ -838,5 +838,84 @@ CONTENT-TYPE defaults to application/json."
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" t)
    :type 'gnosis-core-mutation-uncertain))
 
+(ert-deftest gnosis-core-review-bindings-use-live-operation-identities ()
+  (let ((source `(:kind "due" :tags [] :exclude_tags []
+                  :topic_node_id ,gnosis-core--json-null
+                  :topic_forward_depth ,gnosis-core--json-null
+                  :topic_backward_depth ,gnosis-core--json-null
+                  :manual_ids []))
+        calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 (pcase (car arguments)
+                   ("get_review_sessions_active"
+                    `(:session ,gnosis-core--json-null))
+                   ((or "post_review_sessions"
+                        "post_review_sessions__id__resume"
+                        "post_review_sessions__id__quit"
+                        "post_review_sessions__id__abort")
+                    '(:session_id "session"))
+                   ((or "post_review_sessions__id__attempts"
+                        "post_review_attempts__id__answer")
+                    '(:attempt_id "attempt" :session_id "session"))
+                   ("get_review_attempt_state"
+                    '(:version 1 :attempt_revision 3
+                      :attempt (:attempt_id "attempt")))
+                   ("post_review_attempts__id__commit"
+                    '(:event_id "event"))))))
+      (gnosis-core-review-session-create source 12)
+      (gnosis-core-review-session-active)
+      (gnosis-core-review-session-resume "session")
+      (gnosis-core-review-session-quit "session")
+      (gnosis-core-review-session-abort "session")
+      (gnosis-core-review-attempt-begin "session")
+      (gnosis-core-review-attempt-answer
+       "attempt" '(:kind "texts" :value ["one" "two"]))
+      (gnosis-core-review-attempt-state "attempt")
+      (gnosis-core-review-attempt-commit "attempt"))
+    (should
+     (equal
+      `(("post_review_sessions" nil nil
+         (:source ,source :target_count 12))
+        ("get_review_sessions_active")
+        ("post_review_sessions__id__resume" (("id" . "session")))
+        ("post_review_sessions__id__quit" (("id" . "session")))
+        ("post_review_sessions__id__abort" (("id" . "session")))
+        ("post_review_sessions__id__attempts" (("id" . "session")))
+        ("post_review_attempts__id__answer" (("id" . "attempt")) nil
+         (:kind "texts" :value ["one" "two"]))
+        ("get_review_attempt_state" (("id" . "attempt")))
+        ("post_review_attempts__id__commit" (("id" . "attempt"))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-review-desired-state-correlates-response ()
+  (let (calls result)
+    (cl-letf (((symbol-function 'gnosis-core-operation-id)
+               (lambda () "operation"))
+              ((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments) (push arguments calls) result)))
+      (setq result
+            '(:version 1 :operation_id "operation" :changed t
+              :attempt_revision 8 :attempt (:attempt_id "attempt")))
+      (should
+       (eq result
+           (gnosis-core-review-attempt-set-accepted-success
+            "attempt" 7 gnosis-core--json-false)))
+      (should
+       (equal
+        `("put_review_attempt_accepted_success" (("id" . "attempt")) nil
+          (:version 1 :operation_id "operation"
+           :expected_attempt_revision 7
+           :accepted_success ,gnosis-core--json-false))
+        (car calls)))
+      (setq result
+            `(:version 1 :operation_id "operation"
+              :changed ,gnosis-core--json-false :attempt_revision 8
+              :attempt (:attempt_id "different")))
+      (should-error
+       (gnosis-core-review-attempt-set-suspension "attempt" 8 t)
+       :type 'gnosis-core-mutation-uncertain))))
+
 (provide 'gnosis-test-core)
 ;;; gnosis-test-core.el ends here
