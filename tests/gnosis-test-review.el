@@ -23,6 +23,9 @@
         :revealed_answer (if (equal status "pending")
                              gnosis-core--json-null ["Answer"])
         :revealed_parathema gnosis-core--json-null
+        :response (if (equal status "pending")
+                      gnosis-core--json-null
+                    '(:kind "text" :value "response"))
         :accepted_success (if (equal status "pending")
                               gnosis-core--json-null t)
         :desired_suspended gnosis-core--json-false
@@ -145,6 +148,58 @@
         (should (= answers 1))
         (should (= reads 1))
         (should (equal "graded" (plist-get gnosis-review--attempt :status)))))))
+
+(ert-deftest gnosis-review-answer-uncertainty-rejects-unrelated-response ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "pending"))
+    (cl-letf (((symbol-function 'gnosis-review--read-answer)
+               (lambda () '(:kind "text" :value "mine")))
+              ((symbol-function 'gnosis-core-review-attempt-answer)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-mutation-uncertain '("unknown"))))
+              ((symbol-function 'gnosis-core-review-attempt-state)
+               (lambda (_id)
+                 (let ((attempt (gnosis-test-review--attempt "graded")))
+                   (setf (plist-get attempt :response)
+                         '(:kind "text" :value "other"))
+                   (list :attempt_revision 2 :attempt attempt)))))
+      (should-error (gnosis-review--answer)
+                    :type 'gnosis-core-mutation-uncertain))))
+
+(ert-deftest gnosis-review-uncertain-no-op-requires-revision-advance ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "graded")
+          gnosis-review--attempt-revision 3)
+    (cl-letf (((symbol-function 'gnosis-review--load-revision)
+               (lambda ()
+                 (setf (plist-get gnosis-review--attempt :accepted_success) t)
+                 (list :attempt_revision 3 :attempt gnosis-review--attempt)))
+              ((symbol-function 'gnosis-review--render) #'ignore))
+      (should-error
+       (gnosis-review--revisioned-operation
+        (lambda () (signal 'gnosis-core-mutation-uncertain '("unknown")))
+        :accepted_success t)
+       :type 'gnosis-core-mutation-uncertain))))
+
+(ert-deftest gnosis-review-create-uncertainty-rejects-unrelated-session ()
+  (let ((source (gnosis-review--source "due"))
+        opened)
+    (cl-letf (((symbol-function 'gnosis-core-status) #'ignore)
+              ((symbol-function 'gnosis-core-review-session-create)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-mutation-uncertain '("unknown"))))
+              ((symbol-function 'gnosis-review--active-session)
+               (lambda ()
+                 (append (gnosis-test-review--session)
+                         (list :source (gnosis-review--source "topic")
+                               :target_count 100))))
+              ((symbol-function 'gnosis-review--open)
+               (lambda (_) (setq opened t))))
+      (should-error (gnosis-review--start source 20)
+                    :type 'gnosis-core-mutation-uncertain)
+      (should-not opened))))
 
 (ert-deftest gnosis-review-finish-orders-authoritative-state-before-commit ()
   (with-temp-buffer

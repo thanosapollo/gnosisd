@@ -172,18 +172,21 @@
 
 (defun gnosis-review--revisioned-operation (operation key desired)
   "Call OPERATION and reconcile KEY with DESIRED after recoverable errors."
-  (condition-case condition
-      (funcall operation)
-    (gnosis-core-conflict
-     (gnosis-review--load-revision)
-     (gnosis-review--render)
-     (user-error "Review attempt changed on server; refreshed"))
-    (gnosis-core-mutation-uncertain
-     (let ((state (gnosis-review--load-revision)))
+  (let ((expected-revision gnosis-review--attempt-revision))
+    (condition-case condition
+        (funcall operation)
+      (gnosis-core-conflict
+       (gnosis-review--load-revision)
        (gnosis-review--render)
-       (if (equal desired (plist-get gnosis-review--attempt key))
-           state
-         (signal (car condition) (cdr condition)))))))
+       (user-error "Review attempt changed on server; refreshed"))
+      (gnosis-core-mutation-uncertain
+       (let ((state (gnosis-review--load-revision)))
+         (gnosis-review--render)
+         (if (and (= gnosis-review--attempt-revision
+                     (1+ expected-revision))
+                  (equal desired (plist-get gnosis-review--attempt key)))
+             state
+           (signal (car condition) (cdr condition))))))))
 
 (defun gnosis-review--active-session ()
   "Return the authoritative active session, or nil."
@@ -240,9 +243,13 @@
       (gnosis-review--open
        (gnosis-core-review-session-create source target-count))
     (gnosis-core-mutation-uncertain
-     (if-let* ((session (gnosis-review--active-session)))
-         (gnosis-review--open session)
-       (signal (car condition) (cdr condition))))))
+     (let ((session (gnosis-review--active-session))
+           (expected-count (or target-count gnosis-core--json-null)))
+       (if (and session
+                (equal source (plist-get session :source))
+                (equal expected-count (plist-get session :target_count)))
+           (gnosis-review--open session)
+         (signal (car condition) (cdr condition)))))))
 
 ;;;###autoload
 (defun gnosis-review (&optional target-count)
@@ -283,16 +290,18 @@
   (interactive)
   (unless (equal (plist-get gnosis-review--attempt :status) "pending")
     (user-error "Attempt already answered"))
-  (setq gnosis-review--attempt-revision nil)
-  (condition-case condition
-      (setq gnosis-review--attempt
-            (gnosis-core-review-attempt-answer
-             (plist-get gnosis-review--attempt :attempt_id)
-             (gnosis-review--read-answer)))
-    (gnosis-core-mutation-uncertain
-     (gnosis-review--load-revision)
-     (when (equal "pending" (plist-get gnosis-review--attempt :status))
-       (signal (car condition) (cdr condition)))))
+  (let ((answer (gnosis-review--read-answer)))
+    (setq gnosis-review--attempt-revision nil)
+    (condition-case condition
+        (setq gnosis-review--attempt
+              (gnosis-core-review-attempt-answer
+               (plist-get gnosis-review--attempt :attempt_id) answer))
+      (gnosis-core-mutation-uncertain
+       (gnosis-review--load-revision)
+       (unless (and (not (equal "pending"
+                                (plist-get gnosis-review--attempt :status)))
+                    (equal answer (plist-get gnosis-review--attempt :response)))
+         (signal (car condition) (cdr condition))))))
   (unless gnosis-review--attempt-revision
     (gnosis-review--load-revision))
   (gnosis-review--render))
