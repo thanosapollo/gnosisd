@@ -74,7 +74,16 @@ device=$(
         --scope content:write
 )
 token=$(printf '%s\n' "$device" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-[ -n "$token" ] || { echo "Temporary device token missing" >&2; exit 1; }
+device_2=$(
+    "$gnosis_cli" --socket "$state/gnosis.sock" \
+        device-create emacs-contract-2 --scope read --scope review \
+        --scope content:write
+)
+token_2=$(printf '%s\n' "$device_2" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+[ -n "$token" ] && [ -n "$token_2" ] || {
+    echo "Temporary device tokens missing" >&2
+    exit 1
+}
 
 openapi=$state/openapi.json
 generated=$state/gnosis-openapi-contract.el
@@ -90,6 +99,7 @@ GNOSIS_ENV_WRAPPED=1 \
 GNOSIS_ENV_WRAPPED=1 \
 GNOSIS_HTTP_TEST_URL="http://127.0.0.1:$port" \
 GNOSIS_HTTP_TEST_TOKEN="$token" \
+GNOSIS_HTTP_TEST_TOKEN_2="$token_2" \
 GNOSIS_OPENAPI_GENERATED="$generated" \
     "$make_bin" --no-print-directory EMACS="$emacs_bin" \
     TEST=tests/gnosis-test-core-integration.el do-test

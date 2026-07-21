@@ -1688,17 +1688,34 @@ Use already validated PAYLOAD when supplied."
              (equal (gnosis-nodes--nullable (plist-get entry :digest)) digest))
          (eq active (not (eq kind :delete))))))
 
-(defun gnosis-nodes--reconcile-applied-effect-p (entry record projection)
+(defun gnosis-nodes--reconcile-applied-effect-p
+    (entry record projection &optional state)
   "Reconcile exact local effect for applied ENTRY and return non-nil.
-RECORD and PROJECTION describe the confirming feed conflict."
+RECORD and PROJECTION describe the confirming feed conflict.  STATE supplies
+the durable dependent local intent when present."
   (let* ((kind (plist-get entry :kind))
          (logical-path (plist-get projection :logical_path))
          (local-path (or (plist-get record :local-path) logical-path))
+         (source-path (if (eq kind :rename)
+                          (plist-get entry :previous-path)
+                        local-path))
          (destination (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
-         (source (gnosis-nodes--safe-path gnosis-nodes-dir local-path))
+         (source (gnosis-nodes--safe-path gnosis-nodes-dir source-path))
          (destination-buffer (get-file-buffer destination))
          (source-buffer (get-file-buffer source))
-         (digest (gnosis-nodes--projection-digest projection)))
+         (digest (gnosis-nodes--projection-digest projection))
+         (dependent
+          (and state
+               (seq-find
+                (lambda (candidate)
+                  (and (eq :replace (plist-get candidate :kind))
+                       (memq (plist-get candidate :status)
+                             '(:blocked :pending :sending :uncertain))
+                       (equal (plist-get entry :operation-id)
+                              (plist-get candidate :depends-on))
+                       (equal logical-path
+                              (plist-get candidate :logical-path))))
+                (append (plist-get state :outbox) nil)))))
     (pcase kind
       (:delete
        (and (equal local-path logical-path)
@@ -1706,8 +1723,7 @@ RECORD and PROJECTION describe the confirming feed conflict."
                       (buffer-modified-p source-buffer)))
             (null (gnosis-nodes--working-bytes source))))
       (:rename
-       (and (equal local-path (plist-get entry :previous-path))
-            (not (equal local-path logical-path))
+       (and (not (equal source-path logical-path))
             (not (buffer-live-p destination-buffer))
             (not (and (buffer-live-p source-buffer)
                       (buffer-modified-p source-buffer)))
@@ -1718,10 +1734,13 @@ RECORD and PROJECTION describe the confirming feed conflict."
                    (or (null source-bytes)
                        (equal digest (gnosis-nodes--digest source-bytes)))
                    (or (null destination-bytes)
-                       (equal digest (gnosis-nodes--digest destination-bytes)))
+                       (equal digest (gnosis-nodes--digest destination-bytes))
+                       (and dependent
+                            (equal (plist-get dependent :digest)
+                                   (gnosis-nodes--digest destination-bytes))))
                    (progn
                      (gnosis-nodes--move-document
-                      local-path logical-path
+                      source-path logical-path
                       (or source-bytes destination-bytes))
                      t)))))
       (_
@@ -1742,7 +1761,7 @@ RECORD and PROJECTION describe the confirming feed conflict."
                   (append (plist-get state :conflicts) nil)))
                 (projection (plist-get record :projection))
                 ((gnosis-nodes--reconcile-applied-effect-p
-                  entry record projection)))
+                  entry record projection state)))
       (setf (plist-get state :conflicts)
             (vconcat (delq record (append (plist-get state :conflicts) nil))))
       (setq state (gnosis-nodes--record-base state projection))))
@@ -1811,6 +1830,7 @@ RECORD and PROJECTION describe the confirming feed conflict."
                            entry (if (equal "applied" (plist-get result :status))
                                      :applied :rejected)))
                     (when (equal "applied" (plist-get result :status))
+                      (gnosis-nodes--write-state state)
                       (let ((before (length (plist-get state :outbox))))
                         (setq state
                               (gnosis-nodes--reconcile-applied-result

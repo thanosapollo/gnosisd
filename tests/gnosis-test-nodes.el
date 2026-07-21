@@ -1525,6 +1525,8 @@
 (ert-deftest gnosis-nodes-retained-receipt-reconciles-consumed-feed-conflict ()
   (let* ((directory (make-temp-file "gnosis-nodes-retained-receipt-" t))
          (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
          (bytes (string-to-unibyte "accepted"))
          (digest (gnosis-nodes--digest bytes))
          (projection `(:document_id "doc" :revision 3
@@ -1653,6 +1655,113 @@
           (should (= 3 (plist-get (gnosis-nodes--base state "doc") :revision)))
           (should (= 0 (length (plist-get state :outbox))))
           (should (= 0 (length (plist-get state :conflicts)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-keep-local-rename-reconciles-after-restart ()
+  (let* ((directory (make-temp-file "gnosis-nodes-keep-rename-" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (gnosis-nodes-max-mutations-per-pass 0)
+         (bytes (string-to-unibyte "local"))
+         (digest (gnosis-nodes--digest bytes))
+         (remote-bytes (string-to-unibyte "remote"))
+         (remote-digest (gnosis-nodes--digest remote-bytes))
+         (remote-projection `(:document_id "doc" :revision 2
+                              :logical_path "remote.org"
+                              :content_sha256 ,remote-digest
+                              :operation "rename"))
+         (authoritative `(:document_id "doc" :revision 3
+                          :logical_path "local.org"
+                          :content_sha256 ,remote-digest :active t))
+         (confirmation `(:document_id "doc" :revision 3
+                         :logical_path "local.org"
+                         :content_sha256 ,remote-digest :operation "rename"))
+         (conflict `(:document-id "doc" :kind :rename
+                     :local-path "local.org" :logical-path "remote.org"
+                     :local-digest ,digest :remote-digest ,remote-digest
+                     :remote-revision 2 :projection ,remote-projection))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "cursor"
+                  :bases [(:document-id "doc" :revision 1
+                           :logical-path "local.org"
+                           :digest ,remote-digest :active t)]
+                  :outbox [] :conflicts [,conflict]))
+         entry)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "local.org" bytes)
+          (setq state (gnosis-nodes--keep-local-conflict state conflict bytes)
+                entry (aref (plist-get state :outbox) 0))
+          (should (equal "remote.org" (plist-get entry :previous-path)))
+          (setf (plist-get entry :status) :applied
+                (plist-get entry :result)
+                `(:status "applied" :authoritative ,authoritative))
+          (aset (plist-get state :outbox) 0 entry)
+          (gnosis-nodes--write-state state)
+          (setq state (gnosis-nodes--read-state))
+          (cl-letf (((symbol-function 'gnosis-core-blob)
+                     (lambda (_) remote-bytes)))
+            (setq state
+                  (gnosis-nodes--apply-document
+                   state confirmation
+                   (list (cons remote-digest remote-bytes)))))
+          (gnosis-nodes--write-state state)
+          (setq state (gnosis-nodes--send-outbox (gnosis-nodes--read-state)))
+          (should-not (file-exists-p (expand-file-name "remote.org" directory)))
+          (should (equal bytes
+                         (gnosis-nodes--working-bytes
+                          (expand-file-name "local.org" directory))))
+          (should (= 3 (plist-get (gnosis-nodes--base state "doc") :revision)))
+          (should (= 1 (length (plist-get state :outbox))))
+          (should (eq :pending
+                      (plist-get (aref (plist-get state :outbox) 0) :status)))
+          (should (= 0 (length (plist-get state :conflicts)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-persists-applied-authority-before-local-effect ()
+  (let* ((directory (make-temp-file "gnosis-nodes-applied-before-effect-" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (bytes (string-to-unibyte "accepted"))
+         (digest (gnosis-nodes--digest bytes))
+         (projection `(:document_id "doc" :revision 2
+                       :logical_path "new.org" :content_sha256 ,digest
+                       :operation "rename"))
+         (authoritative `(:document_id "doc" :revision 2
+                          :logical_path "new.org" :content_sha256 ,digest
+                          :active t))
+         (entry (gnosis-nodes--outbox-entry
+                 :rename "doc" 1 "new.org" digest "old.org"))
+         (conflict `(:document-id "doc" :kind :rename
+                     :local-path "old.org" :logical-path "new.org"
+                     :local-digest ,digest :remote-digest ,digest
+                     :remote-revision 2 :projection ,projection))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor "cursor"
+                  :bases [(:document-id "doc" :revision 1
+                           :logical-path "old.org" :digest ,digest :active t)]
+                  :outbox [,entry] :conflicts [,conflict])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "old.org" bytes)
+          (gnosis-nodes--write-state state)
+          (cl-letf (((symbol-function 'gnosis-nodes--send-entry)
+                     (lambda (&rest _)
+                       `(:status "applied" :changed t
+                         :authoritative ,authoritative)))
+                    ((symbol-function 'gnosis-nodes--move-document)
+                     (lambda (&rest _)
+                       (signal 'gnosis-nodes-conflict '("new.org")))))
+            (should-error (gnosis-nodes--send-outbox state)
+                          :type 'gnosis-nodes-conflict))
+          (let* ((stored (gnosis-nodes--read-state))
+                 (stored-entry (aref (plist-get stored :outbox) 0)))
+            (should (eq :applied (plist-get stored-entry :status)))
+            (should (equal authoritative
+                           (plist-get (plist-get stored-entry :result)
+                                      :authoritative)))))
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-retained-receipt-rejects-unrelated-conflict ()

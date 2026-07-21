@@ -39,6 +39,13 @@
                 (lambda (&rest _) (list (list :secret token)))))
        ,@body)))
 
+(defmacro gnosis-test-core-integration--with-token (token &rest body)
+  "Evaluate BODY using explicit integration TOKEN."
+  (declare (indent 1) (debug t))
+  `(cl-letf (((symbol-function 'auth-source-search)
+              (lambda (&rest _) (list (list :secret ,token)))))
+     ,@body))
+
 (ert-deftest gnosis-core-integration-health-and-openapi ()
   (skip-unless (gnosis-test-core-integration--available-p))
   (gnosis-test-core-integration--with-client
@@ -210,6 +217,83 @@
           (should (= 1 (length (plist-get (gnosis-nodes--read-state)
                                           :conflicts)))))
       (delete-directory root t)))))
+
+(ert-deftest gnosis-core-integration-two-client-rename-restart ()
+  (skip-unless (gnosis-test-core-integration--available-p))
+  (gnosis-test-core-integration--with-client
+    (let* ((root-a (make-temp-file "gnosis-org-client-a-" t))
+           (root-b (make-temp-file "gnosis-org-client-b-" t))
+           (nonce (gnosis-core-operation-id))
+           (local-path (format "integration/%s-local.org" nonce))
+           (remote-path (format "integration/%s-remote.org" nonce))
+           (initial (string-to-unibyte
+                     ":PROPERTIES:\n:ID: two-client\n:END:\n#+TITLE: Initial\n"))
+           (local (string-to-unibyte
+                   ":PROPERTIES:\n:ID: two-client\n:END:\n#+TITLE: Local\n"))
+           (digest (gnosis-nodes--digest initial))
+           (token-b (getenv "GNOSIS_HTTP_TEST_TOKEN_2"))
+           create document-id)
+      (should (stringp token-b))
+      (unwind-protect
+          (progn
+            (setq create
+                  (gnosis-core-document-create
+                   (gnosis-core-operation-id) local-path initial)
+                  document-id
+                  (plist-get (plist-get create :authoritative) :document_id))
+            (let ((gnosis-nodes-dir root-a)
+                  (user-emacs-directory (file-name-as-directory root-a))
+                  (gnosis-nodes-state-file nil))
+              (gnosis-nodes-bootstrap))
+            (gnosis-test-core-integration--with-token token-b
+              (let ((gnosis-nodes-dir root-b)
+                    (user-emacs-directory (file-name-as-directory root-b))
+                    (gnosis-nodes-state-file nil))
+                (gnosis-nodes-bootstrap)))
+            (gnosis-core-document-rename
+             document-id (gnosis-core-operation-id) 1 remote-path digest)
+            (gnosis-test-core-integration--with-token token-b
+              (let ((gnosis-nodes-dir root-b)
+                    (user-emacs-directory (file-name-as-directory root-b))
+                    (gnosis-nodes-state-file nil))
+                (gnosis-nodes--write-document local-path local)
+                (gnosis-nodes-sync nil t)
+                (let* ((state (gnosis-nodes--read-state))
+                       (record (aref (plist-get state :conflicts) 0)))
+                  (should (eq :rename (plist-get record :kind)))
+                  (setq state
+                        (gnosis-nodes--keep-local-conflict state record local))
+                  (gnosis-nodes--write-state state)
+                  (gnosis-nodes--send-outbox state))
+                (should
+                 (seq-some
+                  (lambda (entry) (eq :applied (plist-get entry :status)))
+                  (append (plist-get (gnosis-nodes--read-state) :outbox) nil)))))
+            ;; Re-enter with only durable client state after the applied rename.
+            (gnosis-test-core-integration--with-token token-b
+              (let ((gnosis-nodes-dir root-b)
+                    (user-emacs-directory (file-name-as-directory root-b))
+                    (gnosis-nodes-state-file nil))
+                (gnosis-nodes-sync nil t)
+                (let ((state (gnosis-nodes--read-state)))
+                  (should (= 0 (length (plist-get state :conflicts))))
+                  (should (= 0 (length (plist-get state :outbox)))))
+                (should (equal local
+                               (gnosis-nodes--working-bytes
+                                (gnosis-nodes--safe-path root-b local-path))))
+                (should-not (file-exists-p
+                             (gnosis-nodes--safe-path root-b remote-path)))))
+            (let ((gnosis-nodes-dir root-a)
+                  (user-emacs-directory (file-name-as-directory root-a))
+                  (gnosis-nodes-state-file nil))
+              (gnosis-nodes-sync nil t)
+              (should (equal local
+                             (gnosis-nodes--working-bytes
+                              (gnosis-nodes--safe-path root-a local-path))))
+              (should-not (file-exists-p
+                           (gnosis-nodes--safe-path root-a remote-path)))))
+        (delete-directory root-a t)
+        (delete-directory root-b t)))))
 
 (provide 'gnosis-test-core-integration)
 ;;; gnosis-test-core-integration.el ends here
