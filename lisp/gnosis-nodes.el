@@ -1792,14 +1792,33 @@ boundedly selected durable dependent local intent when present."
                   (append (plist-get state :outbox) nil))))))))
   state)
 
-(defun gnosis-nodes--start-applied-recovery
-    (state authoritative entry-index)
-  "Persist bounded recovery for AUTHORITATIVE at outbox ENTRY-INDEX in STATE."
+(defun gnosis-nodes--start-applied-recovery (state entry authoritative)
+  "Persist bounded recovery for applied ENTRY and AUTHORITATIVE in STATE."
   (plist-put
    state :applied-recovery
-   (list :phase "conflict" :entry-index entry-index
+   (list :phase "conflict"
+         :operation-id (plist-get entry :operation-id)
+         :kind (substring (symbol-name (plist-get entry :kind)) 1)
+         :document-id (plist-get entry :document-id)
+         :revision (plist-get entry :revision)
+         :logical-path (plist-get entry :logical-path)
+         :previous-path (plist-get entry :previous-path)
+         :digest (plist-get entry :digest)
+         :payload (plist-get entry :payload)
          :authoritative (copy-tree authoritative) :cursor 0
          :remaining (length (plist-get state :conflicts)))))
+
+(defun gnosis-nodes--recovery-entry (recovery)
+  "Return applied outbox entry reconstructed from durable RECOVERY."
+  (list :operation-id (plist-get recovery :operation-id)
+        :kind (intern (concat ":" (plist-get recovery :kind)))
+        :document-id (plist-get recovery :document-id)
+        :revision (plist-get recovery :revision)
+        :logical-path (plist-get recovery :logical-path)
+        :previous-path (plist-get recovery :previous-path)
+        :digest (plist-get recovery :digest)
+        :payload (plist-get recovery :payload)
+        :status :applied))
 
 (defun gnosis-nodes--bounded-recovery-find
     (items cursor remaining predicate &optional budget)
@@ -1844,16 +1863,15 @@ Return match, next cursor, remaining count, and visits."
   "Advance one durable applied-result recovery phase in STATE within BUDGET."
   (let* ((recovery (plist-get state :applied-recovery))
          (phase (plist-get recovery :phase))
-         (entry (aref (plist-get state :outbox)
-                      (plist-get recovery :entry-index)))
+         (entry (gnosis-nodes--recovery-entry recovery))
          (authoritative (plist-get recovery :authoritative))
-         (items (if (equal phase "conflict")
+         (items (if (member phase '("conflict" "confirm-conflict"))
                     (plist-get state :conflicts)
                   (plist-get state :outbox)))
          (result
           (gnosis-nodes--bounded-recovery-find
            items (plist-get recovery :cursor) (plist-get recovery :remaining)
-           (if (equal phase "conflict")
+           (if (member phase '("conflict" "confirm-conflict"))
                (lambda (candidate)
                  (or (gnosis-nodes--authoritative-confirms-projection-p
                       authoritative (plist-get candidate :projection))
@@ -1877,26 +1895,27 @@ Return match, next cursor, remaining count, and visits."
      ((and (equal phase "conflict") match
            (eq :rename (plist-get entry :kind)))
       (setq recovery (plist-put recovery :phase "dependent"))
-      (setq recovery
-            (plist-put recovery :record-index
-                       (plist-get result :match-index)))
       (setq recovery (plist-put recovery :cursor 0))
       (setq recovery
             (plist-put recovery :remaining (length (plist-get state :outbox))))
       (setq state (plist-put state :applied-recovery recovery)))
-     ((and (equal phase "conflict") match)
+     ((and (member phase '("conflict" "confirm-conflict")) match)
       (setq state
             (gnosis-nodes--reconcile-applied-result
-             state entry authoritative match))
+             state entry authoritative match
+             (and (plist-get recovery :dependent-digest)
+                  (list :digest (plist-get recovery :dependent-digest)))))
       (setq state (plist-put state :applied-recovery nil)))
      ((and (equal phase "dependent") (or match (= remaining 0)))
-      (setq state
-            (gnosis-nodes--reconcile-applied-result
-             state entry authoritative
-             (aref (plist-get state :conflicts)
-                   (plist-get recovery :record-index))
-             match))
-      (setq state (plist-put state :applied-recovery nil)))
+      (setq recovery (plist-put recovery :phase "confirm-conflict"))
+      (setq recovery
+            (plist-put recovery :dependent-digest
+                       (and match (plist-get match :digest))))
+      (setq recovery (plist-put recovery :cursor 0))
+      (setq recovery
+            (plist-put recovery :remaining
+                       (length (plist-get state :conflicts))))
+      (setq state (plist-put state :applied-recovery recovery)))
      ((= remaining 0)
       (setq state
             (gnosis-nodes--prune-unchanged-applied state entry authoritative))
@@ -1961,7 +1980,7 @@ Return match, next cursor, remaining count, and visits."
                         (plist-get (plist-get entry :result) :authoritative)))
               (setq state
                     (gnosis-nodes--start-applied-recovery
-                     state authoritative index))
+                     state entry authoritative))
               (setq state
                     (gnosis-nodes--run-applied-recovery-pass
                      state (- gnosis-nodes-max-outbox-scan-per-pass
@@ -2004,7 +2023,7 @@ Return match, next cursor, remaining count, and visits."
                       (gnosis-nodes--write-state state)
                       (setq state
                             (gnosis-nodes--start-applied-recovery
-                             state authoritative index))
+                             state entry authoritative))
                       (setq state
                             (gnosis-nodes--run-applied-recovery-pass
                              state (- gnosis-nodes-max-outbox-scan-per-pass

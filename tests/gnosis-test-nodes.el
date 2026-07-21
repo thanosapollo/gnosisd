@@ -1580,6 +1580,95 @@
                    (plist-get (plist-get result :match) :operation-id)))
     (should (= 0 remaining))))
 
+(ert-deftest gnosis-nodes-applied-recovery-survives-pull-consumption ()
+  (let* ((directory (make-temp-file "gnosis-nodes-recovery-pull-" t))
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (digest (gnosis-nodes--digest "note"))
+         (projection `(:document_id "doc" :revision 1 :logical_path "note.org"
+                       :content_sha256 ,digest :active t :operation "create"))
+         (authoritative `(:document_id "doc" :revision 1
+                          :logical_path "note.org" :content_sha256 ,digest
+                          :active t))
+         (entry (gnosis-nodes--outbox-entry
+                 :create "doc" nil "note.org" digest nil "note"))
+         (conflict `(:document-id "old" :kind :tombstone
+                     :operation-id ,(plist-get entry :operation-id)
+                     :projection (:document_id "old" :revision 2
+                                  :logical_path "note.org"
+                                  :content_sha256 nil :active nil
+                                  :operation "tombstone")))
+         state)
+    (setf (plist-get entry :status) :applied
+          (plist-get entry :result)
+          `(:status "applied" :authoritative ,authoritative)
+          state `(:version 1 :server-id "server" :device-id "device"
+                  :notes-root ,(gnosis-nodes--notes-root)
+                  :service-authority ,(gnosis-nodes--service-authority)
+                  :cursor "cursor" :bases [] :outbox [,entry]
+                  :conflicts [,conflict]))
+    (unwind-protect
+        (progn
+          (setq state
+                (gnosis-nodes--start-applied-recovery state entry authoritative))
+          (gnosis-nodes--write-state state)
+          (setq state (gnosis-nodes--read-state))
+          (setq state (gnosis-nodes--record-base state projection))
+          (should (= 0 (length (plist-get state :outbox))))
+          (should (= 0 (length (plist-get state :conflicts))))
+          (setq state (gnosis-nodes--send-outbox state))
+          (should-not (plist-get state :applied-recovery)))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-rename-recovery-reconfirms-reordered-conflict ()
+  (let* ((directory (make-temp-file "gnosis-nodes-recovery-reorder-" t))
+         (gnosis-nodes-dir directory)
+         (bytes (string-to-unibyte "local"))
+         (digest (gnosis-nodes--digest bytes))
+         (authoritative `(:document_id "doc" :revision 3
+                          :logical_path "new.org" :content_sha256 ,digest
+                          :active t))
+         (projection (append (copy-tree authoritative) '(:operation "rename")))
+         (entry (gnosis-nodes--outbox-entry
+                 :rename "doc" 2 "new.org" digest "old.org"))
+         (dependent (gnosis-nodes--outbox-entry
+                     :replace "doc" nil "new.org" digest nil bytes))
+         (record `(:document-id "doc" :kind :rename
+                   :operation-id ,(plist-get entry :operation-id)
+                   :local-path "old.org" :logical-path "new.org"
+                   :projection ,projection))
+         (unrelated '(:document-id "other" :kind :content
+                      :projection (:document_id "other" :revision 1
+                                   :logical_path "other.org"
+                                   :content_sha256 nil :active t
+                                   :operation "update")))
+         state)
+    (setf (plist-get entry :status) :applied
+          (plist-get dependent :status) :blocked
+          (plist-get dependent :depends-on) (plist-get entry :operation-id)
+          state `(:bases [] :outbox [,entry ,dependent]
+                  :conflicts [,record ,unrelated]))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "new.org" bytes)
+          (setq state (gnosis-nodes--start-applied-recovery
+                       state entry authoritative))
+          (setf (plist-get (plist-get state :applied-recovery) :phase)
+                "dependent"
+                (plist-get (plist-get state :applied-recovery) :cursor) 0
+                (plist-get (plist-get state :applied-recovery) :remaining) 2
+                (plist-get state :conflicts) (vector unrelated record))
+          (setq state (gnosis-nodes--run-applied-recovery-pass state 8))
+          (should-not (plist-get state :applied-recovery))
+          (should (= 1 (length (plist-get state :conflicts))))
+          (should (equal "other"
+                         (plist-get (aref (plist-get state :conflicts) 0)
+                                    :document-id)))
+          (should (= 1 (length (plist-get state :outbox))))
+          (should (eq :blocked
+                      (plist-get (aref (plist-get state :outbox) 0) :status))))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-uncertain-create-clears-consumed-tombstone-conflict ()
   (let* ((directory (make-temp-file "gnosis-nodes-create-tombstone-" t))
          (gnosis-nodes-dir directory)
@@ -1908,7 +1997,7 @@
           (gnosis-nodes--write-document "note.org" bytes)
           (setq state
                 (gnosis-nodes--start-applied-recovery
-                 state authoritative 0))
+                 state entry authoritative))
           (setq state
                 (gnosis-nodes--run-applied-recovery-pass
                  state gnosis-nodes-max-outbox-scan-per-pass))
