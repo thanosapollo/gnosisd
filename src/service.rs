@@ -1342,37 +1342,35 @@ impl ServiceRuntime {
             backup_thread,
             backup_cancelled,
         } = self;
+        let started = Instant::now();
         backup_cancelled.store(true, Ordering::Release);
-        tokio::task::spawn_blocking(move || {
-            let started = Instant::now();
-            let (response, receiver) = mpsc::sync_channel(0);
-            let mut command = StoreCommand::Shutdown { response };
-            loop {
-                match handle.sender.try_send(command) {
-                    Ok(()) => break,
-                    Err(TrySendError::Full(returned)) => {
-                        command = returned;
-                        sleep_until_next_shutdown_poll(started, deadline)?;
-                    }
-                    Err(TrySendError::Disconnected(_)) => return Err(ServiceError::Stopped),
+        let (response, receiver) = mpsc::sync_channel(0);
+        let mut command = StoreCommand::Shutdown { response };
+        loop {
+            match handle.sender.try_send(command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    command = returned;
+                    sleep_until_next_shutdown_poll(started, deadline).await?;
                 }
+                Err(TrySendError::Disconnected(_)) => return Err(ServiceError::Stopped),
             }
-            let remaining = shutdown_remaining(started, deadline)?;
-            receiver
-                .recv_timeout(remaining)
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => ServiceError::ShutdownDeadlineExceeded,
-                    mpsc::RecvTimeoutError::Disconnected => ServiceError::Stopped,
-                })?;
-            drop(handle);
-            while !store_thread.is_finished() || !backup_thread.is_finished() {
-                sleep_until_next_shutdown_poll(started, deadline)?;
+        }
+        loop {
+            match receiver.try_recv() {
+                Ok(()) => break,
+                Err(mpsc::TryRecvError::Empty) => {
+                    sleep_until_next_shutdown_poll(started, deadline).await?;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => return Err(ServiceError::Stopped),
             }
-            store_thread.join().map_err(|_| ServiceError::Stopped)?;
-            backup_thread.join().map_err(|_| ServiceError::Stopped)
-        })
-        .await
-        .map_err(|_| ServiceError::Stopped)?
+        }
+        drop(handle);
+        while !store_thread.is_finished() || !backup_thread.is_finished() {
+            sleep_until_next_shutdown_poll(started, deadline).await?;
+        }
+        store_thread.join().map_err(|_| ServiceError::Stopped)?;
+        backup_thread.join().map_err(|_| ServiceError::Stopped)
     }
 }
 
@@ -1383,11 +1381,11 @@ fn shutdown_remaining(started: Instant, deadline: Duration) -> Result<Duration, 
         .ok_or(ServiceError::ShutdownDeadlineExceeded)
 }
 
-fn sleep_until_next_shutdown_poll(
+async fn sleep_until_next_shutdown_poll(
     started: Instant,
     deadline: Duration,
 ) -> Result<(), ServiceError> {
-    thread::sleep(SERVICE_SHUTDOWN_POLL.min(shutdown_remaining(started, deadline)?));
+    tokio::time::sleep(SERVICE_SHUTDOWN_POLL.min(shutdown_remaining(started, deadline)?)).await;
     Ok(())
 }
 
