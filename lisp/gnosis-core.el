@@ -1314,9 +1314,11 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
          (gnosis-core--typed-request
           "post_review_attempts__id__answer"
           (list (cons "id" attempt-id)) nil answer)))
-    (unless (equal attempt-id (plist-get attempt :attempt_id))
+    (unless (and (equal attempt-id (plist-get attempt :attempt_id))
+                 (equal (plist-get attempt :status) "graded")
+                 (equal (plist-get attempt :response) answer))
       (signal 'gnosis-core-mutation-uncertain
-              '("Gnosis review answer response identity is invalid")))
+              '("Gnosis review answer response is not correlated")))
     attempt))
 
 (defun gnosis-core-review-attempt-state (attempt-id)

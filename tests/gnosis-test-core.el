@@ -864,9 +864,11 @@ CONTENT-TYPE defaults to application/json."
                     `(:session_id "session" :mode "online" :status "aborted"
                       :source ,source :target_count 12
                       :current_position 0 :queue_length 1))
-                   ((or "post_review_sessions__id__attempts"
-                        "post_review_attempts__id__answer")
+                   ("post_review_sessions__id__attempts"
                     '(:attempt_id "attempt" :session_id "session"))
+                   ("post_review_attempts__id__answer"
+                    (list :attempt_id "attempt" :status "graded"
+                          :response (nth 3 arguments)))
                    ("get_review_attempt_state"
                     '(:version 1 :attempt_revision 3
                       :attempt (:attempt_id "attempt")))
