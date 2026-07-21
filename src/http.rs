@@ -55,7 +55,7 @@ use crate::{
             DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1,
             NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
-            OfflineContentOperationEnvelopeV2, OfflineContentResultEnvelopeV1,
+            OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
             OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
             ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
@@ -2630,7 +2630,7 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
         )),
         ("/v1/content/offline-operations", "post") => Some(json_contract(
             "content:write",
-            Some("OfflineContentOperationEnvelopeV2"),
+            Some("OfflineContentOperationEnvelopeV1"),
             "200",
             "OfflineContentResultEnvelopeV1",
             &[
@@ -3366,7 +3366,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
     requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
-    requests.subschema_for::<OfflineContentOperationEnvelopeV2>();
+    requests.subschema_for::<OfflineContentOperationEnvelopeV1>();
     requests.subschema_for::<OfflineAssetOperationEnvelopeV1>();
     definitions.extend(requests.take_definitions(true));
     definitions
@@ -4321,7 +4321,7 @@ mod tests {
         assert_schema_ref(
             operation,
             "requestBody",
-            "OfflineContentOperationEnvelopeV2",
+            "OfflineContentOperationEnvelopeV1",
         );
         assert_response_schema(operation, "200", "OfflineContentResultEnvelopeV1");
         assert_response_statuses(
@@ -4332,15 +4332,15 @@ mod tests {
         );
         let schemas = &api["components"]["schemas"];
         assert_eq!(
-            schemas["OfflineContentOperationEnvelopeV2"]["properties"]["version"]["const"],
-            2
+            schemas["OfflineContentOperationEnvelopeV1"]["properties"]["version"]["const"],
+            1
         );
         assert_eq!(
             schemas["OfflineContentResultEnvelopeV1"]["properties"]["version"]["const"],
             1
         );
         assert_tagged_variants(
-            &schemas["OfflineContentMutationV2"],
+            &schemas["OfflineContentMutationV1"],
             "kind",
             &["put_document", "rename_document", "tombstone_document"],
         );
@@ -7431,7 +7431,7 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(capabilities.version, 2);
+        assert_eq!(capabilities.version, 1);
         assert_eq!(capabilities.server_id, server_id);
         assert_eq!(capabilities.document_lifecycle, 1);
         assert_eq!(
@@ -8165,7 +8165,7 @@ mod tests {
         source: &str,
     ) -> serde_json::Value {
         json!({
-            "version": 2,
+            "version": 1,
             "operation": {
                 "operation_id": operation_id,
                 "device_id": device_id,

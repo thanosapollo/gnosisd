@@ -308,6 +308,7 @@ impl HttpClient {
                 document_id: None,
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
+                content_type: Some(input.content_type.clone()),
                 content_sha256: Some(format!("{:x}", Sha256::digest(input.source.as_bytes()))),
                 prior_revision: None,
             },
@@ -342,6 +343,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
+                content_type: Some(input.content_type.clone()),
                 content_sha256: Some(format!("{:x}", Sha256::digest(input.source.as_bytes()))),
                 prior_revision: Some(expected_revision),
             },
@@ -375,6 +377,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
+                content_type: None,
                 content_sha256: None,
                 prior_revision: Some(expected_revision),
             },
@@ -404,6 +407,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: false,
                 logical_path: None,
+                content_type: None,
                 content_sha256: None,
                 prior_revision: Some(expected_revision),
             },
@@ -683,6 +687,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: true,
                 logical_path: None,
+                content_type: Some(input.content_type.clone()),
                 content_sha256: Some(format!("{:x}", Sha256::digest(input.source.as_bytes()))),
                 prior_revision: input.expected_revision,
             },
@@ -1788,6 +1793,7 @@ struct DocumentMutationExpectation {
     document_id: Option<String>,
     active: bool,
     logical_path: Option<String>,
+    content_type: Option<String>,
     content_sha256: Option<String>,
     prior_revision: Option<u64>,
 }
@@ -1844,6 +1850,10 @@ fn validate_document_head(
             .logical_path
             .as_deref()
             .is_none_or(|expected| head.logical_path == expected)
+        && expectation
+            .content_type
+            .as_deref()
+            .is_none_or(|expected| head.content_type == expected)
         && expected_revision == Some(head.revision)
         && head.active == expectation.active
         && match (
@@ -2474,6 +2484,7 @@ mod tests {
             document_id: Some("document".into()),
             active: true,
             logical_path: Some("note.org".into()),
+            content_type: Some("text/org; charset=utf-8".into()),
             content_sha256: Some(digest.clone()),
             prior_revision: None,
         };
@@ -2509,6 +2520,9 @@ mod tests {
         head.logical_path = "../note.org".into();
         assert!(!validate_document_head(&head, &update_expectation, true));
         head.logical_path = "note.org".into();
+        head.content_type = "text/markdown; charset=utf-8".into();
+        assert!(!validate_document_head(&head, &update_expectation, true));
+        head.content_type = "text/org; charset=utf-8".into();
         head.revision = 1;
         head.content_sha256 = Some("b".repeat(64));
         assert!(!validate_document_head(&head, &update_expectation, false));

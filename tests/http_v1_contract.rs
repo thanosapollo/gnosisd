@@ -4,8 +4,7 @@ use gnosis_core::protocol::http_v1::{
     DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1,
     NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
     OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
-    OfflineContentOperationEnvelopeV1, OfflineContentOperationEnvelopeV2,
-    OfflineContentResultEnvelopeV1,
+    OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
@@ -79,7 +78,7 @@ fn replica_state_rejects_retired_sequence_name() {
 #[test]
 fn public_capability_and_error_dtos_preserve_http_shapes() {
     let content_wire = json!({
-        "version":2,
+        "version":1,
         "server_id":"a".repeat(32),
         "document_lifecycle":1,
         "supported_content_types":["text/org; charset=utf-8"],
@@ -398,7 +397,6 @@ fn public_offline_review_dtos_preserve_v1_requests_and_v2_responses() {
 #[test]
 fn public_offline_content_dtos_preserve_strict_versioned_shapes() {
     let operation = offline_content_operation();
-    assert_round_trip::<OfflineContentOperationEnvelopeV2>(offline_content_operation_v2());
     let accepted = offline_content_result("accepted");
     let conflict = offline_content_result("conflict");
     assert_round_trip::<OfflineContentOperationEnvelopeV1>(operation.clone());
@@ -515,20 +513,6 @@ fn offline_content_operation() -> Value {
             "cursor":"cursor","authored_at_us":1,
             "mutation":{"kind":"put_document","document_id":"document",
                 "logical_path":"note.org","content_sha256":"a".repeat(64),
-                "org":"#+title: Note\n",
-                "base":{"kind":"absent"}}
-        }
-    })
-}
-
-fn offline_content_operation_v2() -> Value {
-    json!({
-        "version":2,
-        "operation":{
-            "operation_id":"operation","device_id":"device","device_sequence":1,
-            "cursor":"cursor","authored_at_us":1,
-            "mutation":{"kind":"put_document","document_id":"document",
-                "logical_path":"note.org","content_sha256":"a".repeat(64),
                 "content_type":"text/org; charset=utf-8","source":"#+title: Note\n",
                 "base":{"kind":"absent"}}
         }
@@ -543,7 +527,8 @@ fn offline_content_result(status: &str) -> Value {
             "operation_id":"operation","status":status,
             "conflict_reason":(!accepted).then_some("invalid_content"),
             "authoritative":accepted.then(|| json!({
-                "document_id":"document","logical_path":"note.org","revision":1,
+                "document_id":"document","logical_path":"note.org",
+                "content_type":"text/org; charset=utf-8","revision":1,
                 "content_sha256":"a".repeat(64),"active":true
             })),
             "cursor":"cursor"

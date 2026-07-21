@@ -145,6 +145,7 @@ pub(crate) struct OfflineContentResult {
 pub(crate) struct AuthoritativeDocument {
     pub(crate) document_id: String,
     pub(crate) logical_path: String,
+    pub(crate) content_type: Option<String>,
     pub(crate) revision: u64,
     pub(crate) content_sha256: Option<String>,
     pub(crate) active: bool,

@@ -1306,11 +1306,13 @@ fn validate_accepted_document(
         OfflineContentMutation::Put {
             logical_path,
             content_sha256,
+            content_type,
             ..
         } => {
             authoritative.active
                 && authoritative.logical_path == *logical_path
                 && authoritative.content_sha256.as_ref() == Some(content_sha256)
+                && authoritative.content_type.as_ref() == Some(content_type)
         }
         OfflineContentMutation::Rename {
             logical_path, base, ..

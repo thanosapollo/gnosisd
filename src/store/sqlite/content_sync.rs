@@ -528,6 +528,7 @@ fn current_document_projection(
     Ok(Some(AuthoritativeDocument {
         document_id: head.document_id,
         logical_path: head.logical_path,
+        content_type: Some(head.content_type),
         revision: head.revision,
         content_sha256,
         active: head.active,

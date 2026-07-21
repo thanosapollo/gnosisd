@@ -14,8 +14,7 @@ pub use super::offline_asset::{
 };
 pub use super::offline_content::{
     OfflineContentBaseV1, OfflineContentConflictReasonV1, OfflineContentDocumentV1,
-    OfflineContentMutationV1, OfflineContentMutationV2, OfflineContentOperationEnvelopeV1,
-    OfflineContentOperationEnvelopeV2, OfflineContentOperationV1, OfflineContentOperationV2,
+    OfflineContentMutationV1, OfflineContentOperationEnvelopeV1, OfflineContentOperationV1,
     OfflineContentResultEnvelopeV1, OfflineContentResultV1,
 };
 pub use super::offline_review::{
@@ -94,7 +93,7 @@ pub struct ReplicaStateV1 {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentCapabilitiesV1 {
-    #[schemars(extend("const" = 2))]
+    #[schemars(extend("const" = 1))]
     pub version: u32,
     #[schemars(regex(pattern = "^[0-9a-f]{32}$"))]
     pub server_id: String,
