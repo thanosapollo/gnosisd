@@ -144,7 +144,7 @@ stage content
 note=$(curl --fail-with-body --silent --show-error \
     -H "$auth" -H 'Idempotency-Key: smoke-create-document' \
     -H 'Content-Type: application/json' \
-    -d "{\"logical_path\":\"smoke.org\",\"org\":\"#+TITLE: Smoke\\n* Node\\n:PROPERTIES:\\n:ID: smoke-node\\n:END:\\nSee [[id:smoke-linked][Linked]].\\n[[file:$asset_path]]\\n* Linked\\n:PROPERTIES:\\n:ID: smoke-linked\\n:END:\\n\"}" \
+    -d "{\"logical_path\":\"smoke.org\",\"content_type\":\"text/org; charset=utf-8\",\"source\":\"#+TITLE: Smoke\\n* Node\\n:PROPERTIES:\\n:ID: smoke-node\\n:END:\\nSee [[id:smoke-linked][Linked]].\\n[[file:$asset_path]]\\n* Linked\\n:PROPERTIES:\\n:ID: smoke-linked\\n:END:\\n\"}" \
     "$api/document-mutations")
 document_id=$(printf %s "$note" | jq -er .authoritative.document_id)
 curl --fail-with-body --silent --show-error -H "$auth" \
