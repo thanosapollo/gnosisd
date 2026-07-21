@@ -1557,6 +1557,41 @@
           (should (= 0 (length (plist-get state :conflicts)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-uncertain-create-clears-consumed-tombstone-conflict ()
+  (let* ((directory (make-temp-file "gnosis-nodes-create-tombstone-" t))
+         (gnosis-nodes-dir directory)
+         (bytes (string-to-unibyte "local"))
+         (digest (gnosis-nodes--digest bytes))
+         (authoritative `(:document_id "new" :revision 1
+                          :logical_path "note.org" :content_sha256 ,digest
+                          :active t))
+         (entry (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" digest nil bytes))
+         (conflict `(:operation-id ,(plist-get entry :operation-id)
+                     :status :queued :document-id "old" :kind :tombstone
+                     :local-path "note.org" :logical-path "note.org"
+                     :remote-revision 2 :projection
+                     (:document_id "old" :revision 2
+                      :logical_path "note.org" :content_sha256 nil
+                      :operation "tombstone")))
+         (state `(:bases [(:document-id "new" :revision 1
+                           :logical-path "note.org" :digest ,digest :active t)]
+                  :outbox [,entry] :conflicts [,conflict])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "note.org" bytes)
+          (cl-letf (((symbol-function 'gnosis-nodes--send-entry)
+                     (lambda (&rest _)
+                       `(:status "applied" :changed ,gnosis-core--json-false
+                         :authoritative ,authoritative))))
+            (setq state (gnosis-nodes--send-outbox state)))
+          (should (= 0 (length (plist-get state :outbox))))
+          (should (= 0 (length (plist-get state :conflicts))))
+          (should (equal "new"
+                         (plist-get (gnosis-nodes--base state "new")
+                                    :document-id))))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-retained-tombstone-reconciles-after-restart ()
   (let* ((directory (make-temp-file "gnosis-nodes-retained-tombstone-" t))
          (gnosis-nodes-dir directory)
@@ -1655,6 +1690,36 @@
           (should (= 3 (plist-get (gnosis-nodes--base state "doc") :revision)))
           (should (= 0 (length (plist-get state :outbox))))
           (should (= 0 (length (plist-get state :conflicts)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-retained-rename-allows-authoritative-live-destination ()
+  (let* ((directory (make-temp-file "gnosis-nodes-live-rename-" t))
+         (gnosis-nodes-dir directory)
+         (bytes (string-to-unibyte "accepted"))
+         (digest (gnosis-nodes--digest bytes))
+         (projection `(:document_id "doc" :revision 3
+                       :logical_path "new.org" :content_sha256 ,digest
+                       :operation "rename"))
+         (entry (gnosis-nodes--outbox-entry
+                 :rename "doc" 2 "new.org" digest "old.org"))
+         (conflict '(:document-id "doc" :kind :rename
+                     :local-path "old.org" :logical-path "new.org"))
+         destination-buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "new.org" bytes)
+          (setq destination-buffer
+                (find-file-noselect (expand-file-name "new.org" directory)))
+          (should (gnosis-nodes--reconcile-applied-effect-p
+                   entry conflict projection))
+          (with-current-buffer destination-buffer
+            (set-buffer-modified-p t))
+          (should-not (gnosis-nodes--reconcile-applied-effect-p
+                       entry conflict projection)))
+      (when (buffer-live-p destination-buffer)
+        (with-current-buffer destination-buffer
+          (set-buffer-modified-p nil))
+        (kill-buffer destination-buffer))
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-keep-local-rename-reconciles-after-restart ()
@@ -1880,6 +1945,20 @@
       (remhash session-id gnosis-nodes--ediff-sessions)
       (when (buffer-live-p control-buffer) (kill-buffer control-buffer))
       (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-resolve-rejects-rename-before-ediff ()
+  (let ((state '(:conflicts [(:document-id "doc" :kind :rename
+                              :local-path "old.org" :logical-path "new.org")]))
+        (writes 0)
+        (ediff-calls 0))
+    (cl-letf (((symbol-function 'gnosis-nodes--read-state) (lambda () state))
+              ((symbol-function 'gnosis-nodes--write-state)
+               (lambda (_) (cl-incf writes)))
+              ((symbol-function 'ediff-merge-buffers-with-ancestor)
+               (lambda (&rest _) (cl-incf ediff-calls))))
+      (should-error (gnosis-nodes-resolve-conflict) :type 'user-error))
+    (should (= 0 writes))
+    (should (= 0 ediff-calls))))
 
 (ert-deftest gnosis-nodes-reconciliation-rejects-non-regular-destination ()
   (let* ((directory (make-temp-file "gnosis-nodes-nonregular" t))

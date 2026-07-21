@@ -1688,6 +1688,16 @@ Use already validated PAYLOAD when supplied."
              (equal (gnosis-nodes--nullable (plist-get entry :digest)) digest))
          (eq active (not (eq kind :delete))))))
 
+(defun gnosis-nodes--entry-authoritative-projection (entry authoritative)
+  "Return document projection for confirmed ENTRY and AUTHORITATIVE."
+  (let ((projection (copy-sequence authoritative)))
+    (plist-put projection :operation
+               (pcase (plist-get entry :kind)
+                 (:create "create")
+                 (:replace "update")
+                 (:rename "rename")
+                 (:delete "tombstone")))))
+
 (defun gnosis-nodes--reconcile-applied-effect-p
     (entry record projection &optional state)
   "Reconcile exact local effect for applied ENTRY and return non-nil.
@@ -1724,7 +1734,8 @@ the durable dependent local intent when present."
             (null (gnosis-nodes--working-bytes source))))
       (:rename
        (and (not (equal source-path logical-path))
-            (not (buffer-live-p destination-buffer))
+            (not (and (buffer-live-p destination-buffer)
+                      (buffer-modified-p destination-buffer)))
             (not (and (buffer-live-p source-buffer)
                       (buffer-modified-p source-buffer)))
             (let ((source-bytes (gnosis-nodes--working-bytes source))
@@ -1738,10 +1749,12 @@ the durable dependent local intent when present."
                        (and dependent
                             (equal (plist-get dependent :digest)
                                    (gnosis-nodes--digest destination-bytes))))
-                   (progn
-                     (gnosis-nodes--move-document
-                      source-path logical-path
-                      (or source-bytes destination-bytes))
+                   (if source-bytes
+                       (and (not (buffer-live-p destination-buffer))
+                            (progn
+                              (gnosis-nodes--move-document
+                               source-path logical-path source-bytes)
+                              t))
                      t)))))
       (_
        (let ((bytes (gnosis-nodes--working-bytes destination)))
@@ -1756,10 +1769,18 @@ the durable dependent local intent when present."
     (when-let* ((record
                  (seq-find
                   (lambda (candidate)
-                    (gnosis-nodes--authoritative-confirms-projection-p
-                     authoritative (plist-get candidate :projection)))
+                    (or (gnosis-nodes--authoritative-confirms-projection-p
+                         authoritative (plist-get candidate :projection))
+                        (and (plist-get entry :operation-id)
+                             (equal (plist-get entry :operation-id)
+                                    (plist-get candidate :operation-id)))))
                   (append (plist-get state :conflicts) nil)))
-                (projection (plist-get record :projection))
+                (projection
+                 (if (gnosis-nodes--authoritative-confirms-projection-p
+                      authoritative (plist-get record :projection))
+                     (plist-get record :projection)
+                   (gnosis-nodes--entry-authoritative-projection
+                    entry authoritative)))
                 ((gnosis-nodes--reconcile-applied-effect-p
                   entry record projection state)))
       (setf (plist-get state :conflicts)
@@ -2370,6 +2391,8 @@ Edit and save Ediff's merge buffer; accept it before quitting Ediff."
            (selection (gnosis-nodes--select-conflict conflicts))
            (index (car selection))
            (record (cdr selection)))
+      (when (eq :rename (plist-get record :kind))
+        (user-error "Choose local or remote resolution for rename conflicts"))
       (let* ((local (gnosis-nodes--safe-path
                      gnosis-nodes-dir
                      (or (plist-get record :local-path)
