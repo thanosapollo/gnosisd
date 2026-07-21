@@ -499,6 +499,13 @@ pub(crate) fn prepare_document(
     expected_revision: Option<u64>,
 ) -> Result<PreparedNote, ContentError> {
     validate_document_path(&logical_path)?;
+    crate::parser::validate_document_path(&content_type, &logical_path).map_err(
+        |error| match error {
+            DocumentParseError::UnsupportedContentType(_)
+            | DocumentParseError::InvalidReference => ContentError::UnsupportedType,
+            DocumentParseError::Org(_) => ContentError::DocumentParser,
+        },
+    )?;
     if source.len() > MAX_DOCUMENT_SOURCE_BYTES {
         return Err(ContentError::SourceTooLarge);
     }
@@ -561,7 +568,10 @@ pub(crate) fn validate_logical_path(value: &str) -> Result<(), ContentError> {
 
 pub(crate) fn validate_org_path(value: &str) -> Result<(), ContentError> {
     validate_logical_path(value)?;
-    if !value.ends_with(".org") || value.starts_with("assets/") {
+    if value.len() > crate::parser::MAX_DOCUMENT_LOGICAL_PATH_BYTES
+        || !value.ends_with(".org")
+        || value.starts_with("assets/")
+    {
         return Err(ContentError::UnsupportedType);
     }
     Ok(())
@@ -704,6 +714,43 @@ mod tests {
         .unwrap();
         assert_eq!(document.content_type, "text/org; charset=utf-8");
         assert_eq!(document.source, "#+title: Note\n");
+
+        let prefix = "#+title: Maximum\n";
+        let maximum_source = format!(
+            "{prefix}{}",
+            "\n".repeat(MAX_DOCUMENT_SOURCE_BYTES - prefix.len())
+        );
+        prepare_document(
+            None,
+            "maximum.org".into(),
+            "text/org; charset=utf-8".into(),
+            maximum_source,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepare_document(
+                None,
+                "notes/note.md".into(),
+                "text/org; charset=utf-8".into(),
+                "#+title: Note\n".into(),
+                None,
+            )
+            .unwrap_err(),
+            ContentError::UnsupportedType
+        );
+        assert_eq!(
+            prepare_document(
+                None,
+                format!("{}.org", "a".repeat(4093)),
+                "text/org; charset=utf-8".into(),
+                "#+title: Note\n".into(),
+                None,
+            )
+            .unwrap_err(),
+            ContentError::UnsupportedType
+        );
 
         assert_eq!(
             prepare_document(

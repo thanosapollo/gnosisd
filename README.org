@@ -251,7 +251,7 @@ immutable. Normal replica synchronization never creates a review pack.
 
 * Storage
 
-The server's canonical schema v2 stores native themata, tags, node associations,
+The server's canonical schema v1 stores native themata, tags, node associations,
 scheduling state, exact review history, sessions, attempts, devices, settings,
 documents, and the node graph. It also stores replica snapshots and feed
 revisions, review packs, immutable offline operations and results, device

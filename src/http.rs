@@ -14,7 +14,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response, Sse, sse::Event},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::NaiveDate;
 use schemars::generate::SchemaSettings;
@@ -43,8 +43,8 @@ use crate::{
     domain::{DocumentId, DueThema, NodeId, ThemaId},
     is_canonical_sha256,
     protocol::{
-        DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_REVIEW_OPERATION_BYTES,
-        OfflineAssetSubmission, OfflineAssetWireError, OfflineContentSubmission,
+        DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
+        MAX_OFFLINE_REVIEW_OPERATION_BYTES, OfflineAssetSubmission, OfflineAssetWireError,
         OfflineContentWireError, OfflineReviewSubmission, OfflineReviewWireError, ReplicaWireError,
         active_review_pack_response, decode_cursor, decode_snapshot_cursor,
         http_v1::{
@@ -187,7 +187,10 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/dashboard", get(dashboard))
         .route(
             "/v1/documents/{id}",
-            get(get_document_projection).put(import_document_projection),
+            get(get_document_projection).merge(
+                put(import_document_projection)
+                    .layer(DefaultBodyLimit::max(MAX_OFFLINE_CONTENT_OPERATION_BYTES)),
+            ),
         )
         .route("/v1/review/due", get(due_page))
         .route("/v1/changes", get(changes))
@@ -217,7 +220,11 @@ fn data_router() -> Router<HttpState> {
             get(get_asset).put(put_asset).delete(delete_asset),
         )
         .route("/v1/blobs/{digest}", get(get_blob))
-        .route("/v1/content/offline-operations", post(reconcile_content))
+        .route(
+            "/v1/content/offline-operations",
+            post(reconcile_content)
+                .layer(DefaultBodyLimit::max(MAX_OFFLINE_CONTENT_OPERATION_BYTES)),
+        )
         .route(
             "/v1/content/offline-asset-operations",
             post(reconcile_asset),
@@ -1963,7 +1970,7 @@ async fn reconcile_offline(
 async fn reconcile_content(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
-    ApiJson(submission): ApiJson<OfflineContentSubmission>,
+    ApiJson(submission): ApiJson<OfflineContentOperationEnvelopeV1>,
 ) -> Result<Json<OfflineContentResultEnvelopeV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let decoded = submission
@@ -7027,7 +7034,7 @@ mod tests {
         assert_eq!(malformed.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             response_json(malformed).await["error"]["code"],
-            "invalid_offline_content_operation"
+            "invalid_body"
         );
         let state: ReplicaStateV1 = response_typed(
             app.clone()

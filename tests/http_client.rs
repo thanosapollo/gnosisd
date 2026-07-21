@@ -198,6 +198,50 @@ async fn client_authenticates_and_decodes_replica_bootstrap() {
 }
 
 #[tokio::test]
+async fn maximum_document_source_crosses_direct_and_offline_http_envelopes() {
+    const MAX_DOCUMENT_SOURCE_BYTES: usize = 1_048_576;
+
+    let daemon = RunningDaemon::start().await;
+    let (device_id, raw_token) = create_device(&daemon.socket).await;
+    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
+    let prefix = "#+title: Maximum\n";
+    let source = format!(
+        "{prefix}{}",
+        "\n".repeat(MAX_DOCUMENT_SOURCE_BYTES - prefix.len())
+    );
+    assert_eq!(source.len(), MAX_DOCUMENT_SOURCE_BYTES);
+
+    client
+        .import_document(
+            "direct-maximum",
+            "direct-maximum-operation",
+            &DocumentImportRequestV1 {
+                content_type: "text/org; charset=utf-8".into(),
+                source: source.clone(),
+                expected_revision: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut replica = bootstrap_replica(&daemon, &client, &device_id).await;
+    replica
+        .record_document(OfflineDocumentEdit {
+            operation_id: "offline-maximum-operation".into(),
+            document_id: "offline-maximum".into(),
+            logical_path: "offline-maximum.org".into(),
+            org: source,
+            authored_at_us: 10,
+        })
+        .unwrap();
+    let upload = replica.next_device_upload().unwrap().unwrap();
+    let result = client.upload(&upload).await.unwrap();
+    assert_eq!(result.operation_id(), "offline-maximum-operation");
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn client_runs_managed_asset_lifecycle_and_retains_blob() {
     let daemon = RunningDaemon::start().await;
     let (_, raw_token) = create_device(&daemon.socket).await;

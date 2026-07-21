@@ -14,15 +14,15 @@ use crate::{
     },
     protocol::{
         DecodedOfflineAssetResult, DecodedOfflineContentResult, OfflineAssetSubmission,
-        OfflineAssetWireError, OfflineContentSubmission, OfflineContentWireError,
-        OfflineReviewWireError, ReplicaWireError, canonical_asset_operation,
-        canonical_content_operation, canonical_offline_operation, decode_change_page,
-        decode_cursor, decode_offline_asset_capabilities, decode_offline_asset_result,
-        decode_offline_content_capabilities, decode_offline_content_result, decode_offline_result,
-        decode_replica_state, decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
+        OfflineAssetWireError, OfflineContentWireError, OfflineReviewWireError, ReplicaWireError,
+        canonical_asset_operation, canonical_content_operation, canonical_offline_operation,
+        decode_change_page, decode_cursor, decode_offline_asset_capabilities,
+        decode_offline_asset_result, decode_offline_content_capabilities,
+        decode_offline_content_result, decode_offline_result, decode_replica_state,
+        decode_review_pack, decode_snapshot_cursor, decode_snapshot_page,
         http_v1::{
-            AssetCapabilitiesV1, ContentCapabilitiesV1, ReplicaChangePageV1, ReplicaSnapshotPageV1,
-            ReplicaStateV1, ReviewPackEnvelopeV2,
+            AssetCapabilitiesV1, ContentCapabilitiesV1, OfflineContentOperationEnvelopeV1,
+            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewPackEnvelopeV2,
         },
     },
     store::{
@@ -33,6 +33,8 @@ use crate::{
         canonical_json_sha256,
     },
 };
+
+type OfflineContentSubmission = OfflineContentOperationEnvelopeV1;
 
 pub struct LocalReplica {
     store: LocalReplicaStore,
@@ -1893,9 +1895,9 @@ mod tests {
 
     use super::{
         AssetConflictReason, ContentConflictReason, Error, LocalReplica, OfflineAnswer,
-        OfflineAssetCreate, OfflineContentOutcome, OfflineDocumentEdit, OfflineDocumentRename,
-        OfflineDocumentTombstone, OfflineResponse, PendingAssetUpload, PendingContentUpload,
-        PendingDeviceUpload, ReplicaAssetState, ReviewConflictReason,
+        OfflineAssetCreate, OfflineContentOutcome, OfflineContentSubmission, OfflineDocumentEdit,
+        OfflineDocumentRename, OfflineDocumentTombstone, OfflineResponse, PendingAssetUpload,
+        PendingContentUpload, PendingDeviceUpload, ReplicaAssetState, ReviewConflictReason,
     };
     use crate::{
         application::{
@@ -1904,11 +1906,11 @@ mod tests {
         },
         domain::ThemaConceptRelation,
         protocol::{
-            OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineContentSubmission,
-            OfflineReviewSubmission, decode_cursor, decode_snapshot_cursor, encode_cursor,
-            encode_snapshot_cursor, offline_asset_capabilities, offline_asset_result_json,
-            offline_content_capabilities, offline_content_result_json, offline_result_json,
-            replica_change_page, replica_snapshot_page, replica_state_response, review_pack_json,
+            OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineReviewSubmission, decode_cursor,
+            decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
+            offline_asset_capabilities, offline_asset_result_json, offline_content_capabilities,
+            offline_content_result_json, offline_result_json, replica_change_page,
+            replica_snapshot_page, replica_state_response, review_pack_json,
         },
         service::{ServiceHandle, ServiceRuntime},
     };

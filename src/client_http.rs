@@ -21,10 +21,10 @@ use thiserror::Error;
 
 use crate::{
     application::{
-        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, MAX_DUE_CURSOR_BYTES, MAX_OFFLINE_ASSET_BYTES,
-        MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path, prepare_document, prepare_thema,
-        thema_content, valid_operation_id, validate_asset_path, validate_blob_metadata,
-        validate_org_path,
+        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, MAX_DOCUMENT_SOURCE_BYTES, MAX_DUE_CURSOR_BYTES,
+        MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path,
+        prepare_document, prepare_thema, thema_content, valid_operation_id, validate_asset_path,
+        validate_blob_metadata, validate_org_path,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
@@ -34,6 +34,7 @@ use crate::{
         SourceSpan, ThemaId, TitlePath,
     },
     is_canonical_sha256,
+    parser::ORG_CONTENT_TYPE,
     protocol::{
         DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
         MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
@@ -668,9 +669,12 @@ impl HttpClient {
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
         validate_document_mutation_request(document_id, input.expected_revision)?;
         require_operation_id(operation_id)?;
+        if input.source.len() > MAX_DOCUMENT_SOURCE_BYTES {
+            return Err(HttpClientError::InvalidMutation);
+        }
         let url = self.resource_endpoint("v1/documents", document_id)?;
         let body = serde_json::to_vec(input).map_err(|_| HttpClientError::InvalidMutation)?;
-        if body.len() > MAX_FRAME_SIZE {
+        if body.len() > MAX_OFFLINE_CONTENT_OPERATION_BYTES {
             return Err(HttpClientError::InvalidMutation);
         }
         let request = self
@@ -1789,6 +1793,7 @@ fn thema_matches_input(thema: &ThemaV1, input: &ThemaWriteRequestV1) -> bool {
         && is_canonical_sha256(&thema.content_sha256)
 }
 
+#[derive(Clone)]
 struct DocumentMutationExpectation {
     document_id: Option<String>,
     active: bool,
@@ -1846,6 +1851,7 @@ fn validate_document_head(
         .is_none_or(|expected| head.document_id == expected)
         && DocumentId::new(head.document_id.clone()).is_ok()
         && validate_org_path(&head.logical_path).is_ok()
+        && head.content_type == ORG_CONTENT_TYPE
         && expectation
             .logical_path
             .as_deref()
@@ -2522,6 +2528,12 @@ mod tests {
         head.logical_path = "note.org".into();
         head.content_type = "text/markdown; charset=utf-8".into();
         assert!(!validate_document_head(&head, &update_expectation, true));
+        let lifecycle_expectation = DocumentMutationExpectation {
+            content_type: None,
+            content_sha256: None,
+            ..update_expectation.clone()
+        };
+        assert!(!validate_document_head(&head, &lifecycle_expectation, true));
         head.content_type = "text/org; charset=utf-8".into();
         head.revision = 1;
         head.content_sha256 = Some("b".repeat(64));
@@ -2808,7 +2820,7 @@ mod tests {
         let client = HttpClient::new("http://127.0.0.1:1/", token).unwrap();
         let input = DocumentImportRequestV1 {
             content_type: "text/org; charset=utf-8".into(),
-            source: "\\".repeat(MAX_FRAME_SIZE / 2 + 1),
+            source: "x".repeat(MAX_DOCUMENT_SOURCE_BYTES + 1),
             expected_revision: None,
         };
 

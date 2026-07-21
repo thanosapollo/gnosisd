@@ -8,6 +8,7 @@ use crate::domain::DocumentProjection;
 pub mod org;
 
 pub(crate) const ORG_CONTENT_TYPE: &str = "text/org; charset=utf-8";
+pub(crate) const MAX_DOCUMENT_LOGICAL_PATH_BYTES: usize = 4096;
 
 struct DocumentAdapter {
     content_type: &'static str,
@@ -67,6 +68,9 @@ pub(crate) fn validate_document_path(
     content_type: &str,
     logical_path: &str,
 ) -> Result<(), DocumentParseError> {
+    if logical_path.len() > MAX_DOCUMENT_LOGICAL_PATH_BYTES {
+        return Err(DocumentParseError::InvalidReference);
+    }
     let adapter = adapter(content_type)?;
     (adapter.validate_path)(logical_path).map_err(|_| DocumentParseError::InvalidReference)
 }

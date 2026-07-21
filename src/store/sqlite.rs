@@ -46,17 +46,8 @@ mod review;
 pub(crate) use mutation::DeviceMutationExecution;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
-const MIGRATE_SCHEMA_1_TO_2: &str = "
-BEGIN IMMEDIATE;
-ALTER TABLE document ADD COLUMN content_type TEXT NOT NULL
-    DEFAULT 'text/org; charset=utf-8';
-ALTER TABLE document_revision ADD COLUMN content_type TEXT NOT NULL
-    DEFAULT 'text/org; charset=utf-8';
-PRAGMA user_version = 2;
-COMMIT;
-";
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 1;
 const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -3576,13 +3567,6 @@ fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
             .map_err(StoreError::storage)?;
         found = schema_version(connection)?;
     }
-    if found == 1 {
-        require_application_id(connection)?;
-        connection
-            .execute_batch(MIGRATE_SCHEMA_1_TO_2)
-            .map_err(StoreError::storage)?;
-        found = schema_version(connection)?;
-    }
     match found {
         SCHEMA_VERSION => {
             require_application_id(connection)?;
@@ -3599,9 +3583,6 @@ fn require_current_schema_layout(connection: &Connection) -> Result<(), StoreErr
     let expected = Connection::open_in_memory().map_err(StoreError::storage)?;
     expected
         .execute_batch(CURRENT_SCHEMA)
-        .map_err(StoreError::storage)?;
-    expected
-        .execute_batch(MIGRATE_SCHEMA_1_TO_2)
         .map_err(StoreError::storage)?;
     if schema_objects(connection)? == schema_objects(&expected)? {
         Ok(())
@@ -4623,9 +4604,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, MIGRATE_SCHEMA_1_TO_2,
-        SCHEMA_VERSION, SqliteStore, StoreError, application_id, backup_database_with_step,
-        initialize_schema, replace_rows, retire_removed_nodes, schema_version,
+        APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION,
+        SqliteStore, StoreError, application_id, backup_database_with_step, initialize_schema,
+        replace_rows, retire_removed_nodes, schema_version,
     };
     use crate::application::{
         NodeThemaAssociation, PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind,
@@ -5029,35 +5010,22 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v1_documents_with_the_org_media_type() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("gnosis.db");
-        let connection = rusqlite::Connection::open(&path).unwrap();
+    fn canonical_v1_schema_contains_document_content_types() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection.execute_batch(CURRENT_SCHEMA).unwrap();
-        connection
-            .execute(
-                "INSERT INTO document(
-                     document_id, revision, title, file_tags_json, content_sha256,
-                     logical_path, path_key, head_blob_sha256
-                 ) VALUES ('document', 1, 'Title', '[]', 'digest',
-                           'note.org', 'note.org', 'digest')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
 
-        let store = SqliteStore::open(&path).unwrap();
-        let content_type: String = store
-            .connection
-            .query_row(
-                "SELECT content_type FROM document WHERE document_id = 'document'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert_eq!(content_type, "text/org; charset=utf-8");
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        for table in ["document", "document_revision"] {
+            let count: u64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1)
+                     WHERE name = 'content_type' AND type = 'TEXT' AND \"notnull\" = 1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} must require content_type");
+        }
+        assert_eq!(schema_version(&connection).unwrap(), 1);
     }
 
     #[test]
@@ -5165,7 +5133,6 @@ mod tests {
         let database = directory.path().join("backup.sqlite3");
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection.execute_batch(CURRENT_SCHEMA).unwrap();
-        connection.execute_batch(MIGRATE_SCHEMA_1_TO_2).unwrap();
         connection
             .execute_batch("CREATE TABLE stale_table(value TEXT) STRICT;")
             .unwrap();

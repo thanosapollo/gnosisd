@@ -46,13 +46,6 @@ where
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct OfflineContentSubmission {
-    version: u32,
-    operation: Value,
-}
-
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OfflineContentOperationEnvelopeV1 {
@@ -61,6 +54,9 @@ pub struct OfflineContentOperationEnvelopeV1 {
     pub version: u32,
     pub operation: OfflineContentOperationV1,
 }
+
+#[cfg(test)]
+type OfflineContentSubmission = OfflineContentOperationEnvelopeV1;
 
 pub(crate) struct DecodedOfflineContent {
     pub(crate) version: u32,
@@ -90,22 +86,15 @@ pub(crate) enum OfflineContentWireError {
     Operation,
 }
 
-impl OfflineContentSubmission {
+impl OfflineContentOperationEnvelopeV1 {
     pub(crate) fn decode(self) -> Result<DecodedOfflineContent, OfflineContentWireError> {
-        match self.version {
-            OFFLINE_CONTENT_VERSION => {
-                let wire: OfflineContentOperationV1 =
-                    serde_json::from_value(self.operation).map_err(invalid_operation)?;
-                validate_operation(&wire)?;
-                let canonical_payload = encode_operation(&wire)?;
-                Ok(DecodedOfflineContent {
-                    version: self.version,
-                    operation: wire.into(),
-                    canonical_payload,
-                })
-            }
-            _ => Err(OfflineContentWireError::Version),
-        }
+        validate_operation(&self.operation)?;
+        let canonical_payload = encode_operation(&self.operation)?;
+        Ok(DecodedOfflineContent {
+            version: self.version,
+            operation: self.operation.into(),
+            canonical_payload,
+        })
     }
 }
 
@@ -190,9 +179,9 @@ fn content_result_envelope(
         ContentReconciliationStatus::Accepted => OfflineContentResultV1::Accepted {
             operation_id: result.operation_id.clone(),
             conflict_reason: require_absent(result.conflict_reason)?,
-            authoritative: OfflineContentDocumentV1::from(
+            authoritative: offline_content_document(
                 authoritative.ok_or(OfflineContentWireError::Operation)?,
-            ),
+            )?,
             cursor,
         },
         ContentReconciliationStatus::Conflict => OfflineContentResultV1::Conflict {
@@ -201,13 +190,29 @@ fn content_result_envelope(
                 .conflict_reason
                 .ok_or(OfflineContentWireError::Operation)?
                 .into(),
-            authoritative: authoritative.map(OfflineContentDocumentV1::from),
+            authoritative: authoritative.map(offline_content_document).transpose()?,
             cursor,
         },
     };
     Ok(OfflineContentResultEnvelopeV1 {
         version: OFFLINE_CONTENT_VERSION,
         result: wire,
+    })
+}
+
+fn offline_content_document(
+    value: &AuthoritativeDocument,
+) -> Result<OfflineContentDocumentV1, OfflineContentWireError> {
+    Ok(OfflineContentDocumentV1 {
+        document_id: value.document_id.clone(),
+        logical_path: value.logical_path.clone(),
+        content_type: value
+            .content_type
+            .clone()
+            .ok_or(OfflineContentWireError::Operation)?,
+        revision: value.revision,
+        content_sha256: value.content_sha256.clone(),
+        active: value.active,
     })
 }
 
@@ -422,11 +427,10 @@ fn validate_authoritative(document: &AuthoritativeDocument) -> Result<(), Offlin
     if let Some(digest) = &document.content_sha256 {
         require_digest(digest)?;
     }
-    if document
+    if !document
         .content_type
         .as_deref()
-        .is_some_and(|content_type| !SUPPORTED_CONTENT_TYPES.contains(&content_type))
-        || (document.active && document.content_type.is_none())
+        .is_some_and(|content_type| SUPPORTED_CONTENT_TYPES.contains(&content_type))
     {
         return Err(OfflineContentWireError::Operation);
     }
@@ -763,9 +767,7 @@ pub struct OfflineContentDocumentV1 {
     pub document_id: String,
     #[schemars(length(min = 1, max = 4096))]
     pub logical_path: String,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
-    pub content_type: Option<String>,
+    pub content_type: String,
     #[schemars(range(min = 1))]
     pub revision: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
@@ -774,25 +776,12 @@ pub struct OfflineContentDocumentV1 {
     pub active: bool,
 }
 
-impl From<&AuthoritativeDocument> for OfflineContentDocumentV1 {
-    fn from(value: &AuthoritativeDocument) -> Self {
-        Self {
-            document_id: value.document_id.clone(),
-            logical_path: value.logical_path.clone(),
-            content_type: value.content_type.clone(),
-            revision: value.revision,
-            content_sha256: value.content_sha256.clone(),
-            active: value.active,
-        }
-    }
-}
-
 impl From<OfflineContentDocumentV1> for AuthoritativeDocument {
     fn from(value: OfflineContentDocumentV1) -> Self {
         Self {
             document_id: value.document_id,
             logical_path: value.logical_path,
-            content_type: value.content_type,
+            content_type: Some(value.content_type),
             revision: value.revision,
             content_sha256: value.content_sha256,
             active: value.active,
@@ -892,6 +881,33 @@ mod tests {
         assert!(matches!(
             decode_offline_content_result(value),
             Err(OfflineContentWireError::Version)
+        ));
+    }
+
+    #[test]
+    fn accepted_tombstones_require_a_stable_content_type() {
+        let cursor = super::encode_cursor(&"a".repeat(32), 1, &"b".repeat(32)).unwrap();
+        let value = json!({
+            "version": 1,
+            "result": {
+                "status": "accepted",
+                "operation_id": "operation",
+                "conflict_reason": null,
+                "authoritative": {
+                    "document_id": "document",
+                    "logical_path": "note.org",
+                    "content_type": null,
+                    "revision": 2,
+                    "content_sha256": null,
+                    "active": false
+                },
+                "cursor": cursor
+            }
+        });
+
+        assert!(matches!(
+            decode_offline_content_result(value),
+            Err(OfflineContentWireError::Operation)
         ));
     }
 
@@ -1005,8 +1021,7 @@ mod tests {
         }))
         .unwrap();
 
-        let wire: super::OfflineContentOperationV1 =
-            serde_json::from_value(submission.operation.clone()).unwrap();
+        let wire = submission.operation.clone();
         super::validate_operation(&wire).unwrap();
         super::encode_operation(&wire).unwrap();
         submission.decode().unwrap();
