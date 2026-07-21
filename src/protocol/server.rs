@@ -4,7 +4,7 @@ use std::{
     net::SocketAddr,
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use thiserror::Error;
@@ -22,7 +22,9 @@ use crate::{
         MessageValidationError, PROTOCOL_VERSION, ProtocolError, RepairView, Request,
         RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo, frame,
     },
-    service::{ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError},
+    service::{
+        SERVICE_SHUTDOWN_DEADLINE, ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError,
+    },
     store::StoreError,
 };
 
@@ -163,18 +165,42 @@ impl DaemonServer {
             shutdown,
         )
         .await;
+        let shutdown_started = Instant::now();
+        service.request_shutdown();
         let _ = shutdown_sender.send(true);
-        while handlers.join_next().await.is_some() {}
+        if timeout(shutdown_remaining(shutdown_started), async {
+            while handlers.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            handlers.abort_all();
+        }
         let http_result = match http_task {
-            Some(task) => task.await.map_err(|_| ServerError::HttpTask)?,
+            Some(mut task) => {
+                match timeout(shutdown_remaining(shutdown_started), &mut task).await {
+                    Ok(result) => result.map_err(|_| ServerError::HttpTask)?,
+                    Err(_) => {
+                        task.abort();
+                        Ok(())
+                    }
+                }
+            }
             None => Ok(()),
         };
         drop(state);
-        service.finish().await.map_err(ServerError::service)?;
+        service
+            .finish_with_deadline(shutdown_remaining(shutdown_started))
+            .await
+            .map_err(ServerError::service)?;
         drop(target_locks);
         drop(socket);
         accept_error.and(http_result.map_err(ServerError::Http))
     }
+}
+
+fn shutdown_remaining(started: Instant) -> Duration {
+    SERVICE_SHUTDOWN_DEADLINE.saturating_sub(started.elapsed())
 }
 
 async fn serve_http(

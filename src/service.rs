@@ -25,7 +25,7 @@ use backup::{
     verify_backup_cancellable,
 };
 
-const SERVICE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const SERVICE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 const SERVICE_SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 #[cfg(test)]
 use import::persist_server_import;
@@ -1332,11 +1332,16 @@ impl ServiceRuntime {
         self.handle.clone()
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish(self) -> Result<(), ServiceError> {
         self.finish_with_deadline(SERVICE_SHUTDOWN_DEADLINE).await
     }
 
-    async fn finish_with_deadline(self, deadline: Duration) -> Result<(), ServiceError> {
+    pub(crate) fn request_shutdown(&self) {
+        self.backup_cancelled.request();
+    }
+
+    pub(crate) async fn finish_with_deadline(self, deadline: Duration) -> Result<(), ServiceError> {
         let Self {
             handle,
             store_thread,

@@ -98,6 +98,70 @@ async fn unix_socket_serves_operator_commands_and_secures_files() {
     task.await.unwrap().unwrap();
 }
 
+#[tokio::test]
+async fn shutdown_cancels_an_accepted_contended_backup_before_draining_handlers() {
+    let temporary = TempDir::new().unwrap();
+    let socket = temporary.path().join("gnosis.sock");
+    let database = temporary.path().join("gnosis.sqlite");
+    let backup = temporary.path().join("backup");
+    let server = DaemonServer::bind(DaemonConfig::new(&socket, &database))
+        .await
+        .unwrap();
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(server.run(async {
+        let _ = shutdown_rx.await;
+    }));
+    let request_socket = socket.clone();
+    let request_backup = backup.clone();
+    let backup_task = tokio::spawn(async move {
+        request(
+            &request_socket,
+            "backup-create",
+            Request::BackupCreate {
+                destination: request_backup.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot_exists = fs::read_dir(temporary.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".gnosis-backup-snapshot-")
+            });
+            if snapshot_exists {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("backup was not accepted before shutdown");
+    shutdown_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), server_task)
+        .await
+        .expect("accepted contended backup blocked daemon shutdown")
+        .unwrap()
+        .unwrap();
+    let response = backup_task.await.unwrap();
+    assert!(matches!(response.outcome, ResponseOutcome::Failure { .. }));
+    assert!(!backup.exists());
+    assert!(fs::read_dir(temporary.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".gnosis-backup-")
+    }));
+    writer.execute_batch("ROLLBACK;").unwrap();
+}
+
 async fn request(socket: &std::path::Path, id: &str, request: Request) -> ResponseEnvelope {
     let mut stream = connect(socket).await;
     let request = RequestEnvelope {
