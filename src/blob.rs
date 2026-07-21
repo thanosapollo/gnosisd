@@ -121,16 +121,54 @@ impl BlobStore {
         Ok(removed)
     }
 
-    pub(crate) fn copy_to(&self, digest: &str, size: u64, root: &Path) -> Result<(), BlobError> {
+    pub(crate) fn copy_to_cancellable(
+        &self,
+        digest: &str,
+        size: u64,
+        root: &Path,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<(), BlobError> {
         let source = self.blob_path(digest)?;
-        self.verify(digest, size)?;
+        let metadata = fs::symlink_metadata(&source)?;
+        if !metadata.file_type().is_file() || metadata.len() != size {
+            return Err(BlobError::Corrupt);
+        }
         let target = root.join(&digest[..2]).join(digest);
         let parent = target.parent().ok_or(BlobError::InvalidDigest)?;
         fs::create_dir_all(parent)?;
         sync_directory(root)?;
-        fs::copy(source, &target)?;
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
-        File::open(&target)?.sync_all()?;
+        let result = (|| {
+            let mut source = File::open(source)?;
+            let mut target_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&target)?;
+            let mut hasher = Sha256::new();
+            let mut copied = 0_u64;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                if cancelled() {
+                    return Err(BlobError::Cancelled);
+                }
+                let read = source.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                target_file.write_all(&buffer[..read])?;
+                hasher.update(&buffer[..read]);
+                copied = copied.checked_add(read as u64).ok_or(BlobError::Corrupt)?;
+            }
+            if copied != size || format!("{:x}", hasher.finalize()) != digest {
+                return Err(BlobError::Corrupt);
+            }
+            target_file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = fs::remove_file(&target);
+            return Err(error);
+        }
         sync_directory(parent)?;
         Ok(())
     }
@@ -241,6 +279,8 @@ pub(crate) enum BlobError {
     InvalidDigest,
     #[error("blob content is missing or corrupt")]
     Corrupt,
+    #[error("blob operation was cancelled")]
+    Cancelled,
     #[error("system clock is before the Unix epoch")]
     Clock,
     #[error("blob filesystem operation failed")]
@@ -249,7 +289,9 @@ pub(crate) enum BlobError {
 
 #[cfg(test)]
 mod tests {
-    use super::BlobStore;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{BlobError, BlobStore};
 
     #[test]
     fn immutable_blobs_deduplicate_and_verify() {
@@ -279,5 +321,28 @@ mod tests {
         assert!(root.join(&keep.sha256[..2]).join(&keep.sha256).exists());
         assert!(root.join(&orphan.sha256[..2]).join(&orphan.sha256).exists());
         assert!(!root.join(".tmp-interrupted").exists());
+    }
+
+    #[test]
+    fn cancellable_copy_stops_between_chunks_and_removes_partial_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(directory.path().join("source")).unwrap();
+        let blob = store
+            .put(&vec![b'x'; 256 * 1024], "application/octet-stream")
+            .unwrap();
+        let destination = directory.path().join("destination");
+        let checks = AtomicUsize::new(0);
+
+        let result = store.copy_to_cancellable(&blob.sha256, blob.size_bytes, &destination, || {
+            checks.fetch_add(1, Ordering::Relaxed) >= 2
+        });
+
+        assert!(matches!(result, Err(BlobError::Cancelled)));
+        assert!(
+            !destination
+                .join(&blob.sha256[..2])
+                .join(&blob.sha256)
+                .exists()
+        );
     }
 }

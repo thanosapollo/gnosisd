@@ -2,7 +2,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread,
@@ -21,8 +20,8 @@ mod import;
 
 pub(crate) use backup::BackupSummary;
 use backup::{
-    BackupError, create_backup_cancellable, ensure_restore_complete, prune_backups, restore_backup,
-    snapshot_backup_cancellable, validate_restore, verify_backup,
+    BackupCancellation, BackupError, create_backup_cancellable, ensure_restore_complete,
+    prune_backups, restore_backup, snapshot_backup_cancellable, validate_restore, verify_backup,
 };
 
 const SERVICE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
@@ -1266,7 +1265,7 @@ pub(crate) struct ServiceRuntime {
     handle: ServiceHandle,
     store_thread: thread::JoinHandle<()>,
     backup_thread: thread::JoinHandle<()>,
-    backup_cancelled: Arc<AtomicBool>,
+    backup_cancelled: Arc<BackupCancellation>,
 }
 
 impl ServiceRuntime {
@@ -1293,7 +1292,7 @@ impl ServiceRuntime {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let actor_blobs = blobs.clone();
         let backup_blobs = blobs.clone();
-        let backup_cancelled = Arc::new(AtomicBool::new(false));
+        let backup_cancelled = Arc::new(BackupCancellation::new());
         let actor_backup_cancelled = backup_cancelled.clone();
         let backup_thread = thread::Builder::new()
             .name("gnosis-backup".into())
@@ -1344,12 +1343,19 @@ impl ServiceRuntime {
             backup_cancelled,
         } = self;
         let started = Instant::now();
-        backup_cancelled.store(true, Ordering::Release);
+        backup_cancelled.request();
+        while !backup_cancelled.publication_idle() {
+            sleep_until_next_shutdown_poll(started, deadline).await?;
+        }
+        complete_shutdown_phase(started, deadline)?;
         let (response, receiver) = mpsc::sync_channel(0);
         let mut command = StoreCommand::Shutdown { response };
         loop {
             match handle.sender.try_send(command) {
-                Ok(()) => break,
+                Ok(()) => {
+                    complete_shutdown_phase(started, deadline)?;
+                    break;
+                }
                 Err(TrySendError::Full(returned)) => {
                     command = returned;
                     sleep_until_next_shutdown_poll(started, deadline).await?;
@@ -1359,7 +1365,10 @@ impl ServiceRuntime {
         }
         loop {
             match receiver.try_recv() {
-                Ok(()) => break,
+                Ok(()) => {
+                    complete_shutdown_phase(started, deadline)?;
+                    break;
+                }
                 Err(mpsc::TryRecvError::Empty) => {
                     sleep_until_next_shutdown_poll(started, deadline).await?;
                 }
@@ -1369,7 +1378,10 @@ impl ServiceRuntime {
         let mut backup_command = BackupCommand::Shutdown;
         loop {
             match handle.backup_sender.try_send(backup_command) {
-                Ok(()) => break,
+                Ok(()) => {
+                    complete_shutdown_phase(started, deadline)?;
+                    break;
+                }
                 Err(TrySendError::Full(returned)) => {
                     backup_command = returned;
                     sleep_until_next_shutdown_poll(started, deadline).await?;
@@ -1381,8 +1393,10 @@ impl ServiceRuntime {
         while !store_thread.is_finished() || !backup_thread.is_finished() {
             sleep_until_next_shutdown_poll(started, deadline).await?;
         }
+        complete_shutdown_phase(started, deadline)?;
         store_thread.join().map_err(|_| ServiceError::Stopped)?;
-        backup_thread.join().map_err(|_| ServiceError::Stopped)
+        backup_thread.join().map_err(|_| ServiceError::Stopped)?;
+        complete_shutdown_phase(started, deadline)
     }
 }
 
@@ -1391,6 +1405,10 @@ fn shutdown_remaining(started: Instant, deadline: Duration) -> Result<Duration, 
         .checked_sub(started.elapsed())
         .filter(|remaining| !remaining.is_zero())
         .ok_or(ServiceError::ShutdownDeadlineExceeded)
+}
+
+fn complete_shutdown_phase(started: Instant, deadline: Duration) -> Result<(), ServiceError> {
+    shutdown_remaining(started, deadline).map(drop)
 }
 
 async fn sleep_until_next_shutdown_poll(
@@ -2826,7 +2844,7 @@ fn run_store_command(
 fn backup_actor(
     blobs: Arc<BlobStore>,
     receiver: mpsc::Receiver<BackupCommand>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<BackupCancellation>,
 ) {
     for command in receiver {
         match command {
@@ -2969,7 +2987,7 @@ mod tests {
     use std::{
         sync::{Arc, mpsc},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use sha2::Digest as _;
@@ -2977,7 +2995,7 @@ mod tests {
 
     use super::{
         BackupCommand, BackupError, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
-        repair_canonical_state, stage_blob_command, store_actor,
+        complete_shutdown_phase, repair_canonical_state, stage_blob_command, store_actor,
     };
     use crate::application::{
         AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
@@ -3734,6 +3752,18 @@ mod tests {
             .unwrap();
 
         assert!(matches!(service.ready().await, Err(ServiceError::Stopped)));
+    }
+
+    #[test]
+    fn shutdown_completion_observed_after_deadline_is_rejected() {
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(20))
+            .unwrap();
+
+        assert!(matches!(
+            complete_shutdown_phase(started, Duration::from_millis(10)),
+            Err(ServiceError::ShutdownDeadlineExceeded)
+        ));
     }
 
     #[tokio::test]
