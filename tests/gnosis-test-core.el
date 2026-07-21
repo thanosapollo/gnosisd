@@ -911,6 +911,13 @@ CONTENT-TYPE defaults to application/json."
         (car calls)))
       (setq result
             `(:version 1 :operation_id "operation"
+              :changed ,gnosis-core--json-false :attempt_revision 9
+              :attempt (:attempt_id "attempt")))
+      (should
+       (eq result
+           (gnosis-core-review-attempt-set-suspension "attempt" 8 t)))
+      (setq result
+            `(:version 1 :operation_id "operation"
               :changed ,gnosis-core--json-false :attempt_revision 8
               :attempt (:attempt_id "different")))
       (should-error

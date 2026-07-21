@@ -105,6 +105,12 @@
              gnosis-core--json-false))
       (should (eq gnosis-core--json-false
                   (plist-get (plist-get result :attempt) :accepted_success)))
+      (let ((revision (plist-get result :attempt_revision)))
+        (setq result
+              (gnosis-core-review-attempt-set-accepted-success
+               attempt-id revision gnosis-core--json-false))
+        (should (eq gnosis-core--json-false (plist-get result :changed)))
+        (should (= (1+ revision) (plist-get result :attempt_revision))))
       (setq result
             (gnosis-core-review-attempt-set-suspension
              attempt-id (plist-get result :attempt_revision) t))

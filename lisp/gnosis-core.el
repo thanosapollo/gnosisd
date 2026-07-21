@@ -1309,8 +1309,7 @@ Correlate the response with EXPECTED-REVISION and OPERATION-ID."
            (list :version 1 :operation_id operation-id
                  :expected_attempt_revision expected-revision key desired)))
          (changed (plist-get result :changed))
-         (expected-result-revision
-          (+ expected-revision (if (eq changed t) 1 0))))
+         (expected-result-revision (1+ expected-revision)))
     (unless (and (integerp expected-revision)
                  (integerp (plist-get result :attempt_revision))
                  (equal 1 (plist-get result :version))
