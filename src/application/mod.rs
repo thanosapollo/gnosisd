@@ -32,8 +32,8 @@ pub(crate) use content::{
     MAX_DOCUMENT_SOURCE_BYTES, NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote,
     PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
     ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
-    prepare_document, prepare_thema, retained_asset_paths_in_org, stored_thema_content,
-    thema_content, validate_asset_path, validate_blob_metadata, validate_document_path,
+    prepare_document, prepare_thema, retained_asset_paths, stored_thema_content, thema_content,
+    validate_asset_path, validate_blob_metadata, validate_document_path,
     validate_offline_thema_assets,
 };
 #[cfg(test)]

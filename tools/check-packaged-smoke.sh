@@ -115,6 +115,26 @@ stage asset
 token_file=$temporary/device.token
 printf '%s\n' "$token" >"$token_file"
 chmod 600 "$token_file"
+
+stage ingestion-apply
+apply_report=$temporary/apply.json
+replay_report=$temporary/replay.json
+"$gnosis" --http-url "$http" --token-file "$token_file" \
+    import-manifest "$manifest" --journal "$journal" >"$apply_report"
+"$gnosis" --http-url "$http" --token-file "$token_file" \
+    import-manifest "$manifest" --journal "$journal" >"$replay_report"
+jq -e '.entry_count == 1 and .completed_count == 1 and (.path_hashes | length) == 1' \
+    "$apply_report" >/dev/null
+cmp "$apply_report" "$replay_report"
+jq -e '.version == 1 and (.completed | keys) == ["packaged-ingestion-smoke"]' \
+    "$journal" >/dev/null
+imported_document_id=$(jq -er '.completed["packaged-ingestion-smoke"].authoritative.document_id' "$journal")
+imported_content_type=$(curl --fail-with-body --silent --show-error -H "$auth" \
+    --output "$temporary/imported-source.org" --write-out '%{content_type}' \
+    "$api/notes/$imported_document_id")
+test "$imported_content_type" = 'text/org; charset=utf-8'
+cmp "$corpus/note.org" "$temporary/imported-source.org"
+
 asset_source=$temporary/image.png
 asset_fetch=$temporary/fetched.png
 asset_blob=$temporary/blob.png

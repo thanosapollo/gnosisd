@@ -145,6 +145,7 @@ impl StoredDocument {
 pub(crate) struct DocumentAssetSource {
     pub(crate) document_id: String,
     pub(crate) revision: u64,
+    pub(crate) content_type: String,
     pub(crate) blob_sha256: Option<String>,
     pub(crate) active_head: bool,
     pub(crate) head_revision: bool,
@@ -2421,7 +2422,8 @@ fn load_document_asset_sources_page(
 ) -> Result<Vec<DocumentAssetSource>, StoreError> {
     let mut statement = connection
         .prepare(
-            "SELECT revision.document_id, revision.revision, revision.blob_sha256, 0, 0
+            "SELECT revision.document_id, revision.revision, revision.blob_sha256,
+                    revision.content_type, 0, 0
              FROM document_revision AS revision
              JOIN document USING(document_id)
              WHERE (revision.document_id, revision.revision) >
@@ -2443,8 +2445,9 @@ fn load_document_asset_sources_page(
                     document_id: row.get(0)?,
                     revision: row_u64(row, 1)?,
                     blob_sha256: row.get(2)?,
-                    active_head: row.get(3)?,
-                    head_revision: row.get(4)?,
+                    content_type: row.get(3)?,
+                    active_head: row.get(4)?,
+                    head_revision: row.get(5)?,
                 })
             },
         )
@@ -2461,7 +2464,7 @@ fn load_document_asset_heads_page(
     let mut statement = connection
         .prepare(
             "SELECT document.document_id, document.revision, revision.blob_sha256,
-                    document.active = 1, 1
+                    revision.content_type, document.active = 1, 1
              FROM document
              JOIN document_revision AS revision
                ON revision.document_id = document.document_id
@@ -2476,8 +2479,9 @@ fn load_document_asset_heads_page(
                 document_id: row.get(0)?,
                 revision: row_u64(row, 1)?,
                 blob_sha256: row.get(2)?,
-                active_head: row.get(3)?,
-                head_revision: row.get(4)?,
+                content_type: row.get(3)?,
+                active_head: row.get(4)?,
+                head_revision: row.get(5)?,
             })
         })
         .map_err(StoreError::storage)?
@@ -3965,7 +3969,9 @@ fn note_is_unchanged(
 ) -> Result<bool, StoreError> {
     let head = load_document_head(connection, &prepared.document_id)?;
     let blob_matches = head.is_some_and(|head| {
-        head.active && head.blob_sha256.as_deref() == Some(prepared.blob_sha256.as_str())
+        head.active
+            && head.blob_sha256.as_deref() == Some(prepared.blob_sha256.as_str())
+            && head.content_type == prepared.content_type
     });
     Ok(blob_matches
         && current.is_some_and(|stored| {
@@ -5767,12 +5773,13 @@ mod tests {
              WHERE content_sha256 > '' ORDER BY content_sha256 LIMIT 1",
             "SELECT operation_id, content_sha256, size_bytes FROM offline_asset_evidence
              WHERE operation_id > '' ORDER BY operation_id LIMIT 1",
-            "SELECT revision.document_id, revision.revision, revision.blob_sha256, 0, 0
+            "SELECT revision.document_id, revision.revision, revision.blob_sha256,
+                    revision.content_type, 0, 0
              FROM document_revision AS revision JOIN document USING(document_id)
              WHERE (revision.document_id, revision.revision) > ('', 0)
              ORDER BY revision.document_id, revision.revision LIMIT 1",
             "SELECT document.document_id, document.revision, revision.blob_sha256,
-                    document.active = 1, 1
+                    revision.content_type, document.active = 1, 1
              FROM document JOIN document_revision AS revision
                ON revision.document_id = document.document_id
               AND revision.revision = document.revision
@@ -5799,7 +5806,7 @@ mod tests {
 
     #[test]
     fn paged_repair_preserves_current_and_history_associations() {
-        use crate::application::retained_asset_paths_in_org;
+        use crate::application::retained_asset_paths;
         let mut store = SqliteStore::open_in_memory().unwrap();
 
         let digest_one = register_asset(&mut store, b"asset-one");
@@ -5820,8 +5827,8 @@ mod tests {
         };
         store.replace_note(&second, &second_blob, 3, None).unwrap();
 
-        let first_assets = retained_asset_paths_in_org(&first.source);
-        let second_assets = retained_asset_paths_in_org(&second.source);
+        let first_assets = retained_asset_paths(&first.content_type, &first.source).unwrap();
+        let second_assets = retained_asset_paths(&second.content_type, &second.source).unwrap();
         let document_id = DocumentId::new("document").unwrap();
         store.tombstone_document(&document_id, 2, 4, None).unwrap();
         store
@@ -5877,8 +5884,8 @@ mod tests {
                 document_id: sources[0].document_id.clone(),
                 revision: sources[0].revision,
                 asset_paths: match sources[0].revision {
-                    1 => retained_asset_paths_in_org(&first.source),
-                    2 => retained_asset_paths_in_org(&second.source),
+                    1 => retained_asset_paths(&first.content_type, &first.source).unwrap(),
+                    2 => retained_asset_paths(&second.content_type, &second.source).unwrap(),
                     _ => Vec::new(),
                 },
                 active_head: sources[0].active_head,

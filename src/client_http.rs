@@ -357,6 +357,7 @@ impl HttpClient {
         document_id: &str,
         operation_id: &str,
         expected_revision: u64,
+        expected_content_type: &str,
         input: &NoteRenameRequestV1,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
         validate_document_mutation_request(document_id, Some(expected_revision))?;
@@ -378,7 +379,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: true,
                 logical_path: Some(input.logical_path.clone()),
-                content_type: None,
+                content_type: Some(expected_content_type.to_owned()),
                 content_sha256: None,
                 prior_revision: Some(expected_revision),
             },
@@ -391,6 +392,7 @@ impl HttpClient {
         document_id: &str,
         operation_id: &str,
         expected_revision: u64,
+        expected_content_type: &str,
     ) -> Result<DocumentMutationResultV1, HttpClientError> {
         validate_document_mutation_request(document_id, Some(expected_revision))?;
         require_operation_id(operation_id)?;
@@ -408,7 +410,7 @@ impl HttpClient {
                 document_id: Some(document_id.to_owned()),
                 active: false,
                 logical_path: None,
-                content_type: None,
+                content_type: Some(expected_content_type.to_owned()),
                 content_sha256: None,
                 prior_revision: Some(expected_revision),
             },
@@ -2893,17 +2895,19 @@ mod tests {
                 .replace_note(&invalid_id, "operation", 1, &note)
                 .await,
             client
-                .rename_note(&invalid_id, "operation", 1, &rename)
+                .rename_note(&invalid_id, "operation", 1, "text/org", &rename)
                 .await,
-            client.tombstone_note(&invalid_id, "operation", 1).await,
+            client
+                .tombstone_note(&invalid_id, "operation", 1, "text/org")
+                .await,
             client
                 .replace_note("document", "operation", u64::MAX, &note)
                 .await,
             client
-                .rename_note("document", "operation", u64::MAX, &rename)
+                .rename_note("document", "operation", u64::MAX, "text/org", &rename)
                 .await,
             client
-                .tombstone_note("document", "operation", u64::MAX)
+                .tombstone_note("document", "operation", u64::MAX, "text/org")
                 .await,
             client
                 .import_document(

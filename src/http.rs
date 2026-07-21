@@ -923,7 +923,7 @@ async fn get_note(
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/org; charset=utf-8"),
+        HeaderValue::from_str(&head.content_type).map_err(|_| ApiError::internal())?,
     );
     response.headers_mut().insert(
         header::ETAG,
@@ -984,7 +984,8 @@ async fn note_revision(
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        "text/org; charset=utf-8"
+        record
+            .content_type
             .parse()
             .map_err(|_| ApiError::internal())?,
     );
@@ -2878,14 +2879,14 @@ fn content_raw_responses(path: &str, method: &str) -> Option<Value> {
         "/v1/notes/{id}" => {
             responses.insert(
                 "200".into(),
-                media_response("Org document", "text/org", false, &["ETag"]),
+                media_response("Document source", "*/*", false, &["ETag"]),
             );
             &["400", "401", "403", "404", "408", "500", "503"]
         }
         "/v1/notes/{id}/revisions/{revision}" => {
             responses.insert(
                 "200".into(),
-                media_response("Org revision", "text/org", false, &["ETag"]),
+                media_response("Document revision source", "*/*", false, &["ETag"]),
             );
             responses.insert(
                 "410".into(),
@@ -4905,7 +4906,7 @@ mod tests {
 
         let revision = &api["paths"]["/v1/notes/{id}/revisions/{revision}"]["get"];
         assert_eq!(
-            revision["responses"]["200"]["content"]["text/org"]["schema"]["type"],
+            revision["responses"]["200"]["content"]["*/*"]["schema"]["type"],
             "string"
         );
         assert_eq!(
@@ -4917,7 +4918,7 @@ mod tests {
             "#/components/schemas/DocumentRevisionSummaryV1"
         );
         let note = &api["paths"]["/v1/notes/{id}"]["get"]["responses"]["200"];
-        assert_eq!(note["content"]["text/org"]["schema"]["type"], "string");
+        assert_eq!(note["content"]["*/*"]["schema"]["type"], "string");
         assert_eq!(note["headers"]["ETag"]["schema"]["type"], "string");
         assert_binary_request(&api, "/v1/sync/blobs/{digest}");
         assert_binary_request(&api, "/v1/assets/{digest}/{name}");

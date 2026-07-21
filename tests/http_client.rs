@@ -2358,6 +2358,7 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
             &authoritative.document_id,
             "lifecycle-rename",
             authoritative.revision,
+            &authoritative.content_type,
             &rename,
         )
         .await
@@ -2367,6 +2368,7 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
             &authoritative.document_id,
             "lifecycle-rename",
             authoritative.revision,
+            &authoritative.content_type,
             &rename,
         )
         .await
@@ -2381,6 +2383,7 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
             &authoritative.document_id,
             "unchanged-rename",
             authoritative.revision,
+            &authoritative.content_type,
             &rename,
         )
         .await
@@ -2399,6 +2402,7 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
             &authoritative.document_id,
             "lifecycle-delete",
             authoritative.revision,
+            &authoritative.content_type,
         )
         .await
         .unwrap();
@@ -2407,6 +2411,7 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
             &authoritative.document_id,
             "lifecycle-delete",
             authoritative.revision,
+            &authoritative.content_type,
         )
         .await
         .unwrap();
@@ -2420,6 +2425,7 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
             &authoritative.document_id,
             "unchanged-tombstone",
             authoritative.revision,
+            &authoritative.content_type,
         )
         .await
         .unwrap();
@@ -3150,6 +3156,7 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
             "http-only-doc",
             "rename-http-only-doc",
             1,
+            "text/org; charset=utf-8",
             &NoteRenameRequestV1 {
                 logical_path: "renamed-http-only.org".into(),
             },

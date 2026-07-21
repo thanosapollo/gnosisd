@@ -91,11 +91,12 @@ replica after restart and prints its snapshot, delta, blob, and outbox counts.
 The durable replica identity comes from the authenticated token and is checked
 again before synchronization changes local state.
 
-Manifest dry-run reads and validates every source before opening the HTTP client.
-Apply records each immutable operation result in the mode-0600 journal; reruns
-skip completed operation IDs. Documents are not imported as one transaction.
-Keep manifest, source files, and journal unchanged when resuming; journal binds
-both manifest and source bytes.
+~--dry-run~ reads and validates every manifest source without opening the HTTP
+client or creating the journal. Omit it to apply the whole preflighted manifest
+with the normal HTTP token. The mode-0600 journal records only server-confirmed
+results; exact reruns skip completed operation IDs, while changed manifest or
+source bytes fail closed. Transport failures retain the operation identity for
+explicit replay.
 
 #+begin_src json
 {"version":1,"root":"/path/to/export","entries":[{"operation_id":"stable-operation-id","document_id":null,"expected_revision":null,"logical_path":"notes/example.org","content_type":"text/org; charset=utf-8","source_path":"notes/example.org"}]}

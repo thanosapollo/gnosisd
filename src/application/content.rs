@@ -621,8 +621,17 @@ pub(crate) fn asset_paths_in_org(org: &str) -> Result<Vec<String>, ContentError>
         })
 }
 
-pub(crate) fn retained_asset_paths_in_org(org: &str) -> Vec<String> {
-    crate::parser::retained_asset_paths(crate::parser::ORG_CONTENT_TYPE, org)
+pub(crate) fn retained_asset_paths(
+    content_type: &str,
+    source: &str,
+) -> Result<Vec<String>, ContentError> {
+    crate::parser::retained_asset_paths(content_type, source).map_err(|error| match error {
+        DocumentParseError::UnsupportedContentType(_) | DocumentParseError::InvalidReference => {
+            ContentError::UnsupportedType
+        }
+        DocumentParseError::AdapterPanicked => ContentError::DocumentParser,
+        DocumentParseError::Org(error) => ContentError::Org(error),
+    })
 }
 
 fn external_reference(value: &str) -> bool {
@@ -819,7 +828,10 @@ mod tests {
             "#+title: Legacy\n[[file:image.png]]\n[[file:assets/not-canonical.png]]\n[[file:{asset}]]\n"
         );
 
-        assert_eq!(super::retained_asset_paths_in_org(&org), [asset]);
+        assert_eq!(
+            super::retained_asset_paths(crate::parser::ORG_CONTENT_TYPE, &org).unwrap(),
+            [asset]
+        );
     }
 
     #[test]

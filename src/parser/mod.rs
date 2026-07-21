@@ -104,7 +104,14 @@ pub(crate) fn supported_content_types() -> impl Iterator<Item = &'static str> {
 }
 
 fn adapter(content_type: &str) -> Result<&'static DocumentAdapter, DocumentParseError> {
-    DOCUMENT_ADAPTERS
+    adapter_in(&DOCUMENT_ADAPTERS, content_type)
+}
+
+fn adapter_in<'a>(
+    adapters: &'a [DocumentAdapter],
+    content_type: &str,
+) -> Result<&'a DocumentAdapter, DocumentParseError> {
+    adapters
         .iter()
         .find(|adapter| adapter.content_type == content_type)
         .ok_or_else(|| DocumentParseError::UnsupportedContentType(content_type.to_owned()))
@@ -128,12 +135,12 @@ fn org_asset_paths(source: &str) -> Result<Vec<String>, DocumentParseError> {
     Ok(paths.into_iter().collect())
 }
 
-pub(crate) fn retained_asset_paths(content_type: &str, source: &str) -> Vec<String> {
-    DOCUMENT_ADAPTERS
-        .iter()
-        .find(|adapter| adapter.content_type == content_type)
-        .map(|adapter| (adapter.retained_asset_paths)(source))
-        .unwrap_or_default()
+pub(crate) fn retained_asset_paths(
+    content_type: &str,
+    source: &str,
+) -> Result<Vec<String>, DocumentParseError> {
+    let adapter = adapter(content_type)?;
+    adapter_call(|| Ok((adapter.retained_asset_paths)(source)))
 }
 
 fn retained_org_asset_paths(source: &str) -> Vec<String> {
@@ -176,6 +183,30 @@ fn validate_org_path(value: &str) -> Result<(), DocumentParseError> {
     } else {
         Err(DocumentParseError::InvalidReference)
     }
+}
+
+#[cfg(test)]
+fn validate_test_path(value: &str) -> Result<(), DocumentParseError> {
+    if valid_relative_path(value) && value.ends_with(".txt") && !value.starts_with("assets/") {
+        Ok(())
+    } else {
+        Err(DocumentParseError::InvalidReference)
+    }
+}
+
+#[cfg(test)]
+fn test_asset_paths(source: &str) -> Result<Vec<String>, DocumentParseError> {
+    Ok(retained_test_asset_paths(source))
+}
+
+#[cfg(test)]
+fn retained_test_asset_paths(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| line.strip_prefix("asset:"))
+        .filter(|path| valid_asset_path(path))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn valid_relative_path(value: &str) -> bool {
@@ -226,8 +257,9 @@ mod org_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentParseError, ORG_CONTENT_TYPE, adapter_call, generated_document_path,
-        parse_document, supported_content_types, validate_document_path,
+        DocumentAdapter, DocumentParseError, ORG_CONTENT_TYPE, adapter_call, adapter_in,
+        generated_document_path, org, parse_document, supported_content_types, test_asset_paths,
+        validate_document_path, validate_test_path,
     };
 
     #[test]
@@ -259,6 +291,25 @@ mod tests {
             validate_document_path(ORG_CONTENT_TYPE, "notes/topic.md"),
             Err(DocumentParseError::InvalidReference)
         );
+    }
+
+    #[test]
+    fn registry_dispatches_non_org_path_and_asset_policies() {
+        const TEST_CONTENT_TYPE: &str = "text/x-gnosis-test; charset=utf-8";
+        let adapters = [DocumentAdapter {
+            content_type: TEST_CONTENT_TYPE,
+            path_suffix: ".txt",
+            parse: org::parse_org,
+            validate_path: validate_test_path,
+            asset_paths: test_asset_paths,
+            retained_asset_paths: super::retained_test_asset_paths,
+        }];
+        let asset = format!("assets/{}/image.png", "a".repeat(64));
+        let source = format!("#+title: Note\nasset:{asset}\n");
+        let adapter = adapter_in(&adapters, TEST_CONTENT_TYPE).unwrap();
+
+        assert!((adapter.validate_path)("notes/topic.txt").is_ok());
+        assert_eq!((adapter.retained_asset_paths)(&source), [asset]);
     }
 
     #[test]

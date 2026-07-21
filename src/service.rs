@@ -49,7 +49,7 @@ use crate::{
         ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
         ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
         SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
-        ThemaReviewState, prepare_offline_document, retained_asset_paths_in_org, token_digest,
+        ThemaReviewState, prepare_offline_document, retained_asset_paths, token_digest,
         validate_asset_path, validate_blob_metadata,
     },
     blob::{BlobError, BlobMeta, BlobStore},
@@ -1981,10 +1981,15 @@ fn document_asset_associations(
                 let bytes = blobs
                     .read(blob_sha256)
                     .map_err(|error| StoreError::Storage(Box::new(error)))?;
-                let org = String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
-                    field: "document blob UTF-8",
-                })?;
-                retained_asset_paths_in_org(&org)
+                let source_text =
+                    String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
+                        field: "document blob UTF-8",
+                    })?;
+                retained_asset_paths(&source.content_type, &source_text).map_err(|_| {
+                    StoreError::CorruptData {
+                        field: "document content type",
+                    }
+                })?
             } else {
                 Vec::new()
             };

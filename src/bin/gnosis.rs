@@ -1377,7 +1377,6 @@ fn preflight_manifest(
     for entry in manifest.entries {
         if !valid_client_operation_id(&entry.operation_id)
             || !operation_ids.insert(entry.operation_id.clone())
-            || !safe_logical_path(&entry.logical_path)
             || !logical_paths.insert(entry.logical_path.to_lowercase())
             || !relative_normal_path(&entry.source_path)
             || !source_paths.insert(entry.source_path.to_string_lossy().to_lowercase())
@@ -1473,13 +1472,6 @@ fn relative_normal_path(path: &Path) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
-}
-
-fn safe_logical_path(path: &str) -> bool {
-    let path = Path::new(path);
-    relative_normal_path(path)
-        && path.extension().is_some_and(|extension| extension == "org")
-        && path.to_str().is_some_and(|value| value.len() <= 1024)
 }
 
 fn read_bounded_file(path: &Path) -> Result<Vec<u8>, CliError> {
