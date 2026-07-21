@@ -12,7 +12,7 @@ use crate::application::{
     OfflineAnswerInput, OfflineAssetConflictReason, OfflineAssetOperation,
     OfflineContentConflictReason, OfflineContentMutation, OfflineContentOperation,
     OfflineReviewOperation, OfflineReviewResult, ReconciliationStatus, ReviewPackView,
-    ReviewSessionMode, path_key, prepare_offline_operation, validate_org_path,
+    ReviewSessionMode, path_key, prepare_offline_operation, validate_document_path,
 };
 
 const CURRENT_SCHEMA: &str = include_str!("schema/replica_v1.sql");
@@ -76,6 +76,7 @@ pub(crate) struct LocalContentContext {
     pub(crate) cursor: String,
     pub(crate) next_device_sequence: u64,
     pub(crate) base: ContentBase,
+    pub(crate) content_type: Option<String>,
 }
 
 pub(crate) struct PendingContentOperation {
@@ -667,13 +668,15 @@ impl LocalReplicaStore {
         }
         let cursor = context.2.ok_or(LocalReplicaError::Content)?;
         let base = working_content_base(&self.connection, &server_id, document_id)?;
+        let content_type = working_content_type(&self.connection, &server_id, document_id)?;
         if matches!(
             &base,
             ContentBase::Revision {
                 content_sha256: None,
                 ..
             }
-        ) {
+        ) || matches!(&base, ContentBase::Revision { .. }) && content_type.is_none()
+        {
             return Err(LocalReplicaError::Content);
         }
         Ok(LocalContentContext {
@@ -681,6 +684,7 @@ impl LocalReplicaStore {
             cursor,
             next_device_sequence: context.4,
             base,
+            content_type,
         })
     }
 
@@ -1197,7 +1201,7 @@ impl LocalReplicaStore {
         &self,
         logical_path: &str,
     ) -> Result<Option<String>, LocalReplicaError> {
-        validate_org_path(logical_path).map_err(|_| LocalReplicaError::Content)?;
+        validate_document_path(logical_path).map_err(|_| LocalReplicaError::Content)?;
         let Some(server_id) = self.current_server_id()? else {
             return Ok(None);
         };
@@ -2129,6 +2133,57 @@ fn replica_document_digest(payload: &str) -> Result<Option<String>, LocalReplica
         }
     }
     Ok(None)
+}
+
+fn working_content_type(
+    connection: &Connection,
+    server_id: &str,
+    document_id: &str,
+) -> Result<Option<String>, LocalReplicaError> {
+    let local = connection
+        .query_row(
+            "SELECT content.operation_json
+             FROM replica_device_operation AS device
+             JOIN replica_content_operation AS content USING(operation_id)
+             LEFT JOIN replica_content_result AS result USING(operation_id)
+             WHERE device.server_id = ?1 AND content.document_id = ?2
+               AND (result.operation_id IS NULL OR result.status = 'accepted')
+             ORDER BY device.device_sequence DESC LIMIT 1",
+            params![server_id, document_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    if let Some(payload) = local {
+        let value: Value =
+            serde_json::from_str(&payload).map_err(|_| LocalReplicaError::Corrupt)?;
+        return value
+            .pointer("/operation/mutation/content_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(LocalReplicaError::Corrupt)
+            .map(Some);
+    }
+    let canonical = connection
+        .query_row(
+            "SELECT payload_json FROM replica_projection
+             WHERE entity_kind = 'document' AND entity_id = ?1",
+            [document_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(LocalReplicaError::Storage)?;
+    canonical
+        .map(|payload| {
+            let value: Value =
+                serde_json::from_str(&payload).map_err(|_| LocalReplicaError::Corrupt)?;
+            value
+                .pointer("/projection/content_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(LocalReplicaError::Corrupt)
+        })
+        .transpose()
 }
 
 fn replica_document_path(payload: &str) -> Result<String, LocalReplicaError> {

@@ -45,7 +45,11 @@ pub(super) fn persist_server_import(
 
 pub(crate) fn protocol_logical_path(document_id: &DocumentId) -> String {
     let digest = Sha256::digest(document_id.as_str().as_bytes());
-    format!("protocol/{digest:x}.org")
+    crate::parser::generated_document_path(
+        crate::parser::ORG_CONTENT_TYPE,
+        &format!("protocol/{digest:x}"),
+    )
+    .expect("the built-in document adapter must accept generated paths")
 }
 
 #[cfg(test)]

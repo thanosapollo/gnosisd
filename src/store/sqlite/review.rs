@@ -2813,8 +2813,11 @@ mod tests {
         transaction
             .execute(
                 "INSERT INTO document(
-                     document_id, revision, title, file_tags_json, content_sha256
-                 ) VALUES ('topic-document', 1, 'Topics', '[]', 'digest')",
+                     document_id, revision, title, file_tags_json, content_sha256, content_type
+                 ) VALUES (
+                     'topic-document', 1, 'Topics', '[]', 'digest',
+                     'text/org; charset=utf-8'
+                 )",
                 [],
             )
             .unwrap();

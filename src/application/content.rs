@@ -481,7 +481,6 @@ pub(crate) fn prepare_note(
     org: String,
     expected_revision: Option<u64>,
 ) -> Result<PreparedNote, ContentError> {
-    validate_org_path(&logical_path)?;
     prepare_document(
         document_id,
         logical_path,
@@ -503,20 +502,18 @@ pub(crate) fn prepare_document(
         |error| match error {
             DocumentParseError::UnsupportedContentType(_)
             | DocumentParseError::InvalidReference => ContentError::UnsupportedType,
+            DocumentParseError::AdapterPanicked => ContentError::DocumentParser,
             DocumentParseError::Org(_) => ContentError::DocumentParser,
         },
     )?;
     if source.len() > MAX_DOCUMENT_SOURCE_BYTES {
         return Err(ContentError::SourceTooLarge);
     }
-    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_document(&content_type, &source)
-    }))
-    .map_err(|_| ContentError::DocumentParser)?
-    .map_err(|error| match error {
+    let parsed = parse_document(&content_type, &source).map_err(|error| match error {
         DocumentParseError::UnsupportedContentType(_) | DocumentParseError::InvalidReference => {
             ContentError::UnsupportedType
         }
+        DocumentParseError::AdapterPanicked => ContentError::DocumentParser,
         DocumentParseError::Org(error) => ContentError::Org(error),
     })?;
     let asset_paths = parsed.asset_paths().to_vec();
@@ -562,17 +559,6 @@ pub(crate) fn validate_logical_path(value: &str) -> Result<(), ContentError> {
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
     {
         return Err(ContentError::Path);
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_org_path(value: &str) -> Result<(), ContentError> {
-    validate_logical_path(value)?;
-    if value.len() > crate::parser::MAX_DOCUMENT_LOGICAL_PATH_BYTES
-        || !value.ends_with(".org")
-        || value.starts_with("assets/")
-    {
-        return Err(ContentError::UnsupportedType);
     }
     Ok(())
 }
@@ -630,6 +616,7 @@ pub(crate) fn asset_paths_in_org(org: &str) -> Result<Vec<String>, ContentError>
         .map_err(|error| match error {
             DocumentParseError::UnsupportedContentType(_)
             | DocumentParseError::InvalidReference => ContentError::UnsupportedType,
+            DocumentParseError::AdapterPanicked => ContentError::DocumentParser,
             DocumentParseError::Org(error) => ContentError::Org(error),
         })
 }

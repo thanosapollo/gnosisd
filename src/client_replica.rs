@@ -12,6 +12,7 @@ use crate::{
         OfflineContentMutation, OfflineContentOperation, OfflineReviewResult, ReconciliationStatus,
         asset_paths_in_org, canonical_asset_path, validate_asset_path,
     },
+    parser::ORG_CONTENT_TYPE,
     protocol::{
         DecodedOfflineAssetResult, DecodedOfflineContentResult, OfflineAssetSubmission,
         OfflineAssetWireError, OfflineContentWireError, OfflineReviewWireError, ReplicaWireError,
@@ -809,16 +810,21 @@ impl LocalReplica {
         let operation_id = edit.operation_id;
         let document_id = edit.document_id;
         let authored_at_us = edit.authored_at_us;
-        self.record_content_mutation(operation_id, document_id.clone(), authored_at_us, |base| {
-            OfflineContentMutation::Put {
-                document_id,
-                logical_path: edit.logical_path,
-                content_sha256: format!("{:x}", Sha256::digest(edit.org.as_bytes())),
-                content_type: "text/org; charset=utf-8".into(),
-                source: edit.org,
-                base,
-            }
-        })
+        self.record_content_mutation(
+            operation_id,
+            document_id.clone(),
+            authored_at_us,
+            |base, _| {
+                Ok(OfflineContentMutation::Put {
+                    document_id,
+                    logical_path: edit.logical_path,
+                    content_sha256: format!("{:x}", Sha256::digest(edit.org.as_bytes())),
+                    content_type: ORG_CONTENT_TYPE.into(),
+                    source: edit.org,
+                    base,
+                })
+            },
+        )
     }
 
     pub fn rename_document(
@@ -834,13 +840,19 @@ impl LocalReplica {
         let operation_id = rename.operation_id;
         let document_id = rename.document_id;
         let authored_at_us = rename.authored_at_us;
-        self.record_content_mutation(operation_id, document_id.clone(), authored_at_us, |base| {
-            OfflineContentMutation::Rename {
-                document_id,
-                logical_path: rename.logical_path,
-                base,
-            }
-        })
+        self.record_content_mutation(
+            operation_id,
+            document_id.clone(),
+            authored_at_us,
+            |base, content_type| {
+                Ok(OfflineContentMutation::Rename {
+                    document_id,
+                    logical_path: rename.logical_path,
+                    content_type: content_type.ok_or(Error::Content)?,
+                    base,
+                })
+            },
+        )
     }
 
     pub fn tombstone_document(
@@ -856,9 +868,18 @@ impl LocalReplica {
         let operation_id = tombstone.operation_id;
         let document_id = tombstone.document_id;
         let authored_at_us = tombstone.authored_at_us;
-        self.record_content_mutation(operation_id, document_id.clone(), authored_at_us, |base| {
-            OfflineContentMutation::Tombstone { document_id, base }
-        })
+        self.record_content_mutation(
+            operation_id,
+            document_id.clone(),
+            authored_at_us,
+            |base, content_type| {
+                Ok(OfflineContentMutation::Tombstone {
+                    document_id,
+                    content_type: content_type.ok_or(Error::Content)?,
+                    base,
+                })
+            },
+        )
     }
 
     pub fn record_asset(
@@ -915,7 +936,7 @@ impl LocalReplica {
         operation_id: String,
         document_id: String,
         authored_at_us: u64,
-        mutation: impl FnOnce(ContentBase) -> OfflineContentMutation,
+        mutation: impl FnOnce(ContentBase, Option<String>) -> Result<OfflineContentMutation, Error>,
     ) -> Result<RecordedContentOperation, Error> {
         let context = self.store.content_context(&document_id)?;
         let (server_id, cursor, token) = decode_cursor(&context.cursor)?;
@@ -930,7 +951,7 @@ impl LocalReplica {
             cursor,
             cursor_token: token,
             authored_at_us,
-            mutation: mutation(context.base),
+            mutation: mutation(context.base, context.content_type)?,
         };
         let canonical_payload = canonical_content_operation(&operation)?;
         self.store
@@ -1317,14 +1338,20 @@ fn validate_accepted_document(
                 && authoritative.content_type.as_ref() == Some(content_type)
         }
         OfflineContentMutation::Rename {
-            logical_path, base, ..
+            logical_path,
+            content_type,
+            base,
+            ..
         } => {
             authoritative.active
                 && authoritative.logical_path == *logical_path
+                && authoritative.content_type.as_ref() == Some(content_type)
                 && authoritative.content_sha256.as_deref() == base.content_sha256()
         }
-        OfflineContentMutation::Tombstone { .. } => {
-            !authoritative.active && authoritative.content_sha256.is_none()
+        OfflineContentMutation::Tombstone { content_type, .. } => {
+            !authoritative.active
+                && authoritative.content_type.as_ref() == Some(content_type)
+                && authoritative.content_sha256.is_none()
         }
     };
     (valid && authoritative.revision == expected_revision)
@@ -1359,7 +1386,7 @@ fn replayed_document_edit(
     if operation.operation_id != edit.operation_id
         || document_id != &edit.document_id
         || logical_path != &edit.logical_path
-        || content_type != "text/org; charset=utf-8"
+        || content_type != ORG_CONTENT_TYPE
         || source != &edit.org
         || operation.authored_at_us != edit.authored_at_us
     {
@@ -1905,6 +1932,7 @@ mod tests {
             prepare_asset, prepare_note, prepare_thema, thema_content,
         },
         domain::ThemaConceptRelation,
+        parser::ORG_CONTENT_TYPE,
         protocol::{
             OFFLINE_REVIEW_VERSION, OfflineAssetSubmission, OfflineReviewSubmission, decode_cursor,
             decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor,
@@ -2508,6 +2536,13 @@ mod tests {
         for expected in ["create", "rename"] {
             let upload = replica.next_content_upload().unwrap().unwrap();
             assert_eq!(upload.operation_id, expected);
+            if expected == "rename" {
+                let payload: Value = serde_json::from_str(&upload.canonical_payload).unwrap();
+                assert_eq!(
+                    payload["operation"]["mutation"]["content_type"],
+                    ORG_CONTENT_TYPE
+                );
+            }
             let result = reconcile_content_upload(&service, &upload, &device_id, 20).await;
             assert_eq!(result["result"]["status"], "accepted");
             if expected == "rename" {
@@ -2526,6 +2561,11 @@ mod tests {
         }
         let upload = replica.next_content_upload().unwrap().unwrap();
         assert_eq!(upload.operation_id, "tombstone");
+        let payload: Value = serde_json::from_str(&upload.canonical_payload).unwrap();
+        assert_eq!(
+            payload["operation"]["mutation"]["content_type"],
+            ORG_CONTENT_TYPE
+        );
         let lost = reconcile_content_upload(&service, &upload, &device_id, 22).await;
         let replay = reconcile_content_upload(&service, &upload, &device_id, 23).await;
         assert_eq!(replay, lost);

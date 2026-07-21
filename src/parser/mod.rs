@@ -12,6 +12,7 @@ pub(crate) const MAX_DOCUMENT_LOGICAL_PATH_BYTES: usize = 4096;
 
 struct DocumentAdapter {
     content_type: &'static str,
+    path_suffix: &'static str,
     parse: fn(&str) -> Result<DocumentProjection, org::OrgParseError>,
     validate_path: fn(&str) -> Result<(), DocumentParseError>,
     asset_paths: fn(&str) -> Result<Vec<String>, DocumentParseError>,
@@ -20,13 +21,12 @@ struct DocumentAdapter {
 
 static DOCUMENT_ADAPTERS: [DocumentAdapter; 1] = [DocumentAdapter {
     content_type: ORG_CONTENT_TYPE,
+    path_suffix: ".org",
     parse: org::parse_org,
     validate_path: validate_org_path,
     asset_paths: org_asset_paths,
     retained_asset_paths: retained_org_asset_paths,
 }];
-
-pub(crate) const SUPPORTED_CONTENT_TYPES: [&str; 1] = [ORG_CONTENT_TYPE];
 
 static ORG_FILE_LINK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[{1,2}file:([^]\n]+)").expect("Org file-link regex is valid"));
@@ -56,8 +56,9 @@ pub(crate) fn parse_document(
     source: &str,
 ) -> Result<ParsedDocument, DocumentParseError> {
     let adapter = adapter(content_type)?;
-    let projection = (adapter.parse)(source)?;
-    let asset_paths = (adapter.asset_paths)(source)?;
+    let (projection, asset_paths) = adapter_call(|| {
+        Ok::<_, DocumentParseError>(((adapter.parse)(source)?, (adapter.asset_paths)(source)?))
+    })?;
     Ok(ParsedDocument {
         projection,
         asset_paths,
@@ -72,11 +73,34 @@ pub(crate) fn validate_document_path(
         return Err(DocumentParseError::InvalidReference);
     }
     let adapter = adapter(content_type)?;
-    (adapter.validate_path)(logical_path).map_err(|_| DocumentParseError::InvalidReference)
+    adapter_call(|| {
+        (adapter.validate_path)(logical_path).map_err(|_| DocumentParseError::InvalidReference)
+    })
+}
+
+fn adapter_call<T>(
+    call: impl FnOnce() -> Result<T, DocumentParseError>,
+) -> Result<T, DocumentParseError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
+        .map_err(|_| DocumentParseError::AdapterPanicked)?
+}
+
+pub(crate) fn generated_document_path(
+    content_type: &str,
+    prefix: &str,
+) -> Result<String, DocumentParseError> {
+    let adapter = adapter(content_type)?;
+    let path = format!("{prefix}{}", adapter.path_suffix);
+    validate_document_path(content_type, &path)?;
+    Ok(path)
 }
 
 pub(crate) fn supported_content_type(content_type: &str) -> bool {
     adapter(content_type).is_ok()
+}
+
+pub(crate) fn supported_content_types() -> impl Iterator<Item = &'static str> {
+    DOCUMENT_ADAPTERS.iter().map(|adapter| adapter.content_type)
 }
 
 fn adapter(content_type: &str) -> Result<&'static DocumentAdapter, DocumentParseError> {
@@ -192,6 +216,8 @@ pub(crate) enum DocumentParseError {
     Org(#[from] org::OrgParseError),
     #[error("invalid Org reference")]
     InvalidReference,
+    #[error("document adapter panicked")]
+    AdapterPanicked,
 }
 
 #[cfg(test)]
@@ -200,8 +226,8 @@ mod org_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        DocumentParseError, ORG_CONTENT_TYPE, SUPPORTED_CONTENT_TYPES, parse_document,
-        validate_document_path,
+        DocumentParseError, ORG_CONTENT_TYPE, adapter_call, generated_document_path,
+        parse_document, supported_content_types, validate_document_path,
     };
 
     #[test]
@@ -210,7 +236,10 @@ mod tests {
 
         assert!(parsed.asset_paths().is_empty());
         assert_eq!(parsed.into_projection().title(), "Note");
-        assert_eq!(SUPPORTED_CONTENT_TYPES, [ORG_CONTENT_TYPE]);
+        assert_eq!(
+            supported_content_types().collect::<Vec<_>>(),
+            [ORG_CONTENT_TYPE]
+        );
     }
 
     #[test]
@@ -229,6 +258,22 @@ mod tests {
         assert_eq!(
             validate_document_path(ORG_CONTENT_TYPE, "notes/topic.md"),
             Err(DocumentParseError::InvalidReference)
+        );
+    }
+
+    #[test]
+    fn adapter_panics_are_contained_at_the_registry_boundary() {
+        assert_eq!(
+            adapter_call::<()>(|| panic!("adapter failure")),
+            Err(DocumentParseError::AdapterPanicked)
+        );
+    }
+
+    #[test]
+    fn adapter_owns_generated_logical_paths() {
+        assert_eq!(
+            generated_document_path(ORG_CONTENT_TYPE, "protocol/digest").unwrap(),
+            "protocol/digest.org"
         );
     }
 }

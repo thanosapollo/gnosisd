@@ -34,7 +34,7 @@ pub(crate) use content::{
     ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
     prepare_document, prepare_thema, retained_asset_paths_in_org, stored_thema_content,
     thema_content, validate_asset_path, validate_blob_metadata, validate_document_path,
-    validate_offline_thema_assets, validate_org_path,
+    validate_offline_thema_assets,
 };
 #[cfg(test)]
 pub(crate) use content::{ContentError, prepare_note};

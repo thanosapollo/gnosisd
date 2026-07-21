@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use super::{
     AssetHead, PreparedAsset, PreparedNote, PreparedThema, SettingsInput, SettingsRecord,
-    ThemaRecord, valid_operation_id, validate_org_path,
+    ThemaRecord, valid_operation_id, validate_document_path,
 };
 use crate::domain::{DocumentId, ThemaId};
 
@@ -656,7 +656,7 @@ fn validate_lifecycle_mutation(
 ) -> Result<(), DeviceMutationError> {
     match mutation {
         DeviceDocumentLifecycleMutation::Rename { logical_path } => {
-            validate_org_path(logical_path).map_err(|_| DeviceMutationError::Identity)
+            validate_document_path(logical_path).map_err(|_| DeviceMutationError::Identity)
         }
         DeviceDocumentLifecycleMutation::Tombstone => Ok(()),
     }

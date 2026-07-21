@@ -23,10 +23,12 @@ pub(crate) enum OfflineContentMutation {
     Rename {
         document_id: String,
         logical_path: String,
+        content_type: String,
         base: ContentBase,
     },
     Tombstone {
         document_id: String,
+        content_type: String,
         base: ContentBase,
     },
 }
@@ -82,6 +84,14 @@ impl OfflineContentOperation {
             OfflineContentMutation::Put { logical_path, .. }
             | OfflineContentMutation::Rename { logical_path, .. } => Some(logical_path),
             OfflineContentMutation::Tombstone { .. } => None,
+        }
+    }
+
+    pub(crate) fn content_type(&self) -> &str {
+        match &self.mutation {
+            OfflineContentMutation::Put { content_type, .. }
+            | OfflineContentMutation::Rename { content_type, .. }
+            | OfflineContentMutation::Tombstone { content_type, .. } => content_type,
         }
     }
 }

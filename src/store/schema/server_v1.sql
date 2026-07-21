@@ -7,8 +7,7 @@ CREATE TABLE document(
   file_node_id TEXT,
   file_tags_json TEXT NOT NULL,
   content_sha256 TEXT NOT NULL,
-  content_type TEXT NOT NULL DEFAULT 'text/org; charset=utf-8'
-    CHECK(content_type = 'text/org; charset=utf-8'),
+  content_type TEXT NOT NULL,
   logical_path TEXT,
   path_key TEXT,
   head_blob_sha256 TEXT,
@@ -389,8 +388,7 @@ CREATE TABLE document_revision(
   document_id TEXT NOT NULL,
   revision INTEGER NOT NULL CHECK(revision > 0),
   logical_path TEXT NOT NULL CHECK(length(logical_path) > 0),
-  content_type TEXT NOT NULL DEFAULT 'text/org; charset=utf-8'
-    CHECK(content_type = 'text/org; charset=utf-8'),
+  content_type TEXT NOT NULL,
   blob_sha256 TEXT,
   operation TEXT NOT NULL CHECK(operation IN('create', 'update', 'rename', 'tombstone', 'snapshot')),
   created_at_us INTEGER NOT NULL CHECK(created_at_us > 0),

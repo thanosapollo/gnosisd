@@ -383,7 +383,9 @@ fn base_matches(
     else {
         return Ok(head.is_none());
     };
-    let Some(head) = head.filter(|head| head.active && head.revision == *revision) else {
+    let Some(head) = head.filter(|head| {
+        head.active && head.revision == *revision && head.content_type == operation.content_type()
+    }) else {
         return Ok(false);
     };
     let current_digest = current_document_digest(connection, head)?;
@@ -739,6 +741,7 @@ mod tests {
             mutation: OfflineContentMutation::Rename {
                 document_id: "document".into(),
                 logical_path: logical_path.into(),
+                content_type: crate::parser::ORG_CONTENT_TYPE.into(),
                 base,
             },
         }
@@ -762,6 +765,7 @@ mod tests {
             authored_at_us: sequence + 10,
             mutation: OfflineContentMutation::Tombstone {
                 document_id: "document".into(),
+                content_type: crate::parser::ORG_CONTENT_TYPE.into(),
                 base,
             },
         }

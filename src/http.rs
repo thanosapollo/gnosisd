@@ -38,7 +38,7 @@ use crate::{
         canonical_asset_path, prepare_asset, prepare_device_desired_state_mutation,
         prepare_device_document_mutation, prepare_device_document_rename,
         prepare_device_document_tombstone, prepare_document, prepare_thema, review_day_at,
-        thema_content, validate_org_path,
+        thema_content,
     },
     domain::{DocumentId, DueThema, NodeId, ThemaId},
     is_canonical_sha256,
@@ -204,10 +204,16 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/events", get(events))
         .route("/v1/settings", get(get_settings).put(update_settings))
         .route("/v1/notes/{id}", get(get_note))
-        .route("/v1/document-mutations", post(create_document_mutation))
+        .route(
+            "/v1/document-mutations",
+            post(create_document_mutation)
+                .layer(DefaultBodyLimit::max(MAX_OFFLINE_CONTENT_OPERATION_BYTES)),
+        )
         .route(
             "/v1/document-mutations/{id}",
-            axum::routing::put(replace_document_mutation).delete(tombstone_document_mutation),
+            axum::routing::put(replace_document_mutation)
+                .layer(DefaultBodyLimit::max(MAX_OFFLINE_CONTENT_OPERATION_BYTES))
+                .delete(tombstone_document_mutation),
         )
         .route(
             "/v1/document-mutations/{id}/rename",
@@ -794,12 +800,23 @@ async fn rename_document_mutation(
     ApiJson(input): ApiJson<NoteRenameRequestV1>,
 ) -> Result<Json<DocumentMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
-    validate_org_path(&input.logical_path).map_err(ApiError::invalid_content)?;
+    let document_id =
+        DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
+    let content_type = state
+        .service
+        .note(document_id.clone())
+        .await
+        .map_err(ApiError::service)?
+        .ok_or_else(ApiError::not_found)?
+        .0
+        .content_type;
+    crate::parser::validate_document_path(&content_type, &input.logical_path)
+        .map_err(|_| ApiError::invalid_content("logical path is invalid"))?;
     let operation = prepare_device_document_rename(
         1,
         idempotency_key(&headers)?,
         principal.device_id,
-        DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?,
+        document_id,
         input.logical_path,
         if_match(&headers)?,
     )

@@ -32,7 +32,7 @@ use crate::{
         ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsInput,
         SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition, ThemaRecord,
         ThemaRevision, parse_stored_scopes, path_key, stored_scopes, stored_thema_content,
-        validate_org_path,
+        validate_document_path,
     },
     blob::BlobMeta,
 };
@@ -759,10 +759,18 @@ impl SqliteStore {
         updated_at_us: i64,
         author_device_id: Option<&str>,
     ) -> Result<DocumentHead, StoreError> {
-        validate_org_path(logical_path).map_err(|_| StoreError::InvalidProjection {
+        validate_document_path(logical_path).map_err(|_| StoreError::InvalidProjection {
             reason: "logical path is invalid",
         })?;
         let transaction = self.write_transaction()?;
+        let content_type = load_document_head(&transaction, document_id)?
+            .ok_or(StoreError::NotFound)?
+            .content_type;
+        crate::parser::validate_document_path(&content_type, logical_path).map_err(|_| {
+            StoreError::InvalidProjection {
+                reason: "logical path is invalid",
+            }
+        })?;
         let head = rename_document_in(
             &transaction,
             document_id,
@@ -1603,7 +1611,14 @@ impl SqliteStore {
             return current.ok_or(StoreError::CorruptData { field: "document" });
         }
         let revision = next_revision(current.as_ref())?;
-        replace_rows(&transaction, document_id, projection, revision, fail_point)?;
+        replace_rows(
+            &transaction,
+            document_id,
+            projection,
+            crate::parser::ORG_CONTENT_TYPE,
+            revision,
+            fail_point,
+        )?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(StoredDocument {
             document_id: document_id.clone(),
@@ -3799,6 +3814,7 @@ fn replace_rows(
     transaction: &Transaction<'_>,
     document_id: &DocumentId,
     projection: &DocumentProjection,
+    content_type: &str,
     revision: u64,
     fail_point: FailPoint,
 ) -> Result<(), StoreError> {
@@ -3810,7 +3826,7 @@ fn replace_rows(
             )
             .map_err(StoreError::storage)?;
     }
-    insert_document(transaction, document_id, projection, revision)?;
+    insert_document(transaction, document_id, projection, content_type, revision)?;
     #[cfg(test)]
     if fail_point == FailPoint::AfterDocument {
         return Err(StoreError::storage(std::io::Error::other(
@@ -3827,6 +3843,7 @@ fn insert_document(
     transaction: &Transaction<'_>,
     document_id: &DocumentId,
     projection: &DocumentProjection,
+    content_type: &str,
     revision: u64,
 ) -> Result<(), StoreError> {
     let revision =
@@ -3836,14 +3853,15 @@ fn insert_document(
         .execute(
             "INSERT INTO document (\
              document_id, revision, title, file_node_id, file_tags_json, \
-             content_sha256\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             content_sha256, content_type\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(document_id) DO UPDATE SET
                  revision = excluded.revision,
                  title = excluded.title,
                  file_node_id = excluded.file_node_id,
                  file_tags_json = excluded.file_tags_json,
-                 content_sha256 = excluded.content_sha256",
+                 content_sha256 = excluded.content_sha256,
+                 content_type = excluded.content_type",
             params![
                 document_id.as_str(),
                 revision,
@@ -3851,6 +3869,7 @@ fn insert_document(
                 projection.file_node_id().map(NodeId::as_str),
                 file_tags,
                 projection.content_sha256(),
+                content_type,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -3970,6 +3989,7 @@ fn write_note_revision(
         transaction,
         &prepared.document_id,
         &prepared.projection,
+        &prepared.content_type,
         revision,
         FailPoint::None,
     )?;
@@ -5018,13 +5038,15 @@ mod tests {
             let count: u64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info(?1)
-                     WHERE name = 'content_type' AND type = 'TEXT' AND \"notnull\" = 1",
+                     WHERE name = 'content_type' AND type = 'TEXT' AND \"notnull\" = 1
+                       AND dflt_value IS NULL",
                     [table],
                     |row| row.get(0),
                 )
                 .unwrap();
             assert_eq!(count, 1, "{table} must require content_type");
         }
+        assert!(!CURRENT_SCHEMA.contains("CHECK(content_type ="));
         assert_eq!(schema_version(&connection).unwrap(), 1);
     }
 
@@ -5566,6 +5588,7 @@ mod tests {
             &transaction,
             &document_id,
             &prepared_replacement.projection,
+            crate::parser::ORG_CONTENT_TYPE,
             2,
             FailPoint::None,
         )

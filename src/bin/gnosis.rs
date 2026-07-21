@@ -1379,7 +1379,6 @@ fn preflight_manifest(
             || !operation_ids.insert(entry.operation_id.clone())
             || !safe_logical_path(&entry.logical_path)
             || !logical_paths.insert(entry.logical_path.to_lowercase())
-            || entry.content_type != "text/org; charset=utf-8"
             || !relative_normal_path(&entry.source_path)
             || !source_paths.insert(entry.source_path.to_string_lossy().to_lowercase())
             || entry.document_id.is_some() != entry.expected_revision.is_some()

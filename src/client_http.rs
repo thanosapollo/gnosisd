@@ -24,7 +24,7 @@ use crate::{
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, MAX_DOCUMENT_SOURCE_BYTES, MAX_DUE_CURSOR_BYTES,
         MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, canonical_asset_path,
         prepare_document, prepare_thema, thema_content, valid_operation_id, validate_asset_path,
-        validate_blob_metadata, validate_org_path,
+        validate_blob_metadata,
     },
     client_replica::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
@@ -34,7 +34,7 @@ use crate::{
         SourceSpan, ThemaId, TitlePath,
     },
     is_canonical_sha256,
-    parser::ORG_CONTENT_TYPE,
+    parser::validate_document_path,
     protocol::{
         DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
         MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
@@ -1850,8 +1850,7 @@ fn validate_document_head(
         .as_deref()
         .is_none_or(|expected| head.document_id == expected)
         && DocumentId::new(head.document_id.clone()).is_ok()
-        && validate_org_path(&head.logical_path).is_ok()
-        && head.content_type == ORG_CONTENT_TYPE
+        && validate_document_path(&head.content_type, &head.logical_path).is_ok()
         && expectation
             .logical_path
             .as_deref()
