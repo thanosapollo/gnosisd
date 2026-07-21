@@ -70,7 +70,11 @@
       (insert-file-contents file)
       (should (re-search-forward "OpenAPI" nil t))
       (should (re-search-forward "gnosis-nodes-bootstrap" nil t))
-      (should-not (re-search-forward "POST /v1/themata" nil t)))))
+      (should-not (re-search-forward "POST /v1/themata" nil t))))
+  (with-temp-buffer
+    (insert-file-contents "docs/gnosis.org")
+    (should (re-search-forward "isolated review" nil t))
+    (should-not (re-search-forward "does not seed or exercise" nil t))))
 
 (provide 'gnosis-test-boundary)
 ;;; gnosis-test-boundary.el ends here

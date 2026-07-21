@@ -97,7 +97,8 @@
     (if pending
         (insert (propertize "RET: answer   g: refresh   q: quit"
                             'face 'gnosis-face-hint))
-      (let ((success (plist-get gnosis-review--attempt :accepted_success)))
+      (let ((detected (plist-get gnosis-review--attempt :detected_success))
+            (accepted (plist-get gnosis-review--attempt :accepted_success)))
         (insert (propertize "Answer\n" 'face 'bold)
                 (mapconcat (lambda (item) (concat "• " item))
                            (plist-get gnosis-review--attempt :revealed_answer)
@@ -107,10 +108,18 @@
                     gnosis-core--json-null)
           (insert (plist-get gnosis-review--attempt :revealed_parathema) "\n\n"))
         (insert (propertize
-                 (if (eq success t) "Detected: success" "Detected: failure")
-                 'face (if (eq success t)
+                 (if (eq detected t) "Detected: success" "Detected: failure")
+                 'face (if (eq detected t)
                            'gnosis-face-correct 'gnosis-face-false))
-                "\n\nn: commit  o: override  s: suspend  g: refresh  q: quit\n")))
+                (unless (equal detected accepted)
+                  (concat
+                   "\n"
+                   (propertize
+                    (if (eq accepted t) "Accepted: success" "Accepted: failure")
+                    'face (if (eq accepted t)
+                              'gnosis-face-correct 'gnosis-face-false))))
+                "\n\nn: commit accepted result  o: override accepted result"
+                "  s: suspend  g: refresh  q: quit\n")))
     (goto-char (point-min))))
 
 (defun gnosis-review--read-string (prompt script)

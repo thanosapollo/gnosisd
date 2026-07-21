@@ -146,8 +146,8 @@ nix flake check
 =make integration= builds or uses local =gnosisd= and =gnosis= binaries, starts
 an isolated temporary daemon/database/socket/token, fetches
 =/v1/openapi.json=, generates and byte-compiles a manifest, then checks public
-health and authenticated transport.  It does not seed or exercise provisional
-domain flows.
+health, authenticated transport, dashboard projection, and isolated review and
+Org synchronization journeys.
 
 Runtime package contains exactly =gnosis.el=, =gnosis-core.el=,
 =gnosis-core-assets.el=, =gnosis-edit.el=, =gnosis-review.el=,

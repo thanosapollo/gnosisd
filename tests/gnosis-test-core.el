@@ -954,7 +954,9 @@ CONTENT-TYPE defaults to application/json."
                (lambda (&rest arguments) (push arguments calls) result)))
       (setq result
             '(:version 1 :operation_id "operation" :changed t
-              :attempt_revision 8 :attempt (:attempt_id "attempt")))
+              :attempt_revision 8
+              :attempt (:attempt_id "attempt"
+                        :accepted_success :gnosis-json-false)))
       (should
        (eq result
            (gnosis-core-review-attempt-set-accepted-success
@@ -969,14 +971,30 @@ CONTENT-TYPE defaults to application/json."
       (setq result
             `(:version 1 :operation_id "operation"
               :changed ,gnosis-core--json-false :attempt_revision 9
-              :attempt (:attempt_id "attempt")))
+              :attempt (:attempt_id "attempt" :desired_suspended t)))
       (should
        (eq result
            (gnosis-core-review-attempt-set-suspension "attempt" 8 t)))
       (setq result
             `(:version 1 :operation_id "operation"
               :changed ,gnosis-core--json-false :attempt_revision 8
-              :attempt (:attempt_id "different")))
+              :attempt (:attempt_id "different" :desired_suspended t)))
+      (should-error
+       (gnosis-core-review-attempt-set-suspension "attempt" 8 t)
+       :type 'gnosis-core-mutation-uncertain)
+      (setq result
+            `(:version 1 :operation_id "operation" :changed t
+              :attempt_revision 8
+              :attempt (:attempt_id "attempt" :accepted_success t)))
+      (should-error
+       (gnosis-core-review-attempt-set-accepted-success
+        "attempt" 7 gnosis-core--json-false)
+       :type 'gnosis-core-mutation-uncertain)
+      (setq result
+            `(:version 1 :operation_id "operation" :changed t
+              :attempt_revision 9
+              :attempt (:attempt_id "attempt"
+                        :desired_suspended ,gnosis-core--json-false)))
       (should-error
        (gnosis-core-review-attempt-set-suspension "attempt" 8 t)
        :type 'gnosis-core-mutation-uncertain))))

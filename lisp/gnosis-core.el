@@ -1349,6 +1349,7 @@ Correlate the response with EXPECTED-REVISION and OPERATION-ID."
            identity (list (cons "id" attempt-id)) nil
            (list :version 1 :operation_id operation-id
                  :expected_attempt_revision expected-revision key desired)))
+         (attempt (plist-get result :attempt))
          (changed (plist-get result :changed))
          (expected-result-revision (1+ expected-revision)))
     (unless (and (integerp expected-revision)
@@ -1358,8 +1359,8 @@ Correlate the response with EXPECTED-REVISION and OPERATION-ID."
                  (memq changed (list t gnosis-core--json-false))
                  (= expected-result-revision
                     (plist-get result :attempt_revision))
-                 (equal attempt-id
-                        (plist-get (plist-get result :attempt) :attempt_id)))
+                 (equal attempt-id (plist-get attempt :attempt_id))
+                 (equal desired (plist-get attempt key)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review mutation response correlation failed")))
     result))

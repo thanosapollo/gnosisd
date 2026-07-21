@@ -26,6 +26,8 @@
         :response (if (equal status "pending")
                       gnosis-core--json-null
                     '(:kind "text" :value "response"))
+        :detected_success (if (equal status "pending")
+                              gnosis-core--json-null t)
         :accepted_success (if (equal status "pending")
                               gnosis-core--json-null t)
         :desired_suspended gnosis-core--json-false
@@ -120,6 +122,19 @@
       (gnosis-review--render)
       (should (string-match-p "RET: answer" (buffer-string)))
       (should-not (string-match-p "SECRET" (buffer-string))))))
+
+(ert-deftest gnosis-review-render-distinguishes-detected-and-accepted-results ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+    (setf (plist-get gnosis-review--attempt :accepted_success)
+          gnosis-core--json-false)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (should (string-match-p "Detected: success" (buffer-string)))
+      (should (string-match-p "Accepted: failure" (buffer-string)))
+      (should (string-match-p "commit accepted result" (buffer-string))))))
 
 (ert-deftest gnosis-review-answer-submits-one-structured-mutation ()
   (with-temp-buffer
@@ -294,6 +309,27 @@
                  (lambda () (push 'render events))))
         (should-error (gnosis-review--toggle-suspension) :type 'user-error)
         (should (equal '(render refresh) events))))))
+
+(ert-deftest gnosis-review-finish-does-not-commit-mismatched-recovery ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "graded")
+          gnosis-review--attempt-revision 3)
+    (let ((commits 0))
+      (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-mutation-uncertain '("mismatch"))))
+                ((symbol-function 'gnosis-review--load-revision)
+                 (lambda ()
+                   (setq gnosis-review--attempt-revision 4)
+                   (setf (plist-get gnosis-review--attempt :accepted_success) t)
+                   (list :attempt_revision 4 :attempt gnosis-review--attempt)))
+                ((symbol-function 'gnosis-review--render) #'ignore)
+                ((symbol-function 'gnosis-core-review-attempt-commit)
+                 (lambda (&rest _) (cl-incf commits))))
+        (should-error (gnosis-review--finish gnosis-core--json-false)
+                      :type 'gnosis-core-mutation-uncertain)
+        (should (= commits 0))))))
 
 (ert-deftest gnosis-review-commit-uncertainty-recovers-committed-attempt ()
   (with-temp-buffer
