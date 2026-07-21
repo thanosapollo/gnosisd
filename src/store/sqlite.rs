@@ -4,7 +4,10 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -1148,34 +1151,66 @@ impl SqliteStore {
         repair_document_asset_rows(&mut self.connection, associations)
     }
 
+    #[cfg(test)]
     pub(crate) fn verify_database_file(path: &Path) -> Result<Vec<(String, u64)>, StoreError> {
+        Self::verify_database_file_cancellable(path, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub(crate) fn verify_database_file_cancellable(
+        path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        Self::verify_database_file_cancellable_with(path, cancelled, || {})
+    }
+
+    fn verify_database_file_cancellable_with(
+        path: &Path,
+        cancelled: Arc<AtomicBool>,
+        active: impl FnOnce(),
+    ) -> Result<Vec<(String, u64)>, StoreError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(StoreError::BackupCancelled);
+        }
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(StoreError::storage)?;
-        let version = schema_version(&connection)?;
-        if version != SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchemaVersion {
-                found: version,
-                supported: SCHEMA_VERSION,
-            });
+        let progress_cancelled = Arc::clone(&cancelled);
+        connection.progress_handler(
+            1_000,
+            Some(move || progress_cancelled.load(Ordering::Acquire)),
+        );
+        active();
+        let result = (|| {
+            let version = schema_version(&connection)?;
+            if version != SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchemaVersion {
+                    found: version,
+                    supported: SCHEMA_VERSION,
+                });
+            }
+            require_application_id(&connection)?;
+            require_current_schema_layout(&connection)?;
+            let integrity: String = connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(StoreError::storage)?;
+            let foreign_key_failure: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::storage)?;
+            if integrity != "ok" || foreign_key_failure {
+                return Err(StoreError::CorruptData {
+                    field: "backup integrity",
+                });
+            }
+            load_blob_rows_cancellable(&connection, &cancelled)
+        })();
+        if cancelled.load(Ordering::Acquire) {
+            Err(StoreError::BackupCancelled)
+        } else {
+            result
         }
-        require_application_id(&connection)?;
-        require_current_schema_layout(&connection)?;
-        let integrity: String = connection
-            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-            .map_err(StoreError::storage)?;
-        let foreign_key_failure: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::storage)?;
-        if integrity != "ok" || foreign_key_failure {
-            return Err(StoreError::CorruptData {
-                field: "backup integrity",
-            });
-        }
-        load_blob_rows(&connection)
     }
 
     pub(crate) fn settings(&self) -> Result<SettingsRecord, StoreError> {
@@ -2276,7 +2311,15 @@ fn load_settings(connection: &Connection) -> Result<SettingsRecord, StoreError> 
     })
 }
 
+#[cfg(test)]
 fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreError> {
+    load_blob_rows_cancellable(connection, &AtomicBool::new(false))
+}
+
+fn load_blob_rows_cancellable(
+    connection: &Connection,
+    cancelled: &AtomicBool,
+) -> Result<Vec<(String, u64)>, StoreError> {
     let mut statement = connection
         .prepare(
             "SELECT content_sha256, size_bytes FROM blob
@@ -2290,6 +2333,9 @@ fn load_blob_rows(connection: &Connection) -> Result<Vec<(String, u64)>, StoreEr
         .map_err(StoreError::storage)?;
     let mut blobs = Vec::new();
     for row in rows {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(StoreError::BackupCancelled);
+        }
         let (digest, size) = row.map_err(StoreError::storage)?;
         if let Some((previous_digest, previous_size)) = blobs.last()
             && previous_digest == &digest
@@ -4532,7 +4578,11 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
-        sync::{Arc, atomic::AtomicBool, mpsc},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
         time::Duration,
     };
@@ -5001,6 +5051,49 @@ mod tests {
                 .unwrap(),
             "preserved"
         );
+    }
+
+    #[test]
+    fn verification_observes_cancellation_before_sqlite_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        drop(SqliteStore::open(&database).unwrap());
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        let error =
+            SqliteStore::verify_database_file_cancellable(&database, cancelled).unwrap_err();
+
+        assert!(matches!(error, StoreError::BackupCancelled));
+    }
+
+    #[test]
+    fn active_verification_observes_cancellation() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        drop(SqliteStore::open(&database).unwrap());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let (started, started_receiver) = mpsc::sync_channel(0);
+        let (release, release_receiver) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            SqliteStore::verify_database_file_cancellable_with(
+                &database,
+                worker_cancelled,
+                move || {
+                    started.send(()).unwrap();
+                    release_receiver.recv().unwrap();
+                },
+            )
+        });
+
+        started_receiver.recv().unwrap();
+        cancelled.store(true, Ordering::Release);
+        release.send(()).unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(StoreError::BackupCancelled)
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Mutex, TryLockError,
+        Arc, Mutex, TryLockError,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -81,20 +81,24 @@ enum ActivationStep {
 }
 
 pub(crate) struct BackupCancellation {
-    requested: AtomicBool,
+    requested: Arc<AtomicBool>,
     publication: Mutex<()>,
 }
 
 impl BackupCancellation {
     pub(crate) fn new() -> Self {
         Self {
-            requested: AtomicBool::new(false),
+            requested: Arc::new(AtomicBool::new(false)),
             publication: Mutex::new(()),
         }
     }
 
     pub(crate) fn request(&self) {
         self.requested.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
     }
 
     pub(crate) fn publication_idle(&self) -> bool {
@@ -114,7 +118,12 @@ pub(crate) fn snapshot_backup(
     source: &Path,
     destination: &Path,
 ) -> Result<BackupSnapshot, BackupError> {
-    snapshot_backup_with(source, destination, SqliteStore::backup_database)
+    snapshot_backup_with(
+        source,
+        destination,
+        Arc::new(AtomicBool::new(false)),
+        SqliteStore::backup_database,
+    )
 }
 
 pub(crate) fn snapshot_backup_cancellable(
@@ -122,9 +131,14 @@ pub(crate) fn snapshot_backup_cancellable(
     destination: &Path,
     cancellation: &BackupCancellation,
 ) -> Result<BackupSnapshot, BackupError> {
-    snapshot_backup_with(source, destination, |source, database| {
-        SqliteStore::backup_database_cancellable(source, database, &cancellation.requested)
-    })
+    snapshot_backup_with(
+        source,
+        destination,
+        cancellation.flag(),
+        |source, database| {
+            SqliteStore::backup_database_cancellable(source, database, &cancellation.requested)
+        },
+    )
 }
 
 #[cfg(test)]
@@ -134,19 +148,25 @@ fn snapshot_backup_with_deadline(
     retry_budget: Duration,
     cancelled: &AtomicBool,
 ) -> Result<BackupSnapshot, BackupError> {
-    snapshot_backup_with(source, destination, |source, database| {
-        SqliteStore::backup_database_cancellable_with_deadline(
-            source,
-            database,
-            retry_budget,
-            cancelled,
-        )
-    })
+    snapshot_backup_with(
+        source,
+        destination,
+        Arc::new(AtomicBool::new(cancelled.load(Ordering::Acquire))),
+        |source, database| {
+            SqliteStore::backup_database_cancellable_with_deadline(
+                source,
+                database,
+                retry_budget,
+                cancelled,
+            )
+        },
+    )
 }
 
 fn snapshot_backup_with(
     source: &Path,
     destination: &Path,
+    cancelled: Arc<AtomicBool>,
     backup_database: impl FnOnce(&Path, &Path) -> Result<(), StoreError>,
 ) -> Result<BackupSnapshot, BackupError> {
     require_new_directory(destination)?;
@@ -164,7 +184,7 @@ fn snapshot_backup_with(
             error => error.into(),
         });
     }
-    let blobs = match SqliteStore::verify_database_file(&database) {
+    let blobs = match SqliteStore::verify_database_file_cancellable(&database, cancelled) {
         Ok(blobs) => blobs,
         Err(error) => {
             let _ = fs::remove_file(&database);
@@ -252,7 +272,7 @@ fn create_backup_inner(
             return Err(error);
         }
     };
-    if let Err(error) = verify_backup_cancellable(&staging, &cancellation.requested) {
+    if let Err(error) = verify_backup_cancellable(&staging, cancellation) {
         let _ = fs::remove_dir_all(&staging);
         return Err(error);
     }
@@ -318,27 +338,29 @@ fn create_staging_backup(
     Ok(summary(staging, &manifest))
 }
 
+#[cfg(test)]
 pub(crate) fn verify_backup(path: &Path) -> Result<BackupSummary, BackupError> {
     let manifest = verified_manifest(path)?;
     Ok(summary(path, &manifest))
 }
 
 fn verified_manifest(path: &Path) -> Result<BackupManifest, BackupError> {
-    verified_manifest_cancellable(path, &AtomicBool::new(false))
+    verified_manifest_cancellable(path, &BackupCancellation::new())
 }
 
-fn verify_backup_cancellable(
+pub(crate) fn verify_backup_cancellable(
     path: &Path,
-    cancelled: &AtomicBool,
+    cancellation: &BackupCancellation,
 ) -> Result<BackupSummary, BackupError> {
-    let manifest = verified_manifest_cancellable(path, cancelled)?;
+    let manifest = verified_manifest_cancellable(path, cancellation)?;
     Ok(summary(path, &manifest))
 }
 
 fn verified_manifest_cancellable(
     path: &Path,
-    cancelled: &AtomicBool,
+    cancellation: &BackupCancellation,
 ) -> Result<BackupManifest, BackupError> {
+    let cancelled = cancellation.requested.as_ref();
     ensure_not_cancelled(cancelled)?;
     require_directory(path)?;
     let manifest = read_manifest(&path.join(MANIFEST_FILE))?;
@@ -349,7 +371,8 @@ fn verified_manifest_cancellable(
     if sha256_file_cancellable(&database, cancelled)? != manifest.database_sha256 {
         return Err(BackupError::DatabaseDigest);
     }
-    let rows = SqliteStore::verify_database_file(&database)?;
+    let rows = SqliteStore::verify_database_file_cancellable(&database, cancellation.flag())
+        .map_err(backup_store_error)?;
     let expected = manifest
         .blobs
         .iter()
@@ -362,16 +385,17 @@ fn verified_manifest_cancellable(
     Ok(manifest)
 }
 
-pub(crate) fn validate_restore(
+pub(crate) fn validate_restore_cancellable(
     backup: &Path,
     temporary: &Path,
+    cancellation: &BackupCancellation,
 ) -> Result<BackupSummary, BackupError> {
-    let manifest = verified_manifest(backup)?;
+    let manifest = verified_manifest_cancellable(backup, cancellation)?;
     let summary = summary(backup, &manifest);
     require_new_directory(temporary)?;
     fs::create_dir(temporary)?;
     fs::set_permissions(temporary, fs::Permissions::from_mode(0o700))?;
-    let result = materialize_restore(backup, temporary, &manifest);
+    let result = materialize_restore_cancellable(backup, temporary, &manifest, cancellation);
     let cleanup = fs::remove_dir_all(temporary);
     result?;
     cleanup?;
@@ -532,7 +556,21 @@ fn materialize_restore(
     temporary: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), BackupError> {
-    fs::copy(backup.join(DATABASE_FILE), temporary.join(DATABASE_FILE))?;
+    materialize_restore_cancellable(backup, temporary, manifest, &BackupCancellation::new())
+}
+
+fn materialize_restore_cancellable(
+    backup: &Path,
+    temporary: &Path,
+    manifest: &BackupManifest,
+    cancellation: &BackupCancellation,
+) -> Result<(), BackupError> {
+    let cancelled = cancellation.requested.as_ref();
+    copy_file_cancellable(
+        &backup.join(DATABASE_FILE),
+        &temporary.join(DATABASE_FILE),
+        cancelled,
+    )?;
     fs::set_permissions(
         temporary.join(DATABASE_FILE),
         fs::Permissions::from_mode(0o600),
@@ -542,14 +580,15 @@ fn materialize_restore(
     fs::create_dir(&restored_blobs)?;
     fs::set_permissions(&restored_blobs, fs::Permissions::from_mode(0o700))?;
     for blob in &manifest.blobs {
-        copy_manifest_blob(backup, temporary, blob)?;
+        copy_manifest_blob_cancellable(backup, temporary, blob, cancelled)?;
     }
     File::open(&restored_blobs)?.sync_all()?;
     let database = temporary.join(DATABASE_FILE);
-    if sha256_file(&database)? != manifest.database_sha256 {
+    if sha256_file_cancellable(&database, cancelled)? != manifest.database_sha256 {
         return Err(BackupError::DatabaseDigest);
     }
-    let rows = SqliteStore::verify_database_file(&database)?;
+    let rows = SqliteStore::verify_database_file_cancellable(&database, cancellation.flag())
+        .map_err(backup_store_error)?;
     let expected = manifest
         .blobs
         .iter()
@@ -558,7 +597,7 @@ fn materialize_restore(
     if rows != expected {
         return Err(BackupError::BlobManifest);
     }
-    verify_manifest_blobs(temporary, &manifest.blobs)?;
+    verify_manifest_blobs_cancellable(temporary, &manifest.blobs, cancelled)?;
     for sidecar in sqlite_sidecar_paths(&database) {
         match fs::symlink_metadata(sidecar) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -764,26 +803,23 @@ fn sqlite_sidecar_paths(database: &Path) -> [PathBuf; 3] {
     })
 }
 
-fn copy_manifest_blob(
+fn copy_manifest_blob_cancellable(
     backup: &Path,
     temporary: &Path,
     blob: &ManifestBlob,
+    cancelled: &AtomicBool,
 ) -> Result<(), BackupError> {
     let relative = blob_relative_path(&blob.sha256)?;
     let target = temporary.join("blobs").join(&relative);
     let parent = target.parent().ok_or(BackupError::Format)?;
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    fs::copy(backup.join("blobs").join(relative), &target)?;
+    copy_file_cancellable(&backup.join("blobs").join(relative), &target, cancelled)?;
     fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
-    verify_file(&target, &blob.sha256, blob.size_bytes)?;
+    verify_file_cancellable(&target, &blob.sha256, blob.size_bytes, cancelled)?;
     File::open(&target)?.sync_all()?;
     File::open(parent)?.sync_all()?;
     Ok(())
-}
-
-fn verify_manifest_blobs(path: &Path, blobs: &[ManifestBlob]) -> Result<(), BackupError> {
-    verify_manifest_blobs_cancellable(path, blobs, &AtomicBool::new(false))
 }
 
 fn verify_manifest_blobs_cancellable(
@@ -1004,10 +1040,6 @@ fn copy_file_cancellable(
     result
 }
 
-fn verify_file(path: &Path, digest: &str, size: u64) -> Result<(), BackupError> {
-    verify_file_cancellable(path, digest, size, &AtomicBool::new(false))
-}
-
 fn verify_file_cancellable(
     path: &Path,
     digest: &str,
@@ -1023,6 +1055,7 @@ fn verify_file_cancellable(
     }
 }
 
+#[cfg(test)]
 fn sha256_file(path: &Path) -> Result<String, BackupError> {
     sha256_file_cancellable(path, &AtomicBool::new(false))
 }
@@ -1058,6 +1091,13 @@ fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), BackupError> {
         Err(BackupError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+fn backup_store_error(error: StoreError) -> BackupError {
+    match error {
+        StoreError::BackupCancelled => BackupError::Cancelled,
+        error => error.into(),
     }
 }
 

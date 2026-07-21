@@ -21,7 +21,8 @@ mod import;
 pub(crate) use backup::BackupSummary;
 use backup::{
     BackupCancellation, BackupError, create_backup_cancellable, ensure_restore_complete,
-    prune_backups, restore_backup, snapshot_backup_cancellable, validate_restore, verify_backup,
+    prune_backups, restore_backup, snapshot_backup_cancellable, validate_restore_cancellable,
+    verify_backup_cancellable,
 };
 
 const SERVICE_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
@@ -1415,10 +1416,10 @@ async fn sleep_until_next_shutdown_poll(
     started: Instant,
     deadline: Duration,
 ) -> Result<(), ServiceError> {
-    tokio::time::sleep(SERVICE_SHUTDOWN_POLL.min(shutdown_remaining(started, deadline)?)).await;
-    Ok(())
+    let remaining = shutdown_remaining(started, deadline)?;
+    tokio::time::sleep(SERVICE_SHUTDOWN_POLL.min(remaining)).await;
+    complete_shutdown_phase(started, deadline)
 }
-
 type StoreResult<T> = Result<T, StoreError>;
 
 enum PreparedContentOperation {
@@ -2872,9 +2873,10 @@ fn backup_actor(
                     });
                 send(response, result.map_err(ServiceError::Backup));
             }
-            BackupCommand::Verify { path, response } => {
-                send(response, verify_backup(&path).map_err(ServiceError::Backup))
-            }
+            BackupCommand::Verify { path, response } => send(
+                response,
+                verify_backup_cancellable(&path, &cancelled).map_err(ServiceError::Backup),
+            ),
             BackupCommand::Prune {
                 directory,
                 keep,
@@ -2889,7 +2891,8 @@ fn backup_actor(
                 response,
             } => send(
                 response,
-                validate_restore(&path, &temporary).map_err(ServiceError::Backup),
+                validate_restore_cancellable(&path, &temporary, &cancelled)
+                    .map_err(ServiceError::Backup),
             ),
         }
     }
@@ -2995,7 +2998,8 @@ mod tests {
 
     use super::{
         BackupCommand, BackupError, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
-        complete_shutdown_phase, repair_canonical_state, stage_blob_command, store_actor,
+        complete_shutdown_phase, repair_canonical_state, sleep_until_next_shutdown_poll,
+        stage_blob_command, store_actor,
     };
     use crate::application::{
         AssetReconciliationStatus, DeviceDesiredStateMutation, DeviceMutationResult,
@@ -3741,6 +3745,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_accepted_verify_and_restore_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let backup = directory.path().join("backup");
+        service.create_backup(backup.clone(), 1).await.unwrap();
+        let (started, started_receiver) = mpsc::sync_channel(1);
+        let (release, release_receiver) = mpsc::sync_channel(1);
+        service
+            .backup_sender
+            .try_send(BackupCommand::Block {
+                started,
+                release: release_receiver,
+            })
+            .unwrap();
+        tokio::task::spawn_blocking(move || started_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (verify_response, verify_result) = oneshot::channel();
+        service
+            .backup_sender
+            .try_send(BackupCommand::Verify {
+                path: backup.clone(),
+                response: verify_response,
+            })
+            .unwrap();
+        let restore = directory.path().join("restore-check");
+        let (restore_response, restore_result) = oneshot::channel();
+        service
+            .backup_sender
+            .try_send(BackupCommand::ValidateRestore {
+                path: backup,
+                temporary: restore.clone(),
+                response: restore_response,
+            })
+            .unwrap();
+
+        let shutdown = tokio::spawn(async move { runtime.finish().await });
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+
+        assert!(matches!(
+            verify_result.await.unwrap(),
+            Err(ServiceError::Backup(BackupError::Cancelled))
+        ));
+        assert!(matches!(
+            restore_result.await.unwrap(),
+            Err(ServiceError::Backup(BackupError::Cancelled))
+        ));
+        shutdown.await.unwrap().unwrap();
+        assert!(!restore.exists());
+    }
+
+    #[tokio::test]
     async fn shutdown_finishes_while_a_stopped_service_handle_survives() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = runtime(&directory).await;
@@ -3762,6 +3821,16 @@ mod tests {
 
         assert!(matches!(
             complete_shutdown_phase(started, Duration::from_millis(10)),
+            Err(ServiceError::ShutdownDeadlineExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_poll_rechecks_deadline_after_wake() {
+        let result = sleep_until_next_shutdown_poll(Instant::now(), Duration::from_millis(1)).await;
+
+        assert!(matches!(
+            result,
             Err(ServiceError::ShutdownDeadlineExceeded)
         ));
     }
