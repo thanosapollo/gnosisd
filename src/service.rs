@@ -91,6 +91,7 @@ pub(crate) struct ServiceHandle {
 }
 
 enum BackupCommand {
+    Shutdown,
     #[cfg(test)]
     Block {
         started: SyncSender<()>,
@@ -1363,6 +1364,17 @@ impl ServiceRuntime {
                     sleep_until_next_shutdown_poll(started, deadline).await?;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => return Err(ServiceError::Stopped),
+            }
+        }
+        let mut backup_command = BackupCommand::Shutdown;
+        loop {
+            match handle.backup_sender.try_send(backup_command) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    backup_command = returned;
+                    sleep_until_next_shutdown_poll(started, deadline).await?;
+                }
+                Err(TrySendError::Disconnected(_)) => return Err(ServiceError::Stopped),
             }
         }
         drop(handle);
@@ -2818,6 +2830,7 @@ fn backup_actor(
 ) {
     for command in receiver {
         match command {
+            BackupCommand::Shutdown => break,
             #[cfg(test)]
             BackupCommand::Block { started, release } => {
                 let _ = started.send(());
@@ -3707,6 +3720,20 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".gnosis-backup-")
         }));
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_while_a_stopped_service_handle_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+
+        runtime
+            .finish_with_deadline(Duration::from_millis(250))
+            .await
+            .unwrap();
+
+        assert!(matches!(service.ready().await, Err(ServiceError::Stopped)));
     }
 
     #[tokio::test]
