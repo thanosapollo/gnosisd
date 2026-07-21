@@ -78,6 +78,7 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 (defvar gnosis-nodes--conflict-base-blobs nil)
 (defvar gnosis-nodes--pages-left nil)
 (defvar gnosis-nodes--mutation-sent nil)
+(defvar gnosis-nodes--recovery-visits 0)
 (defvar gnosis-nodes--ediff-sessions (make-hash-table :test #'equal))
 
 (defun gnosis-nodes--private-state-root ()
@@ -1913,18 +1914,27 @@ Return match, next cursor, remaining count, and visits."
       (setq state (plist-get result :state))
       (if (> (plist-get result :visited) 0)
           (cl-decf left (plist-get result :visited))
-        (setq left 0)))
+        (when (plist-get state :applied-recovery)
+          (setq left 0))))
+    (setq gnosis-nodes--recovery-visits (- budget left))
     state))
 
 (defun gnosis-nodes--send-outbox (state)
   "Send pending operations in STATE once; persist unknown delivery explicitly."
   (if (plist-get state :applied-recovery)
-      (progn
+      (let ((gnosis-nodes--recovery-visits 0))
         (setq state
               (gnosis-nodes--run-applied-recovery-pass
                state gnosis-nodes-max-outbox-scan-per-pass))
         (gnosis-nodes--write-state state)
-        state)
+        (if (and (not (plist-get state :applied-recovery))
+                 (< gnosis-nodes--recovery-visits
+                    gnosis-nodes-max-outbox-scan-per-pass))
+            (let ((gnosis-nodes-max-outbox-scan-per-pass
+                   (- gnosis-nodes-max-outbox-scan-per-pass
+                      gnosis-nodes--recovery-visits)))
+              (gnosis-nodes--send-outbox state))
+          state))
     (let* ((outbox (plist-get state :outbox))
          (length (length outbox))
          (stored-start (plist-get state :outbox-scan-index))
@@ -1956,6 +1966,13 @@ Return match, next cursor, remaining count, and visits."
                     (gnosis-nodes--run-applied-recovery-pass
                      state (- gnosis-nodes-max-outbox-scan-per-pass
                               inspected)))
+              (when (and (< (length (plist-get state :outbox)) length)
+                         (< (+ inspected gnosis-nodes--recovery-visits)
+                            gnosis-nodes-max-outbox-scan-per-pass))
+                (let ((gnosis-nodes-max-outbox-scan-per-pass
+                       (- gnosis-nodes-max-outbox-scan-per-pass
+                          inspected gnosis-nodes--recovery-visits)))
+                  (setq state (gnosis-nodes--send-outbox state))))
               (gnosis-nodes--write-state state)
               (throw 'gnosis-nodes--stop-outbox nil)))
           (when (eq :pending (plist-get entry :status))
