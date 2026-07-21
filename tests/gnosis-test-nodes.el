@@ -1558,28 +1558,34 @@
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-applied-recovery-scan-is-bounded-and-fair ()
-  (let* ((gnosis-nodes-max-outbox-scan-per-pass 1)
-         (entries
-          [(:operation-id "a" :status :applied
-            :result (:authoritative (:document_id "a")))
-           (:operation-id "b" :status :applied
-            :result (:authoritative (:document_id "b")))
-           (:operation-id "c" :status :applied
-            :result (:authoritative (:document_id "c")))])
-         (state `(:outbox ,entries :conflicts [] :bases []))
-         calls)
-    (cl-letf (((symbol-function 'gnosis-nodes--reconcile-applied-result)
-               (lambda (value entry _authoritative)
-                 (push (plist-get entry :operation-id) calls)
-                 value)))
-      (dotimes (_ 3)
-        (setq state (gnosis-nodes--reconcile-applied-results state))))
-    (should (equal '("c" "b" "a") calls))
-    (should (= 0 (plist-get state :applied-scan-index)))))
+  (let ((items [(:operation-id "a") (:operation-id "b")
+                (:operation-id "target")])
+        (cursor 0)
+        (remaining 3)
+        (visits 0)
+        result)
+    (dotimes (_ 3)
+      (setq result
+            (gnosis-nodes--bounded-recovery-find
+             items cursor remaining
+             (lambda (item)
+               (cl-incf visits)
+               (equal "target" (plist-get item :operation-id)))
+             1))
+      (setq cursor (plist-get result :cursor)
+            remaining (plist-get result :remaining))
+      (should (= 1 (plist-get result :visited))))
+    (should (= 3 visits))
+    (should (equal "target"
+                   (plist-get (plist-get result :match) :operation-id)))
+    (should (= 0 remaining))))
 
 (ert-deftest gnosis-nodes-uncertain-create-clears-consumed-tombstone-conflict ()
   (let* ((directory (make-temp-file "gnosis-nodes-create-tombstone-" t))
          (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (gnosis-nodes-max-outbox-scan-per-pass 1)
          (bytes (string-to-unibyte "local"))
          (digest (gnosis-nodes--digest bytes))
          (authoritative `(:document_id "new" :revision 1
@@ -1598,11 +1604,24 @@
                      (:document_id "old" :revision 2
                       :logical_path "note.org" :content_sha256 nil
                       :operation "tombstone")))
-         (state `(:bases [(:document-id "new" :revision 1
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :notes-root ,(gnosis-nodes--notes-root)
+                  :service-authority ,(gnosis-nodes--service-authority)
+                  :cursor "cursor"
+                  :bases [(:document-id "new" :revision 1
                            :logical-path "note.org" :digest ,digest
                            :fingerprint ,(gnosis-nodes--projection-fingerprint feed)
                            :active t)]
-                  :outbox [,entry] :conflicts [,conflict])))
+                  :outbox [,entry]
+                  :conflicts [(:document-id "junk-a" :projection
+                                (:document_id "junk-a" :revision 1
+                                 :logical_path "a.org" :content_sha256 nil
+                                 :operation "tombstone"))
+                              (:document-id "junk-b" :projection
+                                (:document_id "junk-b" :revision 1
+                                 :logical_path "b.org" :content_sha256 nil
+                                 :operation "tombstone"))
+                              ,conflict])))
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "note.org" bytes)
@@ -1610,9 +1629,11 @@
                      (lambda (&rest _)
                        `(:status "applied" :changed ,gnosis-core--json-false
                          :authoritative ,authoritative))))
-            (setq state (gnosis-nodes--send-outbox state)))
+            (dotimes (_ 4)
+              (setq state (gnosis-nodes--send-outbox state))
+              (setq state (gnosis-nodes--read-state))))
           (should (= 0 (length (plist-get state :outbox))))
-          (should (= 0 (length (plist-get state :conflicts))))
+          (should (= 2 (length (plist-get state :conflicts))))
           (setq state (gnosis-nodes--apply-document state feed))
           (should (equal "new"
                          (plist-get (gnosis-nodes--base state "new")
@@ -1886,8 +1907,11 @@
                 `(:status "applied" :authoritative ,authoritative))
           (gnosis-nodes--write-document "note.org" bytes)
           (setq state
-                (gnosis-nodes--reconcile-applied-result
-                 state entry authoritative))
+                (gnosis-nodes--start-applied-recovery
+                 state authoritative 0))
+          (setq state
+                (gnosis-nodes--run-applied-recovery-pass
+                 state gnosis-nodes-max-outbox-scan-per-pass))
           (should (= 2 (plist-get (gnosis-nodes--base state "doc") :revision)))
           (should (= 1 (length (plist-get state :outbox))))
           (should (= 1 (length (plist-get state :conflicts)))))
@@ -1977,18 +2001,25 @@
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-resolve-rejects-rename-before-ediff ()
-  (let ((state '(:conflicts [(:document-id "doc" :kind :rename
-                              :local-path "old.org" :logical-path "new.org")]))
+  (let* ((directory (make-temp-file "gnosis-nodes-resolve-rename-" t))
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (state '(:conflicts [(:document-id "doc" :kind :rename
+                               :local-path "old.org" :logical-path "new.org")]))
         (writes 0)
         (ediff-calls 0))
-    (cl-letf (((symbol-function 'gnosis-nodes--read-state) (lambda () state))
-              ((symbol-function 'gnosis-nodes--write-state)
-               (lambda (_) (cl-incf writes)))
-              ((symbol-function 'ediff-merge-buffers-with-ancestor)
-               (lambda (&rest _) (cl-incf ediff-calls))))
-      (should-error (gnosis-nodes-resolve-conflict) :type 'user-error))
-    (should (= 0 writes))
-    (should (= 0 ediff-calls))))
+    (unwind-protect
+        (progn
+          (cl-letf (((symbol-function 'gnosis-nodes--read-state)
+                     (lambda () state))
+                    ((symbol-function 'gnosis-nodes--write-state)
+                     (lambda (_) (cl-incf writes)))
+                    ((symbol-function 'ediff-merge-buffers-with-ancestor)
+                     (lambda (&rest _) (cl-incf ediff-calls))))
+            (should-error (gnosis-nodes-resolve-conflict) :type 'user-error))
+          (should (= 0 writes))
+          (should (= 0 ediff-calls)))
+      (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-reconciliation-rejects-non-regular-destination ()
   (let* ((directory (make-temp-file "gnosis-nodes-nonregular" t))
