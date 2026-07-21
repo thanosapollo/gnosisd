@@ -136,6 +136,22 @@
       (should (string-match-p "Accepted: failure" (buffer-string)))
       (should (string-match-p "commit accepted result" (buffer-string))))))
 
+(ert-deftest gnosis-review-render-equal-results-and-suspension-action ()
+  (dolist (case `((t t ,gnosis-core--json-false "s: suspend")
+                  (,gnosis-core--json-false ,gnosis-core--json-false
+                   t "s: unsuspend")))
+    (with-temp-buffer
+      (gnosis-review-mode)
+      (setq gnosis-review--session (gnosis-test-review--session)
+            gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+      (setf (plist-get gnosis-review--attempt :detected_success) (nth 0 case)
+            (plist-get gnosis-review--attempt :accepted_success) (nth 1 case)
+            (plist-get gnosis-review--attempt :desired_suspended) (nth 2 case))
+      (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+        (gnosis-review--render)
+        (should (string-match-p (nth 3 case) (buffer-string)))
+        (should-not (string-match-p "Accepted:" (buffer-string)))))))
+
 (ert-deftest gnosis-review-answer-submits-one-structured-mutation ()
   (with-temp-buffer
     (gnosis-review-mode)
@@ -152,7 +168,7 @@
                  (lambda (_id)
                    (list :attempt_revision 2
                          :attempt (gnosis-test-review--attempt "graded"))))
-                ((symbol-function 'gnosis-review--render) #'ignore))
+                ((symbol-function 'display-images-p) (lambda () nil)))
         (gnosis-review--answer)
         (should (equal '(:kind "text" :value "response") submitted))
         (should (= 2 gnosis-review--attempt-revision))))))

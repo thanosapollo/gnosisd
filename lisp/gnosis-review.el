@@ -110,16 +110,18 @@
         (insert (propertize
                  (if (eq detected t) "Detected: success" "Detected: failure")
                  'face (if (eq detected t)
-                           'gnosis-face-correct 'gnosis-face-false))
-                (unless (equal detected accepted)
-                  (concat
-                   "\n"
-                   (propertize
-                    (if (eq accepted t) "Accepted: success" "Accepted: failure")
-                    'face (if (eq accepted t)
-                              'gnosis-face-correct 'gnosis-face-false))))
-                "\n\nn: commit accepted result  o: override accepted result"
-                "  s: suspend  g: refresh  q: quit\n")))
+                           'gnosis-face-correct 'gnosis-face-false)))
+        (unless (equal detected accepted)
+          (insert "\n"
+                  (propertize
+                   (if (eq accepted t) "Accepted: success" "Accepted: failure")
+                   'face (if (eq accepted t)
+                             'gnosis-face-correct 'gnosis-face-false))))
+        (insert "\n\nn: commit accepted result  o: override accepted result  s: "
+                (if (eq (plist-get gnosis-review--attempt :desired_suspended) t)
+                    "unsuspend"
+                  "suspend")
+                "  g: refresh  q: quit\n")))
     (goto-char (point-min))))
 
 (defun gnosis-review--read-string (prompt script)
