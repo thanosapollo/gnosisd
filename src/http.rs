@@ -4097,6 +4097,18 @@ mod tests {
             schemas["ReviewAttemptStatusV1"]["enum"],
             json!(["pending", "graded", "committed"])
         );
+        let attempt_cases = schemas["ReviewAttemptV1"]["oneOf"].as_array().unwrap();
+        assert_eq!(attempt_cases.len(), 3);
+        assert_eq!(attempt_cases[0]["properties"]["status"]["const"], "pending");
+        assert_eq!(
+            attempt_cases[0]["properties"]["proposed_transition"]["type"],
+            "null"
+        );
+        assert_eq!(attempt_cases[1]["properties"]["status"]["const"], "graded");
+        assert_eq!(
+            attempt_cases[2]["properties"]["status"]["const"],
+            "committed"
+        );
         assert_eq!(
             schemas["ThemaKindV1"]["enum"],
             json!(["basic", "cloze", "mcq", "mc-cloze"])
@@ -8009,7 +8021,7 @@ mod tests {
 
     #[test]
     fn pending_attempts_do_not_reveal_captured_answers() {
-        let mut attempt = ReviewAttemptView {
+        let attempt = ReviewAttemptView {
             attempt_id: "attempt".into(),
             session_id: "session".into(),
             thema_id: "thema".into(),
@@ -8048,10 +8060,6 @@ mod tests {
         let encoded = serde_json::to_string(&pending).unwrap();
         assert!(!encoded.contains("μυστικό"));
         assert!(!encoded.contains("тайна"));
-        attempt.response = Some(AnswerInput::Text("answer".into()));
-        let graded =
-            serde_json::to_value(ReviewAttemptV1::from_application(&attempt).unwrap()).unwrap();
-        assert_eq!(graded["revealed_answer"], json!(["μυστικό", "тайна"]));
     }
 
     fn authorized(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {

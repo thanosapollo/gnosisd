@@ -1566,7 +1566,8 @@ fn checked_attempt(
 }
 
 fn valid_attempt(attempt: &ReviewAttemptV1) -> bool {
-    require_review_id(&attempt.attempt_id).is_ok()
+    attempt.has_valid_status_fields()
+        && require_review_id(&attempt.attempt_id).is_ok()
         && require_review_id(&attempt.session_id).is_ok()
         && require_review_id(&attempt.thema_id).is_ok()
 }

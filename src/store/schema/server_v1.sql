@@ -690,8 +690,7 @@ AND instr(operation_id, char(0)) = 0
 AND substr(operation_id, 1, 1) GLOB '[A-Za-z0-9]'
 AND operation_id NOT GLOB '*[^A-Za-z0-9._:-]*'),
 format_version INTEGER NOT NULL CHECK(format_version = 1),
-actor_kind TEXT NOT NULL CHECK(actor_kind IN('local', 'device')),
-actor_device_id TEXT,
+actor_device_id TEXT NOT NULL,
 attempt_id TEXT NOT NULL,
 operation_kind TEXT NOT NULL CHECK(operation_kind IN('accepted_success_set', 'suspension_set')),
 expected_revision INTEGER NOT NULL CHECK(expected_revision >= 0),
@@ -704,20 +703,8 @@ result_json TEXT NOT NULL CHECK(length(result_json) > 0),
 created_at_us INTEGER NOT NULL CHECK(created_at_us > 0),
 FOREIGN KEY(actor_device_id) REFERENCES device(device_id) ON DELETE RESTRICT,
 FOREIGN KEY(attempt_id) REFERENCES review_attempt(attempt_id) ON DELETE RESTRICT,
-CHECK((actor_kind = 'local' AND actor_device_id IS NULL)
-OR(actor_kind = 'device' AND actor_device_id IS NOT NULL))
+UNIQUE(actor_device_id, operation_id)
 ) STRICT;
-CREATE UNIQUE INDEX review_attempt_operation_local_identity
-ON review_attempt_operation(
-  operation_id
-)
-WHERE actor_kind = 'local';
-CREATE UNIQUE INDEX review_attempt_operation_device_identity
-ON review_attempt_operation(
-  actor_device_id,
-  operation_id
-)
-WHERE actor_kind = 'device';
 CREATE INDEX review_attempt_operation_attempt
 ON review_attempt_operation(
   attempt_id,

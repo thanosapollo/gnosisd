@@ -793,7 +793,7 @@ impl ReviewAttemptStateResponseV1 {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewAttemptV1 {
     pub attempt_id: String,
@@ -801,38 +801,171 @@ pub struct ReviewAttemptV1 {
     pub thema_id: String,
     pub presentation: ReviewPresentationV1,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(with = "crate::protocol::RequiredNullable<Vec<String>>", required)]
     pub revealed_answer: Option<Vec<String>>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub revealed_parathema: Option<String>,
     pub matcher_version: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(with = "crate::protocol::RequiredNullable<ReviewAnswerV1>", required)]
     pub response: Option<ReviewAnswerV1>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
     pub detected_success: Option<bool>,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
     pub accepted_success: Option<bool>,
     pub override_count: u32,
     #[serde(deserialize_with = "deserialize_required_option")]
-    #[schemars(
-        with = "crate::protocol::RequiredNullable<ReviewTransitionV1>",
-        required
-    )]
     pub proposed_transition: Option<ReviewTransitionV1>,
     pub desired_suspended: bool,
     pub status: ReviewAttemptStatusV1,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviewAttemptWireV1 {
+    attempt_id: String,
+    session_id: String,
+    thema_id: String,
+    presentation: ReviewPresentationV1,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<Vec<String>>", required)]
+    revealed_answer: Option<Vec<String>>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    revealed_parathema: Option<String>,
+    matcher_version: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<ReviewAnswerV1>", required)]
+    response: Option<ReviewAnswerV1>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
+    detected_success: Option<bool>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<bool>", required)]
+    accepted_success: Option<bool>,
+    override_count: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(
+        with = "crate::protocol::RequiredNullable<ReviewTransitionV1>",
+        required
+    )]
+    proposed_transition: Option<ReviewTransitionV1>,
+    desired_suspended: bool,
+    status: ReviewAttemptStatusV1,
+}
+
+impl From<ReviewAttemptWireV1> for ReviewAttemptV1 {
+    fn from(value: ReviewAttemptWireV1) -> Self {
+        Self {
+            attempt_id: value.attempt_id,
+            session_id: value.session_id,
+            thema_id: value.thema_id,
+            presentation: value.presentation,
+            revealed_answer: value.revealed_answer,
+            revealed_parathema: value.revealed_parathema,
+            matcher_version: value.matcher_version,
+            response: value.response,
+            detected_success: value.detected_success,
+            accepted_success: value.accepted_success,
+            override_count: value.override_count,
+            proposed_transition: value.proposed_transition,
+            desired_suspended: value.desired_suspended,
+            status: value.status,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewAttemptV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let attempt = Self::from(ReviewAttemptWireV1::deserialize(deserializer)?);
+        if !attempt.has_valid_status_fields() {
+            return Err(de::Error::custom(
+                "review attempt fields do not match its status",
+            ));
+        }
+        Ok(attempt)
+    }
+}
+
+impl JsonSchema for ReviewAttemptV1 {
+    fn schema_name() -> Cow<'static, str> {
+        "ReviewAttemptV1".into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = ReviewAttemptWireV1::json_schema(generator);
+        let response = generator.subschema_for::<ReviewAnswerV1>().to_value();
+        let transition = generator.subschema_for::<ReviewTransitionV1>().to_value();
+        let graded_fields = serde_json::json!({
+            "revealed_answer":{"type":"array","items":{"type":"string"}},
+            "response":response,
+            "detected_success":{"type":"boolean"},
+            "accepted_success":{"type":"boolean"},
+            "proposed_transition":transition
+        });
+        schema.insert(
+            "oneOf".into(),
+            serde_json::json!([
+                {"properties":{
+                    "status":{"const":"pending"},
+                    "revealed_answer":{"type":"null"},
+                    "revealed_parathema":{"type":"null"},
+                    "response":{"type":"null"},
+                    "detected_success":{"type":"null"},
+                    "accepted_success":{"type":"null"},
+                    "override_count":{"const":0},
+                    "proposed_transition":{"type":"null"}
+                }},
+                {"properties":{
+                    "status":{"const":"graded"},
+                    "revealed_answer":graded_fields["revealed_answer"].clone(),
+                    "response":graded_fields["response"].clone(),
+                    "detected_success":graded_fields["detected_success"].clone(),
+                    "accepted_success":graded_fields["accepted_success"].clone(),
+                    "proposed_transition":graded_fields["proposed_transition"].clone()
+                }},
+                {"properties":{
+                    "status":{"const":"committed"},
+                    "revealed_answer":graded_fields["revealed_answer"].clone(),
+                    "response":graded_fields["response"].clone(),
+                    "detected_success":graded_fields["detected_success"].clone(),
+                    "accepted_success":graded_fields["accepted_success"].clone(),
+                    "proposed_transition":graded_fields["proposed_transition"].clone()
+                }}
+            ]),
+        );
+        schema
+    }
+}
+
 impl ReviewAttemptV1 {
+    pub(crate) fn has_valid_status_fields(&self) -> bool {
+        match self.status {
+            ReviewAttemptStatusV1::Pending => {
+                self.revealed_answer.is_none()
+                    && self.revealed_parathema.is_none()
+                    && self.response.is_none()
+                    && self.detected_success.is_none()
+                    && self.accepted_success.is_none()
+                    && self.override_count == 0
+                    && self.proposed_transition.is_none()
+            }
+            ReviewAttemptStatusV1::Graded | ReviewAttemptStatusV1::Committed => {
+                self.revealed_answer.is_some()
+                    && self.response.is_some()
+                    && self.detected_success.is_some()
+                    && self.accepted_success.is_some()
+                    && self.proposed_transition.is_some()
+            }
+        }
+    }
+
     pub(crate) fn from_application(
         value: &ReviewAttemptView,
     ) -> Result<Self, ReviewAttemptWireError> {
         let reveal = value.response.is_some();
-        Ok(Self {
+        let attempt = Self {
             attempt_id: value.attempt_id.clone(),
             session_id: value.session_id.clone(),
             thema_id: value.thema_id.clone(),
@@ -852,7 +985,11 @@ impl ReviewAttemptV1 {
                 .map(ReviewTransitionV1::from),
             desired_suspended: value.desired_suspended,
             status: ReviewAttemptStatusV1::from_application(&value.status)?,
-        })
+        };
+        if !attempt.has_valid_status_fields() {
+            return Err(ReviewAttemptWireError::StatusFields);
+        }
+        Ok(attempt)
     }
 }
 
@@ -946,6 +1083,7 @@ pub(crate) enum ReviewAttemptWireError {
     PresentationKind,
     SessionStatus,
     Status,
+    StatusFields,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

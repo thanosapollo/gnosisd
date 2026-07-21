@@ -38,7 +38,7 @@ struct StoredAttemptOperationPayload<'a> {
 
 const ATTEMPT_OPERATION_REPLAY_SQL: &str =
     "SELECT payload_sha256, result_json FROM review_attempt_operation
-     WHERE operation_id = ?1 AND actor_kind = ?2 AND actor_device_id IS ?3";
+     WHERE operation_id = ?1 AND actor_device_id = ?2";
 const MAX_TOPIC_TRAVERSAL_ROWS: i64 = 1_024;
 
 impl SqliteStore {
@@ -2212,7 +2212,7 @@ fn replayed_attempt_operation(
     let stored = connection
         .query_row(
             ATTEMPT_OPERATION_REPLAY_SQL,
-            params![operation.operation_id, actor.kind(), actor.device_id()],
+            params![operation.operation_id, actor.device_id()],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()
@@ -2437,14 +2437,13 @@ fn insert_attempt_operation(
     connection
         .execute(
             "INSERT INTO review_attempt_operation(
-             operation_id, format_version, actor_kind, actor_device_id, attempt_id,
+             operation_id, format_version, actor_device_id, attempt_id,
              operation_kind, expected_revision, desired_value, payload_sha256,
              payload_json, result_kind, result_json, created_at_us
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 operation.operation_id,
                 operation.format_version,
-                actor.kind(),
                 actor.device_id(),
                 operation.attempt_id,
                 operation.mutation.kind(),
@@ -4317,18 +4316,19 @@ mod tests {
             ReviewAttemptMutation::AcceptedSuccess(false),
         )
         .unwrap();
+        let device_id = add_device(&mut store, "device");
 
         let first = store
             .apply_review_attempt_operation(
                 &operation,
-                &ReviewOperationAuthority::Local,
+                &ReviewOperationAuthority::DeviceAdministrator(device_id.clone()),
                 1_752_600_000_002_000,
             )
             .unwrap();
         let replay = store
             .apply_review_attempt_operation(
                 &operation,
-                &ReviewOperationAuthority::Local,
+                &ReviewOperationAuthority::DeviceAdministrator(device_id),
                 1_752_600_000_003_000,
             )
             .unwrap();
@@ -4346,13 +4346,14 @@ mod tests {
     fn no_op_consumes_revision_and_competing_operation_is_retained() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let attempt_id = graded_online_attempt(&mut store);
+        let device_id = add_device(&mut store, "device");
         let no_op = attempt_operation(
             "no-op",
             &attempt_id,
             1,
             ReviewAttemptMutation::Suspension(false),
         );
-        let no_op_result = apply_local_operation(&mut store, &no_op, 2);
+        let no_op_result = apply_device_operation(&mut store, &device_id, &no_op, 2);
         assert!(!no_op_result.changed);
         assert_eq!(no_op_result.attempt_revision, 2);
 
@@ -4362,7 +4363,7 @@ mod tests {
             1,
             ReviewAttemptMutation::Suspension(true),
         );
-        let conflict = apply_local_operation(&mut store, &competing, 3);
+        let conflict = apply_device_operation(&mut store, &device_id, &competing, 3);
         assert_eq!(
             conflict.status,
             ReviewAttemptOperationStatus::RevisionConflict
@@ -4376,8 +4377,11 @@ mod tests {
             2,
             ReviewAttemptMutation::Suspension(true),
         );
-        assert!(apply_local_operation(&mut store, &later, 4).changed);
-        assert_eq!(apply_local_operation(&mut store, &competing, 5), conflict);
+        assert!(apply_device_operation(&mut store, &device_id, &later, 4).changed);
+        assert_eq!(
+            apply_device_operation(&mut store, &device_id, &competing, 5),
+            conflict
+        );
         assert_eq!(attempt_revision(&store, &attempt_id), 3);
     }
 
@@ -4385,13 +4389,14 @@ mod tests {
     fn operation_identity_rejects_changed_payload() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let attempt_id = graded_online_attempt(&mut store);
+        let device_id = add_device(&mut store, "device");
         let original = attempt_operation(
             "operation",
             &attempt_id,
             1,
             ReviewAttemptMutation::AcceptedSuccess(false),
         );
-        apply_local_operation(&mut store, &original, 2);
+        apply_device_operation(&mut store, &device_id, &original, 2);
         let changed = attempt_operation(
             "operation",
             &attempt_id,
@@ -4400,25 +4405,30 @@ mod tests {
         );
 
         assert!(matches!(
-            store.apply_review_attempt_operation(&changed, &ReviewOperationAuthority::Local, 3),
+            store.apply_review_attempt_operation(
+                &changed,
+                &ReviewOperationAuthority::DeviceAdministrator(device_id),
+                3
+            ),
             Err(crate::store::StoreError::IdempotencyConflict)
         ));
         assert_eq!(attempt_revision(&store, &attempt_id), 2);
     }
 
     #[test]
-    fn operation_identity_is_scoped_to_the_authenticated_actor() {
+    fn operation_identity_is_scoped_to_the_authenticated_device() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let attempt_id = graded_online_attempt(&mut store);
-        let device_id = add_device(&mut store, "device");
-        let local = attempt_operation(
+        let first_device_id = add_device(&mut store, "first-device");
+        let second_device_id = add_device(&mut store, "second-device");
+        let first = attempt_operation(
             "shared-operation",
             &attempt_id,
             1,
             ReviewAttemptMutation::Suspension(true),
         );
-        apply_local_operation(&mut store, &local, 2);
-        let device = attempt_operation(
+        apply_device_operation(&mut store, &first_device_id, &first, 2);
+        let second = attempt_operation(
             "shared-operation",
             &attempt_id,
             2,
@@ -4427,8 +4437,8 @@ mod tests {
 
         let result = store
             .apply_review_attempt_operation(
-                &device,
-                &ReviewOperationAuthority::DeviceAdministrator(device_id),
+                &second,
+                &ReviewOperationAuthority::DeviceAdministrator(second_device_id),
                 3,
             )
             .unwrap();
@@ -4439,33 +4449,60 @@ mod tests {
     }
 
     #[test]
-    fn operation_replay_lookup_uses_actor_identity_indexes() {
+    fn operation_replay_lookup_uses_device_identity_index() {
         let store = SqliteStore::open_in_memory().unwrap();
-        for (kind, device_id, index) in [
-            ("local", None, "review_attempt_operation_local_identity"),
-            (
-                "device",
-                Some("device"),
-                "review_attempt_operation_device_identity",
-            ),
-        ] {
-            let plan = operation_replay_plan(&store, kind, device_id);
-            assert!(plan.iter().any(|line| line.contains(index)), "{plan:?}");
-        }
+        let plan = operation_replay_plan(&store, "device");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("sqlite_autoindex_review_attempt_operation_1")),
+            "{plan:?}"
+        );
     }
 
-    fn operation_replay_plan(
-        store: &SqliteStore,
-        actor_kind: &str,
-        actor_device_id: Option<&str>,
-    ) -> Vec<String> {
+    #[test]
+    fn review_operation_receipts_reject_local_identity() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let attempt_id = graded_online_attempt(&mut store);
+        let payload_sha256 = "a".repeat(64);
+
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO review_attempt_operation(
+                     operation_id, format_version, actor_device_id, attempt_id,
+                     operation_kind, expected_revision, desired_value, payload_sha256,
+                     payload_json, result_kind, result_json, created_at_us
+                     ) VALUES ('missing-device', 1, NULL, ?1,
+                     'accepted_success_set', 1, 0, ?2, '{}', 'accepted', '{}', 1)",
+                    params![attempt_id, payload_sha256],
+                )
+                .is_err()
+        );
+
+        assert!(
+            store
+                .connection
+                .execute(
+                    "INSERT INTO review_attempt_operation(
+                     operation_id, format_version, actor_kind, actor_device_id, attempt_id,
+                     operation_kind, expected_revision, desired_value, payload_sha256,
+                     payload_json, result_kind, result_json, created_at_us
+                     ) VALUES ('local-operation', 1, 'local', NULL, ?1,
+                     'accepted_success_set', 1, 0, ?2, '{}', 'accepted', '{}', 1)",
+                    params![attempt_id, payload_sha256],
+                )
+                .is_err()
+        );
+    }
+
+    fn operation_replay_plan(store: &SqliteStore, actor_device_id: &str) -> Vec<String> {
         let sql = format!("EXPLAIN QUERY PLAN {ATTEMPT_OPERATION_REPLAY_SQL}");
         let mut statement = store.connection.prepare(&sql).unwrap();
         statement
-            .query_map(
-                rusqlite::params!["operation", actor_kind, actor_device_id],
-                |row| row.get(3),
-            )
+            .query_map(rusqlite::params!["operation", actor_device_id], |row| {
+                row.get(3)
+            })
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap()
@@ -4475,6 +4512,7 @@ mod tests {
     fn stale_content_operation_is_replayable_and_changes_nothing() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let attempt_id = graded_online_attempt(&mut store);
+        let device_id = add_device(&mut store, "device");
         add_thema(&mut store, "thema", "Changed", Some(1));
         let operation = attempt_operation(
             "stale",
@@ -4483,11 +4521,14 @@ mod tests {
             ReviewAttemptMutation::AcceptedSuccess(false),
         );
 
-        let conflict = apply_local_operation(&mut store, &operation, 2);
+        let conflict = apply_device_operation(&mut store, &device_id, &operation, 2);
         assert_eq!(conflict.status, ReviewAttemptOperationStatus::StaleAttempt);
         assert_eq!(conflict.attempt_revision, 1);
         assert_eq!(conflict.attempt.accepted_success, Some(true));
-        assert_eq!(apply_local_operation(&mut store, &operation, 3), conflict);
+        assert_eq!(
+            apply_device_operation(&mut store, &device_id, &operation, 3),
+            conflict
+        );
         assert_eq!(attempt_revision(&store, &attempt_id), 1);
     }
 
@@ -4495,27 +4536,32 @@ mod tests {
     fn operation_replay_survives_store_restart() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("review-operation.sqlite");
-        let (operation, first) = {
+        let (operation, device_id, first) = {
             let mut store = SqliteStore::open(&path).unwrap();
             let attempt_id = graded_online_attempt(&mut store);
+            let device_id = add_device(&mut store, "device");
             let operation = attempt_operation(
                 "restart",
                 &attempt_id,
                 1,
                 ReviewAttemptMutation::Suspension(true),
             );
-            let result = apply_local_operation(&mut store, &operation, 2);
-            (operation, result)
+            let result = apply_device_operation(&mut store, &device_id, &operation, 2);
+            (operation, device_id, result)
         };
         let mut reopened = SqliteStore::open(&path).unwrap();
 
-        assert_eq!(apply_local_operation(&mut reopened, &operation, 3), first);
+        assert_eq!(
+            apply_device_operation(&mut reopened, &device_id, &operation, 3),
+            first
+        );
     }
 
     #[test]
     fn failed_receipt_insert_rolls_back_attempt_mutation() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let attempt_id = graded_online_attempt(&mut store);
+        let device_id = add_device(&mut store, "device");
         let operation = attempt_operation(
             "rollback",
             &attempt_id,
@@ -4532,7 +4578,7 @@ mod tests {
             Err(crate::store::StoreError::Storage(_))
         ));
         assert_eq!(attempt_revision(&store, &attempt_id), 1);
-        let applied = apply_local_operation(&mut store, &operation, 3);
+        let applied = apply_device_operation(&mut store, &device_id, &operation, 3);
         assert_eq!(applied.status, ReviewAttemptOperationStatus::Accepted);
         assert_eq!(applied.attempt.accepted_success, Some(false));
     }
@@ -4572,15 +4618,16 @@ mod tests {
         .unwrap()
     }
 
-    fn apply_local_operation(
+    fn apply_device_operation(
         store: &mut SqliteStore,
+        device_id: &str,
         operation: &ReviewAttemptOperation,
         operated_at_us: u64,
     ) -> crate::application::ReviewAttemptOperationResult {
         store
             .apply_review_attempt_operation(
                 operation,
-                &ReviewOperationAuthority::Local,
+                &ReviewOperationAuthority::DeviceAdministrator(device_id.into()),
                 operated_at_us,
             )
             .unwrap()

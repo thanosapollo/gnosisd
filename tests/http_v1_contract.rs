@@ -9,8 +9,9 @@ use gnosis_core::protocol::http_v1::{
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
     ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, ReviewStateV1,
-    SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-    ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1,
+    StagedBlobV1, ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1,
+    UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -831,9 +832,75 @@ fn review_attempt_result() -> Value {
             "detected_success":true,
             "accepted_success":false,
             "override_count":1,
-            "proposed_transition":null,
+            "proposed_transition":review_transition_wire(),
             "desired_suspended":false,
             "status":"graded"
         }
     })
+}
+
+fn review_transition_wire() -> Value {
+    let fixture: Value =
+        serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
+    let transition: ReviewTransitionV1 =
+        serde_json::from_value(fixture["submission"]["operation"]["proposed_transition"].clone())
+            .unwrap();
+    serde_json::to_value(transition).unwrap()
+}
+
+#[test]
+fn review_attempt_status_controls_reveal_and_grading_fields() {
+    let graded = review_attempt_result()["attempt"].clone();
+    assert!(serde_json::from_value::<ReviewAttemptV1>(graded.clone()).is_ok());
+
+    let mut committed = graded.clone();
+    committed["status"] = json!("committed");
+    assert!(serde_json::from_value::<ReviewAttemptV1>(committed).is_ok());
+
+    let mut pending = graded.clone();
+    pending["status"] = json!("pending");
+    for field in [
+        "revealed_answer",
+        "revealed_parathema",
+        "response",
+        "detected_success",
+        "accepted_success",
+        "proposed_transition",
+    ] {
+        pending[field] = Value::Null;
+    }
+    pending["override_count"] = json!(0);
+    assert!(serde_json::from_value::<ReviewAttemptV1>(pending.clone()).is_ok());
+
+    for field in [
+        "revealed_answer",
+        "response",
+        "detected_success",
+        "accepted_success",
+        "proposed_transition",
+    ] {
+        let mut invalid = graded.clone();
+        invalid[field] = Value::Null;
+        assert!(
+            serde_json::from_value::<ReviewAttemptV1>(invalid).is_err(),
+            "graded attempt accepted null {field}"
+        );
+    }
+
+    for (field, value) in [
+        ("revealed_answer", json!(["answer"])),
+        ("revealed_parathema", json!("explanation")),
+        ("response", json!({"kind":"text","value":"answer"})),
+        ("detected_success", json!(true)),
+        ("accepted_success", json!(true)),
+        ("proposed_transition", review_transition_wire()),
+        ("override_count", json!(1)),
+    ] {
+        let mut invalid = pending.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<ReviewAttemptV1>(invalid).is_err(),
+            "pending attempt accepted grading field {field}"
+        );
+    }
 }

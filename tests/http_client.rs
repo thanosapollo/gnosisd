@@ -2004,6 +2004,32 @@ async fn review_operations_reject_mismatched_success_identities() {
 }
 
 #[tokio::test]
+async fn review_operation_client_rejects_pending_attempt_with_grading_fields() {
+    let mut response = review_operation_json(1, "operation", "attempt", 2);
+    response["attempt"]["status"] = json!("pending");
+    let raw = spawn_json_server(response).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+
+    assert!(matches!(
+        client
+            .set_review_accepted_success(
+                "attempt",
+                &SetAcceptedSuccessRequestV1 {
+                    version: 1,
+                    operation_id: "operation".into(),
+                    expected_attempt_revision: 1,
+                    accepted_success: true,
+                },
+            )
+            .await,
+        Err(HttpClientError::InvalidResponse {
+            delivery: DeliveryStatus::Unknown
+        })
+    ));
+    raw.task.await.unwrap();
+}
+
+#[tokio::test]
 async fn review_pack_client_rejects_mismatched_and_corrupt_responses() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
@@ -3852,11 +3878,17 @@ fn review_operation_json(
             "detected_success":true,
             "accepted_success":true,
             "override_count":0,
-            "proposed_transition":null,
+            "proposed_transition":review_transition_json(),
             "desired_suspended":false,
             "status":"graded"
         }
     })
+}
+
+fn review_transition_json() -> serde_json::Value {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/protocol/offline-review-v1.json")).unwrap();
+    fixture["submission"]["operation"]["proposed_transition"].clone()
 }
 
 fn document_mutation_json(

@@ -459,8 +459,6 @@ fn valid_review_id(value: &str) -> bool {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewOperationAuthority {
-    #[cfg(test)]
-    Local,
     DeviceOwner(String),
     DeviceAdministrator(String),
 }
@@ -474,19 +472,9 @@ impl ReviewOperationAuthority {
         }
     }
 
-    pub(crate) const fn kind(&self) -> &'static str {
+    pub(crate) fn device_id(&self) -> &str {
         match self {
-            #[cfg(test)]
-            Self::Local => "local",
-            Self::DeviceOwner(_) | Self::DeviceAdministrator(_) => "device",
-        }
-    }
-
-    pub(crate) fn device_id(&self) -> Option<&str> {
-        match self {
-            #[cfg(test)]
-            Self::Local => None,
-            Self::DeviceOwner(device_id) | Self::DeviceAdministrator(device_id) => Some(device_id),
+            Self::DeviceOwner(device_id) | Self::DeviceAdministrator(device_id) => device_id,
         }
     }
 }
