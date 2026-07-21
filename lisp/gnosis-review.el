@@ -157,7 +157,7 @@
       ("choice"
        (list :kind "choice" :value
              (gnosis-completing-read
-              "Answer: " (plist-get prompt :choices) t)))
+              "Answer: " (append (plist-get prompt :choices) nil) t)))
       (_ (user-error "Unsupported review response prompt")))))
 
 (defun gnosis-review--load-revision ()
@@ -244,10 +244,13 @@
      (message "No Gnosis review items are available"))
     (gnosis-core-mutation-uncertain
      (let ((session (gnosis-review--active-session))
-           (expected-count (or target-count gnosis-core--json-null)))
+           (expected-count target-count))
        (if (and session
                 (equal source (plist-get session :source))
-                (equal expected-count (plist-get session :target_count)))
+                (let ((effective (plist-get session :target_count)))
+                  (if expected-count
+                      (equal effective expected-count)
+                    (and (integerp effective) (> effective 0)))))
            (gnosis-review--open session)
          (signal (car condition) (cdr condition)))))))
 
@@ -265,9 +268,11 @@
   (interactive
    (list (read-string "Topic node ID: ")
          (when current-prefix-arg (read-number "Target count: " 20))))
-  (gnosis-review--start
-   (plist-put (gnosis-review--source "topic") :topic_node_id topic-node-id)
-   target-count))
+  (let ((source (gnosis-review--source "topic")))
+    (setq source (plist-put source :topic_node_id topic-node-id))
+    (setq source (plist-put source :topic_forward_depth 0))
+    (setq source (plist-put source :topic_backward_depth 0))
+    (gnosis-review--start source target-count)))
 
 ;;;###autoload
 (defun gnosis-review-resume ()
