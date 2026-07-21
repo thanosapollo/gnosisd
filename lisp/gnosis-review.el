@@ -202,10 +202,13 @@
 
 (defun gnosis-review--next ()
   "Advance to the next server attempt or close a completed session."
-  (setq gnosis-review--session
-        (gnosis-review--resume-session
-         (plist-get gnosis-review--session :session_id)))
-  (if (gnosis-review--session-complete-p gnosis-review--session)
+  (let ((session-id (plist-get gnosis-review--session :session_id))
+        (session (gnosis-review--active-session)))
+    (when (and session
+               (not (equal session-id (plist-get session :session_id))))
+      (gnosis-core--invalid "Gnosis active review session identity mismatch"))
+    (setq gnosis-review--session session))
+  (if (null gnosis-review--session)
       (progn
         (message "Gnosis review complete")
         (kill-buffer (current-buffer)))

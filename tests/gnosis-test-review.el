@@ -207,6 +207,18 @@
         (should (= commits 1))
         (should (equal '(next) events))))))
 
+(ert-deftest gnosis-review-next-observes-completion-without-resume-mutation ()
+  (let ((gnosis-review--session (gnosis-test-review--session))
+        resumed)
+    (cl-letf (((symbol-function 'gnosis-review--active-session)
+               (lambda () nil))
+              ((symbol-function 'gnosis-review--resume-session)
+               (lambda (&rest _) (setq resumed t)))
+              ((symbol-function 'kill-buffer) #'ignore)
+              ((symbol-function 'message) #'ignore))
+      (gnosis-review--next)
+      (should-not resumed))))
+
 (ert-deftest gnosis-review-resume-cancel-does-not-mutate ()
   (let (mutated)
     (cl-letf (((symbol-function 'gnosis-core-review-session-active)
