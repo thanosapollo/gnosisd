@@ -1156,17 +1156,46 @@ mod tests {
         let first = store
             .apply_device_document_lifecycle_mutation(&rename, 3)
             .unwrap();
+        let rejected = prepare_device_document_rename(
+            1,
+            "rejected-rename".into(),
+            rename.identity.device_id.clone(),
+            DocumentId::new("document").unwrap(),
+            "other.org".into(),
+            1,
+        )
+        .unwrap();
+        let rejected_first = store
+            .apply_device_document_lifecycle_mutation(&rejected, 4)
+            .unwrap();
+        let tombstone = prepare_device_document_tombstone(
+            1,
+            "tombstone-after-rename".into(),
+            rename.identity.device_id.clone(),
+            DocumentId::new("document").unwrap(),
+            2,
+        )
+        .unwrap();
+        store
+            .apply_device_document_lifecycle_mutation(&tombstone, 5)
+            .unwrap();
         let retry = store
-            .apply_device_document_lifecycle_mutation(&rename, 4)
+            .apply_device_document_lifecycle_mutation(&rename, 6)
+            .unwrap();
+        let rejected_retry = store
+            .apply_device_document_lifecycle_mutation(&rejected, 7)
             .unwrap();
 
         assert!(!first.replayed);
         assert!(retry.replayed);
         assert_eq!(retry.result, first.result);
+        assert!(!rejected_first.replayed);
+        assert!(rejected_retry.replayed);
+        assert_eq!(rejected_retry.result, rejected_first.result);
         assert_applied_document(&first.result, "document", 2, true);
-        assert_eq!(row_count(&store, "document_revision"), 2);
-        assert_eq!(row_count(&store, "content_change"), 2);
-        assert_eq!(row_count(&store, "device_mutation_receipt"), 2);
+        assert_eq!(row_count(&store, "document_revision"), 3);
+        assert_eq!(row_count(&store, "content_change"), 3);
+        assert_eq!(row_count(&store, "device_mutation_receipt"), 4);
     }
 
     #[test]

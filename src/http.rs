@@ -802,16 +802,6 @@ async fn rename_document_mutation(
     require(&principal, DeviceScope::ContentWrite)?;
     let document_id =
         DocumentId::new(id).map_err(|_| ApiError::bad_request("invalid document ID"))?;
-    let content_type = state
-        .service
-        .note(document_id.clone())
-        .await
-        .map_err(ApiError::service)?
-        .ok_or_else(ApiError::not_found)?
-        .0
-        .content_type;
-    crate::parser::validate_document_path(&content_type, &input.logical_path)
-        .map_err(|_| ApiError::invalid_content("logical path is invalid"))?;
     let operation = prepare_device_document_rename(
         1,
         idempotency_key(&headers)?,

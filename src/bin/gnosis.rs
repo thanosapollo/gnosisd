@@ -29,8 +29,8 @@ use gnosis_core::{
             ReviewPackCurrentV1, ReviewPackReceiptV1, valid_client_operation_id,
         },
         http_v1::{
-            AssetHeadV1, DocumentImportRequestV1, NoteWriteRequestV1, OfflineAnswerV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+            AssetHeadV1, DocumentImportRequestV1, DocumentMutationResultV1, NoteWriteRequestV1,
+            OfflineAnswerV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
         },
         request,
     },
@@ -316,6 +316,15 @@ enum CliError {
         #[source]
         source: Box<CliError>,
     },
+    #[error(
+        "import operation {operation_id} failed ({delivery} delivery); if retried, use the same operation ID: {source}"
+    )]
+    ImportOperation {
+        operation_id: String,
+        delivery: DeliveryStatus,
+        #[source]
+        source: Box<CliError>,
+    },
     #[error("client result failed ({delivery} delivery): {source}")]
     ClientResult {
         delivery: DeliveryStatus,
@@ -396,6 +405,11 @@ fn client_failure(error: &CliError) -> ClientFailureV1 {
             source,
         }
         | CliError::AssetOperation {
+            operation_id,
+            delivery,
+            source,
+        }
+        | CliError::ImportOperation {
             operation_id,
             delivery,
             source,
@@ -785,6 +799,12 @@ async fn run_http_import_manifest(
         .completed
         .keys()
         .any(|operation_id| !operation_ids.contains(operation_id.as_str()))
+        || entries.iter().any(|entry| {
+            journal
+                .completed
+                .get(&entry.operation_id)
+                .is_some_and(|result| !valid_import_result(entry, result))
+        })
     {
         return Err(CliError::BulkImport.into());
     }
@@ -809,10 +829,17 @@ async fn run_http_import_manifest(
             }
             _ => return Err(CliError::BulkImport.into()),
         }
-        .map_err(CliError::from)?;
-        let value = serde_json::to_value(result).map_err(CliError::Encode)?;
-        journal.completed.insert(entry.operation_id.clone(), value);
-        persist_journal(journal_path, &journal)?;
+        .map_err(|source| {
+            import_operation_error(entry.operation_id.clone(), source.delivery(), source.into())
+        })?;
+        journal.completed.insert(entry.operation_id.clone(), result);
+        persist_journal(journal_path, &journal).map_err(|source| {
+            import_operation_error(
+                entry.operation_id.clone(),
+                DeliveryStatus::Confirmed,
+                source,
+            )
+        })?;
     }
 
     write_json(&ImportReport {
@@ -1206,6 +1233,18 @@ fn asset_operation_error(
     }
 }
 
+fn import_operation_error(
+    operation_id: String,
+    delivery: DeliveryStatus,
+    source: CliError,
+) -> CliError {
+    CliError::ImportOperation {
+        operation_id,
+        delivery,
+        source: Box::new(source),
+    }
+}
+
 fn review_http_operation_error(operation_id: String, source: HttpClientError) -> CliError {
     let delivery = source.delivery();
     review_operation_error(operation_id, delivery, source.into())
@@ -1338,7 +1377,7 @@ struct PreparedImportEntry {
 struct ImportJournal {
     version: u32,
     manifest_sha256: String,
-    completed: BTreeMap<String, serde_json::Value>,
+    completed: BTreeMap<String, DocumentMutationResultV1>,
 }
 
 #[derive(Serialize)]
@@ -1423,6 +1462,45 @@ fn preflight_manifest(
         });
     }
     Ok(prepared)
+}
+
+fn valid_import_result(entry: &PreparedImportEntry, result: &DocumentMutationResultV1) -> bool {
+    match result {
+        DocumentMutationResultV1::Applied {
+            format_version,
+            operation_id,
+            changed,
+            authoritative,
+            cursor,
+        } => {
+            let digest = format!("{:x}", Sha256::digest(entry.source.as_bytes()));
+            let revision_matches = match entry.expected_revision {
+                Some(expected) if *changed => {
+                    expected.checked_add(1) == Some(authoritative.revision)
+                }
+                Some(expected) => authoritative.revision == expected,
+                None => authoritative.revision == 1,
+            };
+            *format_version == 1
+                && operation_id == &entry.operation_id
+                && !cursor.is_empty()
+                && authoritative.active
+                && authoritative.logical_path == entry.logical_path
+                && authoritative.content_type == entry.content_type
+                && authoritative.content_sha256.as_deref() == Some(digest.as_str())
+                && entry
+                    .document_id
+                    .as_deref()
+                    .is_none_or(|document_id| document_id == authoritative.document_id)
+                && revision_matches
+        }
+        DocumentMutationResultV1::Rejected {
+            format_version,
+            operation_id,
+            cursor,
+            ..
+        } => *format_version == 1 && operation_id == &entry.operation_id && !cursor.is_empty(),
+    }
 }
 
 fn import_manifest_sha256(manifest_bytes: &[u8], entries: &[PreparedImportEntry]) -> String {
@@ -1645,12 +1723,17 @@ mod tests {
     };
 
     use clap::Parser as _;
-    use gnosis_core::protocol::client_v1::{ClientDeliveryV1, ClientFailureCodeV1};
+    use gnosis_core::protocol::{
+        client_v1::{ClientDeliveryV1, ClientFailureCodeV1},
+        http_v1::{DocumentHeadV1, DocumentMutationRejectionV1, DocumentMutationResultV1},
+    };
+    use sha2::Digest as _;
 
     use super::{
-        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, ImportManifest,
-        ImportManifestEntry, RunError, client_failure, correlation_id, preflight_manifest,
-        read_device_token, read_source_from, run_asset, run_http_import_manifest,
+        AssetCommand, CLIENT_INPUT_LIMIT, Cli, CliError, Command, DeliveryStatus, ImportJournal,
+        ImportManifest, ImportManifestEntry, PreparedImportEntry, RunError, client_failure,
+        correlation_id, import_operation_error, preflight_manifest, read_device_token,
+        read_source_from, run_asset, run_http_import_manifest, valid_import_result,
     };
 
     #[test]
@@ -1912,6 +1995,62 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("gnosis-cli-"));
         assert!(first.len() <= gnosis_core::protocol::MAX_REQUEST_ID_LEN);
+    }
+
+    #[test]
+    fn import_journal_results_are_typed_and_bound_to_entries() {
+        let source = "#+title: Note\n".to_owned();
+        let entry = PreparedImportEntry {
+            operation_id: "import-note".into(),
+            document_id: None,
+            expected_revision: None,
+            logical_path: "note.org".into(),
+            content_type: "text/org; charset=utf-8".into(),
+            source: source.clone(),
+            path_hash: "unused".into(),
+        };
+        let digest = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        let valid = DocumentMutationResultV1::Applied {
+            format_version: 1,
+            operation_id: entry.operation_id.clone(),
+            changed: true,
+            authoritative: DocumentHeadV1 {
+                document_id: "generated-document".into(),
+                logical_path: entry.logical_path.clone(),
+                content_type: entry.content_type.clone(),
+                revision: 1,
+                content_sha256: Some(digest),
+                active: true,
+            },
+            cursor: "cursor".into(),
+        };
+        assert!(valid_import_result(&entry, &valid));
+
+        let wrong_operation = DocumentMutationResultV1::Rejected {
+            format_version: 1,
+            operation_id: "other-operation".into(),
+            rejection: DocumentMutationRejectionV1::InvalidContent,
+            cursor: "cursor".into(),
+        };
+        assert!(!valid_import_result(&entry, &wrong_operation));
+        assert!(
+            serde_json::from_str::<ImportJournal>(
+                r#"{"version":1,"manifest_sha256":"digest","completed":{"import-note":{}}}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn import_failures_preserve_delivery_and_operation_identity() {
+        let error = import_operation_error(
+            "import-note".into(),
+            DeliveryStatus::Unknown,
+            CliError::BulkImport,
+        );
+        let failure = client_failure(&error);
+        assert_eq!(failure.delivery, ClientDeliveryV1::Unknown);
+        assert_eq!(failure.operation_id.as_deref(), Some("import-note"));
     }
 
     #[test]

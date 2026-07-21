@@ -2586,6 +2586,11 @@ fn rename_document_in(
         .filter(|head| head.active)
         .ok_or(StoreError::NotFound)?;
     check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+    crate::parser::validate_document_path(&current.content_type, logical_path).map_err(|_| {
+        StoreError::InvalidProjection {
+            reason: "logical path is invalid",
+        }
+    })?;
     if current.blob_sha256.is_none() {
         return Err(StoreError::InvalidProjection {
             reason: "document source is unavailable",
