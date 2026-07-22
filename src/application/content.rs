@@ -509,13 +509,13 @@ pub(crate) fn prepare_document(
     if source.len() > MAX_DOCUMENT_SOURCE_BYTES {
         return Err(ContentError::SourceTooLarge);
     }
-    let parsed = parse_document(&content_type, &source).map_err(|error| match error {
-        DocumentParseError::UnsupportedContentType(_) | DocumentParseError::InvalidReference => {
-            ContentError::UnsupportedType
-        }
-        DocumentParseError::AdapterPanicked => ContentError::DocumentParser,
-        DocumentParseError::Org(error) => ContentError::Org(error),
-    })?;
+    let parsed =
+        parse_document(&content_type, &logical_path, &source).map_err(|error| match error {
+            DocumentParseError::UnsupportedContentType(_)
+            | DocumentParseError::InvalidReference => ContentError::UnsupportedType,
+            DocumentParseError::AdapterPanicked => ContentError::DocumentParser,
+            DocumentParseError::Org(error) => ContentError::Org(error),
+        })?;
     let asset_paths = parsed.asset_paths().to_vec();
     let projection = parsed.into_projection();
     let projection_bytes = serde_json::to_vec(&DocumentProjectionSnapshot::from(&projection))
@@ -610,8 +610,11 @@ pub(crate) fn path_key(value: &str) -> String {
     value.to_lowercase()
 }
 
-pub(crate) fn asset_paths_in_org(org: &str) -> Result<Vec<String>, ContentError> {
-    parse_document(crate::parser::ORG_CONTENT_TYPE, org)
+pub(crate) fn asset_paths_in_org(
+    logical_path: &str,
+    org: &str,
+) -> Result<Vec<String>, ContentError> {
+    parse_document(crate::parser::ORG_CONTENT_TYPE, logical_path, org)
         .map(|parsed| parsed.asset_paths().to_vec())
         .map_err(|error| match error {
             DocumentParseError::UnsupportedContentType(_)
@@ -797,14 +800,17 @@ mod tests {
         let digest = "a".repeat(64);
         for target in [
             "".into(),
-            "../outside.png".into(),
+            "../../outside.png".into(),
             "/etc/passwd".into(),
             "images/./photo.bmp".into(),
+            "images/../photo.bmp".into(),
             "images//photo.bmp".into(),
             "././images/photo.bmp".into(),
+            ".././photo.bmp".into(),
             "assets/not-canonical/image.png".into(),
             format!("assets/{digest}/image.bmp"),
             format!("./assets/{digest}/image.png"),
+            format!("../assets/{digest}/image.png"),
         ] {
             for link in [format!("[[file:{target}]]"), format!("file:{target}")] {
                 let org = format!("#+TITLE: Test\n{link}\n");
@@ -834,6 +840,32 @@ mod tests {
         assert_eq!(note.source, org);
         assert_eq!(note.asset_paths.as_slice(), std::slice::from_ref(&asset));
         assert!(validate_asset_path(&asset).is_ok());
+    }
+
+    #[test]
+    fn accepts_confined_parent_relative_links_as_unmanaged_references() {
+        let org = concat!(
+            "#+TITLE: Test\n",
+            "[[file:../../images/photo.jpg]]\n",
+            "[[file:../../index.org][Index]]\n",
+        )
+        .to_owned();
+
+        let note = prepare_note(None, "notes/topic/test.org".into(), org.clone(), None).unwrap();
+
+        assert_eq!(note.source, org);
+        assert!(note.asset_paths.is_empty());
+    }
+
+    #[test]
+    fn rejects_parent_relative_links_that_escape_corpus_root() {
+        for (logical_path, target) in [
+            ("test.org", "../outside.org"),
+            ("notes/test.org", "../../outside.jpg"),
+        ] {
+            let org = format!("#+TITLE: Test\n[[file:{target}]]\n");
+            assert!(prepare_note(None, logical_path.into(), org, None).is_err());
+        }
     }
 
     #[test]

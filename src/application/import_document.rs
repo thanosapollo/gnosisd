@@ -40,7 +40,7 @@ impl ImportDocument {
 
     pub(crate) fn prepare_server(self) -> Result<PreparedServerImport, ApplicationError> {
         let projection = parse_org(&self.org)?;
-        let asset_paths = asset_paths_in_org(&self.org)?;
+        let asset_paths = asset_paths_in_org("import.org", &self.org)?;
         let prepared = PreparedImport {
             document_id: self.document_id,
             projection,

@@ -15,7 +15,7 @@ struct DocumentAdapter {
     path_suffix: &'static str,
     parse: fn(&str) -> Result<DocumentProjection, org::OrgParseError>,
     validate_path: fn(&str) -> Result<(), DocumentParseError>,
-    asset_paths: fn(&str) -> Result<Vec<String>, DocumentParseError>,
+    asset_paths: fn(&str, &str) -> Result<Vec<String>, DocumentParseError>,
     retained_asset_paths: fn(&str) -> Vec<String>,
 }
 
@@ -53,11 +53,16 @@ impl ParsedDocument {
 
 pub(crate) fn parse_document(
     content_type: &str,
+    logical_path: &str,
     source: &str,
 ) -> Result<ParsedDocument, DocumentParseError> {
     let adapter = adapter(content_type)?;
     let (projection, asset_paths) = adapter_call(|| {
-        Ok::<_, DocumentParseError>(((adapter.parse)(source)?, (adapter.asset_paths)(source)?))
+        (adapter.validate_path)(logical_path)?;
+        Ok::<_, DocumentParseError>((
+            (adapter.parse)(source)?,
+            (adapter.asset_paths)(logical_path, source)?,
+        ))
     })?;
     Ok(ParsedDocument {
         projection,
@@ -117,7 +122,7 @@ fn adapter_in<'a>(
         .ok_or_else(|| DocumentParseError::UnsupportedContentType(content_type.to_owned()))
 }
 
-fn org_asset_paths(source: &str) -> Result<Vec<String>, DocumentParseError> {
+fn org_asset_paths(logical_path: &str, source: &str) -> Result<Vec<String>, DocumentParseError> {
     let mut paths = BTreeSet::new();
     for expression in [&*ORG_FILE_LINK, &*ORG_PLAIN_FILE_LINK] {
         for captures in expression.captures_iter(source) {
@@ -126,7 +131,7 @@ fn org_asset_paths(source: &str) -> Result<Vec<String>, DocumentParseError> {
                 .map(|capture| capture.as_str())
                 .ok_or(DocumentParseError::InvalidReference)?;
             let target = target.split("::").next().unwrap_or(target);
-            validate_org_reference(target)?;
+            validate_org_reference(logical_path, target)?;
             if target.starts_with("assets/") {
                 paths.insert(target.to_owned());
             }
@@ -159,18 +164,57 @@ fn retained_org_asset_paths(source: &str) -> Vec<String> {
     paths.into_iter().collect()
 }
 
-fn validate_org_reference(target: &str) -> Result<(), DocumentParseError> {
+fn validate_org_reference(logical_path: &str, target: &str) -> Result<(), DocumentParseError> {
     if target.starts_with("http://") || target.starts_with("https://") {
         return Ok(());
     }
-    let relative_target = target.strip_prefix("./").unwrap_or(target);
-    if !valid_relative_path(relative_target) {
+    if target.is_empty()
+        || target.contains('\0')
+        || target.contains('\\')
+        || Path::new(target).is_absolute()
+    {
         return Err(DocumentParseError::InvalidReference);
     }
-    if relative_target.starts_with("assets/") {
-        return (target == relative_target && valid_asset_path(target))
+
+    if target.starts_with("assets/") {
+        return valid_asset_path(target)
             .then_some(())
             .ok_or(DocumentParseError::InvalidReference);
+    }
+
+    let relative_target = if let Some(relative_target) = target.strip_prefix("./") {
+        if relative_target.starts_with("../") {
+            return Err(DocumentParseError::InvalidReference);
+        }
+        relative_target
+    } else {
+        target
+    };
+    if relative_target.starts_with("assets/") {
+        return Err(DocumentParseError::InvalidReference);
+    }
+
+    let owner_depth = logical_path
+        .rsplit_once('/')
+        .map(|(directory, _)| directory.split('/').count())
+        .unwrap_or(0);
+    let mut parent_count = 0;
+    let mut normal_components = relative_target.split('/').peekable();
+    while normal_components.peek() == Some(&"..") {
+        parent_count += 1;
+        normal_components.next();
+    }
+    if parent_count > owner_depth {
+        return Err(DocumentParseError::InvalidReference);
+    }
+    let normal_components = normal_components.collect::<Vec<_>>();
+    if normal_components.is_empty()
+        || normal_components
+            .iter()
+            .any(|component| component.is_empty() || *component == "." || *component == "..")
+        || (parent_count == owner_depth && normal_components[0] == "assets")
+    {
+        return Err(DocumentParseError::InvalidReference);
     }
     Ok(())
 }
@@ -193,7 +237,7 @@ fn validate_test_path(value: &str) -> Result<(), DocumentParseError> {
 }
 
 #[cfg(test)]
-fn test_asset_paths(source: &str) -> Result<Vec<String>, DocumentParseError> {
+fn test_asset_paths(_: &str, source: &str) -> Result<Vec<String>, DocumentParseError> {
     Ok(retained_test_asset_paths(source))
 }
 
@@ -265,7 +309,7 @@ mod tests {
 
     #[test]
     fn dispatches_supported_content_type_to_org_adapter() {
-        let parsed = parse_document(ORG_CONTENT_TYPE, "#+title: Note\n").unwrap();
+        let parsed = parse_document(ORG_CONTENT_TYPE, "note.org", "#+title: Note\n").unwrap();
 
         assert!(parsed.asset_paths().is_empty());
         assert_eq!(parsed.into_projection().title(), "Note");
@@ -277,7 +321,8 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_content_type_without_parsing_source() {
-        let error = parse_document("text/markdown; charset=utf-8", "# Note").unwrap_err();
+        let error =
+            parse_document("text/markdown; charset=utf-8", "note.md", "# Note").unwrap_err();
 
         assert_eq!(
             error,
