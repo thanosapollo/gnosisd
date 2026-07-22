@@ -38,11 +38,12 @@ use crate::{
     application::{
         AnswerInput, ApplicationError, AssetHead, ContentChange,
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
-        DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
-        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord, NodeThemaAssociation,
-        OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
-        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
+        DeviceDocumentLifecycleMutation, DeviceMutationResult, DevicePrincipal, DeviceRecord,
+        DocumentHead, DocumentRevision, MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord,
+        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
+        OfflineContentConflictReason, OfflineContentMutation, OfflineContentOperation,
+        OfflineContentResult, OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
+        PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
         PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
         ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
         ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
@@ -225,9 +226,17 @@ impl ServiceHandle {
         operation: PreparedDeviceDocumentLifecycleMutation,
         created_at_us: i64,
     ) -> Result<DeviceMutationExecution, ServiceError> {
+        let source_validated = match &operation.mutation {
+            DeviceDocumentLifecycleMutation::Rename { logical_path } => {
+                self.rename_source_is_valid(&operation.document_id, logical_path)
+                    .await?
+            }
+            DeviceDocumentLifecycleMutation::Tombstone => true,
+        };
         request(&self.sender, |response| {
             StoreCommand::ApplyDeviceDocumentLifecycleMutation {
                 operation: Box::new(operation),
+                source_validated,
                 created_at_us,
                 response,
             }
@@ -316,9 +325,13 @@ impl ServiceHandle {
         updated_at_us: i64,
         author_device_id: Option<String>,
     ) -> Result<DocumentHead, ServiceError> {
+        let source_validated = self
+            .rename_source_is_valid(&document_id, &logical_path)
+            .await?;
         request(&self.sender, |response| StoreCommand::RenameDocument {
             document_id,
             logical_path,
+            source_validated,
             expected_revision,
             updated_at_us,
             author_device_id,
@@ -326,6 +339,25 @@ impl ServiceHandle {
         })
         .await?
         .map_err(ServiceError::Store)
+    }
+
+    async fn rename_source_is_valid(
+        &self,
+        document_id: &DocumentId,
+        logical_path: &str,
+    ) -> Result<bool, ServiceError> {
+        let Some((head, source)) = self.note(document_id.clone()).await? else {
+            return Ok(false);
+        };
+        let logical_path = logical_path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let Ok(source) = std::str::from_utf8(&source) else {
+                return false;
+            };
+            crate::parser::parse_document(&head.content_type, &logical_path, source).is_ok()
+        })
+        .await
+        .map_err(|_| ServiceError::Stopped)
     }
 
     pub(crate) async fn tombstone_note(
@@ -1167,8 +1199,24 @@ impl ServiceHandle {
         if format_version != 1 {
             return Err(ServiceError::Store(StoreError::InvalidReviewState));
         }
+        let rename_source_validated = match &operation.mutation {
+            OfflineContentMutation::Rename {
+                document_id,
+                logical_path,
+                ..
+            } => {
+                let document_id = DocumentId::new(document_id.clone())
+                    .map_err(|_| ServiceError::Store(StoreError::InvalidReviewState))?;
+                self.rename_source_is_valid(&document_id, logical_path)
+                    .await?
+            }
+            OfflineContentMutation::Put { .. } | OfflineContentMutation::Tombstone { .. } => true,
+        };
         let (operation, prepared) = tokio::task::spawn_blocking(move || {
             let prepared = match prepare_offline_document(&operation) {
+                Ok(_) if !rename_source_validated => {
+                    PreparedContentOperation::Conflict(OfflineContentConflictReason::InvalidContent)
+                }
                 Ok(note) => PreparedContentOperation::Ready(note.map(Box::new)),
                 Err(reason) => PreparedContentOperation::Conflict(reason),
             };
@@ -1480,6 +1528,7 @@ enum StoreCommand {
     },
     ApplyDeviceDocumentLifecycleMutation {
         operation: Box<PreparedDeviceDocumentLifecycleMutation>,
+        source_validated: bool,
         created_at_us: i64,
         response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
     },
@@ -1507,6 +1556,7 @@ enum StoreCommand {
     RenameDocument {
         document_id: DocumentId,
         logical_path: String,
+        source_validated: bool,
         expected_revision: u64,
         updated_at_us: i64,
         author_device_id: Option<String>,
@@ -2315,12 +2365,17 @@ fn run_store_command(
         ),
         StoreCommand::ApplyDeviceDocumentLifecycleMutation {
             operation,
+            source_validated,
             created_at_us,
             response,
         } => send(
             response,
             store
-                .apply_device_document_lifecycle_mutation(&operation, created_at_us)
+                .apply_device_document_lifecycle_mutation_validated(
+                    &operation,
+                    source_validated,
+                    created_at_us,
+                )
                 .map_err(ServiceError::Store),
         ),
         StoreCommand::ApplyDeviceDesiredStateMutation {
@@ -2359,15 +2414,17 @@ fn run_store_command(
         StoreCommand::RenameDocument {
             document_id,
             logical_path,
+            source_validated,
             expected_revision,
             updated_at_us,
             author_device_id,
             response,
         } => send(
             response,
-            store.rename_document(
+            store.rename_document_validated(
                 &document_id,
                 &logical_path,
+                source_validated,
                 expected_revision,
                 updated_at_us,
                 author_device_id.as_deref(),

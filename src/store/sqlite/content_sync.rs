@@ -260,6 +260,7 @@ fn apply_content_mutation(
             transaction,
             &document_id(operation)?,
             logical_path,
+            true,
             expected_revision.ok_or(StoreError::InvalidReviewState)?,
             timestamp,
             Some(&operation.device_id),

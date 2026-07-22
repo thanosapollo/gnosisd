@@ -752,10 +752,11 @@ impl SqliteStore {
             .map_err(StoreError::storage)
     }
 
-    pub(crate) fn rename_document(
+    pub(crate) fn rename_document_validated(
         &mut self,
         document_id: &DocumentId,
         logical_path: &str,
+        source_validated: bool,
         expected_revision: u64,
         updated_at_us: i64,
         author_device_id: Option<&str>,
@@ -776,6 +777,7 @@ impl SqliteStore {
             &transaction,
             document_id,
             logical_path,
+            source_validated,
             expected_revision,
             updated_at_us,
             author_device_id,
@@ -2578,6 +2580,7 @@ fn rename_document_in(
     transaction: &Transaction<'_>,
     document_id: &DocumentId,
     logical_path: &str,
+    source_validated: bool,
     expected_revision: u64,
     updated_at_us: i64,
     author_device_id: Option<&str>,
@@ -2586,6 +2589,11 @@ fn rename_document_in(
         .filter(|head| head.active)
         .ok_or(StoreError::NotFound)?;
     check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
+    if !source_validated {
+        return Err(StoreError::InvalidProjection {
+            reason: "document source is invalid at the new logical path",
+        });
+    }
     crate::parser::validate_document_path(&current.content_type, logical_path).map_err(|_| {
         StoreError::InvalidProjection {
             reason: "logical path is invalid",
