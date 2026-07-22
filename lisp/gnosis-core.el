@@ -1223,24 +1223,88 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
   "Return thema write fields derived from server PROJECTION."
   (gnosis-core--operation-request-view "put_themata__id_" projection))
 
+(defun gnosis-core--thema-mutation-result
+    (result operation-id &optional thema-id revision)
+  "Return authoritative thema from mutation RESULT.
+Correlate OPERATION-ID and, when non-nil, THEMA-ID and REVISION."
+  (let ((status (plist-get result :status))
+        (cursor (plist-get result :cursor)))
+    (unless (and (gnosis-core--json-object-p result)
+                 (equal 1 (plist-get result :format_version))
+                 (equal operation-id (plist-get result :operation_id))
+                 (stringp cursor)
+                 (not (string-empty-p cursor)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis mutation response identity is invalid")))
+    (pcase status
+      ("applied"
+       (let* ((changed (plist-get result :changed))
+              (authoritative (plist-get result :authoritative))
+              (projection (plist-get authoritative :value))
+              (result-revision (plist-get projection :revision)))
+         (unless
+             (and (memq changed (list t gnosis-core--json-false))
+                  (gnosis-core--json-object-p authoritative)
+                  (equal "thema" (plist-get authoritative :kind))
+                  (gnosis-core--json-object-p projection)
+                  (stringp (plist-get projection :thema_id))
+                  (not (string-empty-p (plist-get projection :thema_id)))
+                  (integerp result-revision)
+                  (if thema-id
+                      (and (equal thema-id (plist-get projection :thema_id))
+                           (= result-revision
+                              (if (eq changed t) (1+ revision) revision)))
+                    (and (eq changed t) (= result-revision 1))))
+           (signal 'gnosis-core-mutation-uncertain
+                   '("Gnosis mutation response projection is invalid")))
+         projection))
+      ("rejected"
+       (let* ((rejection (plist-get result :rejection))
+              (reason (plist-get rejection :reason))
+              (expected (plist-get rejection :expected_revision))
+              (current (plist-get rejection :current_revision)))
+         (unless
+             (and (gnosis-core--json-object-p rejection)
+                  (member reason '("revision_conflict" "not_found"
+                                   "invalid_content" "path_conflict"
+                                   "rename_required"))
+                  (or (not (equal reason "revision_conflict"))
+                      (and revision
+                           (equal revision expected)
+                           (or (eq current gnosis-core--json-null)
+                               (and (integerp current) (>= current 0))))))
+           (signal 'gnosis-core-mutation-uncertain
+                   '("Gnosis mutation rejection is invalid")))
+         (pcase reason
+           ("revision_conflict"
+            (signal 'gnosis-core-conflict '("Gnosis thema revision conflict")))
+           ("not_found"
+            (signal 'gnosis-core-not-found '("Gnosis thema not found")))
+           (_
+            (signal 'gnosis-core-validation-error
+                    '("Gnosis thema mutation rejected"))))))
+      (_
+       (signal 'gnosis-core-mutation-uncertain
+               '("Gnosis mutation response status is invalid"))))))
+
 (defun gnosis-core-thema-create (operation-id request)
-  "Create and return a thema from REQUEST under OPERATION-ID without retry."
-  (gnosis-core--typed-request
-   "post_themata" nil nil request
-   (list (gnosis-core--idempotency-key-header operation-id))))
+  "Create a thema from REQUEST under OPERATION-ID without retry.
+Return its authoritative projection."
+  (gnosis-core--thema-mutation-result
+   (gnosis-core--typed-request
+    "post_themata" nil nil request
+    (list (gnosis-core--idempotency-key-header operation-id)))
+   operation-id))
 
 (defun gnosis-core-thema-update (thema-id operation-id revision request)
   "Update opaque THEMA-ID at REVISION from REQUEST under OPERATION-ID.
 Do not retry automatically."
-  (let ((projection
-         (gnosis-core--typed-request
-          "put_themata__id_" (list (cons "id" thema-id)) nil request
-          (list (gnosis-core--idempotency-key-header operation-id)
-                (gnosis-core--if-match-header revision)))))
-    (unless (equal thema-id (plist-get projection :thema_id))
-      (signal 'gnosis-core-mutation-uncertain
-              '("Gnosis mutation response identity is invalid")))
-    projection))
+  (gnosis-core--thema-mutation-result
+   (gnosis-core--typed-request
+    "put_themata__id_" (list (cons "id" thema-id)) nil request
+    (list (gnosis-core--idempotency-key-header operation-id)
+          (gnosis-core--if-match-header revision)))
+   operation-id thema-id revision))
 
 (defun gnosis-core--review-session-valid-p (session expected-status)
   "Return non-nil when SESSION is a valid online EXPECTED-STATUS projection."

@@ -374,16 +374,25 @@ CONTENT-TYPE defaults to application/json."
 
 (ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
+        (created '(:thema_id "created" :revision 1))
+        (updated '(:thema_id "opaque/id" :revision 7))
         calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
                  (push arguments calls)
                  (if (equal (car arguments) "put_themata__id_")
-                     '(:thema_id "opaque/id" :saved t)
-                   '(:saved t)))))
-      (should (equal '(:saved t)
+                     `(:status "applied" :format_version 1
+                       :operation_id "op:update"
+                       :changed ,gnosis-core--json-false
+                       :authoritative (:kind "thema" :value ,updated)
+                       :cursor "cursor:update")
+                   `(:status "applied" :format_version 1
+                     :operation_id "op:create" :changed t
+                     :authoritative (:kind "thema" :value ,created)
+                     :cursor "cursor:create")))))
+      (should (eq created
                      (gnosis-core-thema-create "op:create" request)))
-      (should (equal '(:thema_id "opaque/id" :saved t)
+      (should (eq updated
                      (gnosis-core-thema-update
                       "opaque/id" "op:update" 7 request))))
     (should
@@ -397,7 +406,12 @@ CONTENT-TYPE defaults to application/json."
 
 (ert-deftest gnosis-core-thema-bindings-reject-wrong-response-identity ()
   (cl-letf (((symbol-function 'gnosis-core--typed-request)
-             (lambda (&rest _) '(:thema_id "different"))))
+             (lambda (&rest _)
+               '(:status "applied" :format_version 1
+                 :operation_id "op:update" :changed t
+                 :authoritative
+                 (:kind "thema" :value (:thema_id "different" :revision 2))
+                 :cursor "cursor"))))
     (should-error (gnosis-core-thema "expected")
                   :type 'gnosis-core-protocol-error)
     (should-error
@@ -405,6 +419,54 @@ CONTENT-TYPE defaults to application/json."
       "expected" "op:update" 1
       '(:kind "basic" :keimenon "Q" :answer ["A"]))
      :type 'gnosis-core-mutation-uncertain)))
+
+(ert-deftest gnosis-core-thema-mutation-rejects-untrusted-envelopes ()
+  (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"])))
+    (dolist
+        (result
+         '((:status "applied" :format_version 1 :operation_id "wrong"
+            :changed t
+            :authoritative (:kind "thema"
+                            :value (:thema_id "created" :revision 1))
+            :cursor "cursor")
+           (:status "applied" :format_version 1 :operation_id "op:create"
+            :changed t
+            :authoritative (:kind "settings"
+                            :value (:thema_id "created" :revision 1))
+            :cursor "cursor")
+           (:status "applied" :format_version 1 :operation_id "op:create"
+            :changed t :authoritative (:kind "thema") :cursor "cursor")
+           (:status "applied" :format_version 1 :operation_id "op:create"
+            :changed "true"
+            :authoritative (:kind "thema"
+                            :value (:thema_id "created" :revision 1))
+            :cursor "cursor")))
+      (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                 (lambda (&rest _) result)))
+        (should-error (gnosis-core-thema-create "op:create" request)
+                      :type 'gnosis-core-mutation-uncertain)))))
+
+(ert-deftest gnosis-core-thema-mutation-signals-correlated-rejection ()
+  (let ((expected-revision 7))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _)
+                 `(:status "rejected" :format_version 1
+                   :operation_id "op:update"
+                   :rejection (:reason "revision_conflict"
+                               :expected_revision ,expected-revision
+                               :current_revision 8)
+                   :cursor "cursor"))))
+      (should-error
+       (gnosis-core-thema-update
+        "opaque/id" "op:update" 7
+        '(:kind "basic" :keimenon "Q" :answer ["A"]))
+       :type 'gnosis-core-conflict)
+      (setq expected-revision 6)
+      (should-error
+       (gnosis-core-thema-update
+        "opaque/id" "op:update" 7
+        '(:kind "basic" :keimenon "Q" :answer ["A"]))
+       :type 'gnosis-core-mutation-uncertain))))
 
 (ert-deftest gnosis-core-thema-write-view-follows-request-schema ()
   (let* ((contract (gnosis-test-core--thema-contract))

@@ -84,10 +84,16 @@
                  (lambda ()
                    (cl-incf operation-calls)
                    "op:save"))
-                ((symbol-function 'gnosis-core-thema-create)
-                 (lambda (operation-id request)
-                   (push (list operation-id request) calls)
-                   (append '(:thema_id "created" :revision 1) request)))
+                ((symbol-function 'gnosis-core--typed-request)
+                 (lambda (&rest arguments)
+                   (push arguments calls)
+                   `(:status "applied" :format_version 1
+                     :operation_id "op:save" :changed t
+                     :authoritative
+                     (:kind "thema"
+                      :value ,(append '(:thema_id "created" :revision 1)
+                                      gnosis-test-edit--request))
+                     :cursor "cursor")))
                 ((symbol-function 'gnosis-core-thema-write-view)
                  (lambda (projection)
                    (cl-loop for (key value) on projection by #'cddr
@@ -96,8 +102,10 @@
         (gnosis-edit-save))
       (should (= 1 (length calls)))
       (should (= 1 operation-calls))
-      (should (equal (list "op:save" gnosis-test-edit--request)
-                     (car calls)))
+      (should
+       (equal `("post_themata" nil nil ,gnosis-test-edit--request
+                (("Idempotency-Key" . "op:save")))
+              (car calls)))
       (should (equal "created" gnosis-edit--thema-id))
       (should (= 1 gnosis-edit--revision))
       (should (equal "created" (plist-get callback :thema_id)))
