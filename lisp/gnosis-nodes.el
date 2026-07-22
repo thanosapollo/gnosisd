@@ -2098,7 +2098,9 @@ Return match, next cursor, remaining count, and visits."
                         :device-id (plist-get identity :device_id)
                         :cursor (plist-get remote :cursor)
                         :bases [] :outbox [] :conflicts []))))
-        (when (and existing (plist-get existing :protocol-fingerprint))
+        (when (and existing
+                   (plist-get existing :protocol-fingerprint)
+                   (null (plist-get existing :snapshot)))
           (user-error "Gnosis synchronization is already bootstrapped"))
         (unless (and (equal (plist-get state :server-id)
                             (plist-get remote :server_id))

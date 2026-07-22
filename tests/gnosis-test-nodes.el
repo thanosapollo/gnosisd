@@ -1172,6 +1172,37 @@
           (should (= 0 (length (plist-get state :outbox)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-bootstrap-resumes-after-snapshot-fingerprint ()
+  (let* ((root (make-temp-file "gnosis-nodes-bootstrap-resume" t))
+         (gnosis-nodes-dir (file-name-as-directory
+                            (expand-file-name "notes" root)))
+         (user-emacs-directory (file-name-as-directory
+                                (expand-file-name "emacs" root)))
+         (gnosis-nodes-state-file nil)
+         (gnosis-core-base-url "http://127.0.0.1:8000")
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "before" :protocol-fingerprint "fingerprint"
+                  :bases [] :outbox [] :conflicts []
+                  :snapshot (:stage "blobs")))
+         resumed)
+    (unwind-protect
+        (progn
+          (make-directory gnosis-nodes-dir t)
+          (gnosis-nodes--write-state state)
+          (cl-letf (((symbol-function 'gnosis-core-sync-identity)
+                     (lambda () '(:device_id "device")))
+                    ((symbol-function 'gnosis-core-sync-state)
+                     (lambda () '(:server_id "server" :cursor "cut")))
+                    ((symbol-function 'gnosis-nodes--snapshot)
+                     (lambda (existing &optional _)
+                       (setq resumed (plist-get existing :snapshot))
+                       (plist-put existing :snapshot nil)))
+                    ((symbol-function 'message) #'ignore))
+            (gnosis-nodes-bootstrap)
+            (should (equal "blobs" (plist-get resumed :stage)))
+            (should-not (plist-get (gnosis-nodes--read-state) :snapshot))))
+      (delete-directory root t))))
+
 (ert-deftest gnosis-nodes-reset-resumes-staging-before-publication ()
   (let* ((root (make-temp-file "gnosis-nodes-reset-resume" t))
          (gnosis-nodes-dir (file-name-as-directory
