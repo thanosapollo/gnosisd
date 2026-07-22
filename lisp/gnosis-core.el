@@ -1223,16 +1223,20 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
   "Return thema write fields derived from server PROJECTION."
   (gnosis-core--operation-request-view "put_themata__id_" projection))
 
-(defun gnosis-core-thema-create (request)
-  "Create and return a thema from REQUEST without automatic retry."
-  (gnosis-core--typed-request "post_themata" nil nil request))
+(defun gnosis-core-thema-create (operation-id request)
+  "Create and return a thema from REQUEST under OPERATION-ID without retry."
+  (gnosis-core--typed-request
+   "post_themata" nil nil request
+   (list (gnosis-core--idempotency-key-header operation-id))))
 
-(defun gnosis-core-thema-update (thema-id revision request)
-  "Update opaque THEMA-ID at REVISION from REQUEST without automatic retry."
+(defun gnosis-core-thema-update (thema-id operation-id revision request)
+  "Update opaque THEMA-ID at REVISION from REQUEST under OPERATION-ID.
+Do not retry automatically."
   (let ((projection
          (gnosis-core--typed-request
           "put_themata__id_" (list (cons "id" thema-id)) nil request
-          (list (gnosis-core--if-match-header revision)))))
+          (list (gnosis-core--idempotency-key-header operation-id)
+                (gnosis-core--if-match-header revision)))))
     (unless (equal thema-id (plist-get projection :thema_id))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis mutation response identity is invalid")))

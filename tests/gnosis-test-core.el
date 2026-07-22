@@ -372,7 +372,7 @@ CONTENT-TYPE defaults to application/json."
     (should (equal '(("get_dashboard") ("get_nodes"))
                    (nreverse calls)))))
 
-(ert-deftest gnosis-core-thema-write-bindings-are-single-shot-and-revisioned ()
+(ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
         calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
@@ -381,14 +381,18 @@ CONTENT-TYPE defaults to application/json."
                  (if (equal (car arguments) "put_themata__id_")
                      '(:thema_id "opaque/id" :saved t)
                    '(:saved t)))))
-      (should (equal '(:saved t) (gnosis-core-thema-create request)))
+      (should (equal '(:saved t)
+                     (gnosis-core-thema-create "op:create" request)))
       (should (equal '(:thema_id "opaque/id" :saved t)
-                     (gnosis-core-thema-update "opaque/id" 7 request))))
+                     (gnosis-core-thema-update
+                      "opaque/id" "op:update" 7 request))))
     (should
      (equal
-      `(("post_themata" nil nil ,request)
+      `(("post_themata" nil nil ,request
+         (("Idempotency-Key" . "op:create")))
         ("put_themata__id_" (("id" . "opaque/id")) nil ,request
-         (("If-Match" . "\"7\""))))
+         (("Idempotency-Key" . "op:update")
+          ("If-Match" . "\"7\""))))
       (nreverse calls)))))
 
 (ert-deftest gnosis-core-thema-bindings-reject-wrong-response-identity ()
@@ -398,7 +402,8 @@ CONTENT-TYPE defaults to application/json."
                   :type 'gnosis-core-protocol-error)
     (should-error
      (gnosis-core-thema-update
-      "expected" 1 '(:kind "basic" :keimenon "Q" :answer ["A"]))
+      "expected" "op:update" 1
+      '(:kind "basic" :keimenon "Q" :answer ["A"]))
      :type 'gnosis-core-mutation-uncertain)))
 
 (ert-deftest gnosis-core-thema-write-view-follows-request-schema ()

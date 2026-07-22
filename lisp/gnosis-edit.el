@@ -126,13 +126,13 @@
     (gnosis-edit--open gnosis-edit-buffer-name request thema-id
                        (plist-get projection :revision) after-save)))
 
-(defun gnosis-edit--send (request)
-  "Send REQUEST once, recording an uncertain mutation outcome."
+(defun gnosis-edit--send (operation-id request)
+  "Send REQUEST once under OPERATION-ID, recording an uncertain outcome."
   (condition-case condition
       (if gnosis-edit--thema-id
           (gnosis-core-thema-update
-           gnosis-edit--thema-id gnosis-edit--revision request)
-        (gnosis-core-thema-create request))
+           gnosis-edit--thema-id operation-id gnosis-edit--revision request)
+        (gnosis-core-thema-create operation-id request))
     (gnosis-core-mutation-uncertain
      (setq gnosis-edit--write-uncertain t)
      (signal (car condition) (cdr condition)))))
@@ -145,7 +145,8 @@
   (when gnosis-edit--write-uncertain
     (user-error "Mutation outcome is uncertain; cancel and reload before saving"))
   (let* ((request (gnosis-edit--parse))
-         (projection (gnosis-edit--send request))
+         (operation-id (gnosis-core-operation-id))
+         (projection (gnosis-edit--send operation-id request))
          (saved-request (gnosis-core-thema-write-view projection))
          (thema-id (plist-get projection :thema_id))
          (revision (plist-get projection :revision)))
