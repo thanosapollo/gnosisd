@@ -793,8 +793,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_escaping_absolute_and_unsupported_links() {
-        for target in ["../outside.png", "/etc/passwd", "image.bmp"] {
+    fn rejects_unsafe_and_malformed_managed_file_links() {
+        let digest = "a".repeat(64);
+        for target in [
+            "../outside.png".into(),
+            "/etc/passwd".into(),
+            "assets/not-canonical/image.png".into(),
+            format!("assets/{digest}/image.bmp"),
+            format!("./assets/{digest}/image.png"),
+        ] {
             for link in [format!("[[file:{target}]]"), format!("file:{target}")] {
                 let org = format!("#+TITLE: Test\n{link}\n");
                 assert!(prepare_note(None, "notes/test.org".into(), org, None).is_err());
@@ -803,10 +810,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_org_and_canonical_asset_links() {
+    fn accepts_safe_ordinary_and_canonical_asset_links() {
         let digest = "a".repeat(64);
         let asset = canonical_asset_path(&digest, "image.png").unwrap();
-        let org = format!("#+TITLE: Test\n[[file:other.org]]\n[[file:{asset}]]\n");
+        let org = format!(
+            "#+TITLE: Test\n[[file:./other.org]]\n[[file:images/photo.jpg]]\n[[file:{asset}]]\n"
+        );
         let note = prepare_note(None, "notes/test.org".into(), org, None).unwrap();
         assert_eq!(note.logical_path, "notes/test.org");
         assert_eq!(note.asset_paths.as_slice(), std::slice::from_ref(&asset));

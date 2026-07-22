@@ -163,18 +163,16 @@ fn validate_org_reference(target: &str) -> Result<(), DocumentParseError> {
     if target.starts_with("http://") || target.starts_with("https://") {
         return Ok(());
     }
-    if !valid_relative_path(target) {
+    let relative_target = target.strip_prefix("./").unwrap_or(target);
+    if !valid_relative_path(relative_target) {
         return Err(DocumentParseError::InvalidReference);
     }
-    if target.starts_with("assets/") {
-        return valid_asset_path(target)
+    if relative_target.starts_with("assets/") {
+        return (target == relative_target && valid_asset_path(target))
             .then_some(())
             .ok_or(DocumentParseError::InvalidReference);
     }
-    target
-        .ends_with(".org")
-        .then_some(())
-        .ok_or(DocumentParseError::InvalidReference)
+    Ok(())
 }
 
 fn validate_org_path(value: &str) -> Result<(), DocumentParseError> {
