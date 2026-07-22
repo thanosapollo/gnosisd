@@ -798,6 +798,7 @@ mod tests {
         for target in [
             "assets/not-canonical/image.png".into(),
             format!("assets/{digest}/image.bmp"),
+            format!(r"assets/{digest}/bad\name.png"),
         ] {
             for link in [format!("[[file:{target}]]"), format!("file:{target}")] {
                 let org = format!("#+TITLE: Test\n{link}\n");

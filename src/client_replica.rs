@@ -2826,7 +2826,11 @@ mod tests {
                 operation_id: "invalid-org".into(),
                 document_id: "invalid-document".into(),
                 logical_path: "invalid.org".into(),
-                org: "#+title: Invalid\n[[file:assets/not-canonical/image.png]]\n".into(),
+                org: concat!(
+                    "#+title: Invalid\n",
+                    "[[file:assets/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bad\\name.png]]\n",
+                )
+                .into(),
                 authored_at_us: 2,
             })
             .unwrap();

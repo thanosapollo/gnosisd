@@ -202,7 +202,8 @@ fn valid_relative_path(value: &str) -> bool {
 
 fn valid_asset_path(value: &str) -> bool {
     let parts = value.split('/').collect::<Vec<_>>();
-    parts.len() == 3
+    valid_relative_path(value)
+        && parts.len() == 3
         && parts[0] == "assets"
         && crate::is_canonical_sha256(parts[1])
         && supported_asset(parts[2])
