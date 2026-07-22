@@ -1292,7 +1292,7 @@ Return historical base blobs needed to create conflict evidence."
   state)
 
 (defun gnosis-nodes--finalize-snapshot (state expected-fingerprint)
-  "Advance STATE snapshot finalization within one action budget.
+  "Advance STATE snapshot finalization and checkpoint one action budget.
 Reject a completed manifest that differs from EXPECTED-FINGERPRINT."
   (let ((actions gnosis-nodes-max-snapshot-actions-per-pass))
     (while (and (plist-get state :snapshot) (> actions 0))
@@ -1318,9 +1318,9 @@ Reject a completed manifest that differs from EXPECTED-FINGERPRINT."
                     (gnosis-nodes--snapshot-process-item
                      state snapshot (aref items item-index)))
               (setf (plist-get snapshot :item-index) (1+ item-index))
-              (cl-decf actions)))))
-      (when (plist-get state :snapshot)
-        (gnosis-nodes--write-state state)))
+              (cl-decf actions))))))
+    (when (plist-get state :snapshot)
+      (gnosis-nodes--write-state state))
     state))
 
 (defun gnosis-nodes--snapshot (state &optional expected-fingerprint)

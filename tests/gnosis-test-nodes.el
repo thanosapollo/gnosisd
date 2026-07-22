@@ -2207,6 +2207,99 @@
           (should (equal cut (plist-get state :cursor))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-snapshot-finalization-checkpoints-once-per-pass ()
+  (let* ((directory (make-temp-file "gnosis-nodes-snapshot-checkpoint" t))
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (gnosis-nodes-max-snapshot-actions-per-pass 3)
+         (page '(:version 1 :snapshot_id "snapshot" :cursor "cut" :next nil
+                 :items [(:entity_kind "settings" :projection (:version 1))
+                         (:entity_kind "settings" :projection (:version 1))
+                         (:entity_kind "settings" :projection (:version 1))]))
+         (file (gnosis-nodes--snapshot-spool-file 0))
+         (bytes (encode-coding-string
+                 (json-serialize (gnosis-nodes--json-value page)
+                                 :null-object nil
+                                 :false-object gnosis-core--json-false)
+                 'utf-8-unix))
+         (state `(:snapshot
+                  (:stage "manifest"
+                   :pages [(:file ,file :sha256 ,(gnosis-nodes--digest bytes))]
+                   :page-index 0 :item-index 0
+                   :documents [] :paths [] :shapes [])))
+         (writes 0))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-bytes file bytes)
+          (cl-letf (((symbol-function 'gnosis-nodes--write-state)
+                     (lambda (_) (cl-incf writes))))
+            (setq state (gnosis-nodes--finalize-snapshot state nil)))
+          (should (= 1 writes))
+          (should (= 3 (plist-get (plist-get state :snapshot) :item-index))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-snapshot-finalization-replays-every-stage ()
+  (dolist (interrupted-stage '("manifest" "blobs" "preflight" "apply"))
+    (let* ((directory (make-temp-file "gnosis-nodes-snapshot-stage" t))
+           (gnosis-nodes-dir (expand-file-name "notes" directory))
+           (user-emacs-directory (file-name-as-directory directory))
+           (gnosis-nodes-state-file nil)
+           (gnosis-core-base-url "http://127.0.0.1:8000")
+           (gnosis-nodes-max-snapshot-actions-per-pass 32)
+           (bytes (string-to-unibyte "body"))
+           (digest (gnosis-nodes--digest bytes))
+           (cut (gnosis-test-nodes--cursor "server" 9))
+           (page `(:version 1 :snapshot_id "snapshot" :cursor ,cut :next nil
+                   :items [(:entity_kind "document"
+                            :projection (:document_id "doc" :revision 1
+                                         :logical_path "note.org"
+                                         :content_sha256 ,digest
+                                         :blob_url ,(format "/v1/blobs/%s" digest)
+                                         :operation "create"
+                                         :projection (:content_sha256 ,digest)))]))
+           (state (list :version 1 :server-id "server" :device-id "device"
+                        :cursor "before" :bases [] :outbox [] :conflicts []))
+           (original-process
+            (symbol-function 'gnosis-nodes--snapshot-process-item))
+           (original-write (symbol-function 'gnosis-nodes--write-document))
+           (materializations 0))
+      (unwind-protect
+          (progn
+            (make-directory gnosis-nodes-dir t)
+            (cl-letf (((symbol-function 'gnosis-core-sync-snapshot)
+                       (lambda (_) page))
+                      ((symbol-function 'gnosis-core-blob)
+                       (lambda (_) bytes))
+                      ((symbol-function 'gnosis-nodes--write-document)
+                       (lambda (&rest arguments)
+                         (unless gnosis-nodes--preflight
+                           (cl-incf materializations))
+                         (apply original-write arguments))))
+              (cl-letf (((symbol-function 'gnosis-nodes--snapshot-process-item)
+                         (lambda (current snapshot item)
+                           (let ((result
+                                  (funcall original-process current snapshot item)))
+                             (when (equal interrupted-stage
+                                          (plist-get snapshot :stage))
+                               (throw 'gnosis-test-interruption :interrupted))
+                             result))))
+                (should
+                 (eq :interrupted
+                     (catch 'gnosis-test-interruption
+                       (gnosis-nodes--snapshot state)
+                       :completed))))
+              (setq state (gnosis-nodes--snapshot (gnosis-nodes--read-state))))
+            (should-not (plist-get state :snapshot))
+            (should (equal cut (plist-get state :cursor)))
+            (should (= 1 (length (plist-get state :bases))))
+            (should (= 0 (length (plist-get state :conflicts))))
+            (should (= 0 (length (plist-get state :outbox))))
+            (should (= 1 materializations))
+            (should (equal bytes
+                           (gnosis-nodes--read-bytes
+                            (expand-file-name "note.org" gnosis-nodes-dir)))))
+        (delete-directory directory t)))))
+
 (ert-deftest gnosis-nodes-snapshot-finalization-resumes-from-durable-state ()
   (let* ((directory (make-temp-file "gnosis-nodes-snapshot-resume" t))
          (gnosis-nodes-dir directory)
