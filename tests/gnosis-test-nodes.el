@@ -1184,7 +1184,8 @@
                   :cursor "before" :protocol-fingerprint "fingerprint"
                   :bases [] :outbox [] :conflicts []
                   :snapshot (:stage "blobs")))
-         resumed)
+         resumed
+         (snapshot-calls 0))
     (unwind-protect
         (progn
           (make-directory gnosis-nodes-dir t)
@@ -1195,12 +1196,18 @@
                      (lambda () '(:server_id "server" :cursor "cut")))
                     ((symbol-function 'gnosis-nodes--snapshot)
                      (lambda (existing &optional _)
+                       (cl-incf snapshot-calls)
                        (setq resumed (plist-get existing :snapshot))
                        (plist-put existing :snapshot nil)))
                     ((symbol-function 'message) #'ignore))
             (gnosis-nodes-bootstrap)
             (should (equal "blobs" (plist-get resumed :stage)))
-            (should-not (plist-get (gnosis-nodes--read-state) :snapshot))))
+            (should (= 1 snapshot-calls))
+            (let ((completed (gnosis-nodes--read-state)))
+              (should-not (plist-get completed :snapshot))
+              (should-error (gnosis-nodes-bootstrap) :type 'user-error)
+              (should (= 1 snapshot-calls))
+              (should (equal completed (gnosis-nodes--read-state))))))
       (delete-directory root t))))
 
 (ert-deftest gnosis-nodes-reset-resumes-staging-before-publication ()
