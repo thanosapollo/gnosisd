@@ -796,8 +796,12 @@ mod tests {
     fn rejects_unsafe_and_malformed_managed_file_links() {
         let digest = "a".repeat(64);
         for target in [
+            "".into(),
             "../outside.png".into(),
             "/etc/passwd".into(),
+            "images/./photo.bmp".into(),
+            "images//photo.bmp".into(),
+            "././images/photo.bmp".into(),
             "assets/not-canonical/image.png".into(),
             format!("assets/{digest}/image.bmp"),
             format!("./assets/{digest}/image.png"),
@@ -807,6 +811,15 @@ mod tests {
                 assert!(prepare_note(None, "notes/test.org".into(), org, None).is_err());
             }
         }
+        assert!(
+            prepare_note(
+                None,
+                "notes/test.org".into(),
+                "#+TITLE: Test\n[[file:][description]]\n".into(),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -814,7 +827,7 @@ mod tests {
         let digest = "a".repeat(64);
         let asset = canonical_asset_path(&digest, "image.png").unwrap();
         let org = format!(
-            "#+TITLE: Test\n[[file:images/photo.jpg]]\nfile:images/photo.jpg\n[[file:./images/photo.jpg]]\nfile:./images/photo.jpg\n[[file:{asset}]]\n"
+            "#+TITLE: Test\n[[file:images/photo.bmp]]\nfile:images/photo.bmp\n[[file:./images/photo.bmp]]\nfile:./images/photo.bmp\n[[file:{asset}]]\n"
         );
         let note = prepare_note(None, "notes/test.org".into(), org.clone(), None).unwrap();
         assert_eq!(note.logical_path, "notes/test.org");

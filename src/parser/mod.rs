@@ -29,9 +29,9 @@ static DOCUMENT_ADAPTERS: [DocumentAdapter; 1] = [DocumentAdapter {
 }];
 
 static ORG_FILE_LINK: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\[{1,2}file:([^]\n]+)").expect("Org file-link regex is valid"));
+    LazyLock::new(|| Regex::new(r"\[{1,2}file:([^]\n]*)").expect("Org file-link regex is valid"));
 static ORG_PLAIN_FILE_LINK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:^|[[:space:](])file:([^[:space:]\[\]<>\n]+)")
+    Regex::new(r"(?:^|[[:space:](])file:([^[:space:]\[\]<>\n]*)")
         .expect("plain Org file-link regex is valid")
 });
 
@@ -211,6 +211,9 @@ fn valid_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.contains('\0')
         && !value.contains('\\')
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
         && !Path::new(value).is_absolute()
         && Path::new(value)
             .components()
