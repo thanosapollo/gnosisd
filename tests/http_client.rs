@@ -12,9 +12,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gnosis_core::{
     client_http::{DeliveryStatus, HttpClient, HttpClientError, SecretToken},
     client_replica::{
-        ContentConflictReason, DeviceUploadKind, LocalReplica, OfflineAnswer, OfflineAssetCreate,
-        OfflineContentOutcome, OfflineDocumentEdit, OfflineDocumentRename, OfflineResponse,
-        OfflineReviewOutcome, PendingDeviceUpload,
+        DeviceUploadKind, LocalReplica, OfflineAnswer, OfflineAssetCreate, OfflineDocumentEdit,
+        OfflineResponse, OfflineReviewOutcome, PendingDeviceUpload,
     },
     client_review::{ReviewPackAcquisition, ReviewPackAcquisitionError},
     client_sync::{ReplicaSync, ReplicaSyncError},
@@ -24,9 +23,9 @@ use gnosis_core::{
         client_v1::{ClientDeliveryV1, ClientFailureCodeV1, ClientFailureV1},
         http_v1::{
             ApiErrorCodeV1, AssetHeadV1, DesiredStateMutationProjectionV1,
-            DesiredStateMutationResultV1, DocumentImportRequestV1, DocumentMutationRejectionV1,
-            DocumentMutationResultV1, NoteRenameRequestV1, NoteWriteRequestV1, ReviewAnswerV1,
-            ReviewPackAssetV2, ReviewSessionRequestV1, ReviewSourceInputV1, ReviewSourceKindV1,
+            DesiredStateMutationResultV1, DocumentImportRequestV1, DocumentMutationResultV1,
+            NoteRenameRequestV1, NoteWriteRequestV1, ReviewAnswerV1, ReviewPackAssetV2,
+            ReviewSessionRequestV1, ReviewSourceInputV1, ReviewSourceKindV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, ThemaWriteRequestV1,
         },
         request,
@@ -2442,96 +2441,6 @@ async fn client_renames_and_tombstones_documents_with_durable_identities() {
 }
 
 #[tokio::test]
-async fn document_rename_revalidates_parent_relative_file_references() {
-    let daemon = RunningDaemon::start().await;
-    let (_, raw_token) = create_device(&daemon.socket).await;
-    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
-    let escaping = NoteWriteRequestV1 {
-        logical_path: "notes/topic/escape.org".into(),
-        content_type: "text/org; charset=utf-8".into(),
-        source: "#+title: Escape\n[[file:../../image.png]]\n".into(),
-    };
-    let created = client
-        .create_note("rename-parent-create", &escaping)
-        .await
-        .unwrap();
-    let DocumentMutationResultV1::Applied { authoritative, .. } = created else {
-        panic!("expected applied document mutation");
-    };
-    let safe = client
-        .rename_note(
-            &authoritative.document_id,
-            "rename-parent-safe",
-            authoritative.revision,
-            &authoritative.content_type,
-            &NoteRenameRequestV1 {
-                logical_path: "other/topic/escape.org".into(),
-            },
-        )
-        .await
-        .unwrap();
-    let DocumentMutationResultV1::Applied { authoritative, .. } = safe else {
-        panic!("expected applied rename");
-    };
-    let escaped = client
-        .rename_note(
-            &authoritative.document_id,
-            "rename-parent-escape",
-            authoritative.revision,
-            &authoritative.content_type,
-            &NoteRenameRequestV1 {
-                logical_path: "escape.org".into(),
-            },
-        )
-        .await;
-    assert!(
-        matches!(
-            &escaped,
-            Ok(DocumentMutationResultV1::Rejected {
-                rejection: DocumentMutationRejectionV1::InvalidContent,
-                ..
-            })
-        ),
-        "unexpected rename result: {escaped:?}"
-    );
-
-    let indirect_asset = NoteWriteRequestV1 {
-        logical_path: "notes/topic/asset.org".into(),
-        content_type: "text/org; charset=utf-8".into(),
-        source: "#+title: Asset\n[[file:../assets/image.png]]\n".into(),
-    };
-    let created = client
-        .create_note("rename-asset-create", &indirect_asset)
-        .await
-        .unwrap();
-    let DocumentMutationResultV1::Applied { authoritative, .. } = created else {
-        panic!("expected applied document mutation");
-    };
-    let indirect = client
-        .rename_note(
-            &authoritative.document_id,
-            "rename-indirect-asset",
-            authoritative.revision,
-            &authoritative.content_type,
-            &NoteRenameRequestV1 {
-                logical_path: "notes/asset.org".into(),
-            },
-        )
-        .await;
-    assert!(
-        matches!(
-            &indirect,
-            Ok(DocumentMutationResultV1::Rejected {
-                rejection: DocumentMutationRejectionV1::InvalidContent,
-                ..
-            })
-        ),
-        "unexpected rename result: {indirect:?}"
-    );
-    daemon.stop().await;
-}
-
-#[tokio::test]
 async fn lost_direct_document_response_replays_without_duplication() {
     let daemon = RunningDaemon::start().await;
     let (_, raw_token) = create_device(&daemon.socket).await;
@@ -3124,53 +3033,6 @@ async fn client_uploads_and_records_a_durable_content_operation() {
     assert!(replica.next_device_upload().unwrap().is_none());
     assert_eq!(replica.content_results(None, 10).unwrap().items.len(), 1);
 
-    daemon.stop().await;
-}
-
-#[tokio::test]
-async fn offline_rename_conflicts_when_parent_reference_would_escape() {
-    let daemon = RunningDaemon::start().await;
-    let (device_id, raw_token) = create_device(&daemon.socket).await;
-    let client = HttpClient::new(&daemon.base_url, SecretToken::new(raw_token).unwrap()).unwrap();
-    let mut replica = bootstrap_replica(&daemon, &client, &device_id).await;
-    replica
-        .record_document(OfflineDocumentEdit {
-            operation_id: "offline-parent-create".into(),
-            document_id: "offline-parent-document".into(),
-            logical_path: "notes/topic/note.org".into(),
-            org: "#+title: Offline\n[[file:../../image.png]]\n".into(),
-            authored_at_us: 10,
-        })
-        .unwrap();
-    let create = replica.next_device_upload().unwrap().unwrap();
-    replica
-        .record_device_result(client.upload(&create).await.unwrap())
-        .unwrap();
-    replica
-        .rename_document(OfflineDocumentRename {
-            operation_id: "offline-parent-rename".into(),
-            document_id: "offline-parent-document".into(),
-            logical_path: "note.org".into(),
-            authored_at_us: 11,
-        })
-        .unwrap();
-    let rename = replica.next_device_upload().unwrap().unwrap();
-    replica
-        .record_device_result(client.upload(&rename).await.unwrap())
-        .unwrap();
-
-    let result = replica
-        .content_results(None, 10)
-        .unwrap()
-        .items
-        .into_iter()
-        .find(|item| item.operation_id == "offline-parent-rename")
-        .unwrap();
-    assert_eq!(result.outcome, OfflineContentOutcome::Conflict);
-    assert_eq!(
-        result.conflict_reason,
-        Some(ContentConflictReason::InvalidContent)
-    );
     daemon.stop().await;
 }
 

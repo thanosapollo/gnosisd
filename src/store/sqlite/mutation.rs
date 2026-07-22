@@ -66,19 +66,9 @@ impl SqliteStore {
         ))
     }
 
-    #[cfg(test)]
     pub(crate) fn apply_device_document_lifecycle_mutation(
         &mut self,
         operation: &PreparedDeviceDocumentLifecycleMutation,
-        created_at_us: i64,
-    ) -> Result<DeviceMutationExecution, StoreError> {
-        self.apply_device_document_lifecycle_mutation_validated(operation, true, created_at_us)
-    }
-
-    pub(crate) fn apply_device_document_lifecycle_mutation_validated(
-        &mut self,
-        operation: &PreparedDeviceDocumentLifecycleMutation,
-        source_validated: bool,
         created_at_us: i64,
     ) -> Result<DeviceMutationExecution, StoreError> {
         operation.validate().map_err(|_| StoreError::CorruptData {
@@ -92,8 +82,7 @@ impl SqliteStore {
             transaction.commit().map_err(StoreError::storage)?;
             return Ok(replay);
         }
-        let result =
-            apply_new_document_lifecycle(&transaction, operation, source_validated, created_at_us)?;
+        let result = apply_new_document_lifecycle(&transaction, operation, created_at_us)?;
         insert_receipt(&transaction, &operation.identity, &result, created_at_us)?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(DeviceMutationExecution {
@@ -518,7 +507,6 @@ fn document_rejection(error: &StoreError) -> Option<DeviceMutationRejection> {
 fn apply_new_document_lifecycle(
     transaction: &Transaction<'_>,
     operation: &PreparedDeviceDocumentLifecycleMutation,
-    source_validated: bool,
     created_at_us: i64,
 ) -> Result<DeviceMutationResult, StoreError> {
     match document_lifecycle_preflight(transaction, operation)? {
@@ -535,7 +523,7 @@ fn apply_new_document_lifecycle(
         }
         DocumentLifecyclePreflight::Write => {}
     }
-    apply_document_lifecycle_write(transaction, operation, source_validated, created_at_us)
+    apply_document_lifecycle_write(transaction, operation, created_at_us)
 }
 
 enum DocumentLifecyclePreflight {
@@ -588,7 +576,6 @@ fn lifecycle_state_preflight(
 fn apply_document_lifecycle_write(
     transaction: &Transaction<'_>,
     operation: &PreparedDeviceDocumentLifecycleMutation,
-    source_validated: bool,
     created_at_us: i64,
 ) -> Result<DeviceMutationResult, StoreError> {
     transaction
@@ -599,7 +586,6 @@ fn apply_document_lifecycle_write(
             transaction,
             &operation.document_id,
             logical_path,
-            source_validated,
             operation.expected_revision,
             created_at_us,
             Some(&operation.identity.device_id),
