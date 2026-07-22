@@ -814,10 +814,11 @@ mod tests {
         let digest = "a".repeat(64);
         let asset = canonical_asset_path(&digest, "image.png").unwrap();
         let org = format!(
-            "#+TITLE: Test\n[[file:./other.org]]\n[[file:images/photo.jpg]]\n[[file:{asset}]]\n"
+            "#+TITLE: Test\n[[file:images/photo.jpg]]\nfile:images/photo.jpg\n[[file:./images/photo.jpg]]\nfile:./images/photo.jpg\n[[file:{asset}]]\n"
         );
-        let note = prepare_note(None, "notes/test.org".into(), org, None).unwrap();
+        let note = prepare_note(None, "notes/test.org".into(), org.clone(), None).unwrap();
         assert_eq!(note.logical_path, "notes/test.org");
+        assert_eq!(note.source, org);
         assert_eq!(note.asset_paths.as_slice(), std::slice::from_ref(&asset));
         assert!(validate_asset_path(&asset).is_ok());
     }
