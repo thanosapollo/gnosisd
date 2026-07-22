@@ -659,7 +659,7 @@ CONTENT-TYPE defaults to application/json."
                     :type 'gnosis-core-protocol-error))))
 
 (ert-deftest gnosis-core-document-mutations-use-exact-bindings ()
-  (let ((bytes (encode-coding-string "* Note\n" 'utf-8 t))
+  (let ((bytes (encode-coding-string "* Γνῶσις\n" 'utf-8 t))
         calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
@@ -686,10 +686,14 @@ CONTENT-TYPE defaults to application/json."
     (should
      (equal
       `(("post_document-mutations" nil nil
-         (:logical_path "note.org" :org "* Note\n")
+         (:logical_path "note.org"
+          :content_type "text/org; charset=utf-8"
+          :source "* Γνῶσις\n")
          (("Idempotency-Key" . "op:create")))
         ("put_document-mutations__id_" (("id" . "doc")) nil
-         (:logical_path "note.org" :org "* Note\n")
+         (:logical_path "note.org"
+          :content_type "text/org; charset=utf-8"
+          :source "* Γνῶσις\n")
          (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\"")))
         ("post_document-mutations__id__rename" (("id" . "doc")) nil
          (:logical_path "moved.org")

@@ -1130,7 +1130,9 @@ ACTIVE constrain an applied authoritative head when non-nil."
          (result
           (gnosis-core--typed-request
            "post_document-mutations" nil nil
-           (list :logical_path logical-path :org text)
+           (list :logical_path logical-path
+                 :content_type "text/org; charset=utf-8"
+                 :source text)
            (gnosis-core--document-mutation-headers operation-id))))
     (gnosis-core--document-mutation-result
      result operation-id nil :create logical-path digest t)))
@@ -1144,7 +1146,9 @@ Use OPERATION-ID as stable mutation identity."
          (result
           (gnosis-core--typed-request
            "put_document-mutations__id_" (list (cons "id" document-id)) nil
-           (list :logical_path logical-path :org text)
+           (list :logical_path logical-path
+                 :content_type "text/org; charset=utf-8"
+                 :source text)
            (gnosis-core--document-mutation-headers operation-id revision))))
     (gnosis-core--document-mutation-result
      result operation-id document-id revision logical-path digest t)))

@@ -56,8 +56,12 @@
     (let ((source (gnosis-test-boundary--library-string feature)))
       (should-not
        (string-match-p
-        "node_ids\\|content_type\\|receipt\\|proposed_transition"
+        "node_ids\\|receipt\\|proposed_transition"
         source))))
+  (dolist (feature '(gnosis gnosis-edit gnosis-nodes gnosis-review))
+    (should-not
+     (string-match-p "content_type"
+                     (gnosis-test-boundary--library-string feature))))
   (let ((source (gnosis-test-boundary--library-string 'gnosis-core)))
     (dolist (route '("/v1/dashboard" "/v1/nodes" "/v1/themata"
                      "/v1/review/" "/v1/documents"))
