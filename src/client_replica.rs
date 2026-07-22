@@ -805,7 +805,7 @@ impl LocalReplica {
         if let Some(json) = self.store.existing_content_operation(&edit.operation_id)? {
             return replayed_document_edit(&json, &edit);
         }
-        let asset_paths = asset_paths_in_org(&edit.logical_path, &edit.org).unwrap_or_default();
+        let asset_paths = asset_paths_in_org(&edit.org).unwrap_or_default();
         self.store.require_document_assets(&asset_paths)?;
         let operation_id = edit.operation_id;
         let document_id = edit.document_id;
