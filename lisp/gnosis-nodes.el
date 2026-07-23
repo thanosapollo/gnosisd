@@ -14,6 +14,7 @@
 
 (require 'cl-lib)
 (require 'json)
+(require 'org)
 (require 'seq)
 (require 'subr-x)
 (require 'gnosis-core)
@@ -80,6 +81,13 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 (defvar gnosis-nodes--mutation-sent nil)
 (defvar gnosis-nodes--recovery-visits 0)
 (defvar gnosis-nodes--ediff-sessions (make-hash-table :test #'equal))
+(defvar gnosis-nodes--node-catalog nil)
+
+(defvar-local gnosis-nodes--content-sha256 nil)
+(defvar-local gnosis-nodes--document-revision nil)
+
+(defconst gnosis-nodes--catalog-page-limit 500)
+(defconst gnosis-nodes--catalog-max-nodes 100000)
 
 (defun gnosis-nodes--private-state-root ()
   "Return configured user's canonical private synchronization root."
@@ -247,6 +255,290 @@ Reject non-regular destinations without opening them."
 (defun gnosis-nodes--digest (bytes)
   "Return SHA-256 hex digest of unibyte BYTES."
   (secure-hash 'sha256 (string-to-unibyte bytes)))
+
+(defun gnosis-nodes--catalog-authority ()
+  "Return a non-secret identity for the current authenticated authority."
+  (list (gnosis-core--validated-base-url)
+        (secure-hash 'sha256 (gnosis-core--token))))
+
+(defun gnosis-nodes--fetch-node-records ()
+  "Return the complete validated server node catalog."
+  (let ((after nil)
+        (done nil)
+        (records nil)
+        (seen-ids (make-hash-table :test #'equal))
+        (seen-cursors (make-hash-table :test #'equal)))
+    (while (not done)
+      (let* ((page
+              (gnosis-core-nodes nil after gnosis-nodes--catalog-page-limit))
+             (items (plist-get page :items))
+             (next (plist-get page :next)))
+        (when (> (+ (length records) (length items))
+                 gnosis-nodes--catalog-max-nodes)
+          (signal 'gnosis-nodes-error '("Gnosis node catalog is too large")))
+        (cl-loop
+         for node across items
+         for node-id = (plist-get node :node_id)
+         do (when (gethash node-id seen-ids)
+              (signal 'gnosis-nodes-error '("Duplicate Gnosis catalog node")))
+         do (puthash node-id t seen-ids)
+         do (push node records))
+        (if (eq next gnosis-core--json-null)
+            (setq done t)
+          (when (or (= (length items) 0)
+                    (gethash next seen-cursors))
+            (signal 'gnosis-nodes-error '("Gnosis node catalog did not advance")))
+          (puthash next t seen-cursors)
+          (setq after next))))
+    (vconcat (nreverse records))))
+
+(defun gnosis-nodes--display-text (value)
+  "Return one-line completion text for VALUE."
+  (string-trim
+   (replace-regexp-in-string "[[:space:]\n\r]+" " " value)))
+
+(defun gnosis-nodes--candidate (node)
+  "Return a unique human-readable completion candidate for NODE."
+  (let* ((path
+          (mapconcat #'gnosis-nodes--display-text
+                     (append (plist-get node :title_path) nil) " / "))
+         (logical-path
+          (gnosis-nodes--display-text (plist-get node :logical_path)))
+         (retired
+          (unless (eq t (plist-get node :active)) " [retired]"))
+         (node-id (prin1-to-string (plist-get node :node_id))))
+    (format "%s  (%s)%s  <%s>" path logical-path (or retired "") node-id)))
+
+(defun gnosis-nodes--build-catalog (nodes authority)
+  "Build a disposable lookup catalog from NODES for AUTHORITY."
+  (let ((by-id (make-hash-table :test #'equal))
+        (by-candidate (make-hash-table :test #'equal))
+        candidates)
+    (cl-loop
+     for node across nodes
+     for node-id = (plist-get node :node_id)
+     for candidate = (gnosis-nodes--candidate node)
+     do (when (or (gethash node-id by-id)
+                  (gethash candidate by-candidate))
+          (signal 'gnosis-nodes-error '("Duplicate Gnosis catalog entry")))
+     do (puthash node-id node by-id)
+     do (puthash candidate node-id by-candidate)
+     do (push candidate candidates))
+    (list :authority authority
+          :nodes nodes
+          :by-id by-id
+          :candidates (vconcat (sort candidates #'string-lessp))
+          :by-candidate by-candidate)))
+
+;;;###autoload
+(defun gnosis-nodes-refresh-cache ()
+  "Replace the disposable in-memory node catalog from the server."
+  (interactive)
+  (let* ((authority (gnosis-nodes--catalog-authority))
+         (nodes (gnosis-nodes--fetch-node-records))
+         (catalog (gnosis-nodes--build-catalog nodes authority)))
+    (unless (equal authority (gnosis-nodes--catalog-authority))
+      (signal 'gnosis-nodes-error
+              '("Gnosis authenticated authority changed during refresh")))
+    (setq gnosis-nodes--node-catalog catalog)
+    (when (called-interactively-p 'interactive)
+      (message "Cached %d Gnosis nodes" (length nodes)))
+    catalog))
+
+(defun gnosis-nodes--catalog (&optional refresh)
+  "Return the current-authority node catalog, refreshing when needed.
+When REFRESH is non-nil, always fetch a new catalog."
+  (let ((authority (gnosis-nodes--catalog-authority)))
+    (if (and (not refresh)
+             gnosis-nodes--node-catalog
+             (equal authority
+                    (plist-get gnosis-nodes--node-catalog :authority)))
+        gnosis-nodes--node-catalog
+      (gnosis-nodes-refresh-cache))))
+
+(defun gnosis-nodes--buffer-bytes (buffer)
+  "Return BUFFER contents encoded as exact UTF-8 bytes."
+  (with-current-buffer buffer
+    (save-restriction
+      (widen)
+      (encode-coding-string
+       (buffer-substring-no-properties (point-min) (point-max))
+       'utf-8 t))))
+
+(defun gnosis-nodes--exact-buffer-p (buffer digest)
+  "Return non-nil when unmodified BUFFER has exact DIGEST."
+  (and (buffer-live-p buffer)
+       (not (buffer-modified-p buffer))
+       (equal digest
+              (gnosis-nodes--digest
+               (gnosis-nodes--buffer-bytes buffer)))))
+
+(defun gnosis-nodes--local-document-source (node)
+  "Return an exact local document source for NODE, or nil."
+  (let* ((path
+          (gnosis-nodes--safe-path
+           gnosis-nodes-dir (plist-get node :logical_path)))
+         (digest (plist-get node :content_sha256))
+         (visiting (get-file-buffer path)))
+    (cond
+     ((gnosis-nodes--exact-buffer-p visiting digest)
+      (list :buffer visiting :bytes (gnosis-nodes--buffer-bytes visiting)))
+     ((buffer-live-p visiting) nil)
+     (t
+      (let ((disk (gnosis-nodes--working-bytes path)))
+        (when (and disk (equal digest (gnosis-nodes--digest disk)))
+          (let ((opened (find-file-noselect path)))
+            (if (gnosis-nodes--exact-buffer-p opened digest)
+                (list :buffer opened :bytes
+                      (gnosis-nodes--buffer-bytes opened))
+              (unless (buffer-modified-p opened) (kill-buffer opened))
+              nil))))))))
+
+(defun gnosis-nodes--historical-buffer (node bytes)
+  "Return a read-only Org buffer for exact NODE revision BYTES."
+  (let* ((digest (plist-get node :content_sha256))
+         (revision (plist-get node :document_revision))
+         (base-name
+          (format "*Gnosis document %s@%d*" (substring digest 0 12) revision))
+         (existing (get-buffer base-name)))
+    (if (and (gnosis-nodes--exact-buffer-p existing digest)
+             (buffer-local-value 'buffer-read-only existing)
+             (with-current-buffer existing (derived-mode-p 'org-mode)))
+        existing
+      (let ((buffer (generate-new-buffer base-name)))
+        (condition-case condition
+            (progn
+              (with-current-buffer buffer
+                (org-mode)
+                (insert (gnosis-core--org-string bytes))
+                (unless (equal digest
+                               (gnosis-nodes--digest
+                                (gnosis-nodes--buffer-bytes buffer)))
+                  (signal 'gnosis-nodes-error
+                          '("Org mode changed the Gnosis document")))
+                (setq-local gnosis-nodes--content-sha256 digest)
+                (setq-local gnosis-nodes--document-revision revision)
+                (setq buffer-read-only t)
+                (set-buffer-modified-p nil))
+              buffer)
+          (error
+           (kill-buffer buffer)
+           (signal (car condition) (cdr condition))))))))
+
+(defun gnosis-nodes--document-source (node)
+  "Return exact buffer and bytes for NODE's digest-bound revision."
+  (or
+   (gnosis-nodes--local-document-source node)
+   (let* ((digest (plist-get node :content_sha256))
+          (bytes
+           (gnosis-core-document-revision
+            (plist-get node :document_id)
+            (plist-get node :document_revision)
+            digest)))
+     (unless (equal digest (gnosis-nodes--digest bytes))
+       (signal 'gnosis-nodes-error '("Gnosis document digest mismatch")))
+     (list :buffer (gnosis-nodes--historical-buffer node bytes)
+           :bytes bytes))))
+
+(defun gnosis-nodes--byte-position (bytes start end)
+  "Convert zero-based half-open byte span START..END in BYTES to a point."
+  (let ((raw (string-to-unibyte bytes)))
+    (unless (and (natnump start) (natnump end)
+                 (< start end) (<= end (length raw)))
+      (signal 'gnosis-nodes-error '("Invalid Gnosis node source span")))
+    (condition-case nil
+        (progn
+          (gnosis-core--org-string raw)
+          (gnosis-core--org-string (substring raw 0 end))
+          (1+ (length
+               (gnosis-core--org-string (substring raw 0 start)))))
+      (gnosis-core-validation-error
+       (signal 'gnosis-nodes-error
+               '("Gnosis node span is not on a UTF-8 boundary"))))))
+
+(defun gnosis-nodes--legacy-position (node)
+  "Return the current buffer position for legacy spanless NODE."
+  (if (= 0 (plist-get node :level))
+      (if (equal (plist-get node :node_id)
+                 (org-entry-get (point-min) "ID"))
+          (point-min)
+        (signal 'gnosis-nodes-error
+                '("Legacy Gnosis file ID is absent from its document")))
+    (let ((position
+           (save-excursion
+             (save-restriction
+               (widen)
+               (org-find-property "ID" (plist-get node :node_id))))))
+      (or position
+          (signal 'gnosis-nodes-error
+                  '("Legacy Gnosis node ID is absent from its document"))))))
+
+(defun gnosis-nodes--node-position (node bytes)
+  "Return NODE point in exact document BYTES."
+  (unless (equal (plist-get node :content_sha256)
+                 (gnosis-nodes--digest bytes))
+    (signal 'gnosis-nodes-error '("Gnosis node document revision is stale")))
+  (let ((start (plist-get node :start_byte))
+        (end (plist-get node :end_byte)))
+    (cond
+     ((and (eq start gnosis-core--json-null)
+           (eq end gnosis-core--json-null))
+      (gnosis-nodes--legacy-position node))
+     ((and (natnump start) (natnump end))
+      (gnosis-nodes--byte-position bytes start end))
+     (t
+      (signal 'gnosis-nodes-error '("Invalid Gnosis node source span"))))))
+
+(defun gnosis-nodes--visit-node (node)
+  "Open NODE's exact document revision and move point to the node."
+  (let* ((source (gnosis-nodes--document-source node))
+         (buffer (plist-get source :buffer))
+         (bytes (plist-get source :bytes))
+         position)
+    (with-current-buffer buffer
+      (setq position (gnosis-nodes--node-position node bytes))
+      (setq-local gnosis-nodes--content-sha256
+                  (plist-get node :content_sha256))
+      (setq-local gnosis-nodes--document-revision
+                  (plist-get node :document_revision)))
+    (pop-to-buffer-same-window buffer)
+    (unless (equal (plist-get node :content_sha256)
+                   (gnosis-nodes--digest
+                    (gnosis-nodes--buffer-bytes buffer)))
+      (signal 'gnosis-nodes-error
+              '("Gnosis document changed before node navigation")))
+    (widen)
+    (goto-char position)
+    (when (derived-mode-p 'org-mode)
+      (org-fold-show-context 'org-goto))
+    buffer))
+
+;;;###autoload
+(defun gnosis-nodes-find (&optional refresh)
+  "Select a server node by name and visit its exact document location.
+With prefix argument REFRESH, rebuild the node catalog first."
+  (interactive "P")
+  (let* ((catalog (gnosis-nodes--catalog refresh))
+         (candidates (plist-get catalog :candidates)))
+    (when (= 0 (length candidates))
+      (user-error "The Gnosis node catalog is empty"))
+    (let* ((candidate
+            (completing-read
+             "Gnosis node: " (append candidates nil) nil t))
+           (node-id
+            (gethash candidate (plist-get catalog :by-candidate))))
+      (unless node-id
+        (signal 'gnosis-nodes-error '("Unknown Gnosis node selection")))
+      (unless (equal (plist-get catalog :authority)
+                     (gnosis-nodes--catalog-authority))
+        (signal 'gnosis-nodes-error
+                '("Gnosis authority changed during node selection")))
+      (let ((node (gnosis-core-node node-id)))
+        (unless (equal (plist-get catalog :authority)
+                       (gnosis-nodes--catalog-authority))
+          (signal 'gnosis-nodes-error
+                  '("Gnosis authority changed during node lookup")))
+        (gnosis-nodes--visit-node node)))))
 
 (defun gnosis-nodes--nullable (value)
   "Return nil for protocol null VALUE, otherwise VALUE."
