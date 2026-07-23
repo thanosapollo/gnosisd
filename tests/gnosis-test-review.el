@@ -60,14 +60,22 @@
 
 (ert-deftest gnosis-review-committed-attempt-disables-mutations ()
   (with-temp-buffer
-    (setq gnosis-review--attempt (gnosis-test-review--attempt "committed"))
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "committed")
+          gnosis-review--attempt-revision 2)
     (dolist (key '("n" "o" "s"))
       (should-not (keymap-lookup gnosis-review-mode-map key)))
-    (let (mutated)
-      (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted)
-                 (lambda (&rest _) (setq mutated t))))
-        (should-error (gnosis-review--finish nil) :type 'user-error)
-        (should-not mutated)))))
+    (dolist (command '(gnosis-review--commit-next
+                       gnosis-review--override
+                       gnosis-review--toggle-suspension))
+      (let (mutations)
+        (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
+                   (lambda (&rest _) (push 'accepted mutations)))
+                  ((symbol-function 'gnosis-core-review-attempt-set-suspension)
+                   (lambda (&rest _) (push 'suspended mutations)))
+                  ((symbol-function 'gnosis-core-review-attempt-commit)
+                   (lambda (&rest _) (push 'committed mutations))))
+          (should-error (funcall command) :type 'user-error)
+          (should-not mutations))))))
 
 (ert-deftest gnosis-review-refresh-advances-committed-attempt-from-authority ()
   (with-temp-buffer
@@ -84,9 +92,9 @@
                  (lambda (&rest _) (list :session next-session)))
                 ((symbol-function 'gnosis-core-review-attempt-begin)
                  (lambda (&rest _) next-attempt))
-                ((symbol-function 'gnosis-core-review-attempt-set-accepted)
+                ((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
                  (lambda (&rest _) (push 'accepted mutations)))
-                ((symbol-function 'gnosis-core-review-attempt-set-desired-suspended)
+                ((symbol-function 'gnosis-core-review-attempt-set-suspension)
                  (lambda (&rest _) (push 'suspended mutations)))
                 ((symbol-function 'gnosis-core-review-attempt-commit)
                  (lambda (&rest _) (push 'committed mutations)))
