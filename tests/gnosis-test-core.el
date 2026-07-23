@@ -30,15 +30,19 @@
 
 (defvar gnosis-core--contract-cache)
 
-(defun gnosis-test-core--http-buffer (status body &optional content-type)
+(defun gnosis-test-core--http-buffer
+    (status body &optional content-type headers)
   "Return synthetic HTTP response buffer for STATUS and BODY.
-CONTENT-TYPE defaults to application/json."
+CONTENT-TYPE defaults to application/json.  HEADERS are appended."
   (let ((buffer (generate-new-buffer " *gnosis-core-http*")))
     (with-current-buffer buffer
       (set-buffer-multibyte nil)
       (insert "HTTP/1.1 " (number-to-string status) " Test\r\n"
               "Content-Type: " (or content-type "application/json")
-              "\r\n\r\n" body)
+              "\r\n")
+      (dolist (header headers)
+        (insert (car header) ": " (cdr header) "\r\n"))
+      (insert "\r\n" body)
       (setq-local url-http-response-status status)
       (setq-local url-http-end-of-headers
                   (copy-marker (1- (- (point-max) (string-bytes body))))))
@@ -140,6 +144,7 @@ CONTENT-TYPE defaults to application/json."
 
 (ert-deftest gnosis-core-encodes-opaque-path-and-query-values ()
   (should (equal "opaque%2Fid%3Fx" (gnosis-core--path-segment "opaque/id?x")))
+  (should (equal "7" (gnosis-core--path-segment 7)))
   (should (equal "after=a%2Fb%3Fc&q=%C3%BC"
                  (gnosis-core--query-string
                   '(("after" . "a/b?c") ("q" . "ü"))))))
@@ -860,6 +865,51 @@ CONTENT-TYPE defaults to application/json."
                (lambda (&rest _) "wrong")))
       (should-error (gnosis-core-blob digest)
                     :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-document-revision-binds-identity-revision-and-digest ()
+  (let* ((bytes (encode-coding-string "* Exact\n" 'utf-8 t))
+         (digest (secure-hash 'sha256 bytes))
+         call)
+    (cl-letf (((symbol-function 'gnosis-core--typed-binary-request)
+               (lambda (&rest arguments)
+                 (setq call arguments)
+                 bytes)))
+      (should (equal bytes
+                     (gnosis-core-document-revision
+                      "document/id" 7 digest)))
+      (should
+       (equal
+        '("get_notes__id__revisions__revision_"
+          (("id" . "document/id") ("revision" . 7))
+          nil "\"7\"")
+        call)))
+    (cl-letf (((symbol-function 'gnosis-core--typed-binary-request)
+               (lambda (&rest _) "wrong")))
+      (should-error
+       (gnosis-core-document-revision "document/id" 7 digest)
+       :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-document-revision-requires-matching-etag ()
+  (cl-letf (((symbol-function 'gnosis-core--retrieve-bounded)
+             (lambda (&rest _)
+               (gnosis-test-core--http-buffer
+                200 "body" "text/org" '(("ETag" . "\"7\""))))))
+    (should
+     (equal "body"
+            (gnosis-core--perform-request
+             "GET" "/v1/notes/doc/revisions/7" nil 200 t nil nil "\"7\"")))
+    (should-error
+     (gnosis-core--perform-request
+      "GET" "/v1/notes/doc/revisions/8" nil 200 t nil nil "\"8\"")
+     :type 'gnosis-core-protocol-error))
+  (cl-letf (((symbol-function 'gnosis-core--retrieve-bounded)
+             (lambda (&rest _)
+               (gnosis-test-core--http-buffer
+                200 "ETag: \"7\"\nbody" "text/org"))))
+    (should-error
+     (gnosis-core--perform-request
+      "GET" "/v1/notes/doc/revisions/7" nil 200 t nil nil "\"7\"")
+     :type 'gnosis-core-protocol-error)))
 
 (ert-deftest gnosis-core-document-mutations-use-exact-bindings ()
   (let ((bytes (encode-coding-string "* Γνῶσις\n" 'utf-8 t))

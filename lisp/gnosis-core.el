@@ -161,9 +161,11 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
 
 (defun gnosis-core--path-segment (value)
   "Return opaque VALUE encoded as one URL path segment."
-  (unless (and (stringp value) (not (string-empty-p value)))
+  (unless (or (and (stringp value) (not (string-empty-p value)))
+              (integerp value))
     (signal 'gnosis-core-validation-error '("Invalid Gnosis path value")))
-  (url-hexify-string value))
+  (url-hexify-string
+   (if (integerp value) (number-to-string value) value)))
 
 (defun gnosis-core--query-value (value)
   "Return VALUE encoded for an HTTP query parameter."
@@ -247,8 +249,18 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
     (let ((case-fold-search t))
       (when (re-search-forward
              "\\(?:\\`\\|[\r\n]\\)Content-Type:[ \t]*\\([^ \t\r\n]+\\)"
-             (point-max) t)
+             (gnosis-core--response-body-start) t)
         (downcase (match-string-no-properties 1))))))
+
+(defun gnosis-core--header-etag ()
+  "Return current response ETag header value."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((case-fold-search t))
+      (when (re-search-forward
+             "\\(?:\\`\\|[\r\n]\\)ETag:[ \t]*\\([^ \t\r\n]+\\)"
+             (gnosis-core--response-body-start) t)
+        (match-string-no-properties 1)))))
 
 (defun gnosis-core--response-body-start ()
   "Return the first body position in the current URL response buffer."
@@ -462,11 +474,12 @@ or `encoding' when content decoding is unsupported."
         (gnosis-core--cleanup-retrieval buffer process)))))
 
 (defun gnosis-core--perform-request
-    (method path body expected-status binary-p auth-p &optional headers)
+    (method path body expected-status binary-p auth-p
+            &optional headers expected-etag)
   "Perform one METHOD request to PATH with BODY.
 EXPECTED-STATUS is the accepted status.  Return binary or decoded JSON as
 selected by BINARY-P.  Add authentication when AUTH-P is non-nil and append
-validated caller-supplied HEADERS."
+validated caller-supplied HEADERS.  Require EXPECTED-ETAG when non-nil."
   (let* ((url (concat (gnosis-core--validated-base-url) path))
          (locator (gnosis-core--locator-for-url url))
          (headers (gnosis-core--safe-request-headers headers)))
@@ -506,6 +519,10 @@ validated caller-supplied HEADERS."
                     (gnosis-core--invalid "Unexpected Gnosis content type"))
                   (gnosis-core--signal-http-error
                    status (gnosis-core--decode-json bytes)))
+                 ((and expected-etag
+                       (not (equal expected-etag
+                                   (gnosis-core--header-etag))))
+                  (gnosis-core--invalid "Gnosis response ETag mismatch"))
                  (binary-p bytes)
                  (t
                   (unless (gnosis-core--json-content-type-p content-type)
@@ -515,11 +532,13 @@ validated caller-supplied HEADERS."
            buffer (and (buffer-live-p buffer) (get-buffer-process buffer))))))))
 
 (defun gnosis-core--request
-    (method path &optional body expected-status binary-p retry-p auth-p headers)
+    (method path &optional body expected-status binary-p retry-p auth-p
+            headers expected-etag)
   "Request METHOD PATH with optional BODY and return the decoded response.
 EXPECTED-STATUS defaults to 200.  BINARY-P preserves bytes.  RETRY-P retries
 one transport failure using the exact request.  AUTH-P defaults to non-nil;
-`:none' disables authentication.  HEADERS are validated caller headers."
+`:none' disables authentication.  HEADERS are validated caller headers.
+EXPECTED-ETAG requires an exact successful response ETag."
   (let ((attempts (if (and retry-p (equal method "GET")) 2 1))
         (authenticate (not (eq auth-p :none))))
     (catch 'result
@@ -528,7 +547,7 @@ one transport failure using the exact request.  AUTH-P defaults to non-nil;
             (throw 'result
                    (gnosis-core--perform-request
                     method path body (or expected-status 200)
-                    binary-p authenticate headers))
+                    binary-p authenticate headers expected-etag))
           ((gnosis-core-unavailable gnosis-core-timeout)
            (when (= attempt (1- attempts)) (signal (car condition) (cdr condition)))))))))
 
@@ -1013,9 +1032,11 @@ PATH-VALUES and QUERY supply the declared request inputs."
              (apply #'gnosis-core--typed-request arguments))
          (signal (car condition) (cdr condition)))))))
 
-(defun gnosis-core--typed-binary-request (identity &optional path-values query)
+(defun gnosis-core--typed-binary-request
+    (identity &optional path-values query expected-etag)
   "Execute binary GET operation IDENTITY from the live contract.
-PATH-VALUES fill path parameters and QUERY supplies query parameters."
+PATH-VALUES fill path parameters and QUERY supplies query parameters.
+EXPECTED-ETAG requires an exact successful response ETag."
   (let* ((contract (gnosis-core--contract))
          (entry (gnosis-core--operation-entry identity))
          (operation (plist-get entry :operation))
@@ -1032,7 +1053,7 @@ PATH-VALUES fill path parameters and QUERY supplies query parameters."
      operation template path-values query nil contract)
     (gnosis-core--request
      method (gnosis-core--operation-path template path-values query)
-     nil (car success) t t t)))
+     nil (car success) t t t nil expected-etag)))
 
 (defun gnosis-core-sync-identity ()
   "Return authenticated replica device identity."
@@ -1064,6 +1085,23 @@ PATH-VALUES fill path parameters and QUERY supplies query parameters."
           "get_blobs__digest_" (list (cons "digest" digest)))))
     (unless (equal digest (secure-hash 'sha256 bytes))
       (gnosis-core--invalid "Gnosis blob digest mismatch"))
+    bytes))
+
+(defun gnosis-core-document-revision (document-id revision digest)
+  "Return DOCUMENT-ID source at exact REVISION matching DIGEST."
+  (unless (and (natnump revision) (> revision 0)
+               (stringp digest)
+               (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest))
+    (signal 'gnosis-core-validation-error
+            '("Invalid Gnosis document revision request")))
+  (let ((bytes
+         (gnosis-core--typed-binary-request
+         "get_notes__id__revisions__revision_"
+          (list (cons "id" document-id)
+                (cons "revision" revision))
+          nil (format "\"%d\"" revision))))
+    (unless (equal digest (secure-hash 'sha256 bytes))
+      (gnosis-core--invalid "Gnosis document revision digest mismatch"))
     bytes))
 
 (defun gnosis-core--org-string (bytes)
