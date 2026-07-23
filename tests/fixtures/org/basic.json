@@ -9,7 +9,9 @@
       "title_path": ["Learn Emacs"],
       "tags": ["learning", "editor"],
       "parent_id": null,
-      "level": 0
+      "level": 0,
+      "start_byte": 0,
+      "end_byte": 333
     },
     {
       "id": "lisp-id",
@@ -17,7 +19,9 @@
       "title_path": ["Learn Emacs", "Lisp"],
       "tags": ["learning", "editor", "language"],
       "parent_id": "root-id",
-      "level": 1
+      "level": 1,
+      "start_byte": 148,
+      "end_byte": 199
     },
     {
       "id": "elisp-id",
@@ -25,7 +29,9 @@
       "title_path": ["Learn Emacs", "Elisp"],
       "tags": ["learning", "editor", "container"],
       "parent_id": "root-id",
-      "level": 2
+      "level": 2,
+      "start_byte": 234,
+      "end_byte": 333
     }
   ],
   "link_occurrences": [

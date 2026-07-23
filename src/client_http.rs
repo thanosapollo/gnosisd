@@ -34,7 +34,7 @@ use crate::{
         SourceSpan, ThemaId, TitlePath,
     },
     is_canonical_sha256,
-    parser::validate_document_path,
+    parser::{supported_content_type, validate_document_path},
     protocol::{
         DocumentView, DuePageView, MAX_FRAME_SIZE, MAX_OFFLINE_ASSET_OPERATION_BYTES,
         MAX_OFFLINE_ASSET_RESULT_BYTES, MAX_OFFLINE_CONTENT_OPERATION_BYTES,
@@ -45,8 +45,8 @@ use crate::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
             AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, DashboardV1,
             DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DeviceIdentityV1,
-            DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1,
-            NodeThemaAssociationPageV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1, NodePageV1,
+            NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
             ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
             ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
@@ -55,8 +55,8 @@ use crate::{
             ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
             ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-            ThemaKindV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
-            valid_bearer_token,
+            ThemaKindV1, ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1,
+            UpdateSettingsRequestV1, valid_bearer_token,
         },
     },
 };
@@ -85,6 +85,60 @@ impl fmt::Debug for SecretToken {
 pub struct HttpClient {
     client: reqwest::Client,
     base_url: Url,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DocumentSource {
+    document_id: String,
+    revision: u64,
+    content_type: String,
+    content_sha256: String,
+    source: String,
+}
+
+impl DocumentSource {
+    pub fn document_id(&self) -> &str {
+        &self.document_id
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeSource {
+    node: NodeV1,
+    document: DocumentSource,
+}
+
+impl NodeSource {
+    pub const fn node(&self) -> &NodeV1 {
+        &self.node
+    }
+
+    pub const fn document(&self) -> &DocumentSource {
+        &self.document
+    }
+
+    pub fn selected_source(&self) -> &str {
+        self.document
+            .source
+            .get(self.node.start_byte.unwrap()..self.node.end_byte.unwrap())
+            .expect("node source range was validated")
+    }
 }
 
 impl HttpClient {
@@ -636,15 +690,107 @@ impl HttpClient {
         execute_json(self.client.get(url), MAX_REPLICA_PAGE_BYTES).await
     }
 
+    pub async fn node(&self, node_id: &str) -> Result<NodeV1, HttpClientError> {
+        let node_id =
+            NodeId::new(node_id.to_owned()).map_err(|_| HttpClientError::InvalidMutation)?;
+        let url = self.resource_endpoint("v1/nodes", node_id.as_str())?;
+        let node = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        checked_node(node, Some(&node_id))
+    }
+
+    pub async fn nodes(
+        &self,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<NodePageV1, HttpClientError> {
+        if !(1..=500).contains(&limit) {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let after = after
+            .map(|value| NodeId::new(value.to_owned()))
+            .transpose()
+            .map_err(|_| HttpClientError::InvalidCursor)?;
+        let mut url = self.endpoint("v1/nodes")?;
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("q", query);
+        pairs.append_pair("limit", &limit.to_string());
+        if let Some(after) = &after {
+            pairs.append_pair("after", after.as_str());
+        }
+        drop(pairs);
+        let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        checked_node_page(page, limit, after.as_ref())
+    }
+
+    pub async fn themata(
+        &self,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<ThemaPageV1, HttpClientError> {
+        if !(1..=500).contains(&limit) {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let after = after
+            .map(|value| ThemaId::new(value.to_owned()))
+            .transpose()
+            .map_err(|_| HttpClientError::InvalidCursor)?;
+        let mut url = self.endpoint("v1/themata")?;
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("q", query);
+        pairs.append_pair("limit", &limit.to_string());
+        if let Some(after) = &after {
+            pairs.append_pair("after", after.as_str());
+        }
+        drop(pairs);
+        let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        checked_thema_page(page, limit, after.as_ref())
+    }
+
+    pub async fn document_source(
+        &self,
+        document_id: &str,
+        revision: u64,
+    ) -> Result<DocumentSource, HttpClientError> {
+        if revision == 0 {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let document_id = DocumentId::new(document_id.to_owned())
+            .map_err(|_| HttpClientError::InvalidMutation)?;
+        let url = self.document_revision_endpoint(&document_id, revision)?;
+        execute_document_source(self.client.get(url), &document_id, revision).await
+    }
+
+    pub async fn node_source(&self, node_id: &str) -> Result<NodeSource, HttpClientError> {
+        let node = self.node(node_id).await?;
+        let span = required_node_span(&node)?;
+        let document_id =
+            DocumentId::new(node.document_id.clone()).map_err(|_| invalid_response())?;
+        let document = self
+            .document_source(document_id.as_str(), node.document_revision)
+            .await?;
+        if document.content_sha256 != node.content_sha256
+            || validate_document_path(&document.content_type, &node.logical_path).is_err()
+        {
+            return Err(invalid_response());
+        }
+        SourceSpan::for_source(&document.source, span.start(), span.end())
+            .map_err(|_| invalid_response())?;
+        Ok(NodeSource { node, document })
+    }
+
     pub async fn node_themata(
         &self,
-        node_id: &NodeId,
+        node_id: &str,
         limit: u16,
         after: Option<&str>,
     ) -> Result<NodeThemaAssociationPageV1, HttpClientError> {
         if !(1..=500).contains(&limit) {
             return Err(HttpClientError::InvalidMutation);
         }
+        let node_id =
+            NodeId::new(node_id.to_owned()).map_err(|_| HttpClientError::InvalidMutation)?;
         if let Some(after) = after {
             ThemaId::new(after.to_owned()).map_err(|_| HttpClientError::InvalidCursor)?;
         }
@@ -970,6 +1116,19 @@ impl HttpClient {
         Ok(url)
     }
 
+    fn document_revision_endpoint(
+        &self,
+        document_id: &DocumentId,
+        revision: u64,
+    ) -> Result<Url, HttpClientError> {
+        let mut url = self.resource_endpoint("v1/notes", document_id.as_str())?;
+        url.path_segments_mut()
+            .map_err(|_| HttpClientError::InvalidBaseUrl)?
+            .push("revisions")
+            .push(&revision.to_string());
+        Ok(url)
+    }
+
     fn document_mutation_endpoint(&self, document_id: &str) -> Result<Url, HttpClientError> {
         let mut url = self.endpoint("v1/document-mutations/")?;
         url.path_segments_mut()
@@ -1210,6 +1369,102 @@ fn checked_node_themata_page(
     Ok(page)
 }
 
+fn checked_node(node: NodeV1, expected: Option<&NodeId>) -> Result<NodeV1, HttpClientError> {
+    let node_id = NodeId::new(node.node_id.clone()).map_err(|_| invalid_response())?;
+    if expected.is_some_and(|expected| expected != &node_id)
+        || DocumentId::new(node.document_id.clone()).is_err()
+        || crate::application::validate_document_path(&node.logical_path).is_err()
+        || node.document_revision == 0
+        || !canonical_hex(&node.content_sha256, 64)
+        || !all_unique(&node.tags)
+        || node_span(&node).is_err()
+        || Node::new(
+            node_id,
+            node.title.clone(),
+            TitlePath::new(node.title_path.clone()).map_err(|_| invalid_response())?,
+            node.tags.clone(),
+            None,
+            node.level,
+        )
+        .is_err()
+    {
+        return Err(invalid_response());
+    }
+    Ok(node)
+}
+
+fn checked_node_page(
+    page: NodePageV1,
+    limit: u16,
+    after: Option<&NodeId>,
+) -> Result<NodePageV1, HttpClientError> {
+    if page.items.len() > usize::from(limit)
+        || page
+            .items
+            .windows(2)
+            .any(|items| items[0].node_id >= items[1].node_id)
+        || after.is_some_and(|after| {
+            page.items
+                .first()
+                .is_some_and(|item| item.node_id.as_str() <= after.as_str())
+        })
+        || page.next.as_deref() != page.items.last().map(|item| item.node_id.as_str())
+    {
+        return Err(invalid_response());
+    }
+    let items = page
+        .items
+        .into_iter()
+        .map(|node| checked_node(node, None))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NodePageV1 {
+        items,
+        next: page.next,
+    })
+}
+
+fn checked_thema_page(
+    page: ThemaPageV1,
+    limit: u16,
+    after: Option<&ThemaId>,
+) -> Result<ThemaPageV1, HttpClientError> {
+    if page.items.len() > usize::from(limit)
+        || page
+            .items
+            .iter()
+            .any(|thema| !validate_thema(thema, &thema.thema_id))
+        || page
+            .items
+            .windows(2)
+            .any(|items| items[0].thema_id >= items[1].thema_id)
+        || after.is_some_and(|after| {
+            page.items
+                .first()
+                .is_some_and(|item| item.thema_id.as_str() <= after.as_str())
+        })
+        || page.next.as_deref() != page.items.last().map(|item| item.thema_id.as_str())
+    {
+        return Err(invalid_response());
+    }
+    Ok(page)
+}
+
+fn node_span(node: &NodeV1) -> Result<Option<SourceSpan>, HttpClientError> {
+    match (node.start_byte, node.end_byte) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if end <= MAX_DOCUMENT_SOURCE_BYTES => {
+            SourceSpan::from_offsets(start, end)
+                .map(Some)
+                .map_err(|_| invalid_response())
+        }
+        _ => Err(invalid_response()),
+    }
+}
+
+fn required_node_span(node: &NodeV1) -> Result<SourceSpan, HttpClientError> {
+    node_span(node)?.ok_or(HttpClientError::NodeLocationUnavailable)
+}
+
 fn validate_document_view(
     document: &DocumentView,
     document_id: &str,
@@ -1227,7 +1482,7 @@ fn validate_document_view(
         .nodes
         .iter()
         .map(|node| {
-            Node::new(
+            let input = (
                 NodeId::new(node.id.clone()).map_err(|_| invalid_response())?,
                 node.title.clone(),
                 TitlePath::new(node.title_path.clone()).map_err(|_| invalid_response())?,
@@ -1238,7 +1493,17 @@ fn validate_document_view(
                     .transpose()
                     .map_err(|_| invalid_response())?,
                 node.level,
-            )
+            );
+            match (node.start_byte, node.end_byte) {
+                (None, None) => Node::new(input.0, input.1, input.2, input.3, input.4, input.5),
+                (Some(start), Some(end)) if end <= MAX_DOCUMENT_SOURCE_BYTES => {
+                    let span =
+                        SourceSpan::from_offsets(start, end).map_err(|_| invalid_response())?;
+                    Node::new(input.0, input.1, input.2, input.3, input.4, input.5)
+                        .map(|node| node.with_source_span(span))
+                }
+                _ => return Err(invalid_response()),
+            }
             .map_err(|_| invalid_response())
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -2036,6 +2301,47 @@ async fn execute_bytes(
     server_error(status, &bytes)
 }
 
+async fn execute_document_source(
+    request: RequestBuilder,
+    document_id: &DocumentId,
+    expected_revision: u64,
+) -> Result<DocumentSource, HttpClientError> {
+    let response = request.send().await.map_err(transport_error)?;
+    let status = response.status();
+    if status != StatusCode::OK {
+        if status.is_success() {
+            return Err(invalid_response());
+        }
+        return execute_error_response(response, status).await;
+    }
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| supported_content_type(value))
+        .map(str::to_owned)
+        .ok_or_else(invalid_response)?;
+    let expected_etag = format!("\"{expected_revision}\"");
+    if response
+        .headers()
+        .get(ETAG)
+        .and_then(|value| value.to_str().ok())
+        != Some(expected_etag.as_str())
+    {
+        return Err(invalid_response());
+    }
+    let bytes = read_bounded(response, MAX_DOCUMENT_SOURCE_BYTES).await?;
+    let content_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let source = String::from_utf8(bytes).map_err(|_| invalid_response())?;
+    Ok(DocumentSource {
+        document_id: document_id.to_string(),
+        revision: expected_revision,
+        content_type,
+        content_sha256,
+        source,
+    })
+}
+
 async fn execute_managed_asset(
     request: RequestBuilder,
     max_bytes: usize,
@@ -2269,6 +2575,8 @@ pub enum HttpClientError {
     InvalidMutation,
     #[error("Gnosis review request is invalid")]
     InvalidReview,
+    #[error("Gnosis node has no exact source location")]
+    NodeLocationUnavailable,
     #[error("Gnosis HTTP client initialization failed")]
     ClientBuild(#[source] reqwest::Error),
     #[error("Gnosis TLS provider initialization failed")]
@@ -2349,6 +2657,123 @@ mod tests {
         assert!(checked_node_themata_page(unordered, 2, None).is_err());
     }
 
+    #[test]
+    fn node_response_validator_binds_identity_digest_span_and_page_cursor() {
+        let node = NodeV1 {
+            node_id: "node".into(),
+            document_id: "document".into(),
+            logical_path: "note.org".into(),
+            document_revision: 1,
+            content_sha256: "a".repeat(64),
+            title: "Node".into(),
+            title_path: vec!["Node".into()],
+            tags: vec![],
+            level: 1,
+            start_byte: Some(0),
+            end_byte: Some(7),
+            active: true,
+        };
+        let node_id = NodeId::new("node").unwrap();
+        assert!(checked_node(node.clone(), Some(&node_id)).is_ok());
+        assert!(
+            checked_node_page(
+                NodePageV1 {
+                    items: vec![node.clone()],
+                    next: Some("node".into()),
+                },
+                1,
+                None,
+            )
+            .is_ok()
+        );
+
+        let mut invalid = node.clone();
+        invalid.content_sha256 = "A".repeat(64);
+        assert!(checked_node(invalid, None).is_err());
+        let mut invalid = node.clone();
+        invalid.end_byte = None;
+        assert!(checked_node(invalid, None).is_err());
+        let mut invalid = node.clone();
+        invalid.end_byte = Some(MAX_DOCUMENT_SOURCE_BYTES + 1);
+        assert!(checked_node(invalid, None).is_err());
+        assert!(
+            checked_node_page(
+                NodePageV1 {
+                    items: vec![node],
+                    next: Some("wrong".into()),
+                },
+                1,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn node_source_rejects_mismatched_revision_and_digest() {
+        let source = "* Node\n";
+        let digest = format!("{:x}", Sha256::digest(source.as_bytes()));
+        let revision_error = node_source_response_error(&digest, "\"2\"").await;
+        assert!(matches!(
+            revision_error,
+            HttpClientError::InvalidResponse {
+                delivery: DeliveryStatus::Unknown
+            }
+        ));
+
+        let digest_error = node_source_response_error(&"a".repeat(64), "\"1\"").await;
+        assert!(matches!(
+            digest_error,
+            HttpClientError::InvalidResponse {
+                delivery: DeliveryStatus::Unknown
+            }
+        ));
+    }
+
+    async fn node_source_response_error(digest: &str, etag: &str) -> HttpClientError {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let node = serde_json::json!({
+            "node_id": "node",
+            "document_id": "document",
+            "logical_path": "note.org",
+            "document_revision": 1,
+            "content_sha256": digest,
+            "title": "Node",
+            "title_path": ["Node"],
+            "tags": [],
+            "level": 1,
+            "start_byte": 0,
+            "end_byte": 7,
+            "active": true
+        })
+        .to_string();
+        let source = "* Node\n";
+        let responses = [
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{node}",
+                node.len()
+            ),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/org; charset=utf-8\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{source}",
+                source.len()
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let client = HttpClient::new(&format!("http://{address}/"), token).unwrap();
+        let error = client.node_source("node").await.unwrap_err();
+        server.await.unwrap();
+        error
+    }
+
     #[tokio::test]
     async fn node_themata_http_pages_and_rejects_unauthorized_or_stale_cursors() {
         let directory = tempfile::tempdir().unwrap();
@@ -2407,30 +2832,51 @@ mod tests {
             SecretToken::new(reader_token.clone()).unwrap(),
         )
         .unwrap();
-        let node_id = NodeId::new("node").unwrap();
-        let first = reader.node_themata(&node_id, 500, None).await.unwrap();
+        let node_id = "node";
+        let node = reader.node(node_id).await.unwrap();
+        assert_eq!(node.document_revision, 1);
+        assert_eq!((node.start_byte, node.end_byte), (Some(15), Some(59)));
+        let nodes = reader.nodes("", 100, None).await.unwrap();
+        assert_eq!(nodes.items.as_slice(), std::slice::from_ref(&node));
+        let located = reader.node_source(node_id).await.unwrap();
+        assert_eq!(
+            located.selected_source(),
+            "* Heading\n:PROPERTIES:\n:ID: node\n:END:\nBody\n"
+        );
+        assert_eq!(located.document().revision(), 1);
+        assert_eq!(located.document().content_sha256(), node.content_sha256);
+        let first_themata = reader.themata("", 500, None).await.unwrap();
+        assert_eq!(first_themata.items.len(), 500);
+        assert_eq!(first_themata.items[0].thema_id, "thema-0000");
+        let second_themata = reader
+            .themata("", 500, first_themata.next.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(second_themata.items.len(), 1);
+        assert_eq!(second_themata.items[0].thema_id, "thema-0500");
+        let first = reader.node_themata(node_id, 500, None).await.unwrap();
         assert_eq!(first.items.len(), 500);
         assert_eq!(first.items[0].thema_id, "thema-0000");
         assert_eq!(first.items[0].relation, ThemaConceptRelationV1::Primary);
         assert_eq!(first.next.as_deref(), Some("thema-0499"));
         let second = reader
-            .node_themata(&node_id, 500, first.next.as_deref())
+            .node_themata(node_id, 500, first.next.as_deref())
             .await
             .unwrap();
         assert_eq!(second.items.len(), 1);
         assert_eq!(second.items[0].thema_id, "thema-0500");
         assert!(matches!(
-            reader.node_themata(&node_id, 501, None).await,
+            reader.node_themata(node_id, 501, None).await,
             Err(HttpClientError::InvalidMutation)
         ));
         assert!(matches!(
-            reader.node_themata(&node_id, 500, Some("missing")).await,
+            reader.node_themata(node_id, 500, Some("missing")).await,
             Err(HttpClientError::Server(error)) if error.status == 400
         ));
         let writer =
             HttpClient::new(&daemon.base_url, SecretToken::new(writer_token).unwrap()).unwrap();
         assert!(matches!(
-            writer.node_themata(&node_id, 500, None).await,
+            writer.node_themata(node_id, 500, None).await,
             Err(HttpClientError::Server(error)) if error.status == 403
         ));
         daemon.stop().await;
@@ -2453,9 +2899,100 @@ mod tests {
         let reader =
             HttpClient::new(&daemon.base_url, SecretToken::new(reader_token).unwrap()).unwrap();
         assert!(matches!(
-            reader.node_themata(&node_id, 500, Some("thema-0000")).await,
+            reader.node_themata(node_id, 500, Some("thema-0000")).await,
             Err(HttpClientError::Server(error)) if error.status == 400
         ));
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn node_source_uses_the_latest_document_that_retired_a_reused_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let socket = directory.path().join("gnosis.sock");
+        let runtime = ServiceRuntime::start(database.clone(), database.with_extension("blobs"), 8)
+            .await
+            .unwrap();
+        let service = runtime.handle();
+        let reader = generate_device("reader".into(), vec!["read".into()]).unwrap();
+        let token = reader.token.clone();
+        service.create_device(reader, 1).await.unwrap();
+        let original_a =
+            "#+title: First\n\n* Historical\n:PROPERTIES:\n:ID: historical\n:END:\nFirst body\n";
+        service
+            .replace_note(
+                prepare_note(
+                    Some("document-a".into()),
+                    "a.org".into(),
+                    original_a.into(),
+                    None,
+                )
+                .unwrap(),
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    Some("document-a".into()),
+                    "a.org".into(),
+                    "#+title: First current\n".into(),
+                    Some(1),
+                )
+                .unwrap(),
+                3,
+                None,
+            )
+            .await
+            .unwrap();
+        let original_b =
+            "#+title: Second\n\n* Historical\n:PROPERTIES:\n:ID: historical\n:END:\nSecond body\n";
+        service
+            .replace_note(
+                prepare_note(
+                    Some("document-b".into()),
+                    "b.org".into(),
+                    original_b.into(),
+                    None,
+                )
+                .unwrap(),
+                4,
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .replace_note(
+                prepare_note(
+                    Some("document-b".into()),
+                    "b.org".into(),
+                    "#+title: Second current\n".into(),
+                    Some(1),
+                )
+                .unwrap(),
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        drop(service);
+        runtime.finish().await.unwrap();
+
+        let daemon = TestDaemon::start_paths(&socket, &database).await;
+        let client = HttpClient::new(&daemon.base_url, SecretToken::new(token).unwrap()).unwrap();
+        let node_id = "historical";
+        let node = client.node(node_id).await.unwrap();
+        assert!(!node.active);
+        assert_eq!(node.document_id, "document-b");
+        assert_eq!(node.document_revision, 1);
+        let located = client.node_source(node_id).await.unwrap();
+        assert_eq!(
+            located.selected_source(),
+            "* Historical\n:PROPERTIES:\n:ID: historical\n:END:\nSecond body\n"
+        );
+        assert_eq!(located.document().source(), original_b);
         daemon.stop().await;
     }
 

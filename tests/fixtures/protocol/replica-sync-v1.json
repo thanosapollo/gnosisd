@@ -35,7 +35,9 @@
                 "title_path": ["Heading"],
                 "tags": ["tag"],
                 "parent_id": null,
-                "level": 1
+                "level": 1,
+                "start_byte": 0,
+                "end_byte": 10
               }
             ],
             "link_occurrences": [

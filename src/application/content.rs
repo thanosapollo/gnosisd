@@ -103,6 +103,10 @@ pub(crate) struct ProjectionNode {
     pub(crate) tags: Vec<String>,
     pub(crate) parent_id: Option<String>,
     pub(crate) level: u32,
+    #[serde(default)]
+    pub(crate) start_byte: Option<usize>,
+    #[serde(default)]
+    pub(crate) end_byte: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -149,6 +153,8 @@ impl From<&DocumentProjection> for DocumentProjectionSnapshot {
                     tags: node.tags().to_vec(),
                     parent_id: node.parent_id().map(ToString::to_string),
                     level: node.level(),
+                    start_byte: node.source_span().map(|span| span.start()),
+                    end_byte: node.source_span().map(|span| span.end()),
                 })
                 .collect(),
             link_occurrences: value
@@ -227,10 +233,14 @@ pub(crate) struct NodeRecord {
     pub(crate) node_id: String,
     pub(crate) document_id: String,
     pub(crate) logical_path: String,
+    pub(crate) document_revision: u64,
+    pub(crate) content_sha256: String,
     pub(crate) title: String,
     pub(crate) title_path: Vec<String>,
     pub(crate) tags: Vec<String>,
     pub(crate) level: u32,
+    pub(crate) start_byte: Option<usize>,
+    pub(crate) end_byte: Option<usize>,
     pub(crate) active: bool,
 }
 
@@ -690,13 +700,51 @@ pub(crate) enum ContentError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use crate::domain::ThemaConceptRelation;
 
     use super::{
-        ContentError, MAX_DOCUMENT_SOURCE_BYTES, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path,
-        prepare_document, prepare_note, prepare_thema, thema_content, validate_asset_path,
-        validate_blob_metadata,
+        ContentError, DocumentProjectionSnapshot, MAX_DOCUMENT_SOURCE_BYTES,
+        MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_document, prepare_note,
+        prepare_thema, thema_content, validate_asset_path, validate_blob_metadata,
     };
+
+    #[test]
+    fn projection_snapshots_store_node_source_spans_and_read_legacy_nodes() {
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            concat!(
+                ":PROPERTIES:\n:ID: root\n:END:\n#+TITLE: Note\n",
+                "* Child\n:PROPERTIES:\n:ID: child\n:END:\nbody\n",
+            )
+            .into(),
+            None,
+        )
+        .unwrap();
+        let snapshot = DocumentProjectionSnapshot::from(&note.projection);
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        let nodes = json["nodes"].as_array_mut().unwrap();
+
+        assert_eq!(nodes[0]["start_byte"], 0);
+        assert_eq!(nodes[0]["end_byte"], note.source.len());
+        assert_eq!(nodes[1]["start_byte"], 43);
+        assert_eq!(nodes[1]["end_byte"], note.source.len());
+
+        for node in nodes {
+            node.as_object_mut().unwrap().remove("start_byte");
+            node.as_object_mut().unwrap().remove("end_byte");
+        }
+        let legacy: DocumentProjectionSnapshot = serde_json::from_value(json).unwrap();
+        assert!(
+            legacy
+                .nodes
+                .iter()
+                .all(|node| node.start_byte.is_none() && node.end_byte.is_none())
+        );
+        let _: Value = serde_json::to_value(legacy).unwrap();
+    }
 
     #[test]
     fn document_preparation_is_content_type_driven_and_source_bounded() {

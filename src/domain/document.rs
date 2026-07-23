@@ -84,6 +84,7 @@ pub struct Node {
     tags: Vec<String>,
     parent_id: Option<NodeId>,
     level: u32,
+    source_span: Option<SourceSpan>,
 }
 
 impl Node {
@@ -108,7 +109,13 @@ impl Node {
             tags,
             parent_id,
             level,
+            source_span: None,
         })
+    }
+
+    pub fn with_source_span(mut self, source_span: SourceSpan) -> Self {
+        self.source_span = Some(source_span);
+        self
     }
 
     pub fn id(&self) -> &NodeId {
@@ -128,6 +135,9 @@ impl Node {
     }
     pub const fn level(&self) -> u32 {
         self.level
+    }
+    pub const fn source_span(&self) -> Option<SourceSpan> {
+        self.source_span
     }
 }
 
@@ -289,6 +299,24 @@ mod tests {
             SourceSpan::for_source("é", 0, 3),
             Err(DocumentError::InvalidUtf8SourceSpan)
         );
+    }
+
+    #[test]
+    fn node_may_carry_a_validated_source_span() {
+        let source = "* Γνῶσις\nbody\n";
+        let span = SourceSpan::for_source(source, 0, source.len()).unwrap();
+        let node = Node::new(
+            NodeId::new("node").unwrap(),
+            "Γνῶσις".into(),
+            TitlePath::new(vec!["Γνῶσις".into()]).unwrap(),
+            vec![],
+            None,
+            1,
+        )
+        .unwrap()
+        .with_source_span(span);
+
+        assert_eq!(node.source_span(), Some(span));
     }
 
     #[test]

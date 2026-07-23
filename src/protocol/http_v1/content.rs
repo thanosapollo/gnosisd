@@ -592,10 +592,21 @@ pub struct NodeV1 {
     pub node_id: String,
     pub document_id: String,
     pub logical_path: String,
+    #[schemars(range(min = 1))]
+    pub document_revision: u64,
+    #[schemars(length(equal = 64))]
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
     pub title: String,
     pub title_path: Vec<String>,
     pub tags: Vec<String>,
     pub level: u32,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub start_byte: Option<usize>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub end_byte: Option<usize>,
     pub active: bool,
 }
 
@@ -605,10 +616,14 @@ impl NodeV1 {
             node_id: value.node_id.clone(),
             document_id: value.document_id.clone(),
             logical_path: value.logical_path.clone(),
+            document_revision: value.document_revision,
+            content_sha256: value.content_sha256.clone(),
             title: value.title.clone(),
             title_path: value.title_path.clone(),
             tags: value.tags.clone(),
             level: value.level,
+            start_byte: value.start_byte,
+            end_byte: value.end_byte,
             active: value.active,
         }
     }

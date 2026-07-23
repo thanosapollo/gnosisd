@@ -30,11 +30,13 @@ struct HeadingContext {
     owner: Option<NodeId>,
     title_path: Vec<String>,
     tags: Vec<String>,
+    source_span: SourceSpan,
 }
 
 #[derive(Clone, Debug)]
 struct HeadingBoundary {
     start: usize,
+    end: usize,
     level: usize,
     owner: Option<NodeId>,
 }
@@ -46,6 +48,7 @@ struct ProjectionBuilder<'a> {
     file_tags: Vec<String>,
     headings: Vec<HeadingContext>,
     heading_boundaries: Vec<HeadingBoundary>,
+    next_heading_boundary: usize,
     nodes: Vec<Node>,
 }
 
@@ -123,6 +126,7 @@ impl<'a> ProjectionBuilder<'a> {
                 file_tags.to_vec(),
                 None,
                 0,
+                SourceSpan::for_source(input, 0, input.len()).map_err(invalid_projection)?,
             )?);
         }
         Ok(Self {
@@ -132,13 +136,14 @@ impl<'a> ProjectionBuilder<'a> {
             file_tags: file_tags.to_vec(),
             headings: Vec::new(),
             heading_boundaries,
+            next_heading_boundary: 0,
             nodes,
         })
     }
 
     fn process_event(&mut self, event: Event<'_, '_>) -> Result<(), OrgParseError> {
         match event {
-            Event::Start(Element::Headline { level }) => self.start_headline(*level),
+            Event::Start(Element::Headline { level }) => self.start_headline(*level)?,
             Event::Start(Element::Title(title)) => self.start_title(title)?,
             Event::End(Element::Headline { .. }) => {
                 self.headings.pop();
@@ -148,13 +153,30 @@ impl<'a> ProjectionBuilder<'a> {
         Ok(())
     }
 
-    fn start_headline(&mut self, level: usize) {
+    fn start_headline(&mut self, level: usize) -> Result<(), OrgParseError> {
+        let boundary = self
+            .heading_boundaries
+            .get(self.next_heading_boundary)
+            .ok_or_else(|| {
+                OrgParseError::InvalidProjection(
+                    "could not align headline event with source".to_owned(),
+                )
+            })?;
+        if boundary.level != level {
+            return Err(OrgParseError::InvalidProjection(
+                "could not align headline level with source".to_owned(),
+            ));
+        }
+        self.next_heading_boundary += 1;
         self.headings.push(HeadingContext {
             level,
             owner: self.current_owner(),
             title_path: self.current_title_path(),
             tags: self.current_tags(),
+            source_span: SourceSpan::for_source(self.input, boundary.start, boundary.end)
+                .map_err(invalid_projection)?,
         });
+        Ok(())
     }
 
     fn start_title(&mut self, title: &Title<'_>) -> Result<(), OrgParseError> {
@@ -178,6 +200,7 @@ impl<'a> ProjectionBuilder<'a> {
             context.tags.clone(),
             context.owner.clone(),
             level,
+            context.source_span,
         )?);
         context.owner = Some(id);
         context.title_path = title_path;
@@ -353,18 +376,33 @@ fn heading_boundaries(input: &str, org: &Org<'_>) -> Result<Vec<HeadingBoundary>
             "could not align parsed headlines with source".to_owned(),
         ));
     }
-    starts
+    let mut boundaries = starts
         .into_iter()
         .zip(headlines)
         .map(|(start, headline)| {
             let title = headline.title(org);
             Ok(HeadingBoundary {
                 start,
+                end: input.len(),
                 level: headline.level(),
                 owner: property(title, "ID").map(NodeId::new).transpose()?,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, OrgParseError>>()?;
+    let mut open: Vec<usize> = Vec::new();
+    for index in 0..boundaries.len() {
+        let start = boundaries[index].start;
+        let level = boundaries[index].level;
+        while let Some(&prior) = open.last() {
+            if boundaries[prior].level < level {
+                break;
+            }
+            open.pop();
+            boundaries[prior].end = start;
+        }
+        open.push(index);
+    }
+    Ok(boundaries)
 }
 
 fn headline_starts(input: &str) -> Vec<usize> {
@@ -419,9 +457,12 @@ fn make_node(
     tags: Vec<String>,
     parent_id: Option<NodeId>,
     level: u32,
+    source_span: SourceSpan,
 ) -> Result<Node, OrgParseError> {
     let title_path = TitlePath::new(title_path).map_err(invalid_projection)?;
-    Node::new(id, title, title_path, tags, parent_id, level).map_err(invalid_projection)
+    Node::new(id, title, title_path, tags, parent_id, level)
+        .map(|node| node.with_source_span(source_span))
+        .map_err(invalid_projection)
 }
 
 fn combine_tags<'a>(inherited: &[String], added: impl IntoIterator<Item = &'a str>) -> Vec<String> {

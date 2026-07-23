@@ -665,9 +665,26 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
     assert_round_trip::<NodePageV1>(json!({
         "items":[{"node_id":"node","document_id":"document",
             "logical_path":"notes/example.org","title":"Node","title_path":["Parent"],
-            "tags":[],"level":2,"active":true}],
+            "tags":[],"level":2,"document_revision":4,
+            "content_sha256":"a".repeat(64),"start_byte":10,"end_byte":20,
+            "active":true}],
         "next":"node"
     }));
+    assert_round_trip::<NodePageV1>(json!({
+        "items":[{"node_id":"legacy","document_id":"document",
+            "logical_path":"notes/example.org","title":"Legacy","title_path":["Legacy"],
+            "tags":[],"level":1,"document_revision":1,
+            "content_sha256":"a".repeat(64),"start_byte":null,"end_byte":null,
+            "active":false}],
+        "next":"legacy"
+    }));
+    let missing_end = json!({
+        "node_id":"node","document_id":"document","logical_path":"notes/example.org",
+        "title":"Node","title_path":["Node"],"tags":[],"level":1,
+        "document_revision":1,"content_sha256":"a".repeat(64),
+        "start_byte":0,"active":true
+    });
+    assert!(serde_json::from_value::<NodeV1>(missing_end).is_err());
     assert_round_trip::<NodeThemaAssociationPageV1>(json!({
         "items":[
             {"thema_id":"thema-a","relation":"primary"},
@@ -679,7 +696,9 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
     assert!(
         serde_json::from_value::<NodeV1>(json!({
             "node_id":"node","document_id":"document","logical_path":"notes/example.org",
-            "title":"Node","title_path":["Parent"],"tags":[],"level":2,"active":true,
+            "title":"Node","title_path":["Parent"],"tags":[],"level":2,
+            "document_revision":4,"content_sha256":"a".repeat(64),
+            "start_byte":10,"end_byte":20,"active":true,
             "thema_ids":["thema"]
         }))
         .is_err()

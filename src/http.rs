@@ -2362,6 +2362,7 @@ impl ApiError {
             },
             StoreError::ReplicaCursor | StoreError::ReplicaServer => Self::snapshot_required(),
             StoreError::InvalidCursor => Self::bad_request("invalid cursor"),
+            StoreError::NodePageProjectionLimit => Self::internal(),
             StoreError::BlobRequired { digest } => Self {
                 status: StatusCode::CONFLICT,
                 code: ApiErrorCodeV1::BlobRequired,
@@ -3846,6 +3847,12 @@ mod tests {
         for (name, field) in [
             ("DocumentView", "file_node_id"),
             ("NodeView", "parent_id"),
+            ("NodeView", "start_byte"),
+            ("NodeView", "end_byte"),
+            ("ProjectionNodeV1", "start_byte"),
+            ("ProjectionNodeV1", "end_byte"),
+            ("NodeV1", "start_byte"),
+            ("NodeV1", "end_byte"),
             ("DuePageView", "next"),
         ] {
             assert!(
@@ -3854,6 +3861,20 @@ mod tests {
                     .unwrap()
                     .contains(&json!(field)),
                 "{name}.{field}"
+            );
+        }
+        for field in [
+            "document_revision",
+            "content_sha256",
+            "start_byte",
+            "end_byte",
+        ] {
+            assert!(
+                schemas["NodeV1"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(field)),
+                "NodeV1.{field}"
             );
         }
         assert_eq!(

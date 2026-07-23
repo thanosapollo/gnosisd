@@ -4,12 +4,13 @@ use thiserror::Error;
 
 use crate::application::{
     DocumentProjectionSnapshot, FsrsAlgorithmSnapshot, FsrsConfigSnapshot,
-    FsrsImplementationSnapshot, FsrsModelSnapshot, ProjectionEdge, ProjectionLinkOccurrence,
-    ProjectionNode, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateSnapshot,
-    SettingsInput, SnapshotPage, SnapshotPosition, prepare_thema, thema_content,
-    validate_asset_path,
+    FsrsImplementationSnapshot, FsrsModelSnapshot, MAX_DOCUMENT_SOURCE_BYTES, ProjectionEdge,
+    ProjectionLinkOccurrence, ProjectionNode, ReplicaChange, ReplicaProjection, ReplicaState,
+    ReviewStateSnapshot, SettingsInput, SnapshotPage, SnapshotPosition, prepare_thema,
+    thema_content, validate_asset_path,
 };
 use crate::{
+    domain::SourceSpan,
     is_canonical_sha256,
     parser::{supported_content_type, validate_document_path},
 };
@@ -514,7 +515,7 @@ fn document_identity(value: &DocumentRevisionV1) -> Result<ProjectionIdentity, R
         return Err(ReplicaWireError::Response);
     }
     if let Some(projection) = &value.projection {
-        require_digest(&projection.content_sha256)?;
+        validate_document_projection(projection)?;
         if value
             .content_sha256
             .as_ref()
@@ -530,6 +531,20 @@ fn document_identity(value: &DocumentRevisionV1) -> Result<ProjectionIdentity, R
         tombstone,
         value.content_sha256.iter().cloned().collect(),
     ))
+}
+
+fn validate_document_projection(projection: &DocumentProjectionV1) -> Result<(), ReplicaWireError> {
+    require_digest(&projection.content_sha256)?;
+    for node in &projection.nodes {
+        match (node.start_byte, node.end_byte) {
+            (Some(start), Some(end))
+                if end <= MAX_DOCUMENT_SOURCE_BYTES
+                    && SourceSpan::from_offsets(start, end).is_ok() => {}
+            (None, None) => {}
+            _ => return Err(ReplicaWireError::Response),
+        }
+    }
+    Ok(())
 }
 
 fn asset_identity(value: &AssetRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
@@ -794,6 +809,8 @@ impl From<&ProjectionNode> for ProjectionNodeV1 {
             tags: value.tags.clone(),
             parent_id: value.parent_id.clone(),
             level: value.level,
+            start_byte: value.start_byte,
+            end_byte: value.end_byte,
         }
     }
 }
@@ -890,8 +907,8 @@ mod tests {
 
     use super::{
         CursorV1, MAX_REPLICA_CURSOR_BYTES, ReplicaWireError, decode_cursor,
-        decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor, encode_token,
-        replica_change_page, replica_snapshot_page, replica_state_response,
+        decode_snapshot_cursor, decode_snapshot_page, encode_cursor, encode_snapshot_cursor,
+        encode_token, replica_change_page, replica_snapshot_page, replica_state_response,
     };
     use crate::application::{
         AssetRevision, DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision,
@@ -1016,6 +1033,31 @@ mod tests {
     }
 
     #[test]
+    fn replica_node_source_spans_must_be_paired_and_bounded() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/protocol/replica-sync-v1.json"
+        ))
+        .unwrap();
+        let page = fixture["snapshot_partial"].clone();
+        assert!(decode_snapshot_page(serde_json::from_value(page.clone()).unwrap()).is_ok());
+
+        let mut unpaired = page.clone();
+        unpaired["items"][0]["projection"]["projection"]["nodes"][0]["end_byte"] = Value::Null;
+        assert!(matches!(
+            decode_snapshot_page(serde_json::from_value(unpaired).unwrap()),
+            Err(ReplicaWireError::Response)
+        ));
+
+        let mut oversized = page;
+        oversized["items"][0]["projection"]["projection"]["nodes"][0]["end_byte"] =
+            json!(crate::application::MAX_DOCUMENT_SOURCE_BYTES + 1);
+        assert!(matches!(
+            decode_snapshot_page(serde_json::from_value(oversized).unwrap()),
+            Err(ReplicaWireError::Response)
+        ));
+    }
+
+    #[test]
     fn one_projection_cannot_exceed_the_response_budget() {
         let mut projection = document_projection();
         let ReplicaProjection::Document(document) = &mut projection else {
@@ -1119,6 +1161,8 @@ mod tests {
                     tags: vec!["tag".into()],
                     parent_id: None,
                     level: 1,
+                    start_byte: Some(0),
+                    end_byte: Some(10),
                 }],
                 link_occurrences: vec![ProjectionLinkOccurrence {
                     owner_id: "node".into(),

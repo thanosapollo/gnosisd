@@ -218,6 +218,16 @@ resource and operation identities; and treats a timeout or invalid mutation
 response as unknown delivery. Clients recover session state through the
 active-session and attempt-state resources.
 
+Clients page the complete thema and node catalogs through ~GET /v1/themata~ and
+~GET /v1/nodes~. Each node result binds its byte range to a document revision
+and SHA-256 digest. To jump to a node, fetch
+~GET /v1/notes/{document_id}/revisions/{document_revision}~, require the
+revision ETag and digest to match, then select the half-open UTF-8 byte range
+~[start_byte, end_byte)~. Heading ranges include the complete heading subtree.
+~HttpClient::node_source~ performs these checks and also works for inactive
+historical nodes while their revision blob is retained. Projections created
+before range support return both offsets as ~null~ instead of guessing.
+
 The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
 direct content resources, online review sessions and attempts, desired-state
 operations, and stable errors are generated from the public Rust DTOs in
@@ -327,6 +337,13 @@ or node index. Tombstones flow through the replica feed and prevent deleted
 content from reappearing. Assets are SHA-256 addressed and deduplicated. An
 offline asset blob is uploaded and verified before its sequenced create
 operation, and dependent Org revisions remain behind it in the outbox.
+
+A client may materialize replica blobs as ordinary local working files for its
+editor. The client owns that file layout and watches or saves files according
+to its UI policy. An explicit save queues a revision- and digest-bound document
+operation in the durable outbox; the next sync publishes it or records a typed
+conflict. The daemon does not watch client working trees, and a local autosave
+is not itself a canonical revision.
 
 Check live Org parsing parity read-only:
 

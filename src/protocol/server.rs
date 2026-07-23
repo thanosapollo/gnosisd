@@ -543,6 +543,7 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::ReplicaCursor
         | StoreError::ReplicaServer
         | StoreError::InvalidCursor
+        | StoreError::NodePageProjectionLimit
         | StoreError::BlobRequired { .. }
         | StoreError::BlobMetadata
         | StoreError::PathChange

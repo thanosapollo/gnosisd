@@ -432,6 +432,12 @@ pub struct NodeView {
     #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub parent_id: Option<String>,
     pub level: u32,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub start_byte: Option<usize>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub end_byte: Option<usize>,
 }
 
 impl From<&crate::domain::Node> for NodeView {
@@ -443,6 +449,8 @@ impl From<&crate::domain::Node> for NodeView {
             tags: node.tags().to_vec(),
             parent_id: node.parent_id().map(ToString::to_string),
             level: node.level(),
+            start_byte: node.source_span().map(|span| span.start()),
+            end_byte: node.source_span().map(|span| span.end()),
         }
     }
 }

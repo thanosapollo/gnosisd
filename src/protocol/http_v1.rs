@@ -343,6 +343,12 @@ pub struct ProjectionNodeV1 {
     pub tags: Vec<String>,
     pub parent_id: Option<String>,
     pub level: u32,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub start_byte: Option<usize>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub end_byte: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
