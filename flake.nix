@@ -1,10 +1,16 @@
 {
   description = "Authenticated Gnosis HTTP client for GNU Emacs";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    keymap-popup = {
+      url = "git+https://codeberg.org/thanosapollo/emacs-keymap-popup.git?ref=refs/tags/0.4.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, keymap-popup }:
     let
       systems = [
         "x86_64-linux"
@@ -28,6 +34,7 @@
             lib.removePrefix ";; Version: " (lib.head versionLines);
           emacs = pkgs.emacs-nox or pkgs.emacs;
           emacsPackages = pkgs.emacsPackagesFor emacs;
+          keymapPopup = keymap-popup.packages.${system}.default;
           elispFiles = [
             "lisp/gnosis-completion.el"
             "lisp/gnosis-core.el"
@@ -67,13 +74,13 @@
           packageSource = sourceFor packageFiles;
           checkSource = sourceFor checkFiles;
           packageLint = emacsPackages.package-lint;
-          devEmacs = emacsPackages.emacsWithPackages (_: [ packageLint ]);
+          devEmacs = emacsPackages.emacsWithPackages (_: [ keymapPopup packageLint ]);
           elispFileArgs = lib.concatStringsSep " " elispFiles;
           gnosisEl = emacsPackages.trivialBuild {
             pname = "gnosis";
             inherit version;
             src = packageSource;
-            packageRequires = [ ];
+            packageRequires = [ keymapPopup ];
             nativeBuildInputs = [ pkgs.gnumake pkgs.texinfo ];
             buildPhase = ''
               runHook preBuild

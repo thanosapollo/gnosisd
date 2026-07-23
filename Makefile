@@ -110,6 +110,7 @@ do-lint:
 	$(EMACS) --batch -q -L $(LISP_DIR) \
 		--eval "(package-initialize)" \
 		--eval "(require 'package-lint)" \
+		--eval "(let ((add-pinned (lambda (&rest _) (add-to-list 'package-alist (list 'keymap-popup (package-desc-create :name 'keymap-popup :version '(0 4 0) :summary \"Pinned UI dependency\" :reqs '((emacs (29 1))) :kind 'single :archive \"pinned\" :dir nil)))))) (funcall add-pinned) (advice-add 'package-initialize :after add-pinned))" \
 		--eval "(setq package-lint-main-file \"lisp/gnosis.el\")" \
 		-f package-lint-batch-and-exit $(LISP_FILES)
 

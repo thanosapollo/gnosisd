@@ -4,7 +4,7 @@
 ;; Author: Thanos Apollo <public@thanosapollo.org>
 ;; URL: https://thanosapollo.org/projects/gnosis
 ;; Version: 0.13.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.1") (keymap-popup "0.4.0"))
 ;; Keywords: extensions, learning
 
 ;; This file is free software; you can redistribute it and/or modify it
@@ -21,7 +21,12 @@
 
 (require 'gnosis-core)
 (require 'gnosis-nodes)
+(require 'keymap-popup)
 (require 'org)
+
+(declare-function gnosis-review "gnosis-review")
+(declare-function gnosis-review-resume "gnosis-review")
+(declare-function gnosis-review-topic "gnosis-review")
 
 (defgroup gnosis nil
   "Emacs client for Gnosis."
@@ -80,9 +85,35 @@
 (defvar-local gnosis-center-content t
   "Non-nil means center content in the current Gnosis buffer.")
 
-(defvar-keymap gnosis-dashboard-mode-map
-  "g" #'gnosis-dashboard-refresh
-  "q" #'quit-window)
+(defvar-local gnosis-dashboard--projection nil
+  "Current validated server dashboard projection.")
+
+(defun gnosis-dashboard--active-session-p ()
+  "Return non-nil when the dashboard has an active review session."
+  (and gnosis-dashboard--projection
+       (not (eq (plist-get gnosis-dashboard--projection :active_session)
+                gnosis-core--json-null))))
+
+(defun gnosis-dashboard--popup-description ()
+  "Return context text for dashboard popup help."
+  (if (gnosis-dashboard--active-session-p)
+      "Gnosis Dashboard — active review"
+    "Gnosis Dashboard — no active review"))
+
+(keymap-popup-define gnosis-dashboard-mode-map
+  "Keymap for `gnosis-dashboard-mode'."
+  :popup-key "?"
+  :exit-key "C-g"
+  :description #'gnosis-dashboard--popup-description
+  :group "Review"
+  "r" ("Review due" gnosis-review)
+  "t" ("Review topic" gnosis-review-topic)
+  "R" ("Resume active review" gnosis-review-resume
+       :if #'gnosis-dashboard--active-session-p)
+  :group "View"
+  "g" ("Refresh" gnosis-dashboard-refresh :stay-open t)
+  "q" ("Quit" quit-window)
+  "?" ("Actions" gnosis-dashboard-mode-map-popup))
 
 (define-derived-mode gnosis-dashboard-mode special-mode "Gnosis"
   "Major mode for the Gnosis foundation dashboard."
@@ -131,12 +162,26 @@
 (defun gnosis--dashboard-session-text (session)
   "Return dashboard text for server-projected SESSION metadata."
   (if (eq session gnosis-core--json-null)
-      "Active session: none"
+      (concat "Active session: " (propertize "none" 'face 'shadow))
     (format "Active session: %s, %s, position %d, queue length %d"
             (plist-get session :status)
             (plist-get session :mode)
             (plist-get session :current_position)
             (plist-get session :queue_length))))
+
+(defun gnosis--face-dashboard-match (text face)
+  "Apply FACE to first dashboard match for TEXT after point."
+  (when (search-forward text nil t)
+    (add-face-text-property (- (point) (length text)) (point) face)))
+
+(defun gnosis--dashboard-actions (active-session)
+  "Return dashboard action help for ACTIVE-SESSION state."
+  (string-join
+   (append '("r Review due" "t Review topic")
+           (and (not (eq active-session gnosis-core--json-null))
+                '("R Resume review"))
+           '("g Refresh" "? Actions" "q Quit"))
+   "   "))
 
 (defun gnosis--dashboard-text (state)
   "Return display text for server dashboard projection STATE."
@@ -160,29 +205,82 @@
               (plist-get content :archived_themata)
               (plist-get content :active_documents)
               (plist-get content :active_nodes))
-      (format "%d days: %d reviews, success rate %.2f"
+      (format "Last %d days: %d reviews, success rate %.2f"
               (plist-get window :days)
               (plist-get (plist-get window :totals) :review_count)
               (plist-get window :success_rate))
-      (gnosis--dashboard-session-text (plist-get state :active_session)))
+      (gnosis--dashboard-session-text (plist-get state :active_session))
+      ""
+      (gnosis--dashboard-actions (plist-get state :active_session)))
      "\n")))
 
 (defun gnosis--render-dashboard (state)
   "Render server dashboard projection STATE in the current buffer."
-  (let ((inhibit-read-only t))
+  (let ((inhibit-read-only t)
+        (old-point (point))
+        (old-window-start
+         (and (eq (window-buffer (selected-window)) (current-buffer))
+              (window-start))))
     (erase-buffer)
     (insert (gnosis-format-string (gnosis--dashboard-text state)))
     (goto-char (point-min))
     (add-face-text-property
      (point-min) (line-end-position) 'gnosis-face-dashboard-header)
-    (goto-char (point-min))))
+    (let ((today (plist-get state :today))
+          (queue (plist-get state :queue))
+          (content (plist-get state :content))
+          (window (plist-get state :window)))
+      (dolist (spec
+               `((,(number-to-string (plist-get state :review_day))
+                  . font-lock-type-face)
+                 (,(format "%d reviews" (plist-get today :review_count))
+                  . font-lock-type-face)
+                 (,(format "%d successful" (plist-get today :success_count))
+                  . success)
+                 (,(format "%d failed" (plist-get today :failure_count)) . error)
+                 (,(format "%d new" (plist-get queue :new_count))
+                  . font-lock-constant-face)
+                 (,(format "%d due" (plist-get queue :due_count)) . warning)
+                 (,(format "%d overdue" (plist-get queue :overdue_count)) . error)
+                 (,(format "%d suspended" (plist-get queue :suspended_count)) . shadow)
+                 (,(format "%d themata" (plist-get content :active_themata))
+                  . font-lock-type-face)
+                 (,(format "%d archived" (plist-get content :archived_themata)) . shadow)
+                 (,(format "%d documents" (plist-get content :active_documents))
+                  . font-lock-type-face)
+                 (,(format "%d nodes" (plist-get content :active_nodes))
+                  . font-lock-type-face)
+                 (,(format "%d reviews"
+                           (plist-get (plist-get window :totals) :review_count))
+                  . font-lock-type-face)
+                 (,(format "%.2f" (plist-get window :success_rate)) . success)))
+        (goto-char (point-min))
+        (gnosis--face-dashboard-match (car spec) (cdr spec))))
+    (goto-char (point-min))
+    (while (re-search-forward
+            "\\(?:Review day\\|Today\\|Queue\\|Content\\|Last 30 days\\|Active session\\):"
+            nil t)
+      (add-face-text-property (match-beginning 0) (match-end 0) 'shadow))
+    (when (eq (plist-get state :active_session) gnosis-core--json-null)
+      (goto-char (point-min))
+      (gnosis--face-dashboard-match "none" 'shadow))
+    (unless (eq (plist-get state :active_session) gnosis-core--json-null)
+      (goto-char (point-min))
+      (search-forward "Active session: ")
+      (add-face-text-property (point) (line-end-position) 'font-lock-type-face))
+    (goto-char (min old-point (point-max)))
+    (when old-window-start
+      (set-window-start (selected-window)
+                        (min old-window-start (point-max)) t))))
 
 (defun gnosis-dashboard-refresh ()
   "Refresh the current Gnosis dashboard from the server projection."
   (interactive)
   (unless (derived-mode-p 'gnosis-dashboard-mode)
     (user-error "Not in a Gnosis dashboard"))
-  (gnosis--render-dashboard (gnosis-core-dashboard)))
+  (let ((state (gnosis-core-dashboard)))
+    (gnosis--render-dashboard state)
+    (setq gnosis-dashboard--projection state)))
 
 (defun gnosis-dashboard ()
   "Open the server-projected Gnosis dashboard."
@@ -191,13 +289,14 @@
         (buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (gnosis-dashboard-mode)
-    (gnosis--render-dashboard state)))
+    (gnosis--render-dashboard state)
+    (setq gnosis-dashboard--projection state)))
 
 ;;;###autoload
 (defun gnosis ()
-  "Open the Gnosis dashboard."
+  "Start a server-owned due review."
   (interactive)
-  (gnosis-dashboard))
+  (call-interactively #'gnosis-review))
 
 (provide 'gnosis)
 ;;; gnosis.el ends here

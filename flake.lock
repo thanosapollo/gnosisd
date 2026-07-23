@@ -1,5 +1,26 @@
 {
   "nodes": {
+    "keymap-popup": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1783912247,
+        "narHash": "sha256-kp3v0FHHVxsAYI+b30uJ8AInenYS1yc6/qKeKY+Az50=",
+        "ref": "refs/tags/0.4.0",
+        "rev": "d0b50926a186d2de72aa12c6d6b06e384731865a",
+        "revCount": 135,
+        "type": "git",
+        "url": "https://codeberg.org/thanosapollo/emacs-keymap-popup.git"
+      },
+      "original": {
+        "ref": "refs/tags/0.4.0",
+        "type": "git",
+        "url": "https://codeberg.org/thanosapollo/emacs-keymap-popup.git"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1781577229,
@@ -18,6 +39,7 @@
     },
     "root": {
       "inputs": {
+        "keymap-popup": "keymap-popup",
         "nixpkgs": "nixpkgs"
       }
     }

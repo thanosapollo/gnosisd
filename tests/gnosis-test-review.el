@@ -33,6 +33,49 @@
         :desired_suspended gnosis-core--json-false
         :status (or status "pending")))
 
+(ert-deftest gnosis-review-map-is-direct-state-aware-and-discoverable ()
+  (dolist (case `(("pending" "RET" gnosis-review--answer)
+                  ("graded" "n" gnosis-review--commit-next)
+                  ("graded" "o" gnosis-review--override)
+                  ("graded" "s" gnosis-review--toggle-suspension)
+                  ("pending" "g" gnosis-review--refresh)
+                  ("pending" "q" gnosis-review--quit)
+                  ("pending" "?" gnosis-review-mode-map-popup)))
+    (with-temp-buffer
+      (setq gnosis-review--attempt (gnosis-test-review--attempt (nth 0 case)))
+      (should (eq (keymap-lookup gnosis-review-mode-map (nth 1 case))
+                  (nth 2 case)))))
+  (should (equal "C-g" (keymap-popup--meta gnosis-review-mode-map 'exit-key)))
+  (let ((rows (keymap-popup--meta gnosis-review-mode-map 'descriptions)))
+    (dolist (row rows)
+      (dolist (group row)
+        (should (<= (length (plist-get group :entries)) 4))))
+    (should-not
+     (seq-some (lambda (entry) (eq (plist-get entry :type) 'switch))
+               (mapcan (lambda (row)
+                         (mapcan (lambda (group)
+                                   (copy-sequence (plist-get group :entries)))
+                                 row))
+                       rows)))))
+
+(ert-deftest gnosis-review-header-and-popup-omit-private-state ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending"))
+    (let ((header (gnosis-review--header-line))
+          (description (gnosis-review--popup-description)))
+      (should (equal "Review 1/2" (substring-no-properties header)))
+      (should (eq (get-text-property 7 'face header) 'font-lock-type-face))
+      (should (equal "Review 1/2 — answer" description))
+      (should-not (string-match-p "session\\|attempt\\|thema" description)))))
+
+(ert-deftest gnosis-review-header-converts-zero-based-session-position ()
+  (with-temp-buffer
+    (setq gnosis-review--session (gnosis-test-review--session))
+    (setf (plist-get gnosis-review--session :current_position) 1)
+    (should (string-prefix-p "Review 2/2" (gnosis-review--header-line)))))
+
 (ert-deftest gnosis-review-source-is-closed-due-view ()
   (let ((source (gnosis-review--source "due")))
     (should (equal "due" (plist-get source :kind)))
@@ -113,15 +156,40 @@
     (gnosis-review-mode)
     (setq gnosis-review--session (gnosis-test-review--session)
           gnosis-review--attempt (gnosis-test-review--attempt "pending"))
-    (setf (plist-get gnosis-review--attempt :revealed_answer) ["SECRET"])
+    (setf (plist-get gnosis-review--attempt :revealed_answer) ["SECRET"]
+          (plist-get gnosis-review--attempt :revealed_parathema) "PRIVATE-HINT"
+          (plist-get gnosis-review--attempt :response)
+          '(:kind "text" :value "PRIVATE-RESPONSE")
+          (plist-get gnosis-review--attempt :detected_success) t
+          (plist-get gnosis-review--attempt :accepted_success) t
+          (plist-get gnosis-review--attempt :desired_suspended) t)
     (cl-letf (((symbol-function 'display-images-p) (lambda () nil))
               ((symbol-function 'gnosis-core-review-attempt-answer)
                (lambda (&rest _) (ert-fail "render answered")))
               ((symbol-function 'gnosis-core-review-attempt-commit)
                (lambda (&rest _) (ert-fail "render committed"))))
       (gnosis-review--render)
-      (should (string-match-p "RET: answer" (buffer-string)))
-      (should-not (string-match-p "SECRET" (buffer-string))))))
+      (should (string-match-p "RET Answer" (buffer-string)))
+      (should-not
+       (string-match-p
+        "SECRET\\|PRIVATE-HINT\\|PRIVATE-RESPONSE\\|success\\|suspend\\|session\\|attempt\\|thema"
+        (buffer-string))))))
+
+(ert-deftest gnosis-review-render-gives-graded-content-semantic-faces ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (dolist (expected '(("Answer:" . gnosis-face-directions)
+                          ("• Answer" . gnosis-face-correct)
+                          ("Your answer:" . gnosis-face-directions)
+                          ("response" . gnosis-face-correct)
+                          ("success" . gnosis-face-correct)))
+        (goto-char (point-min))
+        (search-forward (car expected))
+        (should (eq (get-text-property (1- (point)) 'face) (cdr expected)))))))
 
 (ert-deftest gnosis-review-render-distinguishes-detected-and-accepted-results ()
   (with-temp-buffer
@@ -134,12 +202,12 @@
       (gnosis-review--render)
       (should (string-match-p "Detected: success" (buffer-string)))
       (should (string-match-p "Accepted: failure" (buffer-string)))
-      (should (string-match-p "commit accepted result" (buffer-string))))))
+      (should (string-match-p "Commit & next" (buffer-string))))))
 
 (ert-deftest gnosis-review-render-equal-results-and-suspension-action ()
-  (dolist (case `((t t ,gnosis-core--json-false "s: suspend")
+  (dolist (case `((t t ,gnosis-core--json-false "s Suspend")
                   (,gnosis-core--json-false ,gnosis-core--json-false
-                   t "s: unsuspend")))
+                   t "s Unsuspend")))
     (with-temp-buffer
       (gnosis-review-mode)
       (setq gnosis-review--session (gnosis-test-review--session)
@@ -384,24 +452,17 @@
       (gnosis-review--next)
       (should-not resumed))))
 
-(ert-deftest gnosis-review-uncertain-quit-remains-explicit ()
-  (let ((buffer (generate-new-buffer " *gnosis-review-quit*"))
-        (gets 0))
+(ert-deftest gnosis-review-close-is-local-and-leaves-session-active ()
+  (let ((buffer (generate-new-buffer " *gnosis-review-close*"))
+        mutated)
     (unwind-protect
         (with-current-buffer buffer
           (setq gnosis-review--session (gnosis-test-review--session "active"))
-          (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-                    ((symbol-function 'gnosis-core-review-session-quit)
-                     (lambda (&rest _)
-                       (signal 'gnosis-core-mutation-uncertain '("unknown"))))
-                    ((symbol-function 'gnosis-core-review-session-active)
-                     (lambda ()
-                       (setq gets (1+ gets))
-                       `(:session ,gnosis-core--json-null))))
-            (should-error (gnosis-review--quit)
-                          :type 'gnosis-core-mutation-uncertain)
-            (should (= gets 1))
-            (should (buffer-live-p buffer))))
+          (cl-letf (((symbol-function 'gnosis-core-review-session-quit)
+                     (lambda (&rest _) (setq mutated t))))
+            (gnosis-review--quit)
+            (should-not mutated)
+            (should-not (buffer-live-p buffer))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-review-resume-cancel-does-not-mutate ()

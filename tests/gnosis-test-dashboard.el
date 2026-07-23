@@ -27,7 +27,7 @@
   (unwind-protect
       (cl-letf (((symbol-function 'gnosis-core-dashboard)
                  #'gnosis-test-dashboard--projection))
-        (save-window-excursion (gnosis))
+        (save-window-excursion (gnosis-dashboard))
         (with-current-buffer gnosis-dashboard-buffer-name
           (should (derived-mode-p 'gnosis-dashboard-mode))
           (should (eq 'gnosis-face-dashboard-header
@@ -40,6 +40,13 @@
             (should (string-match-p (regexp-quote text) (buffer-string))))))
     (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
       (kill-buffer buffer))))
+
+(ert-deftest gnosis-entry-starts-due-review ()
+  (let (called)
+    (cl-letf (((symbol-function 'gnosis-review)
+               (lambda () (interactive) (setq called t))))
+      (call-interactively #'gnosis))
+    (should called)))
 
 (ert-deftest gnosis-dashboard-shows-session-metadata-without-id ()
   (let ((text
@@ -62,6 +69,48 @@
                (lambda (&rest _) (signal 'gnosis-core-unavailable '("down")))))
       (should-error (gnosis-dashboard-refresh) :type 'gnosis-core-unavailable)
       (should (equal "existing projection" (buffer-string))))))
+
+(ert-deftest gnosis-dashboard-keymap-is-direct-and-discoverable ()
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "g")
+              #'gnosis-dashboard-refresh))
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "r") 'gnosis-review))
+  (with-temp-buffer
+    (setq gnosis-dashboard--projection
+          (list :active_session '(:status "active")))
+    (should (eq (keymap-lookup gnosis-dashboard-mode-map "R")
+                'gnosis-review-resume)))
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "t")
+              'gnosis-review-topic))
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "q") #'quit-window))
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "?")
+              'gnosis-dashboard-mode-map-popup)))
+
+(ert-deftest gnosis-dashboard-renders-native-sections-actions-and-state-faces ()
+  (with-temp-buffer
+    (gnosis-dashboard-mode)
+    (gnosis--render-dashboard (gnosis-test-dashboard--projection))
+    (dolist (text '("Review day" "Today" "Queue" "Content"
+                    "Last 30 days" "Active session" "Review due"
+                    "Refresh" "Actions" "Quit"))
+      (should (string-search text (buffer-string))))
+    (goto-char (point-min))
+    (search-forward "6 successful")
+    (should (eq (get-text-property (1- (point)) 'face) 'success))
+    (search-forward "2 failed")
+    (should (eq (get-text-property (1- (point)) 'face) 'error))
+    (search-forward "Active session")
+    (search-forward "none")
+    (should (eq (get-text-property (1- (point)) 'face) 'shadow))))
+
+(ert-deftest gnosis-dashboard-refresh-preserves-numeric-point ()
+  (with-temp-buffer
+    (gnosis-dashboard-mode)
+    (gnosis--render-dashboard (gnosis-test-dashboard--projection))
+    (goto-char 25)
+    (cl-letf (((symbol-function 'gnosis-core-dashboard)
+               #'gnosis-test-dashboard--projection))
+      (gnosis-dashboard-refresh))
+    (should (= (point) 25))))
 
 (provide 'gnosis-test-dashboard)
 ;;; gnosis-test-dashboard.el ends here
