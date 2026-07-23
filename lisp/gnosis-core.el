@@ -585,6 +585,12 @@ one transport failure using the exact request.  AUTH-P defaults to non-nil;
         (plist-get gnosis-core--contract-cache :document)
       (gnosis-core-refresh-contract))))
 
+(defun gnosis-core--contract-cached-p ()
+  "Return non-nil when the current authority has a cached contract."
+  (let ((base (gnosis-core--validated-base-url)))
+    (and (equal base (plist-get gnosis-core--contract-cache :base))
+         (plist-get gnosis-core--contract-cache :document))))
+
 (defun gnosis-core--json-key (name)
   "Return plist keyword for JSON object key NAME."
   (intern (concat ":" name)))
@@ -988,6 +994,25 @@ the remaining declared request inputs."
                   '("Gnosis mutation response is invalid"))))
       value)))
 
+(defun gnosis-core--typed-read-request
+    (identity &optional path-values query)
+  "Execute typed GET IDENTITY, refreshing one previously cached contract.
+PATH-VALUES and QUERY supply the declared request inputs."
+  (let ((cached (gnosis-core--contract-cached-p))
+        (arguments
+         (cond
+          (query (list identity path-values query))
+          (path-values (list identity path-values))
+          (t (list identity)))))
+    (condition-case condition
+        (apply #'gnosis-core--typed-request arguments)
+      (gnosis-core-protocol-error
+       (if cached
+           (progn
+             (gnosis-core-refresh-contract)
+             (apply #'gnosis-core--typed-request arguments))
+         (signal (car condition) (cdr condition)))))))
+
 (defun gnosis-core--typed-binary-request (identity &optional path-values query)
   "Execute binary GET operation IDENTITY from the live contract.
 PATH-VALUES fill path parameters and QUERY supplies query parameters."
@@ -1187,8 +1212,17 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
                          (and limit (cons "limit" limit))
                          (and query (cons "q" query))))))
     (if parameters
-        (gnosis-core--typed-request "get_nodes" nil parameters)
-      (gnosis-core--typed-request "get_nodes"))))
+        (gnosis-core--typed-read-request "get_nodes" nil parameters)
+      (gnosis-core--typed-read-request "get_nodes"))))
+
+(defun gnosis-core-node (node-id)
+  "Return the server projection for opaque NODE-ID."
+  (let ((projection
+         (gnosis-core--typed-read-request
+          "get_nodes__id_" (list (cons "id" node-id)))))
+    (unless (equal node-id (plist-get projection :node_id))
+      (gnosis-core--invalid "Gnosis node identity mismatch"))
+    projection))
 
 (defun gnosis-core-thema (thema-id)
   "Return the server projection for opaque THEMA-ID."
