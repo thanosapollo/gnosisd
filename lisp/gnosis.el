@@ -27,6 +27,9 @@
 (declare-function gnosis-review "gnosis-review")
 (declare-function gnosis-review-resume "gnosis-review")
 (declare-function gnosis-review-topic "gnosis-review")
+(autoload 'gnosis-review "gnosis-review" nil t)
+(autoload 'gnosis-review-resume "gnosis-review" nil t)
+(autoload 'gnosis-review-topic "gnosis-review" nil t)
 
 (defgroup gnosis nil
   "Emacs client for Gnosis."

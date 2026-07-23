@@ -25,6 +25,7 @@ TEST_FILES := tests/gnosis-test-core.el \
 	tests/gnosis-test-openapi.el \
 	tests/gnosis-test-edit.el \
 	tests/gnosis-test-nodes.el \
+	tests/gnosis-test-entry-smoke.el \
 	tests/gnosis-test-dashboard.el \
 	tests/gnosis-test-review.el \
 	tests/gnosis-test-boundary.el \
