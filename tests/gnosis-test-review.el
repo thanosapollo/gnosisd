@@ -59,12 +59,22 @@
                                  row))
                        rows)))))
 
+(ert-deftest gnosis-review-pending-attempt-keeps-mutations-visible-but-inapt ()
+  (with-temp-buffer
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "pending"))
+    (dolist (key '("n" "o" "s"))
+      (should (commandp (keymap-lookup gnosis-review-mode-map key))))
+    (let* ((rows (keymap-popup--meta gnosis-review-mode-map 'descriptions))
+           (attempt-group (car (car rows))))
+      (dolist (entry (cdr (plist-get attempt-group :entries)))
+        (should (eq (plist-get entry :inapt-if)
+                    #'gnosis-review--pending-p))
+        (should-not (plist-get entry :if))))))
+
 (ert-deftest gnosis-review-committed-attempt-disables-mutations ()
   (with-temp-buffer
     (setq gnosis-review--attempt (gnosis-test-review--attempt "committed")
           gnosis-review--attempt-revision 2)
-    (dolist (key '("n" "o" "s"))
-      (should-not (keymap-lookup gnosis-review-mode-map key)))
     (dolist (command '(gnosis-review--commit-next
                        gnosis-review--override
                        gnosis-review--toggle-suspension))
@@ -338,7 +348,8 @@
         (setq unavailable t)
         (should-error (gnosis-review--answer) :type 'gnosis-core-unavailable)
         (should (= posts 1))
-        (should (equal "graded" (plist-get gnosis-review--attempt :status)))
+        (should (equal "pending" (plist-get gnosis-review--attempt :status)))
+        (should (= 1 gnosis-review--attempt-revision))
         (should-not (keymap-lookup gnosis-review-mode-map "RET"))
         (should-error (gnosis-review--answer) :type 'user-error)
         (should (= posts 1))
@@ -346,6 +357,24 @@
         (gnosis-review--refresh)
         (should (= 2 gnosis-review--attempt-revision))
         (should (= posts 1))))))
+
+(ert-deftest gnosis-review-answer-definite-rejection-preserves-state ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-review--attempt-revision 1)
+    (let ((attempt gnosis-review--attempt))
+      (cl-letf (((symbol-function 'gnosis-review--read-answer)
+                 (lambda () '(:kind "text" :value "response")))
+                ((symbol-function 'gnosis-core-review-attempt-answer)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-validation-error '("rejected")))))
+        (should-error (gnosis-review--answer)
+                      :type 'gnosis-core-validation-error)
+        (should (eq attempt gnosis-review--attempt))
+        (should (= 1 gnosis-review--attempt-revision))
+        (should-not gnosis-review--answer-locked-p)))))
 
 (ert-deftest gnosis-review-answer-quit-after-dispatch-keeps-retry-locked ()
   (with-temp-buffer

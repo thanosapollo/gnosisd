@@ -82,11 +82,11 @@
   :group "Attempt"
   "RET" ("Answer" gnosis-review--answer :if #'gnosis-review--answerable-p)
   "n" ("Commit & next" gnosis-review--commit-next
-       :if #'gnosis-review--graded-p)
+       :inapt-if #'gnosis-review--pending-p)
   "o" ("Override & next" gnosis-review--override
-       :if #'gnosis-review--graded-p)
+       :inapt-if #'gnosis-review--pending-p)
   "s" (#'gnosis-review--suspension-description gnosis-review--toggle-suspension
-       :if #'gnosis-review--graded-p :stay-open t)
+       :inapt-if #'gnosis-review--pending-p :stay-open t)
   :group "Session"
   "g" ("Refresh" gnosis-review--refresh :stay-open t)
   "q" ("Close review" gnosis-review--quit)
@@ -410,15 +410,15 @@
          answered-attempt
          uncertain
          state)
-    (setq gnosis-review--attempt-revision nil
-          gnosis-review--answer-locked-p t)
+    (setq gnosis-review--answer-locked-p t)
     (condition-case condition
         (setq answered-attempt
               (gnosis-core-review-attempt-answer attempt-id answer))
       (gnosis-core-mutation-uncertain
-       (setq uncertain condition)))
-    (when answered-attempt
-      (setq gnosis-review--attempt answered-attempt))
+       (setq uncertain condition))
+      (gnosis-core-error
+       (setq gnosis-review--answer-locked-p nil)
+       (signal (car condition) (cdr condition))))
     (setq state (gnosis-core-review-attempt-state attempt-id))
     (let ((attempt (plist-get state :attempt)))
       (unless (equal attempt-id (plist-get attempt :attempt_id))
