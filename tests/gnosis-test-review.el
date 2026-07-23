@@ -58,6 +58,43 @@
                                  row))
                        rows)))))
 
+(ert-deftest gnosis-review-committed-attempt-disables-mutations ()
+  (with-temp-buffer
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "committed"))
+    (dolist (key '("n" "o" "s"))
+      (should-not (keymap-lookup gnosis-review-mode-map key)))
+    (let (mutated)
+      (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted)
+                 (lambda (&rest _) (setq mutated t))))
+        (should-error (gnosis-review--finish nil) :type 'user-error)
+        (should-not mutated)))))
+
+(ert-deftest gnosis-review-refresh-advances-committed-attempt-from-authority ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "committed")
+          gnosis-review--attempt-revision 2)
+    (let ((next-session (gnosis-test-review--session))
+          (next-attempt (gnosis-test-review--attempt "pending"))
+          mutations)
+      (setf (plist-get next-session :current_position) 1
+            (plist-get next-attempt :attempt_id) "attempt-2")
+      (cl-letf (((symbol-function 'gnosis-core-review-session-active)
+                 (lambda (&rest _) (list :session next-session)))
+                ((symbol-function 'gnosis-core-review-attempt-begin)
+                 (lambda (&rest _) next-attempt))
+                ((symbol-function 'gnosis-core-review-attempt-set-accepted)
+                 (lambda (&rest _) (push 'accepted mutations)))
+                ((symbol-function 'gnosis-core-review-attempt-set-desired-suspended)
+                 (lambda (&rest _) (push 'suspended mutations)))
+                ((symbol-function 'gnosis-core-review-attempt-commit)
+                 (lambda (&rest _) (push 'committed mutations)))
+                ((symbol-function 'display-images-p) (lambda () nil)))
+        (gnosis-review--refresh)
+        (should (equal "attempt-2" (plist-get gnosis-review--attempt :attempt_id)))
+        (should-not mutations)))))
+
 (ert-deftest gnosis-review-header-and-popup-omit-private-state ()
   (with-temp-buffer
     (gnosis-review-mode)

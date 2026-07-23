@@ -41,6 +41,10 @@
   "Return non-nil when the current attempt awaits an answer."
   (equal "pending" (plist-get gnosis-review--attempt :status)))
 
+(defun gnosis-review--graded-p ()
+  "Return non-nil when the current attempt can be mutated."
+  (equal "graded" (plist-get gnosis-review--attempt :status)))
+
 (defun gnosis-review--session-label ()
   "Return a compact progress label for the current session."
   (format "Review %d/%d"
@@ -50,7 +54,11 @@
 (defun gnosis-review--popup-description ()
   "Return public-safe context text for review popup help."
   (format "%s — %s" (gnosis-review--session-label)
-          (if (gnosis-review--pending-p) "answer" "result")))
+          (pcase (plist-get gnosis-review--attempt :status)
+            ("pending" "answer")
+            ("graded" "result")
+            ("committed" "continue")
+            (_ "refresh"))))
 
 (defun gnosis-review--suspension-description ()
   "Return current server-backed suspension action label."
@@ -66,11 +74,11 @@
   :group "Attempt"
   "RET" ("Answer" gnosis-review--answer :if #'gnosis-review--pending-p)
   "n" ("Commit & next" gnosis-review--commit-next
-       :inapt-if #'gnosis-review--pending-p)
+       :if #'gnosis-review--graded-p)
   "o" ("Override & next" gnosis-review--override
-       :inapt-if #'gnosis-review--pending-p)
+       :if #'gnosis-review--graded-p)
   "s" (#'gnosis-review--suspension-description gnosis-review--toggle-suspension
-       :inapt-if #'gnosis-review--pending-p :stay-open t)
+       :if #'gnosis-review--graded-p :stay-open t)
   :group "Session"
   "g" ("Refresh" gnosis-review--refresh :stay-open t)
   "q" ("Close review" gnosis-review--quit)
@@ -188,12 +196,14 @@
                    (if (eq accepted t) "Accepted: success" "Accepted: failure")
                    'face (if (eq accepted t)
                              'gnosis-face-correct 'gnosis-face-false))))
-        (insert "\n" (propertize "Suspension: " 'face 'gnosis-face-directions)
-                (propertize (if suspended "enabled" "disabled")
-                            'face (if suspended 'warning 'shadow))
-                "\n\nn Commit & next   o Override & next   s "
-                (gnosis-review--suspension-description)
-                "   g Refresh   q Close review   ? Actions\n")))
+        (if (gnosis-review--graded-p)
+            (insert "\n" (propertize "Suspension: " 'face 'gnosis-face-directions)
+                    (propertize (if suspended "enabled" "disabled")
+                                'face (if suspended 'warning 'shadow))
+                    "\n\nn Commit & next   o Override & next   s "
+                    (gnosis-review--suspension-description)
+                    "   g Refresh   q Close review   ? Actions\n")
+          (insert "\n\ng Continue   q Close review   ? Actions\n"))))
     (goto-char (if start-at-top (point-min) (min old-point (point-max))))
     (when old-window-start
       (set-window-start
@@ -407,8 +417,8 @@
 
 (defun gnosis-review--finish (accepted-success)
   "Set ACCEPTED-SUCCESS, commit the current attempt, and continue."
-  (when (equal (plist-get gnosis-review--attempt :status) "pending")
-    (user-error "Answer attempt before grading it"))
+  (unless (gnosis-review--graded-p)
+    (user-error "Current attempt is not graded"))
   (unless gnosis-review--attempt-revision (gnosis-review--load-revision))
   (let ((result
          (gnosis-review--revisioned-operation
@@ -446,8 +456,8 @@
 (defun gnosis-review--toggle-suspension ()
   "Toggle desired suspension for the current graded attempt."
   (interactive)
-  (when (equal (plist-get gnosis-review--attempt :status) "pending")
-    (user-error "Answer attempt before changing suspension"))
+  (unless (gnosis-review--graded-p)
+    (user-error "Current attempt is not graded"))
   (unless gnosis-review--attempt-revision (gnosis-review--load-revision))
   (let* ((desired (if (eq (plist-get gnosis-review--attempt :desired_suspended) t)
                       gnosis-core--json-false
@@ -467,8 +477,10 @@
 (defun gnosis-review--refresh ()
   "Refresh the current attempt from gnosisd."
   (interactive)
-  (gnosis-review--load-revision)
-  (gnosis-review--render))
+  (if (equal "committed" (plist-get gnosis-review--attempt :status))
+      (gnosis-review--next)
+    (gnosis-review--load-revision)
+    (gnosis-review--render)))
 
 (defun gnosis-review--quit ()
   "Close the local review buffer without mutating its durable session."
