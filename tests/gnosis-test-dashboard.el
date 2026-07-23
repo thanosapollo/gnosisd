@@ -96,6 +96,16 @@
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "?")
               'gnosis-dashboard-mode-map-popup)))
 
+(ert-deftest gnosis-dashboard-popup-describes-resume-exactly ()
+  (let* ((rows (keymap-popup--meta gnosis-dashboard-mode-map 'descriptions))
+         (review-group (car (car rows)))
+         (entry (seq-find
+                 (lambda (item) (equal (plist-get item :key) "R"))
+                 (plist-get review-group :entries))))
+    (should (equal (plist-get entry :description) "Resume review"))
+    (should (eq (plist-get entry :if)
+                #'gnosis-dashboard--active-session-p))))
+
 (ert-deftest gnosis-dashboard-renders-native-sections-actions-and-state-faces ()
   (with-temp-buffer
     (gnosis-dashboard-mode)
@@ -112,6 +122,47 @@
     (search-forward "Active session")
     (search-forward "none")
     (should (eq (get-text-property (1- (point)) 'face) 'shadow))))
+
+(ert-deftest gnosis-dashboard-faces-window-label-and-dynamic-day-value ()
+  (dolist (days '(30 7))
+    (let* ((state (copy-tree (gnosis-test-dashboard--projection)))
+           (window (plist-get state :window)))
+      (setf (plist-get window :days) days)
+      (with-temp-buffer
+        (gnosis-dashboard-mode)
+        (gnosis--render-dashboard state)
+        (goto-char (point-min))
+        (search-forward (format "Last %d days:" days))
+        (let ((end (point))
+              (start (match-beginning 0))
+              (day-start (+ (match-beginning 0) 5)))
+          (should (eq (get-text-property start 'face) 'shadow))
+          (should (eq (get-text-property day-start 'face)
+                      'font-lock-type-face))
+          (should (eq (get-text-property (+ day-start
+                                            (length (number-to-string days)))
+                                         'face)
+                      'shadow))
+          (should (equal (buffer-substring-no-properties start end)
+                         (format "Last %d days:" days))))))))
+
+(ert-deftest gnosis-dashboard-initial-open-starts-at-top ()
+  (let ((buffer (get-buffer-create gnosis-dashboard-buffer-name)))
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer buffer
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert (make-string 200 ?x)))
+            (goto-char 50))
+          (set-window-buffer (selected-window) buffer)
+          (set-window-start (selected-window) 25)
+          (cl-letf (((symbol-function 'gnosis-core-dashboard)
+                     #'gnosis-test-dashboard--projection))
+            (gnosis-dashboard))
+          (should (= (with-current-buffer buffer (point)) (point-min)))
+          (should (= (window-start (selected-window)) (point-min))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-dashboard-refresh-preserves-numeric-point ()
   (with-temp-buffer

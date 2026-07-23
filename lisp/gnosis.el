@@ -111,7 +111,7 @@
   :group "Review"
   "r" ("Review due" gnosis-review)
   "t" ("Review topic" gnosis-review-topic)
-  "R" ("Resume active review" gnosis-review-resume
+  "R" ("Resume review" gnosis-review-resume
        :if #'gnosis-dashboard--active-session-p)
   :group "View"
   "g" ("Refresh" gnosis-dashboard-refresh :stay-open t)
@@ -224,8 +224,8 @@
       (gnosis--dashboard-actions (plist-get state :active_session)))
      "\n")))
 
-(defun gnosis--render-dashboard (state)
-  "Render server dashboard projection STATE in the current buffer."
+(defun gnosis--render-dashboard (state &optional start-at-top)
+  "Render dashboard STATE, starting at top when START-AT-TOP."
   (let ((inhibit-read-only t)
         (old-point (point))
         (old-window-start
@@ -272,9 +272,19 @@
         (gnosis--face-dashboard-match (car spec) (cdr spec))))
     (goto-char (point-min))
     (while (re-search-forward
-            "\\(?:Review day\\|Today\\|Queue\\|Content\\|Last 30 days\\|Active session\\):"
+            "\\(?:Review day\\|Today\\|Queue\\|Content\\|Active session\\):"
             nil t)
       (add-face-text-property (match-beginning 0) (match-end 0) 'shadow))
+    (goto-char (point-min))
+    (when (search-forward
+           (format "Last %d days:"
+                   (plist-get (plist-get state :window) :days))
+           nil t)
+      (let ((day-start (+ (match-beginning 0) 5))
+            (day-end (- (match-end 0) 6)))
+        (add-face-text-property (match-beginning 0) day-start 'shadow)
+        (add-face-text-property day-start day-end 'font-lock-type-face)
+        (add-face-text-property day-end (match-end 0) 'shadow)))
     (when (eq (plist-get state :active_session) gnosis-core--json-null)
       (goto-char (point-min))
       (gnosis--face-dashboard-match "none" 'shadow))
@@ -282,10 +292,13 @@
       (goto-char (point-min))
       (search-forward "Active session: ")
       (add-face-text-property (point) (line-end-position) 'font-lock-type-face))
-    (goto-char (min old-point (point-max)))
+    (goto-char (if start-at-top (point-min) (min old-point (point-max))))
     (when old-window-start
       (set-window-start (selected-window)
-                        (min old-window-start (point-max)) t))))
+                        (if start-at-top
+                            (point-min)
+                          (min old-window-start (point-max)))
+                        t))))
 
 (defun gnosis-dashboard-refresh ()
   "Refresh the current Gnosis dashboard from the server projection."
@@ -304,7 +317,7 @@
         (buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (gnosis-dashboard-mode)
-    (gnosis--render-dashboard state)
+    (gnosis--render-dashboard state t)
     (setq gnosis-dashboard--projection state)))
 
 ;;;###autoload
