@@ -5412,6 +5412,55 @@ mod tests {
     }
 
     #[test]
+    fn node_search_reads_legacy_projection_compatibility_digest() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let prepared = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Note\n\n* Node\n:PROPERTIES:\n:ID: node\n:END:\n".into(),
+            None,
+        )
+        .unwrap();
+        let blob = BlobMeta {
+            sha256: prepared.blob_sha256.clone(),
+            size_bytes: prepared.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&prepared, &blob, 1, None).unwrap();
+        let stored: String = store
+            .connection
+            .query_row(
+                "SELECT projection_json FROM document_projection_revision
+                 WHERE document_id = 'document' AND revision = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        legacy["compatibility_sha1"] = serde_json::Value::String("a".repeat(40));
+        for node in legacy["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("start_byte");
+            node.as_object_mut().unwrap().remove("end_byte");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE document_projection_revision SET projection_json = ?1
+                 WHERE document_id = 'document' AND revision = 1",
+                [serde_json::to_string(&legacy).unwrap()],
+            )
+            .unwrap();
+
+        let records = store.search_nodes("", 1, None).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_id, "node");
+        assert_eq!(records[0].document_revision, 1);
+        assert_eq!(records[0].content_sha256, prepared.blob_sha256);
+        assert_eq!((records[0].start_byte, records[0].end_byte), (None, None));
+    }
+
+    #[test]
     fn node_page_stops_before_aggregate_projection_decode_exceeds_its_budget() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let mut projection_size = 0;

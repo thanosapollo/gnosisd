@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -135,6 +135,31 @@ pub(crate) struct DocumentProjectionSnapshot {
     pub(crate) link_occurrences: Vec<ProjectionLinkOccurrence>,
     pub(crate) semantic_edges: Vec<ProjectionEdge>,
     pub(crate) content_sha256: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_legacy_compatibility_sha1",
+        skip_serializing,
+        rename = "compatibility_sha1"
+    )]
+    pub(crate) _compatibility_sha1: Option<String>,
+}
+
+fn deserialize_legacy_compatibility_sha1<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_deref().is_some_and(|digest| {
+        digest.len() != 40
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(D::Error::custom("invalid legacy compatibility digest"));
+    }
+    Ok(value)
 }
 
 impl From<&DocumentProjection> for DocumentProjectionSnapshot {
@@ -176,6 +201,7 @@ impl From<&DocumentProjection> for DocumentProjectionSnapshot {
                 })
                 .collect(),
             content_sha256: value.content_sha256().to_owned(),
+            _compatibility_sha1: None,
         }
     }
 }
@@ -736,6 +762,7 @@ mod tests {
             node.as_object_mut().unwrap().remove("start_byte");
             node.as_object_mut().unwrap().remove("end_byte");
         }
+        json["compatibility_sha1"] = Value::String("a".repeat(40));
         let legacy: DocumentProjectionSnapshot = serde_json::from_value(json).unwrap();
         assert!(
             legacy
@@ -743,7 +770,16 @@ mod tests {
                 .iter()
                 .all(|node| node.start_byte.is_none() && node.end_byte.is_none())
         );
-        let _: Value = serde_json::to_value(legacy).unwrap();
+        let serialized: Value = serde_json::to_value(legacy).unwrap();
+        assert!(serialized.get("compatibility_sha1").is_none());
+
+        let mut malformed = serialized.clone();
+        malformed["compatibility_sha1"] = Value::String("not-a-digest".into());
+        assert!(serde_json::from_value::<DocumentProjectionSnapshot>(malformed).is_err());
+
+        let mut unknown = serialized;
+        unknown["future_field"] = Value::Bool(true);
+        assert!(serde_json::from_value::<DocumentProjectionSnapshot>(unknown).is_err());
     }
 
     #[test]

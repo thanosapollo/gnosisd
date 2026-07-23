@@ -1175,6 +1175,7 @@ mod tests {
                     target_id: "target".into(),
                 }],
                 content_sha256: "a".repeat(64),
+                _compatibility_sha1: None,
             }),
         })
     }
