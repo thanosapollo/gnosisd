@@ -41,6 +41,11 @@
   "Return non-nil when the current attempt awaits an answer."
   (equal "pending" (plist-get gnosis-review--attempt :status)))
 
+(defun gnosis-review--answerable-p ()
+  "Return non-nil when the current attempt may be answered safely."
+  (and (gnosis-review--pending-p)
+       (integerp gnosis-review--attempt-revision)))
+
 (defun gnosis-review--graded-p ()
   "Return non-nil when the current attempt can be mutated."
   (equal "graded" (plist-get gnosis-review--attempt :status)))
@@ -55,7 +60,9 @@
   "Return public-safe context text for review popup help."
   (format "%s — %s" (gnosis-review--session-label)
           (pcase (plist-get gnosis-review--attempt :status)
-            ("pending" "answer")
+            ("pending" (if (gnosis-review--answerable-p)
+                           "answer"
+                         "refresh"))
             ("graded" "result")
             ("committed" "continue")
             (_ "refresh"))))
@@ -72,7 +79,7 @@
   :exit-key "C-g"
   :description #'gnosis-review--popup-description
   :group "Attempt"
-  "RET" ("Answer" gnosis-review--answer :if #'gnosis-review--pending-p)
+  "RET" ("Answer" gnosis-review--answer :if #'gnosis-review--answerable-p)
   "n" ("Commit & next" gnosis-review--commit-next
        :if #'gnosis-review--graded-p)
   "o" ("Override & next" gnosis-review--override
@@ -392,20 +399,28 @@
 (defun gnosis-review--answer ()
   "Submit one structured response for the current pending attempt."
   (interactive)
-  (unless (equal (plist-get gnosis-review--attempt :status) "pending")
-    (user-error "Attempt already answered"))
+  (unless (gnosis-review--answerable-p)
+    (user-error "Attempt cannot be answered; refresh authoritative state"))
   (let* ((attempt-id (plist-get gnosis-review--attempt :attempt_id))
          (answer (gnosis-review--read-answer))
+         answered-attempt
          uncertain
          state)
     (condition-case condition
-        (progn
-          (gnosis-core-review-attempt-answer attempt-id answer)
-          (setq state (gnosis-core-review-attempt-state attempt-id)))
+        (setq answered-attempt
+              (gnosis-core-review-attempt-answer attempt-id answer))
       (gnosis-core-mutation-uncertain
-       (setq uncertain condition
-             state (gnosis-core-review-attempt-state attempt-id))))
+       (setq uncertain condition)))
+    (setq gnosis-review--attempt-revision nil)
+    (when answered-attempt
+      (setq gnosis-review--attempt answered-attempt))
+    (setq state (gnosis-core-review-attempt-state attempt-id))
     (let ((attempt (plist-get state :attempt)))
+      (unless (equal attempt-id (plist-get attempt :attempt_id))
+        (error "Authoritative attempt state changed identity"))
+      (when (and answered-attempt
+                 (equal "pending" (plist-get attempt :status)))
+        (error "Authoritative attempt state did not advance"))
       (when (and uncertain
                  (or (equal "pending" (plist-get attempt :status))
                      (not (equal answer (plist-get attempt :response)))))

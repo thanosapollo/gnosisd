@@ -10,7 +10,7 @@ history, authoring rules, and persistence.
 
 ** Current scope
 
-Run =M-x gnosis= to inspect daemon health and served OpenAPI version.  For an
+Run =M-x gnosis= for due review.  Run =M-x gnosis-dashboard= for the server-projected dashboard; =r= starts review, =t= starts topic review, =R= resumes an active session, =g= refreshes, =?= shows actions, and =q= closes it.  For an
 offline-editable Org working tree, customize =gnosis-nodes-dir= and run
 =M-x gnosis-nodes-bootstrap=.  Edit Org files normally; =M-x gnosis-nodes-sync=
 pulls authoritative changes before sending durable local operations.  Conflicts
@@ -18,9 +18,10 @@ preserve local content and require explicit Ediff resolution and acceptance.
 
 The client resolves operation identities and strict schemas from the daemon's
 live OpenAPI document; it has no handwritten Gnosis DTOs or direct route
-bindings.  There is no SQLite access and no local fallback.  Run =M-x
-gnosis-review= for due review or =M-x gnosis-review-resume= to recover the
-daemon's active session.
+bindings.  There is no SQLite access and no local fallback.  During review,
+=RET= answers, =n= commits the detected result, =o= overrides it, =s= changes
+suspension, =g= refreshes authoritative state, =?= shows actions, and =q= closes
+the local review buffer without aborting the server session.
 
 ** Requirements
 

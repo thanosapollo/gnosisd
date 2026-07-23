@@ -78,11 +78,9 @@ Set authinfo file permissions to 0600.  Change the lookup user when required:
 (setopt gnosis-core-auth-user "review-device")
 #+end_src
 
-* Foundation dashboard
+* Dashboard
 
-Run =M-x gnosis= to open the foundation dashboard.  It checks public =/health=
-readiness and displays the OpenAPI version and path count from
-=/v1/openapi.json=.  Press =g= to refresh and =q= to close the buffer.
+Run =M-x gnosis= for due review.  Run =M-x gnosis-dashboard= for the server-projected dashboard.  It shows review, queue, content, activity, and active-session state without deriving domain data locally.  Press =r= for due review, =t= for topic review, =R= to resume an active session, =g= to refresh, =?= for actions, and =q= to close the buffer.
 
 * Review
 
@@ -92,6 +90,10 @@ to inspect an active durable session.  The UI renders the server presentation
 and submits structured text, text-vector, or choice responses.  The daemon
 alone grades, reveals answers, applies accepted-result overrides and desired
 suspension, schedules, persists, and commits.
+
+Press =RET= to answer, =n= to commit the detected result, =o= to override it,
+=s= to change suspension, =g= to refresh authoritative state, =?= for actions,
+and =q= to close the local buffer without aborting the durable session.
 
 Review writes are single-shot.  Revision conflicts refresh the authoritative
 attempt.  If delivery is unknown, Gnosis reads the active session or attempt

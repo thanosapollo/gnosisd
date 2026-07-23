@@ -74,6 +74,11 @@
       (insert-file-contents file)
       (should (re-search-forward "OpenAPI" nil t))
       (should (re-search-forward "gnosis-nodes-bootstrap" nil t))
+      (goto-char (point-min))
+      (should (search-forward "M-x gnosis= for due review" nil t))
+      (should (search-forward
+               "M-x gnosis-dashboard= for the server-projected dashboard"
+               nil t))
       (should-not (re-search-forward "POST /v1/themata" nil t))))
   (with-temp-buffer
     (insert-file-contents "docs/gnosis.org")
