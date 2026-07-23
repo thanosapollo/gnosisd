@@ -169,7 +169,9 @@
             "\n\n")
     (if pending
         (insert (propertize
-                 "RET Answer   g Refresh   q Close review   ? Actions"
+                 (if gnosis-review--answer-locked-p
+                     "g Refresh   q Close review   ? Actions"
+                   "RET Answer   g Refresh   q Close review   ? Actions")
                  'face 'gnosis-face-hint))
       (let* ((detected (plist-get gnosis-review--attempt :detected_success))
              (accepted (plist-get gnosis-review--attempt :accepted_success))
@@ -408,13 +410,13 @@
          answered-attempt
          uncertain
          state)
+    (setq gnosis-review--attempt-revision nil
+          gnosis-review--answer-locked-p t)
     (condition-case condition
         (setq answered-attempt
               (gnosis-core-review-attempt-answer attempt-id answer))
       (gnosis-core-mutation-uncertain
        (setq uncertain condition)))
-    (setq gnosis-review--attempt-revision nil
-          gnosis-review--answer-locked-p t)
     (when answered-attempt
       (setq gnosis-review--attempt answered-attempt))
     (setq state (gnosis-core-review-attempt-state attempt-id))

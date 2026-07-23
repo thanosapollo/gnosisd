@@ -347,6 +347,36 @@
         (should (= 2 gnosis-review--attempt-revision))
         (should (= posts 1))))))
 
+(ert-deftest gnosis-review-answer-quit-after-dispatch-keeps-retry-locked ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt (gnosis-test-review--attempt "pending"))
+    (let ((posts 0))
+      (cl-letf (((symbol-function 'gnosis-review--read-answer)
+                 (lambda () '(:kind "text" :value "x")))
+                ((symbol-function 'gnosis-core-review-attempt-answer)
+                 (lambda (&rest _)
+                   (cl-incf posts)
+                   (signal 'quit nil))))
+        (condition-case nil
+            (gnosis-review--answer)
+          (quit nil))
+        (should (= posts 1))
+        (should gnosis-review--answer-locked-p)
+        (should-not (keymap-lookup gnosis-review-mode-map "RET"))
+        (should-error (gnosis-review--answer) :type 'user-error)
+        (should (= posts 1))))))
+
+(ert-deftest gnosis-review-render-locked-pending-attempt-offers-refresh-only ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-review--answer-locked-p t)
+    (gnosis-review--render)
+    (should (string-match-p "g Refresh" (buffer-string)))
+    (should-not (string-match-p "RET Answer" (buffer-string)))))
+
 (ert-deftest gnosis-review-answer-uncertainty-recovers-with-get-not-retry ()
   (with-temp-buffer
     (gnosis-review-mode)
