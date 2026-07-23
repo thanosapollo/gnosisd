@@ -296,6 +296,7 @@
     (gnosis--render-dashboard state)
     (setq gnosis-dashboard--projection state)))
 
+;;;###autoload
 (defun gnosis-dashboard ()
   "Open the server-projected Gnosis dashboard."
   (interactive)

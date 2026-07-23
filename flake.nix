@@ -151,6 +151,8 @@
               ${checkEnvironment}
               installDir="${gnosisEl}/share/emacs/site-lisp"
               emacs --batch -q -L "$installDir" -L tests \
+                -l "$installDir/gnosis-autoloads.el" \
+                --eval "(unless (commandp 'gnosis-dashboard) (error \"Missing gnosis-dashboard autoload\"))" \
                 --eval "(require 'gnosis-package-smoke)" \
                 -f ert-run-tests-batch-and-exit
               runHook postBuild
