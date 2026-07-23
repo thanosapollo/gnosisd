@@ -29,6 +29,7 @@
 (defvar-local gnosis-review--session nil)
 (defvar-local gnosis-review--attempt nil)
 (defvar-local gnosis-review--attempt-revision nil)
+(defvar-local gnosis-review--answer-locked-p nil)
 
 (defcustom gnosis-review-input-method-alist
   '(("greek" . "greek")
@@ -44,7 +45,7 @@
 (defun gnosis-review--answerable-p ()
   "Return non-nil when the current attempt may be answered safely."
   (and (gnosis-review--pending-p)
-       (integerp gnosis-review--attempt-revision)))
+       (not gnosis-review--answer-locked-p)))
 
 (defun gnosis-review--graded-p ()
   "Return non-nil when the current attempt can be mutated."
@@ -322,7 +323,8 @@
       (let ((attempt (gnosis-core-review-attempt-begin session-id)))
         (setq gnosis-review--session session
               gnosis-review--attempt attempt
-              gnosis-review--attempt-revision nil)
+              gnosis-review--attempt-revision nil
+              gnosis-review--answer-locked-p nil)
         (gnosis-review--render t)))))
 
 (defun gnosis-review--open (session)
@@ -411,7 +413,8 @@
               (gnosis-core-review-attempt-answer attempt-id answer))
       (gnosis-core-mutation-uncertain
        (setq uncertain condition)))
-    (setq gnosis-review--attempt-revision nil)
+    (setq gnosis-review--attempt-revision nil
+          gnosis-review--answer-locked-p t)
     (when answered-attempt
       (setq gnosis-review--attempt answered-attempt))
     (setq state (gnosis-core-review-attempt-state attempt-id))

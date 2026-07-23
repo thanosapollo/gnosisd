@@ -76,9 +76,13 @@
       (should (re-search-forward "gnosis-nodes-bootstrap" nil t))
       (goto-char (point-min))
       (should (search-forward "M-x gnosis= for due review" nil t))
-      (should (search-forward
-               "M-x gnosis-dashboard= for the server-projected dashboard"
-               nil t))
+      (should (re-search-forward
+               "M-x gnosis-dashboard= for the server-projected dashboard" nil t))
+      (should (re-search-forward "=n= commits the current accepted result" nil t))
+      (should (search-forward "=g= refreshes" nil t))
+      (should (search-forward "committed attempt" nil t))
+      (goto-char (point-min))
+      (should-not (re-search-forward "commits the detected result" nil t))
       (should-not (re-search-forward "POST /v1/themata" nil t))))
   (with-temp-buffer
     (insert-file-contents "docs/gnosis.org")

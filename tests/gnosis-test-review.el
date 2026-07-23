@@ -176,6 +176,32 @@
             (should (equal "keep" (buffer-string)))))
       (kill-buffer buffer))))
 
+(ert-deftest gnosis-review-open-pending-attempt-can-answer-immediately-once ()
+  (let ((buffer (get-buffer-create gnosis-review-buffer-name))
+        (posts 0))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer)
+                   (lambda (target &rest _) (set-buffer target)))
+                  ((symbol-function 'gnosis-core-review-attempt-begin)
+                   (lambda (_) (gnosis-test-review--attempt "pending")))
+                  ((symbol-function 'gnosis-review--read-answer)
+                   (lambda () '(:kind "text" :value "response")))
+                  ((symbol-function 'gnosis-core-review-attempt-answer)
+                   (lambda (&rest _)
+                     (setq posts (1+ posts))
+                     (gnosis-test-review--attempt "graded")))
+                  ((symbol-function 'gnosis-core-review-attempt-state)
+                   (lambda (_)
+                     (list :attempt_revision 2
+                           :attempt (gnosis-test-review--attempt "graded")))))
+          (gnosis-review--open (gnosis-test-review--session))
+          (should (eq (keymap-lookup gnosis-review-mode-map "RET")
+                      #'gnosis-review--answer))
+          (gnosis-review--answer)
+          (should (= posts 1))
+          (should-not (keymap-lookup gnosis-review-mode-map "RET")))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
   (let ((gnosis-review--attempt
          (gnosis-test-review--attempt
@@ -496,6 +522,27 @@
         (should-error (gnosis-review--finish gnosis-core--json-false)
                       :type 'gnosis-core-mutation-uncertain)
         (should (= commits 0))))))
+
+(ert-deftest gnosis-review-commit-and-override-use-accepted-result ()
+  (dolist (case `((,#'gnosis-review--commit-next . ,gnosis-core--json-false)
+                  (,#'gnosis-review--override . t)))
+    (with-temp-buffer
+      (gnosis-review-mode)
+      (setq gnosis-review--attempt
+            (plist-put (gnosis-test-review--attempt "graded")
+                       :accepted_success gnosis-core--json-false)
+            gnosis-review--attempt-revision 4)
+      (let (desired)
+        (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
+                   (lambda (_ _ value)
+                     (setq desired value)
+                     (list :attempt_revision 5
+                           :attempt (plist-put gnosis-review--attempt
+                                               :accepted_success value))))
+                  ((symbol-function 'gnosis-core-review-attempt-commit) #'ignore)
+                  ((symbol-function 'gnosis-review--next) #'ignore))
+          (funcall (car case))
+          (should (eq desired (cdr case))))))))
 
 (ert-deftest gnosis-review-commit-uncertainty-recovers-committed-attempt ()
   (with-temp-buffer

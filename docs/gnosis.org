@@ -91,9 +91,10 @@ and submits structured text, text-vector, or choice responses.  The daemon
 alone grades, reveals answers, applies accepted-result overrides and desired
 suspension, schedules, persists, and commits.
 
-Press =RET= to answer, =n= to commit the detected result, =o= to override it,
-=s= to change suspension, =g= to refresh authoritative state, =?= for actions,
-and =q= to close the local buffer without aborting the durable session.
+=RET= answers.  =n= commits the current accepted result.  =o= inverts and
+commits that result.  =s= changes suspension.  =g= refreshes authoritative
+state or continues a committed attempt.  =?= shows actions.  =q= closes the
+local buffer without aborting the durable session.
 
 Review writes are single-shot.  Revision conflicts refresh the authoritative
 attempt.  If delivery is unknown, Gnosis reads the active session or attempt

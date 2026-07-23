@@ -19,9 +19,10 @@ preserve local content and require explicit Ediff resolution and acceptance.
 The client resolves operation identities and strict schemas from the daemon's
 live OpenAPI document; it has no handwritten Gnosis DTOs or direct route
 bindings.  There is no SQLite access and no local fallback.  During review,
-=RET= answers, =n= commits the detected result, =o= overrides it, =s= changes
-suspension, =g= refreshes authoritative state, =?= shows actions, and =q= closes
-the local review buffer without aborting the server session.
+=RET= answers,
+=n= commits the current accepted result, =o= inverts and commits that result,
+=s= changes suspension, =g= refreshes or continues a committed attempt, =?=
+shows actions, and =q= closes the local buffer without aborting the session.
 
 ** Requirements
 
