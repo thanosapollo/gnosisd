@@ -61,6 +61,17 @@
                             text))
     (should-not (string-match-p "private-session-id\\|owner" text))))
 
+(ert-deftest gnosis-dashboard-renders-missing-success-rate ()
+  (let* ((state (copy-tree (gnosis-test-dashboard--projection)))
+         (window (plist-get state :window)))
+    (setf (plist-get window :success_rate) gnosis-core--json-null)
+    (with-temp-buffer
+      (gnosis-dashboard-mode)
+      (gnosis--render-dashboard state)
+      (goto-char (point-min))
+      (should (search-forward "success rate unavailable" nil t))
+      (should (eq 'shadow (get-text-property (1- (point)) 'face))))))
+
 (ert-deftest gnosis-dashboard-refresh-preserves-buffer-on-failure ()
   (with-temp-buffer
     (gnosis-dashboard-mode)

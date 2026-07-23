@@ -186,6 +186,13 @@
            '("g Refresh" "? Actions" "q Quit"))
    "   "))
 
+(defun gnosis--dashboard-success-rate (window)
+  "Return display text for WINDOW success rate."
+  (let ((rate (plist-get window :success_rate)))
+    (if (eq rate gnosis-core--json-null)
+        "unavailable"
+      (format "%.2f" rate))))
+
 (defun gnosis--dashboard-text (state)
   "Return display text for server dashboard projection STATE."
   (let ((today (plist-get state :today))
@@ -208,10 +215,10 @@
               (plist-get content :archived_themata)
               (plist-get content :active_documents)
               (plist-get content :active_nodes))
-      (format "Last %d days: %d reviews, success rate %.2f"
+      (format "Last %d days: %d reviews, success rate %s"
               (plist-get window :days)
               (plist-get (plist-get window :totals) :review_count)
-              (plist-get window :success_rate))
+              (gnosis--dashboard-success-rate window))
       (gnosis--dashboard-session-text (plist-get state :active_session))
       ""
       (gnosis--dashboard-actions (plist-get state :active_session)))
@@ -256,7 +263,11 @@
                  (,(format "%d reviews"
                            (plist-get (plist-get window :totals) :review_count))
                   . font-lock-type-face)
-                 (,(format "%.2f" (plist-get window :success_rate)) . success)))
+                 (,(gnosis--dashboard-success-rate window)
+                  . ,(if (eq (plist-get window :success_rate)
+                            gnosis-core--json-null)
+                         'shadow
+                       'success))))
         (goto-char (point-min))
         (gnosis--face-dashboard-match (car spec) (cdr spec))))
     (goto-char (point-min))
