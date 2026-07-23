@@ -52,6 +52,7 @@
             "tests/gnosis-test-core-integration.el"
             "tests/gnosis-test-dashboard.el"
             "tests/gnosis-test-edit.el"
+            "tests/gnosis-test-entry-smoke.el"
             "tests/gnosis-test-nodes.el"
             "tests/gnosis-test-boundary.el"
             "tests/gnosis-test-review.el"
