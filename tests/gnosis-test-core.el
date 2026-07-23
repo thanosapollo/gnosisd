@@ -6,6 +6,28 @@
 (require 'ert)
 (require 'gnosis-core)
 
+(defun gnosis-test-core--node (&rest overrides)
+  "Return a valid node projection with OVERRIDES."
+  (let ((node
+         (copy-tree
+          `(:node_id "node-a"
+            :document_id "document-a"
+            :logical_path "notes/a.org"
+            :document_revision 3
+            :content_sha256
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            :title "Alpha"
+            :title_path ["Root" "Alpha"]
+            :tags ["one" "two"]
+            :level 2
+            :start_byte ,gnosis-core--json-null
+            :end_byte ,gnosis-core--json-null
+            :active t)
+          t)))
+    (while overrides
+      (setq node (plist-put node (pop overrides) (pop overrides))))
+    node))
+
 (defvar gnosis-core--contract-cache)
 
 (defun gnosis-test-core--http-buffer (status body &optional content-type)
@@ -401,13 +423,18 @@ CONTENT-TYPE defaults to application/json."
                  (push arguments calls)
                  (pcase (car arguments)
                    ("get_themata__id_" '(:thema_id "opaque/thema?id"))
-                   ("get_nodes__id_" '(:node_id "opaque/node?id"))
+                   ("get_nodes__id_"
+                    (gnosis-test-core--node
+                     :node_id "opaque/node?id"))
+                   ("get_nodes"
+                    `(:items [] :next ,gnosis-core--json-null))
                    (_ '(:projection t))))))
       (should (equal '(:projection t) (gnosis-core-dashboard 90)))
-      (should (equal '(:projection t)
+      (should (equal `(:items [] :next ,gnosis-core--json-null)
                      (gnosis-core-nodes "logic" "opaque/cursor" 25)))
-      (should (equal '(:node_id "opaque/node?id")
-                     (gnosis-core-node "opaque/node?id")))
+      (should (equal "opaque/node?id"
+                     (plist-get (gnosis-core-node "opaque/node?id")
+                                :node_id)))
       (should (equal '(:thema_id "opaque/thema?id")
                      (gnosis-core-thema "opaque/thema?id"))))
     (should
@@ -422,7 +449,10 @@ CONTENT-TYPE defaults to application/json."
 (ert-deftest gnosis-core-read-bindings-omit-absent-query-values ()
   (let (calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
-               (lambda (&rest arguments) (push arguments calls) nil)))
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 (when (equal (car arguments) "get_nodes")
+                   `(:items [] :next ,gnosis-core--json-null)))))
       (gnosis-core-dashboard)
       (gnosis-core-nodes nil nil nil))
     (should (equal '(("get_dashboard") ("get_nodes"))
@@ -430,9 +460,53 @@ CONTENT-TYPE defaults to application/json."
 
 (ert-deftest gnosis-core-node-binding-rejects-wrong-response-identity ()
   (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
-             (lambda (&rest _) '(:node_id "other"))))
+             (lambda (&rest _)
+               (gnosis-test-core--node :node_id "other"))))
     (should-error (gnosis-core-node "expected")
                   :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-core-node-binding-rejects-invalid-node-metadata ()
+  (dolist (node
+           (list
+            (gnosis-test-core--node :document_revision 0)
+            (gnosis-test-core--node :content_sha256 "not-a-digest")
+            (gnosis-test-core--node :tags ["same" "same"])
+            (gnosis-test-core--node :start_byte 4)
+            (gnosis-test-core--node :start_byte 4 :end_byte 4)
+            (gnosis-test-core--node :active nil)))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest _) node)))
+      (should-error (gnosis-core-node "node-a")
+                    :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-node-page-validates-pagination-contract ()
+  (let ((first (gnosis-test-core--node :node_id "node-b"))
+        (second (gnosis-test-core--node :node_id "node-c")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest _)
+                 `(:items [,first ,second] :next "node-c"))))
+      (should (equal "node-c"
+                     (plist-get (gnosis-core-nodes nil "node-a" 2) :next))))
+    (dolist (case
+             (list
+              (list `(:items [,first ,second] :next "node-c")
+                    "node-a" 1)
+              (list `(:items [,second ,first] :next "node-b")
+                    "node-a" 2)
+              (list `(:items [,first] :next "wrong")
+                    "node-a" 1)
+              (list `(:items [,first] :next ,gnosis-core--json-null)
+                    "node-a" 1)
+              (list `(:items [,first] :next "node-b")
+                    "node-b" 1)))
+      (let ((page (nth 0 case))
+            (after (nth 1 case))
+            (limit (nth 2 case)))
+        (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+                   (lambda (&rest _) page)))
+          (should-error
+           (gnosis-core-nodes nil after limit)
+           :type 'gnosis-core-protocol-error))))))
 
 (ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))

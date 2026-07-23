@@ -1205,22 +1205,117 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
        "get_dashboard" nil (list (cons "days" days)))
     (gnosis-core--typed-request "get_dashboard")))
 
+(defun gnosis-core--opaque-id-p (value)
+  "Return non-nil when VALUE is a valid opaque protocol identifier."
+  (and (stringp value)
+       (not (string-empty-p (string-trim value)))
+       (<= (string-bytes value) 128)))
+
+(defun gnosis-core--document-path-p (value)
+  "Return non-nil when VALUE is a confined relative document path."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (not (file-name-absolute-p value))
+       (not (string-match-p "[\\\\\0]" value))
+       (not (string-prefix-p "assets/" value))
+       (cl-every (lambda (part)
+                   (and (not (string-empty-p part))
+                        (not (member part '("." "..")))))
+                 (split-string value "/" nil))))
+
+(defun gnosis-core--unique-vector-p (values)
+  "Return non-nil when string vector VALUES has no duplicates."
+  (and
+   (vectorp values)
+   (let ((seen (make-hash-table :test #'equal)))
+     (cl-loop
+      for value across values
+      always (and (stringp value)
+                  (not (gethash value seen))
+                  (progn (puthash value t seen) t))))))
+
+(defun gnosis-core--node-span-p (start end)
+  "Return non-nil when START and END form a valid optional byte span."
+  (or (and (eq start gnosis-core--json-null)
+           (eq end gnosis-core--json-null))
+      (and (natnump start) (natnump end) (< start end))))
+
+(defun gnosis-core--node-projection-p (node)
+  "Return non-nil when NODE satisfies semantic wire invariants."
+  (let ((title (plist-get node :title))
+        (path (plist-get node :title_path))
+        (tags (plist-get node :tags)))
+    (and
+     (gnosis-core--opaque-id-p (plist-get node :node_id))
+     (gnosis-core--opaque-id-p (plist-get node :document_id))
+     (gnosis-core--document-path-p (plist-get node :logical_path))
+     (natnump (plist-get node :document_revision))
+     (> (plist-get node :document_revision) 0)
+     (stringp (plist-get node :content_sha256))
+     (string-match-p
+      "\\`[0-9a-f]\\{64\\}\\'" (plist-get node :content_sha256))
+     (stringp title)
+     (not (string-empty-p (string-trim title)))
+     (vectorp path)
+     (> (length path) 0)
+     (cl-every (lambda (part)
+                 (and (stringp part)
+                      (not (string-empty-p (string-trim part)))))
+               path)
+     (equal title (aref path (1- (length path))))
+     (gnosis-core--unique-vector-p tags)
+     (cl-every (lambda (tag) (not (string-empty-p (string-trim tag)))) tags)
+     (natnump (plist-get node :level))
+     (gnosis-core--node-span-p
+      (plist-get node :start_byte) (plist-get node :end_byte))
+     (memq (plist-get node :active) (list t gnosis-core--json-false)))))
+
+(defun gnosis-core--increasing-node-ids-p (items after)
+  "Return non-nil when ITEMS increase strictly after optional AFTER."
+  (let ((previous after))
+    (cl-loop
+     for node across items
+     for node-id = (plist-get node :node_id)
+     always (prog1
+                (or (null previous) (string-lessp previous node-id))
+              (setq previous node-id)))))
+
+(defun gnosis-core--node-page-p (page after limit)
+  "Return non-nil when PAGE satisfies node pagination after AFTER at LIMIT."
+  (let* ((items (plist-get page :items))
+         (next (plist-get page :next))
+         (last (and (vectorp items) (> (length items) 0)
+                    (plist-get (aref items (1- (length items))) :node_id))))
+    (and
+     (vectorp items)
+     (<= (length items) limit)
+     (cl-every #'gnosis-core--node-projection-p items)
+     (gnosis-core--increasing-node-ids-p items after)
+     (if last
+         (equal next last)
+       (eq next gnosis-core--json-null)))))
+
 (defun gnosis-core-nodes (&optional query after limit)
   "Return a server node page filtered by optional QUERY, AFTER, and LIMIT."
   (let ((parameters
          (delq nil (list (and after (cons "after" after))
                          (and limit (cons "limit" limit))
                          (and query (cons "q" query))))))
-    (if parameters
-        (gnosis-core--typed-read-request "get_nodes" nil parameters)
-      (gnosis-core--typed-read-request "get_nodes"))))
+    (let ((page
+           (if parameters
+               (gnosis-core--typed-read-request "get_nodes" nil parameters)
+             (gnosis-core--typed-read-request "get_nodes"))))
+      (unless (gnosis-core--node-page-p page after (or limit 100))
+        (gnosis-core--invalid "Invalid Gnosis node page"))
+      page)))
 
 (defun gnosis-core-node (node-id)
   "Return the server projection for opaque NODE-ID."
   (let ((projection
          (gnosis-core--typed-read-request
           "get_nodes__id_" (list (cons "id" node-id)))))
-    (unless (equal node-id (plist-get projection :node_id))
+    (unless (and (equal node-id (plist-get projection :node_id))
+                 (gnosis-core--node-projection-p projection))
       (gnosis-core--invalid "Gnosis node identity mismatch"))
     projection))
 
