@@ -366,7 +366,7 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup verify BACKUP_PATH
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 14
+  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 2
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup restore-validate BACKUP_PATH \
   --temporary-directory "$HOME/.local/share/gnosis/restore-check"
