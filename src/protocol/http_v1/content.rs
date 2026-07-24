@@ -664,14 +664,22 @@ pub struct NodeCatalogPageV1 {
 }
 
 impl NodeCatalogPageV1 {
-    pub(crate) fn from_application(items: &[NodeCatalogRecord], generation: String) -> Self {
+    pub(crate) fn from_application(
+        items: &[NodeCatalogRecord],
+        generation: String,
+        has_more: bool,
+    ) -> Self {
         Self {
             generation,
             items: items
                 .iter()
                 .map(NodeCatalogItemV1::from_application)
                 .collect(),
-            next: items.last().map(|item| item.node_id.clone()),
+            next: if has_more {
+                items.last().map(|item| item.node_id.clone())
+            } else {
+                None
+            },
         }
     }
 }

@@ -47,6 +47,7 @@ pub(crate) struct ReplicaState {
 pub(crate) struct NodeCatalogPage {
     pub(crate) state: ReplicaState,
     pub(crate) items: Vec<NodeCatalogRecord>,
+    pub(crate) has_more: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

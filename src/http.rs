@@ -1485,6 +1485,7 @@ async fn node_catalog(
     let generation = replica_state_response(&page.state)
         .map_err(ApiError::replica_wire)?
         .cursor;
+    let item_count = page.items.len();
     run_blocking(move || {
         bounded_projection_page(
             &page.items,
@@ -1492,6 +1493,7 @@ async fn node_catalog(
                 Ok(NodeCatalogPageV1::from_application(
                     items,
                     generation.clone(),
+                    page.has_more || items.len() < item_count,
                 ))
             },
             "node catalog item exceeds the response limit",
@@ -5549,7 +5551,7 @@ mod tests {
         assert_eq!(body["items"][0]["title_path"], json!(["Alpha"]));
         assert!(body["items"][0].get("document_revision").is_none());
         assert!(body["items"][0].get("content_sha256").is_none());
-        assert_eq!(body["next"], "node-a");
+        assert!(body["next"].is_null());
 
         let invalid = app
             .clone()

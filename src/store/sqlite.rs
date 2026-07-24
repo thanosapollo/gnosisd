@@ -1452,7 +1452,7 @@ impl SqliteStore {
             .map_err(StoreError::storage)?;
         let rows = statement
             .query_map(
-                params![document_id, after, i64::from(limit)],
+                params![document_id, after, i64::from(limit) + 1],
                 |row| -> rusqlite::Result<_> {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -1464,7 +1464,7 @@ impl SqliteStore {
                 },
             )
             .map_err(StoreError::storage)?;
-        let items = rows
+        let mut items = rows
             .map(|row| {
                 let (node_id, document_id, logical_path, title_path, active) =
                     row.map_err(StoreError::storage)?;
@@ -1477,7 +1477,13 @@ impl SqliteStore {
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        Ok(NodeCatalogPage { state, items })
+        let has_more = items.len() > usize::from(limit);
+        items.truncate(usize::from(limit));
+        Ok(NodeCatalogPage {
+            state,
+            items,
+            has_more,
+        })
     }
 
     pub(crate) fn graph_nodes(
@@ -5574,6 +5580,7 @@ mod tests {
 
         let first_page = store.node_catalog(&device_id, None, 2, None).unwrap();
         assert_eq!(first_page.state.cursor, 3);
+        assert!(first_page.has_more);
         assert_eq!(
             first_page
                 .items
@@ -5590,11 +5597,13 @@ mod tests {
             .unwrap();
         assert_eq!(remainder.state, first_page.state);
         assert_eq!(remainder.items[0].node_id, "b-root");
+        assert!(!remainder.has_more);
 
         let filtered = store
             .node_catalog(&device_id, Some("document-a"), 10, None)
             .unwrap();
         assert_eq!(filtered.items.len(), 2);
+        assert!(!filtered.has_more);
         assert!(
             filtered
                 .items
