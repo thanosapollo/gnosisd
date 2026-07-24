@@ -29,9 +29,9 @@ pub(crate) use client_views::{
 pub(crate) use content::{
     AssetHead, AssetRevision, ContentChange, DocumentHead, DocumentProjectionSnapshot,
     DocumentReplicaRevision, DocumentRevision, MAX_DOCUMENT_PROJECTION_BYTES,
-    MAX_DOCUMENT_SOURCE_BYTES, NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote,
-    PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
-    ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
+    MAX_DOCUMENT_SOURCE_BYTES, NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset,
+    PreparedNote, PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
+    ThemaRecord, ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
     prepare_document, prepare_thema, retained_asset_paths, stored_thema_content, thema_content,
     validate_asset_path, validate_blob_metadata, validate_document_path,
     validate_offline_thema_assets,
@@ -78,6 +78,6 @@ pub(crate) use review::{
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord};
 pub(crate) use sync::{
-    ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsRevision,
-    SnapshotPage, SnapshotPosition,
+    NodeCatalogPage, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision,
+    SettingsRevision, SnapshotPage, SnapshotPosition,
 };

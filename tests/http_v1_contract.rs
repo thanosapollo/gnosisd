@@ -1,7 +1,7 @@
 use gnosis_core::protocol::http_v1::{
     ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
     AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
-    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1,
+    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodeCatalogPageV1, NodePageV1,
     NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
     OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
     OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
@@ -677,6 +677,13 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
             "content_sha256":"a".repeat(64),"start_byte":null,"end_byte":null,
             "active":false}],
         "next":"legacy"
+    }));
+    assert_round_trip::<NodeCatalogPageV1>(json!({
+        "generation":"opaque-generation",
+        "items":[{"node_id":"node","document_id":"document",
+            "logical_path":"notes/example.org","title_path":["Parent","Node"],
+            "active":true}],
+        "next":"node"
     }));
     let missing_end = json!({
         "node_id":"node","document_id":"document","logical_path":"notes/example.org",

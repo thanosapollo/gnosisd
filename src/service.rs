@@ -39,10 +39,11 @@ use crate::{
         AnswerInput, ApplicationError, AssetHead, ContentChange,
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
         DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
-        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord, NodeThemaAssociation,
-        OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
-        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
+        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeCatalogPage, NodeRecord,
+        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
+        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
+        PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
         PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
         ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
         ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
@@ -687,6 +688,24 @@ impl ServiceHandle {
     ) -> Result<Vec<NodeRecord>, ServiceError> {
         request(&self.sender, |response| StoreCommand::SearchNodes {
             query,
+            limit,
+            after,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn node_catalog(
+        &self,
+        device_id: String,
+        document_id: Option<String>,
+        limit: u16,
+        after: Option<String>,
+    ) -> Result<NodeCatalogPage, ServiceError> {
+        request(&self.sender, |response| StoreCommand::NodeCatalog {
+            device_id,
+            document_id,
             limit,
             after,
             response,
@@ -1635,6 +1654,13 @@ enum StoreCommand {
         after: Option<String>,
         response: oneshot::Sender<StoreResult<Vec<NodeRecord>>>,
     },
+    NodeCatalog {
+        device_id: String,
+        document_id: Option<String>,
+        limit: u16,
+        after: Option<String>,
+        response: oneshot::Sender<StoreResult<NodeCatalogPage>>,
+    },
     GraphNodes {
         node_id: String,
         inbound: bool,
@@ -2558,6 +2584,16 @@ fn run_store_command(
         } => send(
             response,
             store.search_nodes(&query, limit, after.as_deref()),
+        ),
+        StoreCommand::NodeCatalog {
+            device_id,
+            document_id,
+            limit,
+            after,
+            response,
+        } => send(
+            response,
+            store.node_catalog(&device_id, document_id.as_deref(), limit, after.as_deref()),
         ),
         StoreCommand::GraphNodes {
             node_id,

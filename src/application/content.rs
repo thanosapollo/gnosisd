@@ -271,6 +271,15 @@ pub(crate) struct NodeRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NodeCatalogRecord {
+    pub(crate) node_id: String,
+    pub(crate) document_id: String,
+    pub(crate) logical_path: String,
+    pub(crate) title_path: Vec<String>,
+    pub(crate) active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NodeThemaAssociation {
     pub(crate) thema_id: String,
     pub(crate) relation: ThemaConceptRelation,

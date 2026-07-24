@@ -28,11 +28,12 @@ use crate::{
     application::{
         AssetHead, AssetRevision, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead,
         DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision,
-        MAX_DOCUMENT_PROJECTION_BYTES, MAX_DOCUMENT_SOURCE_BYTES, NewDevice, NodeRecord,
-        NodeThemaAssociation, PreparedAsset, PreparedNote, PreparedThema, ReplicaChange,
-        ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsInput, SettingsRecord,
-        SettingsRevision, SnapshotPage, SnapshotPosition, ThemaRecord, ThemaRevision,
-        parse_stored_scopes, path_key, stored_scopes, stored_thema_content, validate_document_path,
+        MAX_DOCUMENT_PROJECTION_BYTES, MAX_DOCUMENT_SOURCE_BYTES, NewDevice, NodeCatalogPage,
+        NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote,
+        PreparedThema, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision,
+        SettingsInput, SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition,
+        ThemaRecord, ThemaRevision, parse_stored_scopes, path_key, stored_scopes,
+        stored_thema_content, validate_document_path,
     },
     blob::BlobMeta,
 };
@@ -1418,6 +1419,65 @@ impl SqliteStore {
             .collect::<Result<Vec<String>, _>>()
             .map_err(StoreError::storage)?;
         load_node_records(&self.connection, ids)
+    }
+
+    pub(crate) fn node_catalog(
+        &self,
+        device_id: &str,
+        document_id: Option<&str>,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<NodeCatalogPage, StoreError> {
+        let state = self.replica_state(device_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT node_id, document_id, logical_path, title_path_json, active
+                 FROM (
+                     SELECT node.node_id, node.document_id, document.logical_path,
+                            node.title_path_json, node.active
+                     FROM node JOIN document USING(document_id)
+                     UNION ALL
+                     SELECT retired.node_id, retired.document_id, retired.logical_path,
+                            retired.title_path_json, 0
+                     FROM retired_node AS retired
+                     WHERE NOT EXISTS(
+                         SELECT 1 FROM node WHERE node_id = retired.node_id
+                     )
+                 )
+                 WHERE (?1 IS NULL OR document_id = ?1)
+                   AND node_id > coalesce(?2, '')
+                 ORDER BY node_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        let rows = statement
+            .query_map(
+                params![document_id, after, i64::from(limit)],
+                |row| -> rusqlite::Result<_> {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::storage)?;
+        let items = rows
+            .map(|row| {
+                let (node_id, document_id, logical_path, title_path, active) =
+                    row.map_err(StoreError::storage)?;
+                Ok(NodeCatalogRecord {
+                    node_id,
+                    document_id,
+                    logical_path,
+                    title_path: from_json(&title_path, "node title path")?,
+                    active,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(NodeCatalogPage { state, items })
     }
 
     pub(crate) fn graph_nodes(
@@ -5458,6 +5518,89 @@ mod tests {
         assert_eq!(records[0].document_revision, 1);
         assert_eq!(records[0].content_sha256, prepared.blob_sha256);
         assert_eq!((records[0].start_byte, records[0].end_byte), (None, None));
+    }
+
+    #[test]
+    fn node_catalog_is_compact_filterable_and_generation_bound() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Catalog".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let first = prepare_note(
+            Some("document-a".into()),
+            "notes/a.org".into(),
+            concat!(
+                ":PROPERTIES:\n:ID: a-root\n:END:\n#+title: A\n",
+                "* Child\n:PROPERTIES:\n:ID: a-child\n:END:\n"
+            )
+            .into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&first, &first_blob, 2, None).unwrap();
+        let second = prepare_note(
+            Some("document-b".into()),
+            "notes/b.org".into(),
+            ":PROPERTIES:\n:ID: b-root\n:END:\n#+title: B\n".into(),
+            None,
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&second, &second_blob, 3, None).unwrap();
+        let replacement = prepare_note(
+            Some("document-a".into()),
+            "notes/a.org".into(),
+            ":PROPERTIES:\n:ID: a-root\n:END:\n#+title: A\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let replacement_blob = BlobMeta {
+            sha256: replacement.blob_sha256.clone(),
+            size_bytes: replacement.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&replacement, &replacement_blob, 4, None)
+            .unwrap();
+
+        let first_page = store.node_catalog(&device_id, None, 2, None).unwrap();
+        assert_eq!(first_page.state.cursor, 3);
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| (item.node_id.as_str(), item.active))
+                .collect::<Vec<_>>(),
+            vec![("a-child", false), ("a-root", true)]
+        );
+        assert_eq!(first_page.items[0].logical_path, "notes/a.org");
+        assert_eq!(first_page.items[0].title_path, ["A", "Child"]);
+
+        let remainder = store
+            .node_catalog(&device_id, None, 2, Some("a-root"))
+            .unwrap();
+        assert_eq!(remainder.state, first_page.state);
+        assert_eq!(remainder.items[0].node_id, "b-root");
+
+        let filtered = store
+            .node_catalog(&device_id, Some("document-a"), 10, None)
+            .unwrap();
+        assert_eq!(filtered.items.len(), 2);
+        assert!(
+            filtered
+                .items
+                .iter()
+                .all(|item| item.document_id == "document-a")
+        );
     }
 
     #[test]

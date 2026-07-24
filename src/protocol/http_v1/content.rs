@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use super::{DocumentOperationV1, FsrsConfigV1, ThemaKindV1};
 use crate::application::{
     AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
-    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, NodeThemaAssociation,
-    SettingsInput, SettingsRecord, ThemaMutationProjection, ThemaRecord,
+    DeviceMutationResult, DocumentHead, DocumentRevision, NodeCatalogRecord, NodeRecord,
+    NodeThemaAssociation, SettingsInput, SettingsRecord, ThemaMutationProjection, ThemaRecord,
 };
 use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
@@ -625,6 +625,53 @@ impl NodeV1 {
             start_byte: value.start_byte,
             end_byte: value.end_byte,
             active: value.active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCatalogItemV1 {
+    pub node_id: String,
+    pub document_id: String,
+    pub logical_path: String,
+    pub title_path: Vec<String>,
+    pub active: bool,
+}
+
+impl NodeCatalogItemV1 {
+    fn from_application(value: &NodeCatalogRecord) -> Self {
+        Self {
+            node_id: value.node_id.clone(),
+            document_id: value.document_id.clone(),
+            logical_path: value.logical_path.clone(),
+            title_path: value.title_path.clone(),
+            active: value.active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCatalogPageV1 {
+    #[schemars(length(min = 1, max = 512))]
+    pub generation: String,
+    #[schemars(length(max = 5000))]
+    pub items: Vec<NodeCatalogItemV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub next: Option<String>,
+}
+
+impl NodeCatalogPageV1 {
+    pub(crate) fn from_application(items: &[NodeCatalogRecord], generation: String) -> Self {
+        Self {
+            generation,
+            items: items
+                .iter()
+                .map(NodeCatalogItemV1::from_application)
+                .collect(),
+            next: items.last().map(|item| item.node_id.clone()),
         }
     }
 }

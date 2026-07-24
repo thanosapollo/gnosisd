@@ -52,7 +52,7 @@ use crate::{
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
             ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DesiredStateMutationResultV1,
             DeviceIdentityV1, DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
-            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1,
+            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodeCatalogPageV1, NodePageV1,
             NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
             OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
@@ -77,6 +77,7 @@ use crate::{
 
 const MAX_BODY: usize = MAX_OFFLINE_ASSET_BYTES as usize;
 const MAX_PAGE: u16 = 500;
+const MAX_NODE_CATALOG_PAGE: u16 = 5000;
 const MAX_REPLICA_PAGE: u16 = 32;
 
 #[derive(Clone)]
@@ -241,6 +242,7 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/themata/{id}/archive", post(archive_thema))
         .route("/v1/themata/{id}/unarchive", post(unarchive_thema))
         .route("/v1/nodes", get(search_nodes))
+        .route("/v1/nodes/catalog", get(node_catalog))
         .route("/v1/nodes/{id}", get(get_node))
         .route("/v1/nodes/{id}/themata", get(node_themata))
         .route("/v1/nodes/{id}/inbound", get(inbound_nodes))
@@ -355,6 +357,22 @@ fn replica_page_limit(value: Option<u16>) -> Result<u16, ApiError> {
         Ok(value)
     } else {
         Err(ApiError::bad_request("invalid replica page limit"))
+    }
+}
+
+#[derive(Deserialize)]
+struct NodeCatalogQuery {
+    document_id: Option<String>,
+    after: Option<String>,
+    limit: Option<u16>,
+}
+
+fn node_catalog_limit(value: Option<u16>) -> Result<u16, ApiError> {
+    let value = value.unwrap_or(MAX_NODE_CATALOG_PAGE);
+    if (1..=MAX_NODE_CATALOG_PAGE).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("invalid node catalog page limit"))
     }
 }
 
@@ -1440,6 +1458,49 @@ async fn search_nodes(
     .await
     .map(Json)
 }
+
+async fn node_catalog(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<NodeCatalogQuery>,
+) -> Result<Json<NodeCatalogPageV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    if let Some(document_id) = query.document_id.as_deref() {
+        DocumentId::new(document_id.to_owned())
+            .map_err(|_| ApiError::bad_request("invalid document ID"))?;
+    }
+    if let Some(after) = query.after.as_deref() {
+        NodeId::new(after.to_owned()).map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    }
+    let page = state
+        .service
+        .node_catalog(
+            principal.device_id,
+            query.document_id,
+            node_catalog_limit(query.limit)?,
+            query.after,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    let generation = replica_state_response(&page.state)
+        .map_err(ApiError::replica_wire)?
+        .cursor;
+    run_blocking(move || {
+        bounded_projection_page(
+            &page.items,
+            |items| {
+                Ok(NodeCatalogPageV1::from_application(
+                    items,
+                    generation.clone(),
+                ))
+            },
+            "node catalog item exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
+}
+
 async fn inbound_nodes(
     state: State<HttpState>,
     principal: Extension<DevicePrincipal>,
@@ -2805,6 +2866,13 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "NodePageV1",
             &["400", "401", "403", "408", "500", "503"],
         )),
+        ("/v1/nodes/catalog", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "NodeCatalogPageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
         ("/v1/nodes/{id}", "get") => Some(json_contract(
             "read",
             None,
@@ -2974,6 +3042,13 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
             json!({"name":"day","in":"query","required":true,"description":"Valid YYYYMMDD calendar date","schema":{"type":"integer","format":"uint32","minimum":10101}}),
             json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","format":"uint16","minimum":1,"maximum":100,"default":100}}),
             json!({"name":"after","in":"query","required":false,"schema":{"type":"string","minLength":1,"maxLength":MAX_DUE_CURSOR_BYTES}}),
+        ];
+    }
+    if path == "/v1/nodes/catalog" {
+        return vec![
+            json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
+            json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_NODE_CATALOG_PAGE,"default":MAX_NODE_CATALOG_PAGE}}),
+            json!({"name":"document_id","in":"query","required":false,"schema":{"type":"string"}}),
         ];
     }
     let paged = matches!(
@@ -3341,6 +3416,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<StagedBlobV1>();
     generator.subschema_for::<ThemaPageV1>();
     generator.subschema_for::<ThemaV1>();
+    generator.subschema_for::<NodeCatalogPageV1>();
     generator.subschema_for::<NodePageV1>();
     generator.subschema_for::<NodeV1>();
     generator.subschema_for::<NodeThemaAssociationPageV1>();
@@ -3489,6 +3565,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/themata/{id}/archive", "post"),
     ("/v1/themata/{id}/unarchive", "post"),
     ("/v1/nodes", "get"),
+    ("/v1/nodes/catalog", "get"),
     ("/v1/nodes/{id}", "get"),
     ("/v1/nodes/{id}/themata", "get"),
     ("/v1/nodes/{id}/inbound", "get"),
@@ -3531,15 +3608,15 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page,
-        bounded_projection_page, durable_created_thema_id, ensure_thema_response_budget,
-        openapi_document, optional_if_match, router,
+        ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, MAX_NODE_CATALOG_PAGE, OPENAPI_OPERATIONS,
+        bounded_due_page, bounded_projection_page, durable_created_thema_id,
+        ensure_thema_response_budget, openapi_document, optional_if_match, router,
     };
     use crate::application::{
         AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
         PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
-        SettingsInput, generate_device, prepare_asset, prepare_thema, presentation_content,
-        review_day_at, thema_content,
+        SettingsInput, generate_device, prepare_asset, prepare_document, prepare_thema,
+        presentation_content, review_day_at, thema_content,
     };
     use crate::domain::{DocumentId, DueThema, ThemaId, compute_transition, grade};
     use crate::protocol::{
@@ -3881,6 +3958,19 @@ mod tests {
             response_statuses(&api["paths"]["/v1/documents/{id}"]["get"]),
             set(&[
                 "200", "400", "401", "403", "404", "408", "422", "500", "503"
+            ])
+        );
+    }
+
+    #[test]
+    fn openapi_types_node_catalog_query_exactly() {
+        let api = openapi_document();
+        assert_eq!(
+            api["paths"]["/v1/nodes/catalog"]["get"]["parameters"],
+            json!([
+                {"name":"after","in":"query","required":false,"schema":{"type":"string"}},
+                {"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_NODE_CATALOG_PAGE,"default":MAX_NODE_CATALOG_PAGE}},
+                {"name":"document_id","in":"query","required":false,"schema":{"type":"string"}}
             ])
         );
     }
@@ -4814,6 +4904,15 @@ mod tests {
                 &["200", "400", "401", "403", "408", "500", "503"],
             ),
             expected_json_contract(
+                "/v1/nodes/catalog",
+                "get",
+                "read",
+                None,
+                "200",
+                "NodeCatalogPageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
                 "/v1/nodes/{id}",
                 "get",
                 "read",
@@ -5392,6 +5491,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_catalog_route_returns_compact_filterable_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("catalog".into(), vec!["read".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        for (document_id, path, node_id, title) in [
+            ("document-a", "notes/a.org", "node-a", "Alpha"),
+            ("document-b", "notes/b.org", "node-b", "Beta"),
+        ] {
+            let prepared = prepare_document(
+                Some(document_id.into()),
+                path.into(),
+                "text/org; charset=utf-8".into(),
+                format!(":PROPERTIES:\n:ID: {node_id}\n:END:\n#+title: {title}\n"),
+                None,
+            )
+            .unwrap();
+            service.replace_note(prepared, 2, None).await.unwrap();
+        }
+        let app = router(service.clone());
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/catalog?document_id=document-a&limit=5000",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(
+            body["generation"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["node_id"], "node-a");
+        assert_eq!(body["items"][0]["title_path"], json!(["Alpha"]));
+        assert!(body["items"][0].get("document_revision").is_none());
+        assert!(body["items"][0].get("content_sha256").is_none());
+        assert_eq!(body["next"], "node-a");
+
+        let invalid = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/catalog?limit=5001",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
         drop(app);
         drop(service);
