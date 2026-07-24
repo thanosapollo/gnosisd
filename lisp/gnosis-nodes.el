@@ -88,6 +88,7 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 
 (defconst gnosis-nodes--catalog-page-limit 500)
 (defconst gnosis-nodes--catalog-max-nodes 100000)
+(defconst gnosis-nodes--catalog-version 1)
 
 (defun gnosis-nodes--private-state-root ()
   "Return configured user's canonical private synchronization root."
@@ -297,38 +298,91 @@ Reject non-regular destinations without opening them."
   (string-trim
    (replace-regexp-in-string "[[:space:]\n\r]+" " " value)))
 
-(defun gnosis-nodes--candidate (node)
-  "Return a unique human-readable completion candidate for NODE."
-  (let* ((path
-          (mapconcat #'gnosis-nodes--display-text
-                     (append (plist-get node :title_path) nil) " / "))
-         (logical-path
-          (gnosis-nodes--display-text (plist-get node :logical_path)))
-         (retired
-          (unless (eq t (plist-get node :active)) " [retired]"))
-         (node-id (prin1-to-string (plist-get node :node_id))))
-    (format "%s  (%s)%s  <%s>" path logical-path (or retired "") node-id)))
+(defun gnosis-nodes--candidate-label (node)
+  "Return NODE title path formatted for completion."
+  (mapconcat #'gnosis-nodes--display-text
+             (append (plist-get node :title_path) nil) "::"))
+
+(defun gnosis-nodes--candidate-annotation (node)
+  "Return filename and state annotation for NODE."
+  (string-join
+   (delq nil
+         (list
+          (file-name-nondirectory (plist-get node :logical_path))
+          (unless (eq t (plist-get node :active)) "retired")))
+   "  "))
+
+(defun gnosis-nodes--candidate-counts (nodes)
+  "Return occurrence counts for completion labels in NODES."
+  (let ((counts (make-hash-table :test #'equal)))
+    (cl-loop
+     for node across nodes
+     for label = (gnosis-nodes--candidate-label node)
+     do (puthash label (1+ (gethash label counts 0)) counts))
+    counts))
+
+(defun gnosis-nodes--unique-candidate
+    (label occurrence total by-candidate)
+  "Return unused LABEL candidate at OCCURRENCE of TOTAL.
+BY-CANDIDATE contains candidates already assigned."
+  (let ((index occurrence)
+        (candidate (if (= total 1) label
+                     (format "%s [%d]" label occurrence))))
+    (while (gethash candidate by-candidate)
+      (setq index (1+ index)
+            candidate (format "%s [%d]" label index)))
+    candidate))
 
 (defun gnosis-nodes--build-catalog (nodes authority)
   "Build a disposable lookup catalog from NODES for AUTHORITY."
   (let ((by-id (make-hash-table :test #'equal))
         (by-candidate (make-hash-table :test #'equal))
+        (annotations (make-hash-table :test #'equal))
+        (label-counts (gnosis-nodes--candidate-counts nodes))
+        (label-occurrences (make-hash-table :test #'equal))
         candidates)
     (cl-loop
      for node across nodes
      for node-id = (plist-get node :node_id)
-     for candidate = (gnosis-nodes--candidate node)
-     do (when (or (gethash node-id by-id)
-                  (gethash candidate by-candidate))
-          (signal 'gnosis-nodes-error '("Duplicate Gnosis catalog entry")))
+     for label = (gnosis-nodes--candidate-label node)
+     for occurrence = (1+ (gethash label label-occurrences 0))
+     for candidate = (gnosis-nodes--unique-candidate
+                      label occurrence (gethash label label-counts)
+                      by-candidate)
+     do (when (gethash node-id by-id)
+          (signal 'gnosis-nodes-error '("Duplicate Gnosis catalog node")))
+     do (puthash label occurrence label-occurrences)
      do (puthash node-id node by-id)
      do (puthash candidate node-id by-candidate)
+     do (puthash candidate (gnosis-nodes--candidate-annotation node)
+                 annotations)
      do (push candidate candidates))
     (list :authority authority
+          :version gnosis-nodes--catalog-version
           :nodes nodes
           :by-id by-id
           :candidates (vconcat (sort candidates #'string-lessp))
-          :by-candidate by-candidate)))
+          :by-candidate by-candidate
+          :annotations annotations)))
+
+(defun gnosis-nodes--completion-table (catalog)
+  "Return annotated completion table for node CATALOG."
+  (let ((annotations (plist-get catalog :annotations))
+        (candidates
+         (cl-loop
+          for candidate across (plist-get catalog :candidates)
+          collect
+          (cons candidate
+                (gethash candidate (plist-get catalog :by-candidate))))))
+    (lambda (string pred action)
+      (if (eq action 'metadata)
+          `(metadata
+            (annotation-function
+             . ,(lambda (candidate)
+                  (when-let* ((annotation
+                               (gethash candidate annotations)))
+                    (concat "  " annotation)))))
+        (complete-with-action action candidates string pred)))))
 
 ;;;###autoload
 (defun gnosis-nodes-refresh-cache ()
@@ -351,6 +405,8 @@ When REFRESH is non-nil, always fetch a new catalog."
   (let ((authority (gnosis-nodes--catalog-authority)))
     (if (and (not refresh)
              gnosis-nodes--node-catalog
+             (eql gnosis-nodes--catalog-version
+                  (plist-get gnosis-nodes--node-catalog :version))
              (equal authority
                     (plist-get gnosis-nodes--node-catalog :authority)))
         gnosis-nodes--node-catalog
@@ -524,7 +580,8 @@ With prefix argument REFRESH, rebuild the node catalog first."
       (user-error "The Gnosis node catalog is empty"))
     (let* ((candidate
             (completing-read
-             "Gnosis node: " (append candidates nil) nil t))
+             "Gnosis node: "
+             (gnosis-nodes--completion-table catalog) nil t))
            (node-id
             (gethash candidate (plist-get catalog :by-candidate))))
       (unless node-id
@@ -1695,7 +1752,11 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
                                :cursor (plist-get page :cursor)
                                :seen (vconcat seen)
                                :pages (vconcat pages)
-                               :blobs [])))
+                               :blobs []
+                               :validated-pages
+                               (plist-get resume :validated-pages)
+                               :validated-next
+                               (plist-get resume :validated-next))))
         (gnosis-nodes--write-state state))
       (setq next (gnosis-nodes--nullable (plist-get page :next))
             done (null next)
@@ -2553,52 +2614,73 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
   (interactive)
   (setq gnosis-nodes--stop-requested t))
 
+(defun gnosis-nodes--current-org-file-p ()
+  "Return non-nil when the current buffer visits a synchronized Org file."
+  (and buffer-file-name
+       (derived-mode-p 'org-mode)
+       (string-suffix-p ".org" buffer-file-name t)
+       (file-in-directory-p buffer-file-name gnosis-nodes-dir)))
+
+(defun gnosis-nodes--saved-buffer-base (state logical-path head)
+  "Return saved buffer base from STATE for LOGICAL-PATH and outbox HEAD."
+  (let ((authoritative
+         (plist-get (plist-get head :result) :authoritative)))
+    (or (gnosis-nodes--base state nil logical-path)
+        (and head
+             (eq :create (plist-get head :kind))
+             (list :document-id (plist-get authoritative :document_id)
+                   :revision (plist-get authoritative :revision)
+                   :logical-path logical-path
+                   :digest (plist-get head :digest)
+                   :active t)))))
+
 (defun gnosis-nodes--queue-current-buffer ()
-  "Durably queue saved tracked buffer bytes."
-  (when (and gnosis-nodes-mode buffer-file-name
-             (file-in-directory-p buffer-file-name gnosis-nodes-dir))
+  "Durably queue the current saved Gnosis Org file."
+  (when (and gnosis-nodes-mode (gnosis-nodes--current-org-file-p))
     (gnosis-nodes--with-lock
       (let* ((state (gnosis-nodes--read-state))
              (logical-path (file-relative-name buffer-file-name
                                                gnosis-nodes-dir))
              (head (gnosis-nodes--outbox-entry-for state nil logical-path))
-             (authoritative (plist-get (plist-get head :result) :authoritative))
-             (base
-              (or (gnosis-nodes--base state nil logical-path)
-                  (and head
-                       (eq :create (plist-get head :kind))
-                       (list :document-id (plist-get authoritative :document_id)
-                             :revision (plist-get authoritative :revision)
-                             :logical-path logical-path
-                             :digest (plist-get head :digest)
-                             :active t)))))
-        (when base
+             (base (gnosis-nodes--saved-buffer-base
+                    state logical-path head)))
+        (cond
+         (base
           (let* ((bytes (gnosis-nodes--working-bytes buffer-file-name))
                  (digest (gnosis-nodes--digest bytes)))
             (when (or head
                       (not (equal digest (plist-get base :digest))))
               (setq state (gnosis-nodes--queue-save state base bytes))
-              (gnosis-nodes--write-state state))))))))
+              (gnosis-nodes--write-state state))))
+         ((null head)
+          (gnosis-nodes--write-state
+           (gnosis-nodes--enroll-file state buffer-file-name))))))))
+
+(defun gnosis-nodes--sync-current-buffer-after-save ()
+  "Synchronize the current Gnosis Org file after saving."
+  (when (and gnosis-nodes-mode (gnosis-nodes--current-org-file-p))
+    (setq gnosis-nodes--node-catalog nil)
+    (condition-case err
+        (progn
+          (gnosis-nodes--queue-current-buffer)
+          (gnosis-nodes-sync buffer-file-name))
+      (error
+       (message "Gnosis synchronization failed: %s"
+                (error-message-string err))))))
 
 ;;;###autoload
 (define-minor-mode gnosis-nodes-mode
-  "Durably queue saves for one explicitly tracked Org document."
+  "Synchronize the current Org document with Gnosis after each save."
   :lighter " Gnosis"
   (if gnosis-nodes-mode
       (progn
-        (unless (and buffer-file-name
-                     (file-in-directory-p buffer-file-name gnosis-nodes-dir))
+        (unless (gnosis-nodes--current-org-file-p)
           (setq gnosis-nodes-mode nil)
-          (user-error "Buffer is outside `gnosis-nodes-dir'"))
-        (let* ((state (gnosis-nodes--read-state))
-               (logical-path (file-relative-name buffer-file-name
-                                                 gnosis-nodes-dir)))
-          (unless (or (gnosis-nodes--base state nil logical-path)
-                      (gnosis-nodes--outbox-entry-for state nil logical-path))
-            (setq gnosis-nodes-mode nil)
-            (user-error "Run `gnosis-nodes-sync' to enroll this Org file")))
-        (add-hook 'after-save-hook #'gnosis-nodes--queue-current-buffer nil t))
-    (remove-hook 'after-save-hook #'gnosis-nodes--queue-current-buffer t)))
+          (user-error "Buffer is not an Org file inside `gnosis-nodes-dir'"))
+        (add-hook 'after-save-hook
+                  #'gnosis-nodes--sync-current-buffer-after-save nil t))
+    (remove-hook 'after-save-hook
+                 #'gnosis-nodes--sync-current-buffer-after-save t)))
 
 (defun gnosis-nodes--idle-sync ()
   "Run idle synchronization without surfacing expected user errors."
@@ -2608,21 +2690,13 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
       (error (message "%s" (error-message-string err))))))
 
 (defun gnosis-nodes--maybe-enable-mode ()
-  "Enable `gnosis-nodes-mode' when current file is already tracked."
-  (when (and buffer-file-name
-             (file-in-directory-p buffer-file-name gnosis-nodes-dir))
-    (condition-case nil
-        (let* ((state (gnosis-nodes--read-state))
-               (logical-path (file-relative-name buffer-file-name
-                                                 gnosis-nodes-dir)))
-          (when (or (gnosis-nodes--base state nil logical-path)
-                    (gnosis-nodes--outbox-entry-for state nil logical-path))
-            (gnosis-nodes-mode 1)))
-      (error nil))))
+  "Enable `gnosis-nodes-mode' for Org files inside `gnosis-nodes-dir'."
+  (when (gnosis-nodes--current-org-file-p)
+    (gnosis-nodes-mode 1)))
 
 ;;;###autoload
 (define-minor-mode gnosis-nodes-auto-sync-mode
-  "Synchronize tracked Gnosis Org documents using one idle timer."
+  "Automatically synchronize Gnosis Org documents and pending operations."
   :global t :lighter nil
   (when (timerp gnosis-nodes--idle-timer)
     (cancel-timer gnosis-nodes--idle-timer))
@@ -2641,6 +2715,8 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
       (with-current-buffer buffer
         (when gnosis-nodes-mode
           (gnosis-nodes-mode -1))))))
+
+(gnosis-nodes-auto-sync-mode 1)
 
 (defun gnosis-nodes--enroll-file (state file)
   "Return STATE with eligible Org FILE enrolled if not already tracked."

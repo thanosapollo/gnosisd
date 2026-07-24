@@ -291,7 +291,7 @@
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory directory t))))
 
-(ert-deftest gnosis-nodes-save-mode-only-queues-enrolled-file ()
+(ert-deftest gnosis-nodes-save-mode-queues-and-synchronizes-enrolled-file ()
   (let* ((directory (make-temp-file "gnosis-nodes-mode" t))
          (gnosis-nodes-dir directory)
          (user-emacs-directory (file-name-as-directory directory))
@@ -299,7 +299,7 @@
          (path (expand-file-name "note.org" directory))
          (state '(:version 1 :server-id "server" :device-id "device"
                   :cursor "feed" :bases [] :outbox [] :conflicts []))
-         http-called buffer)
+         synchronized buffer)
     (unwind-protect
         (progn
           (gnosis-nodes--write-state state)
@@ -308,17 +308,135 @@
            (gnosis-nodes--enroll-file (gnosis-nodes--read-state) path))
           (gnosis-nodes--write-document "note.org" "updated")
           (setq buffer (find-file-noselect path))
-          (cl-letf (((symbol-function 'gnosis-core-sync-state)
-                     (lambda () (setq http-called t))))
+          (cl-letf (((symbol-function 'gnosis-nodes-sync)
+                     (lambda (scope &optional _full)
+                       (setq synchronized scope))))
             (with-current-buffer buffer
               (gnosis-nodes-mode 1)
               (run-hooks 'after-save-hook)))
-          (should-not http-called)
+          (should (equal path synchronized))
           (let ((entry (aref (plist-get (gnosis-nodes--read-state) :outbox) 0)))
             (should (= 1 (length (plist-get (gnosis-nodes--read-state) :outbox))))
             (should (equal "updated"
                            (base64-decode-string
                             (plist-get entry :payload))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-save-mode-enrolls-and-synchronizes-new-file ()
+  (let* ((directory (make-temp-file "gnosis-nodes-new-file" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (path (expand-file-name "new.org" directory))
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [] :conflicts []))
+         synchronized buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (gnosis-nodes--write-document "new.org" "new")
+          (setq buffer (find-file-noselect path))
+          (cl-letf (((symbol-function 'gnosis-nodes-sync)
+                     (lambda (scope &optional _full)
+                       (setq synchronized scope))))
+            (with-current-buffer buffer
+              (gnosis-nodes-mode 1)
+              (run-hooks 'after-save-hook)))
+          (should (equal path synchronized))
+          (let ((entry
+                 (aref (plist-get (gnosis-nodes--read-state) :outbox) 0)))
+            (should (eq :create (plist-get entry :kind)))
+            (should (equal "new.org" (plist-get entry :logical-path)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-save-mode-reports-remote-error-after-saving ()
+  (let* ((directory (make-temp-file "gnosis-nodes-save-error" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (path (expand-file-name "note.org" directory))
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [] :conflicts []))
+         reported buffer)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (gnosis-nodes--write-document "note.org" "body")
+          (gnosis-nodes--write-state
+           (gnosis-nodes--enroll-file (gnosis-nodes--read-state) path))
+          (setq buffer (find-file-noselect path))
+          (cl-letf (((symbol-function 'gnosis-nodes-sync)
+                     (lambda (&rest _)
+                       (error "offline")))
+                    ((symbol-function 'message)
+                     (lambda (format-string &rest arguments)
+                       (setq reported
+                             (apply #'format format-string arguments)))))
+            (with-current-buffer buffer
+              (gnosis-nodes-mode 1)
+              (run-hooks 'after-save-hook)))
+          (should (string-match-p "offline" reported)))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-save-mode-invalidates-node-catalog ()
+  (let* ((directory (make-temp-file "gnosis-nodes-cache" t))
+         (gnosis-nodes-dir directory)
+         (gnosis-nodes--node-catalog '(:cached t))
+         (buffer (generate-new-buffer " *gnosis-cache*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq buffer-file-name (expand-file-name "note.org" directory))
+          (org-mode)
+          (setq-local gnosis-nodes-mode t)
+          (cl-letf (((symbol-function 'gnosis-nodes--queue-current-buffer)
+                     #'ignore)
+                    ((symbol-function 'gnosis-nodes-sync) #'ignore))
+            (gnosis-nodes--sync-current-buffer-after-save))
+          (should-not gnosis-nodes--node-catalog))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-maybe-enables-untracked-org-file ()
+  (let* ((directory (make-temp-file "gnosis-nodes-enable" t))
+         (gnosis-nodes-dir directory)
+         (buffer (generate-new-buffer " *gnosis-untracked*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq buffer-file-name (expand-file-name "new.org" directory))
+          (org-mode)
+          (gnosis-nodes--maybe-enable-mode)
+          (should gnosis-nodes-mode))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-does-not-enable-file-outside-root ()
+  (let* ((directory (make-temp-file "gnosis-nodes-enable" t))
+         (outside (make-temp-file "gnosis-nodes-outside" nil ".org"))
+         (gnosis-nodes-dir directory)
+         (buffer (generate-new-buffer " *gnosis-outside*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq buffer-file-name outside)
+          (org-mode)
+          (gnosis-nodes--maybe-enable-mode)
+          (should-not gnosis-nodes-mode))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-file outside)
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-does-not-enable-non-org-file ()
+  (let* ((directory (make-temp-file "gnosis-nodes-enable" t))
+         (gnosis-nodes-dir directory)
+         (buffer (generate-new-buffer " *gnosis-text*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq buffer-file-name (expand-file-name "note.txt" directory))
+          (org-mode)
+          (gnosis-nodes--maybe-enable-mode)
+          (should-not gnosis-nodes-mode))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory directory t))))
 
@@ -1406,6 +1524,8 @@
   (should (boundp 'gnosis-nodes-dir))
   (should (equal (expand-file-name "~/Notes/") gnosis-nodes-dir))
   (should (fboundp 'gnosis-nodes-auto-sync-mode))
+  (should gnosis-nodes-auto-sync-mode)
+  (should (memq #'gnosis-nodes--maybe-enable-mode find-file-hook))
   (should-not (boundp 'gnosis-nodes-directory))
   (should-not (fboundp 'global-gnosis-nodes-mode))
   (should (commandp 'gnosis-nodes-track-file))
@@ -1443,6 +1563,24 @@
     (should-error (gnosis-nodes--fetch-node-records)
                   :type 'gnosis-nodes-error)))
 
+(ert-deftest gnosis-nodes-refreshes-catalog-from-older-live-code ()
+  (let ((gnosis-nodes--node-catalog
+         (list :authority '("authority")
+               :nodes []
+               :by-id (make-hash-table :test #'equal)
+               :candidates []
+               :by-candidate (make-hash-table :test #'equal)))
+        (fresh '(:fresh t))
+        refreshed)
+    (cl-letf (((symbol-function 'gnosis-nodes--catalog-authority)
+               (lambda () '("authority")))
+              ((symbol-function 'gnosis-nodes-refresh-cache)
+               (lambda ()
+                 (setq refreshed t)
+                 fresh)))
+      (should (eq fresh (gnosis-nodes--catalog)))
+      (should refreshed))))
+
 (ert-deftest gnosis-nodes-candidates-disambiguate-duplicate-titles ()
   (let* ((active-a (gnosis-test-nodes--catalog-node "node-a"))
          (active-b (gnosis-test-nodes--catalog-node "node-b"))
@@ -1457,12 +1595,38 @@
           (mapcar
            (lambda (candidate)
              (gethash candidate (plist-get catalog :by-candidate)))
+           candidates))
+         (table (gnosis-nodes--completion-table catalog))
+         (metadata (funcall table "" nil 'metadata))
+         (annotate (cdr (assq 'annotation-function (cdr metadata))))
+         (retired-candidate
+          (seq-find
+           (lambda (candidate)
+             (equal "node-c"
+                    (gethash candidate
+                            (plist-get catalog :by-candidate))))
            candidates)))
     (should (= 3 (length (delete-dups (copy-sequence candidates)))))
+    (should (equal candidates (all-completions "" table)))
     (should (equal '("node-a" "node-b" "node-c") (sort resolved #'string<)))
-    (should (seq-some
-             (lambda (candidate) (string-match-p "\\[retired\\]" candidate))
-             candidates))))
+    (should (seq-every-p
+             (lambda (candidate)
+               (and (string-prefix-p "Root::Alpha" candidate)
+                    (not (string-match-p "node-\\|retired" candidate))))
+             candidates))
+    (should (equal "  a.org  retired"
+                   (funcall annotate retired-candidate)))))
+
+(ert-deftest gnosis-nodes-candidate-label-separates-parent-path ()
+  (should
+   (equal
+    "Salmonella::Salmonella enteritidis"
+    (gnosis-nodes--candidate-label
+     (gnosis-test-nodes--catalog-node
+      "node-a"
+      :title "Salmonella enteritidis"
+      :title_path ["Salmonella" "Salmonella enteritidis"]
+      :logical_path "bacteria/salmonella.org")))))
 
 (ert-deftest gnosis-nodes-converts-utf-8-byte-spans-to-buffer-positions ()
   (let* ((prefix "* Αρχή\n")
@@ -1570,7 +1734,7 @@
                (lambda () '("authority")))
               ((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _)
-                 (should (listp collection))
+                 (should (functionp collection))
                  candidate))
               ((symbol-function 'gnosis-core-node)
                (lambda (node-id)
@@ -3053,6 +3217,30 @@
         (should (= 1 reads))
         (should (= 1 (plist-get (plist-get result :snapshot)
                                 :validated-pages)))))))
+
+(ert-deftest gnosis-nodes-snapshot-fetch-preserves-validation-checkpoint ()
+  (let* ((gnosis-nodes-max-pages-per-pass 1)
+         (gnosis-nodes-max-snapshot-actions-per-pass 0)
+         (next (gnosis-test-nodes--cursor "server" 1 "snapshot"))
+         (cursor (gnosis-test-nodes--cursor "server" 9))
+         (state `(:server-id "server"
+                  :snapshot (:snapshot-id "snapshot" :next ,next
+                             :seen [,next] :pages [(:file "one")]
+                             :blobs [] :validated-pages 1
+                             :validated-next ,next))))
+    (cl-letf (((symbol-function 'gnosis-core-sync-snapshot)
+               (lambda (requested)
+                 (should (equal next requested))
+                 `(:version 1 :snapshot_id "snapshot"
+                   :cursor ,cursor :next nil :items [])))
+              ((symbol-function 'gnosis-nodes--snapshot-spool-file)
+               (lambda (_index) "two"))
+              ((symbol-function 'gnosis-nodes--write-bytes) #'ignore)
+              ((symbol-function 'gnosis-nodes--write-state) #'ignore))
+      (let ((snapshot (plist-get (gnosis-nodes--snapshot state) :snapshot)))
+        (should (= 2 (length (plist-get snapshot :pages))))
+        (should (= 1 (plist-get snapshot :validated-pages)))
+        (should (equal next (plist-get snapshot :validated-next)))))))
 
 (ert-deftest gnosis-nodes-change-page-rejects-foreign-or-regressing-cursor ()
   (let* ((from (gnosis-test-nodes--cursor "server" 4))
