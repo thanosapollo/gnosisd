@@ -82,13 +82,15 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 (defvar gnosis-nodes--recovery-visits 0)
 (defvar gnosis-nodes--ediff-sessions (make-hash-table :test #'equal))
 (defvar gnosis-nodes--node-catalog nil)
+(defvar gnosis-nodes--changed-document-ids nil)
 
 (defvar-local gnosis-nodes--content-sha256 nil)
 (defvar-local gnosis-nodes--document-revision nil)
 
-(defconst gnosis-nodes--catalog-page-limit 500)
+(defconst gnosis-nodes--catalog-page-limit 5000)
 (defconst gnosis-nodes--catalog-max-nodes 100000)
-(defconst gnosis-nodes--catalog-version 1)
+(defconst gnosis-nodes--catalog-incremental-limit 16)
+(defconst gnosis-nodes--catalog-version 2)
 
 (defun gnosis-nodes--private-state-root ()
   "Return configured user's canonical private synchronization root."
@@ -262,18 +264,26 @@ Reject non-regular destinations without opening them."
   (list (gnosis-core--validated-base-url)
         (secure-hash 'sha256 (gnosis-core--token))))
 
-(defun gnosis-nodes--fetch-node-records ()
-  "Return the complete validated server node catalog."
+(defun gnosis-nodes--fetch-node-records (&optional document-id)
+  "Return compact server node records for optional DOCUMENT-ID."
   (let ((after nil)
         (done nil)
+        (generation nil)
         (records nil)
         (seen-ids (make-hash-table :test #'equal))
         (seen-cursors (make-hash-table :test #'equal)))
     (while (not done)
       (let* ((page
-              (gnosis-core-nodes nil after gnosis-nodes--catalog-page-limit))
+              (gnosis-core-node-catalog
+               document-id after gnosis-nodes--catalog-page-limit))
              (items (plist-get page :items))
-             (next (plist-get page :next)))
+             (next (plist-get page :next))
+             (page-generation (plist-get page :generation)))
+        (if generation
+            (unless (equal generation page-generation)
+              (signal 'gnosis-nodes-error
+                      '("Gnosis node catalog changed during pagination")))
+          (setq generation page-generation))
         (when (> (+ (length records) (length items))
                  gnosis-nodes--catalog-max-nodes)
           (signal 'gnosis-nodes-error '("Gnosis node catalog is too large")))
@@ -291,7 +301,7 @@ Reject non-regular destinations without opening them."
             (signal 'gnosis-nodes-error '("Gnosis node catalog did not advance")))
           (puthash next t seen-cursors)
           (setq after next))))
-    (vconcat (nreverse records))))
+    (list :generation generation :nodes (vconcat (nreverse records)))))
 
 (defun gnosis-nodes--display-text (value)
   "Return one-line completion text for VALUE."
@@ -333,8 +343,8 @@ BY-CANDIDATE contains candidates already assigned."
             candidate (format "%s [%d]" label index)))
     candidate))
 
-(defun gnosis-nodes--build-catalog (nodes authority)
-  "Build a disposable lookup catalog from NODES for AUTHORITY."
+(defun gnosis-nodes--build-catalog (nodes authority &optional generation)
+  "Build a catalog from NODES for AUTHORITY at optional GENERATION."
   (let ((by-id (make-hash-table :test #'equal))
         (by-candidate (make-hash-table :test #'equal))
         (annotations (make-hash-table :test #'equal))
@@ -359,6 +369,7 @@ BY-CANDIDATE contains candidates already assigned."
      do (push candidate candidates))
     (list :authority authority
           :version gnosis-nodes--catalog-version
+          :generation generation
           :nodes nodes
           :by-id by-id
           :candidates (vconcat (sort candidates #'string-lessp))
@@ -389,8 +400,11 @@ BY-CANDIDATE contains candidates already assigned."
   "Replace the disposable in-memory node catalog from the server."
   (interactive)
   (let* ((authority (gnosis-nodes--catalog-authority))
-         (nodes (gnosis-nodes--fetch-node-records))
-         (catalog (gnosis-nodes--build-catalog nodes authority)))
+         (result (gnosis-nodes--fetch-node-records))
+         (nodes (plist-get result :nodes))
+         (catalog
+          (gnosis-nodes--build-catalog
+           nodes authority (plist-get result :generation))))
     (unless (equal authority (gnosis-nodes--catalog-authority))
       (signal 'gnosis-nodes-error
               '("Gnosis authenticated authority changed during refresh")))
@@ -411,6 +425,82 @@ When REFRESH is non-nil, always fetch a new catalog."
                     (plist-get gnosis-nodes--node-catalog :authority)))
         gnosis-nodes--node-catalog
       (gnosis-nodes-refresh-cache))))
+
+(defun gnosis-nodes--current-catalog-p (catalog authority)
+  "Return non-nil when CATALOG belongs to current AUTHORITY and code."
+  (and catalog
+       (eql gnosis-nodes--catalog-version
+            (plist-get catalog :version))
+       (equal authority (plist-get catalog :authority))))
+
+(defun gnosis-nodes--changed-document-list ()
+  "Return sorted document IDs recorded during the current synchronization."
+  (let (ids)
+    (when (hash-table-p gnosis-nodes--changed-document-ids)
+      (maphash (lambda (document-id _)
+                 (push document-id ids))
+               gnosis-nodes--changed-document-ids))
+    (sort ids #'string-lessp)))
+
+(defun gnosis-nodes--incremental-catalog
+    (catalog document-ids generation authority)
+  "Replace DOCUMENT-IDS in CATALOG at replica GENERATION."
+  (let ((changed (make-hash-table :test #'equal))
+        fresh)
+    (dolist (document-id document-ids)
+      (puthash document-id t changed)
+      (let ((result (gnosis-nodes--fetch-node-records document-id)))
+        (unless (equal generation (plist-get result :generation))
+          (signal 'gnosis-nodes-error
+                  '("Gnosis node catalog changed after synchronization")))
+        (setq fresh
+              (nconc fresh
+                     (append (plist-get result :nodes) nil)))))
+    (unless (equal authority (gnosis-nodes--catalog-authority))
+      (signal 'gnosis-nodes-error
+              '("Gnosis authenticated authority changed during refresh")))
+    (gnosis-nodes--build-catalog
+     (vconcat
+      (cl-loop
+       for node across (plist-get catalog :nodes)
+       unless (gethash (plist-get node :document_id) changed)
+       collect node)
+      fresh)
+     authority generation)))
+
+(defun gnosis-nodes--refresh-full-catalog-safely ()
+  "Refresh the disposable catalog, clearing it when refresh fails."
+  (condition-case err
+      (gnosis-nodes-refresh-cache)
+    (error
+     (setq gnosis-nodes--node-catalog nil)
+     (message "Gnosis node cache refresh failed: %s"
+              (error-message-string err)))))
+
+(defun gnosis-nodes--refresh-catalog-after-sync
+    (document-ids starting-generation generation)
+  "Refresh DOCUMENT-IDS from STARTING-GENERATION to GENERATION."
+  (when gnosis-nodes--node-catalog
+    (let* ((authority (gnosis-nodes--catalog-authority))
+           (catalog gnosis-nodes--node-catalog))
+      (when (gnosis-nodes--current-catalog-p catalog authority)
+        (cond
+         ((not (equal starting-generation
+                      (plist-get catalog :generation)))
+          (gnosis-nodes--refresh-full-catalog-safely))
+         ((null document-ids)
+          (setq gnosis-nodes--node-catalog
+                (plist-put (copy-sequence catalog) :generation generation)))
+         ((> (length document-ids)
+             gnosis-nodes--catalog-incremental-limit)
+          (gnosis-nodes--refresh-full-catalog-safely))
+         (t
+          (condition-case nil
+              (setq gnosis-nodes--node-catalog
+                    (gnosis-nodes--incremental-catalog
+                     catalog document-ids generation authority))
+            (error
+             (gnosis-nodes--refresh-full-catalog-safely)))))))))
 
 (defun gnosis-nodes--buffer-bytes (buffer)
   "Return BUFFER contents encoded as exact UTF-8 bytes."
@@ -1198,7 +1288,11 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
 (defun gnosis-nodes--apply-item (state item &optional blobs)
   "Apply replica ITEM to STATE when it is a document projection."
   (if (equal "document" (plist-get item :entity_kind))
-      (gnosis-nodes--apply-document state (plist-get item :projection) blobs)
+      (let ((projection (plist-get item :projection)))
+        (when (hash-table-p gnosis-nodes--changed-document-ids)
+          (puthash (plist-get projection :document_id) t
+                   gnosis-nodes--changed-document-ids))
+        (gnosis-nodes--apply-document state projection blobs))
     state))
 
 (defun gnosis-nodes--valid-document-p (projection)
@@ -2548,7 +2642,11 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
          (if full most-positive-fixnum gnosis-nodes-max-pages-per-pass))
         (gnosis-nodes-max-local-scan-per-pass
          (if full most-positive-fixnum gnosis-nodes-max-local-scan-per-pass))
-        (gnosis-nodes--mutation-sent nil))
+        (gnosis-nodes--mutation-sent nil)
+        (gnosis-nodes--changed-document-ids
+         (make-hash-table :test #'equal))
+        starting-generation
+        final-state)
     (setq gnosis-nodes--stop-requested nil)
     (gnosis-nodes--with-lock
       (let ((state (gnosis-nodes--read-state)))
@@ -2556,6 +2654,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
                   (null (plist-get state :protocol-fingerprint)))
           (user-error "Gnosis bootstrap is incomplete; run gnosis-nodes-bootstrap"))
         (gnosis-nodes--assert-identity state)
+        (setq starting-generation (plist-get state :cursor))
         (setq state
               (pcase scope
                 (:all (gnosis-nodes--enroll-all state))
@@ -2576,7 +2675,14 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
                     (not gnosis-nodes--mutation-sent)
                     (not gnosis-nodes--pull-complete))
           (setq state (gnosis-nodes--pull state))
-          (gnosis-nodes--write-state state)))))
+          (gnosis-nodes--write-state state))
+        (setq final-state state)))
+    (when (and (not gnosis-nodes--stop-requested)
+               gnosis-nodes--pull-complete)
+      (gnosis-nodes--refresh-catalog-after-sync
+       (gnosis-nodes--changed-document-list)
+       starting-generation
+       (plist-get final-state :cursor))))
   (message (cond
             (gnosis-nodes--stop-requested
              "Gnosis Org synchronization stopped")
@@ -2659,7 +2765,6 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 (defun gnosis-nodes--sync-current-buffer-after-save ()
   "Synchronize the current Gnosis Org file after saving."
   (when (and gnosis-nodes-mode (gnosis-nodes--current-org-file-p))
-    (setq gnosis-nodes--node-catalog nil)
     (condition-case err
         (progn
           (gnosis-nodes--queue-current-buffer)

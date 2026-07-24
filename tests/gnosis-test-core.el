@@ -28,6 +28,20 @@
       (setq node (plist-put node (pop overrides) (pop overrides))))
     node))
 
+(defun gnosis-test-core--catalog-node (&rest overrides)
+  "Return a valid compact node catalog item with OVERRIDES."
+  (let ((node
+         (copy-tree
+          '(:node_id "node-a"
+            :document_id "document-a"
+            :logical_path "notes/a.org"
+            :title_path ["Root" "Alpha"]
+            :active t)
+          t)))
+    (while overrides
+      (setq node (plist-put node (pop overrides) (pop overrides))))
+    node))
+
 (defvar gnosis-core--contract-cache)
 
 (defun gnosis-test-core--http-buffer
@@ -433,10 +447,17 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                      :node_id "opaque/node?id"))
                    ("get_nodes"
                     `(:items [] :next ,gnosis-core--json-null))
+                   ("get_nodes_catalog"
+                    `(:generation "feed-3" :items []
+                      :next ,gnosis-core--json-null))
                    (_ '(:projection t))))))
       (should (equal '(:projection t) (gnosis-core-dashboard 90)))
       (should (equal `(:items [] :next ,gnosis-core--json-null)
                      (gnosis-core-nodes "logic" "opaque/cursor" 25)))
+      (should
+       (equal
+        `(:generation "feed-3" :items [] :next ,gnosis-core--json-null)
+        (gnosis-core-node-catalog "document-a" "opaque/cursor" 5000)))
       (should (equal "opaque/node?id"
                      (plist-get (gnosis-core-node "opaque/node?id")
                                 :node_id)))
@@ -447,6 +468,10 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       '(("get_dashboard" nil (("days" . 90)))
         ("get_nodes" nil
          (("after" . "opaque/cursor") ("limit" . 25) ("q" . "logic")))
+        ("get_nodes_catalog" nil
+         (("document_id" . "document-a")
+          ("after" . "opaque/cursor")
+          ("limit" . 5000)))
         ("get_nodes__id_" (("id" . "opaque/node?id")))
         ("get_themata__id_" (("id" . "opaque/thema?id"))))
       (nreverse calls)))))
@@ -456,11 +481,16 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
                  (push arguments calls)
-                 (when (equal (car arguments) "get_nodes")
-                   `(:items [] :next ,gnosis-core--json-null)))))
+                 (pcase (car arguments)
+                   ("get_nodes"
+                    `(:items [] :next ,gnosis-core--json-null))
+                   ("get_nodes_catalog"
+                    `(:generation "feed-3" :items []
+                      :next ,gnosis-core--json-null))))))
       (gnosis-core-dashboard)
-      (gnosis-core-nodes nil nil nil))
-    (should (equal '(("get_dashboard") ("get_nodes"))
+      (gnosis-core-nodes nil nil nil)
+      (gnosis-core-node-catalog nil nil nil))
+    (should (equal '(("get_dashboard") ("get_nodes") ("get_nodes_catalog"))
                    (nreverse calls)))))
 
 (ert-deftest gnosis-core-node-binding-rejects-wrong-response-identity ()
@@ -512,6 +542,40 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
           (should-error
            (gnosis-core-nodes nil after limit)
            :type 'gnosis-core-protocol-error))))))
+
+(ert-deftest gnosis-core-node-catalog-validates-compact-pagination ()
+  (let ((first (gnosis-test-core--catalog-node :node_id "node-b"))
+        (second (gnosis-test-core--catalog-node :node_id "node-c")))
+    (dolist (next (list "node-c" gnosis-core--json-null))
+      (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+                 (lambda (&rest _)
+                   `(:generation "feed-3"
+                     :items [,first ,second]
+                     :next ,next))))
+        (should
+         (equal "feed-3"
+                (plist-get
+                 (gnosis-core-node-catalog nil "node-a" 2)
+                 :generation)))))
+    (dolist
+        (page
+         (list
+          `(:generation "" :items [,first] :next ,gnosis-core--json-null)
+          `(:generation ,(make-string 513 ?x)
+            :items [,first] :next ,gnosis-core--json-null)
+          `(:generation "feed-3" :items [,second ,first] :next "node-b")
+          `(:generation "feed-3" :items [,first] :next "wrong")
+          `(:generation "feed-3"
+            :items [,(plist-put (copy-tree first) :document_id "other")]
+            :next ,gnosis-core--json-null)
+          `(:generation "feed-3"
+            :items [,(plist-put (copy-tree first) :title_path [])]
+            :next ,gnosis-core--json-null)))
+      (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+                 (lambda (&rest _) page)))
+        (should-error
+         (gnosis-core-node-catalog "document-a" "node-a" 2)
+         :type 'gnosis-core-protocol-error)))))
 
 (ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))

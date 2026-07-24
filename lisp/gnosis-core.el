@@ -1347,6 +1347,66 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
         (gnosis-core--invalid "Invalid Gnosis node page"))
       page)))
 
+(defun gnosis-core--catalog-node-p (node document-id)
+  "Return non-nil when NODE is a valid compact catalog item.
+When DOCUMENT-ID is non-nil, require NODE to belong to it."
+  (let ((path (plist-get node :title_path)))
+    (and
+     (gnosis-core--opaque-id-p (plist-get node :node_id))
+     (gnosis-core--opaque-id-p (plist-get node :document_id))
+     (or (null document-id)
+         (equal document-id (plist-get node :document_id)))
+     (gnosis-core--document-path-p (plist-get node :logical_path))
+     (vectorp path)
+     (> (length path) 0)
+     (cl-every (lambda (part)
+                 (and (stringp part)
+                      (not (string-empty-p (string-trim part)))))
+               path)
+     (memq (plist-get node :active) (list t gnosis-core--json-false)))))
+
+(defun gnosis-core--catalog-generation-p (value)
+  "Return non-nil when VALUE is a bounded opaque catalog generation."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (<= (string-bytes value) 512)))
+
+(defun gnosis-core--node-catalog-page-p
+    (page document-id after limit)
+  "Return non-nil when PAGE for DOCUMENT-ID after AFTER fits LIMIT."
+  (let* ((items (plist-get page :items))
+         (next (plist-get page :next))
+         (last (and (vectorp items) (> (length items) 0)
+                    (plist-get (aref items (1- (length items))) :node_id))))
+    (and
+     (gnosis-core--catalog-generation-p (plist-get page :generation))
+     (vectorp items)
+     (<= (length items) limit)
+     (cl-every (lambda (node)
+                 (gnosis-core--catalog-node-p node document-id))
+               items)
+     (gnosis-core--increasing-node-ids-p items after)
+     (or (eq next gnosis-core--json-null)
+         (and last (equal next last))))))
+
+(defun gnosis-core-node-catalog (&optional document-id after limit)
+  "Return a compact node catalog page.
+Optionally filter by DOCUMENT-ID, page after AFTER, and request LIMIT items."
+  (let* ((parameters
+          (delq nil
+                (list (and document-id (cons "document_id" document-id))
+                      (and after (cons "after" after))
+                      (and limit (cons "limit" limit)))))
+         (page
+          (if parameters
+              (gnosis-core--typed-read-request
+               "get_nodes_catalog" nil parameters)
+            (gnosis-core--typed-read-request "get_nodes_catalog"))))
+    (unless (gnosis-core--node-catalog-page-p
+             page document-id after (or limit 5000))
+      (gnosis-core--invalid "Invalid Gnosis node catalog page"))
+    page))
+
 (defun gnosis-core-node (node-id)
   "Return the server projection for opaque NODE-ID."
   (let ((projection

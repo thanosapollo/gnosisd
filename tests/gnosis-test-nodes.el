@@ -381,7 +381,7 @@
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory directory t))))
 
-(ert-deftest gnosis-nodes-save-mode-invalidates-node-catalog ()
+(ert-deftest gnosis-nodes-save-mode-preserves-node-catalog-during-sync ()
   (let* ((directory (make-temp-file "gnosis-nodes-cache" t))
          (gnosis-nodes-dir directory)
          (gnosis-nodes--node-catalog '(:cached t))
@@ -395,7 +395,7 @@
                      #'ignore)
                     ((symbol-function 'gnosis-nodes-sync) #'ignore))
             (gnosis-nodes--sync-current-buffer-after-save))
-          (should-not gnosis-nodes--node-catalog))
+          (should (equal '(:cached t) gnosis-nodes--node-catalog)))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory directory t))))
 
@@ -1540,28 +1540,121 @@
         (third (gnosis-test-nodes--catalog-node "node-c"))
         calls)
     (cl-letf
-        (((symbol-function 'gnosis-core-nodes)
-          (lambda (_query after limit)
-            (push (list after limit) calls)
+        (((symbol-function 'gnosis-core-node-catalog)
+          (lambda (document-id after limit)
+            (push (list document-id after limit) calls)
             (cond
-             ((null after) `(:items [,first ,second] :next "node-b"))
-             ((equal after "node-b") `(:items [,third] :next "node-c"))
-             (t `(:items [] :next ,gnosis-core--json-null))))))
+             ((null after)
+              `(:generation "feed-3" :items [,first ,second] :next "node-b"))
+             ((equal after "node-b")
+              `(:generation "feed-3" :items [,third]
+                :next ,gnosis-core--json-null))))))
+      (let ((result (gnosis-nodes--fetch-node-records)))
+        (should
+         (equal
+          '("node-a" "node-b" "node-c")
+          (mapcar
+           (lambda (node) (plist-get node :node_id))
+           (append (plist-get result :nodes) nil))))
+        (should (equal "feed-3" (plist-get result :generation))))
       (should
-       (equal '("node-a" "node-b" "node-c")
-              (mapcar
-               (lambda (node) (plist-get node :node_id))
-               (append (gnosis-nodes--fetch-node-records) nil))))
-      (should
-       (equal '((nil 500) ("node-b" 500) ("node-c" 500))
+       (equal '((nil nil 5000) (nil "node-b" 5000))
               (nreverse calls))))))
 
 (ert-deftest gnosis-nodes-catalog-fetch-rejects-replayed-cursors ()
-  (cl-letf (((symbol-function 'gnosis-core-nodes)
+  (cl-letf (((symbol-function 'gnosis-core-node-catalog)
              (lambda (&rest _)
-               '(:items [] :next "replayed"))))
+               '(:generation "feed-3" :items [] :next "replayed"))))
     (should-error (gnosis-nodes--fetch-node-records)
                   :type 'gnosis-nodes-error)))
+
+(ert-deftest gnosis-nodes-catalog-fetch-rejects-generation-changes ()
+  (cl-letf (((symbol-function 'gnosis-core-node-catalog)
+             (lambda (_document-id after _limit)
+               (if after
+                   `(:generation "feed-4" :items []
+                     :next ,gnosis-core--json-null)
+                 '(:generation "feed-3" :items [] :next "node-a")))))
+    (should-error (gnosis-nodes--fetch-node-records)
+                  :type 'gnosis-nodes-error)))
+
+(ert-deftest gnosis-nodes-incrementally-replaces-changed-document-nodes ()
+  (let* ((authority '("authority"))
+         (old
+          (gnosis-test-nodes--catalog-node
+           "node-old" :document_id "document-a"))
+         (keep
+          (gnosis-test-nodes--catalog-node
+           "node-keep" :document_id "document-b"))
+         (fresh
+          (gnosis-test-nodes--catalog-node
+           "node-fresh" :document_id "document-a"))
+         (gnosis-nodes--node-catalog
+          (gnosis-nodes--build-catalog
+           (vector old keep) authority "feed-2")))
+    (cl-letf (((symbol-function 'gnosis-nodes--catalog-authority)
+               (lambda () authority))
+              ((symbol-function 'gnosis-nodes--fetch-node-records)
+               (lambda (document-id)
+                 (should (equal "document-a" document-id))
+                 (list :generation "feed-3" :nodes (vector fresh)))))
+      (gnosis-nodes--refresh-catalog-after-sync
+       '("document-a") "feed-2" "feed-3")
+      (let ((by-id (plist-get gnosis-nodes--node-catalog :by-id)))
+        (should-not (gethash "node-old" by-id))
+        (should (gethash "node-fresh" by-id))
+        (should (gethash "node-keep" by-id)))
+      (should
+       (equal "feed-3"
+              (plist-get gnosis-nodes--node-catalog :generation))))))
+
+(ert-deftest gnosis-nodes-generation-race-forces-full-catalog-refresh ()
+  (let* ((authority '("authority"))
+         (node (gnosis-test-nodes--catalog-node "node-old"))
+         (gnosis-nodes--node-catalog
+          (gnosis-nodes--build-catalog
+           (vector node) authority "feed-2"))
+         refreshed)
+    (cl-letf (((symbol-function 'gnosis-nodes--catalog-authority)
+               (lambda () authority))
+              ((symbol-function 'gnosis-nodes--fetch-node-records)
+               (lambda (_document-id)
+                 (list :generation "feed-4" :nodes [])))
+              ((symbol-function 'gnosis-nodes-refresh-cache)
+               (lambda ()
+                 (setq refreshed t
+                       gnosis-nodes--node-catalog '(:fresh t)))))
+      (gnosis-nodes--refresh-catalog-after-sync
+       '("document-a") "feed-2" "feed-3")
+      (should refreshed)
+      (should (equal '(:fresh t) gnosis-nodes--node-catalog)))))
+
+(ert-deftest gnosis-nodes-stale-cache-generation-forces-full-refresh ()
+  (let* ((authority '("authority"))
+         (node (gnosis-test-nodes--catalog-node "node-old"))
+         (gnosis-nodes--node-catalog
+          (gnosis-nodes--build-catalog
+           (vector node) authority "feed-1"))
+         refreshed)
+    (cl-letf (((symbol-function 'gnosis-nodes--catalog-authority)
+               (lambda () authority))
+              ((symbol-function 'gnosis-nodes-refresh-cache)
+               (lambda () (setq refreshed t))))
+      (gnosis-nodes--refresh-catalog-after-sync
+       nil "feed-2" "feed-3")
+      (should refreshed))))
+
+(ert-deftest gnosis-nodes-apply-item-records-changed-document ()
+  (let ((gnosis-nodes--changed-document-ids
+         (make-hash-table :test #'equal)))
+    (cl-letf (((symbol-function 'gnosis-nodes--apply-document)
+               (lambda (state _projection &optional _blobs) state)))
+      (gnosis-nodes--apply-item
+       '(:state t)
+       '(:entity_kind "document"
+         :projection (:document_id "document-a")))
+      (should
+       (gethash "document-a" gnosis-nodes--changed-document-ids)))))
 
 (ert-deftest gnosis-nodes-refreshes-catalog-from-older-live-code ()
   (let ((gnosis-nodes--node-catalog
