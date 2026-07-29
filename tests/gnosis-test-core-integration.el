@@ -216,30 +216,42 @@
             (gnosis-core-review-attempt-begin
              (plist-get session :session_id)))
            (attempt-id (plist-get attempt :attempt_id))
-           (partial
-            (gnosis-core-review-attempt-check-cloze attempt-id ["beta"]))
-           (complete
-            (gnosis-core-review-attempt-check-cloze
-             attempt-id ["beta" "alpha"])))
-      (should (equal [t] (plist-get partial :matches)))
-      (should (equal "(Greek hint) and beta"
-                     (plist-get partial :question)))
-      (should (eq gnosis-core--json-null
-                  (plist-get partial :next_input_script)))
-      (should (eq t (plist-get complete :complete)))
-      (should (equal "alpha and beta" (plist-get complete :question)))
-      (should (eq gnosis-core--json-null
-                  (plist-get complete :next_input_script)))
-      (should (equal "pending"
-                     (plist-get
-                      (plist-get (gnosis-core-review-attempt-state attempt-id)
-                                 :attempt)
-                      :status)))
-      (should (equal "aborted"
-                     (plist-get
-                      (gnosis-core-review-session-abort
-                       (plist-get session :session_id))
-                      :status))))))
+           (gnosis-review--attempt attempt)
+           (answers '("beta" "alpha"))
+           questions)
+      (cl-letf (((symbol-function 'gnosis-review--read-string)
+                 (lambda (&rest _) (pop answers)))
+                ((symbol-function 'gnosis-review--render)
+                 (lambda ()
+                   (push (plist-get
+                          (plist-get gnosis-review--attempt :presentation)
+                          :question)
+                         questions))))
+        (setq attempt
+              (gnosis-core-review-attempt-answer
+               attempt-id
+               (gnosis-review--read-cloze-answer
+                (plist-get (plist-get attempt :presentation)
+                           :response)))))
+      (should (equal '("(Greek hint) and beta" "alpha and beta")
+                     (nreverse questions)))
+      (should (equal "graded" (plist-get attempt :status)))
+      (let* ((state (gnosis-core-review-attempt-state attempt-id))
+             (gnosis-review--attempt attempt)
+             (gnosis-review--attempt-revision
+              (plist-get state :attempt_revision)))
+        (cl-letf (((symbol-function 'gnosis-review--render) #'ignore)
+                  ((symbol-function 'message) #'ignore))
+          (gnosis-review--override))
+        (setq state (gnosis-core-review-attempt-state attempt-id))
+        (should (equal "graded"
+                       (plist-get (plist-get state :attempt) :status)))
+        (should (eq gnosis-core--json-false
+                    (plist-get (plist-get state :attempt)
+                               :accepted_success))))
+      (should (stringp
+               (plist-get (gnosis-core-review-attempt-commit attempt-id)
+                          :event_id))))))
 
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
