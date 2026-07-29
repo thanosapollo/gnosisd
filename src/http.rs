@@ -6792,6 +6792,8 @@ mod tests {
         assert_eq!(partial["matches"], json!([true]));
         assert_eq!(partial["all_entered_correct"], true);
         assert_eq!(partial["complete"], false);
+        assert_eq!(partial["question"], "cat and (...)");
+        assert_eq!(partial["next_input_script"], Value::Null);
         let complete = check_cloze_inputs(&app, &token, attempt_id, &["cot", "bat"]).await;
         assert_eq!(complete["matches"], json!([true, true]));
         assert_eq!(complete["complete"], true);

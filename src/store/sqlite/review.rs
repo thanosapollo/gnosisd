@@ -16,14 +16,15 @@ use crate::{
         PresentationSnapshot, RecallOutcomeSnapshot, ReconciliationStatus,
         ReviewAttemptBeginResult, ReviewAttemptMutation, ReviewAttemptOperation,
         ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
-        ReviewAttemptView, ReviewItemSkipReason, ReviewOperationAuthority, ReviewPackAsset,
+        ReviewAttemptView, ReviewClozeCheck, ReviewItemSkipReason, ReviewOperationAuthority, ReviewPackAsset,
         ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView, ReviewSource,
         ReviewSourceKind, ReviewStateSnapshot, SkippedReviewItem, TransitionSnapshot,
-        presentation_content, review_day_at, review_question, validate_offline_thema_assets,
+        presentation_content, progressive_cloze_check, review_day_at, review_question,
+        validate_offline_thema_assets,
         validate_review_pack_projection,
     },
     domain::{
-        ClozeCheck, GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition, grade,
+        GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition, grade,
     },
 };
 
@@ -502,7 +503,7 @@ impl SqliteStore {
         attempt_id: &str,
         actor_device_id: Option<&str>,
         inputs: &[String],
-    ) -> Result<ClozeCheck, StoreError> {
+    ) -> Result<ReviewClozeCheck, StoreError> {
         let row = load_attempt_row(&self.connection, attempt_id)?.ok_or(StoreError::NotFound)?;
         require_session_actor(
             &self.connection,
@@ -522,7 +523,8 @@ impl SqliteStore {
         {
             return Err(StoreError::InvalidReviewResponse);
         }
-        Ok(check_clozes(&content.answer, inputs))
+        progressive_cloze_check(&row.presentation, check_clozes(&content.answer, inputs))
+            .map_err(StoreError::storage)
     }
 
     pub(crate) fn override_review_attempt(

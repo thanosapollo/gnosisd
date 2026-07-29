@@ -70,11 +70,11 @@ pub(crate) use review::{
     OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot,
     RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptBeginResult, ReviewAttemptMutation,
     ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-    ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewItemSkipReason,
+    ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck, ReviewError, ReviewItemSkipReason,
     ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
     ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
     ReviewStateSnapshot, SkippedReviewItem, TransitionSnapshot, prepare_offline_operation,
-    presentation_content, review_day_at, review_question, valid_operation_id,
+    presentation_content, progressive_cloze_check, review_day_at, review_question, valid_operation_id,
     validate_review_pack_projection,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord};
