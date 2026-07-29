@@ -16,6 +16,7 @@
   (list :attempt_id "attempt" :session_id "session" :thema_id "thema"
         :presentation
         (list :question "Question?"
+              :hint gnosis-core--json-null
               :response (or prompt
                             (list :kind "text"
                                   :input_script gnosis-core--json-null))
@@ -33,6 +34,12 @@
         :desired_suspended gnosis-core--json-false
         :status (or status "pending")))
 
+(defun gnosis-test-review--begin-result (attempt &optional session skipped)
+  "Return a begin result for ATTEMPT, SESSION, and SKIPPED items."
+  (list :session (or session (gnosis-test-review--session))
+        :attempt (or attempt gnosis-core--json-null)
+        :skipped (or skipped [])))
+
 (ert-deftest gnosis-review-map-is-direct-state-aware-and-discoverable ()
   (dolist (case `(("pending" "RET" gnosis-review--answer)
                   ("graded" "n" gnosis-review--commit-next)
@@ -48,6 +55,12 @@
                   (nth 2 case)))))
   (should (equal "C-g" (keymap-popup--meta gnosis-review-mode-map 'exit-key)))
   (let ((rows (keymap-popup--meta gnosis-review-mode-map 'descriptions)))
+    (should (equal
+             '(("Review" "State" "Session"))
+             (mapcar
+              (lambda (row)
+                (mapcar (lambda (group) (plist-get group :name)) row))
+              rows)))
     (dolist (row rows)
       (dolist (group row)
         (should (<= (length (plist-get group :entries)) 4))))
@@ -58,6 +71,15 @@
                                    (copy-sequence (plist-get group :entries)))
                                  row))
                        rows)))))
+
+(ert-deftest gnosis-review-advancing-actions-close-popup-before-input ()
+  (let ((rows (keymap-popup--meta gnosis-review-mode-map 'descriptions)))
+    (dolist (key '("RET" "n" "o" "g"))
+      (should-not
+       (plist-get (keymap-popup--find-entry-by-key rows key) :stay-open)))
+    (should
+     (plist-get
+      (keymap-popup--find-entry-by-key rows "s") :stay-open))))
 
 (ert-deftest gnosis-review-pending-attempt-keeps-mutations-visible-but-inapt ()
   (with-temp-buffer
@@ -102,13 +124,16 @@
       (cl-letf (((symbol-function 'gnosis-core-review-session-active)
                  (lambda (&rest _) (list :session next-session)))
                 ((symbol-function 'gnosis-core-review-attempt-begin)
-                 (lambda (&rest _) next-attempt))
+                 (lambda (&rest _)
+                   (gnosis-test-review--begin-result
+                    next-attempt next-session)))
                 ((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
                  (lambda (&rest _) (push 'accepted mutations)))
                 ((symbol-function 'gnosis-core-review-attempt-set-suspension)
                  (lambda (&rest _) (push 'suspended mutations)))
                 ((symbol-function 'gnosis-core-review-attempt-commit)
                  (lambda (&rest _) (push 'committed mutations)))
+                ((symbol-function 'gnosis-review--answer) #'ignore)
                 ((symbol-function 'display-images-p) (lambda () nil)))
         (gnosis-review--refresh)
         (should (equal "attempt-2" (plist-get gnosis-review--attempt :attempt_id)))
@@ -120,18 +145,24 @@
     (setq gnosis-review--session (gnosis-test-review--session)
           gnosis-review--attempt (gnosis-test-review--attempt "pending")
           gnosis-review--attempt-revision 1)
-    (let ((header (gnosis-review--header-line))
-          (description (gnosis-review--popup-description)))
-      (should (equal "Review 1/2" (substring-no-properties header)))
-      (should (eq (get-text-property 7 'face header) 'font-lock-type-face))
-      (should (equal "Review 1/2 — answer" description))
-      (should-not (string-match-p "session\\|attempt\\|thema" description)))))
+    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 30)))
+      (let ((header (gnosis-review--header-line))
+            (description (gnosis-review--popup-description)))
+        (should (equal "          Review 1/2"
+                       (substring-no-properties header)))
+        (should (eq (get-text-property 17 'face header)
+                    'font-lock-type-face))
+        (should (equal "Review 1/2 — answer" description))
+        (should-not
+         (string-match-p "session\\|attempt\\|thema" description))))))
 
 (ert-deftest gnosis-review-header-converts-zero-based-session-position ()
   (with-temp-buffer
     (setq gnosis-review--session (gnosis-test-review--session))
     (setf (plist-get gnosis-review--session :current_position) 1)
-    (should (string-prefix-p "Review 2/2" (gnosis-review--header-line)))))
+    (should
+     (string-prefix-p
+      "Review 2/2" (string-trim-left (gnosis-review--header-line))))))
 
 (ert-deftest gnosis-review-source-is-closed-due-view ()
   (let ((source (gnosis-review--source "due")))
@@ -152,9 +183,7 @@
 
 (ert-deftest gnosis-review-empty-queue-is-a-normal-user-outcome ()
   (let (message)
-    (cl-letf (((symbol-function 'gnosis-core-status)
-               (lambda () '(:status "ready")))
-              ((symbol-function 'gnosis-core-review-session-create)
+    (cl-letf (((symbol-function 'gnosis-core-review-session-create)
                  (lambda (&rest _arguments)
                    (signal 'gnosis-core-not-found '("empty"))))
                 ((symbol-function 'message)
@@ -162,8 +191,102 @@
                    (setq message (apply #'format format arguments))))
                 ((symbol-function 'gnosis-review--open)
                  (lambda (&rest _arguments) (ert-fail "must not open"))))
-      (gnosis-review--start (gnosis-review--source "due") nil)
+      (gnosis-review--create (gnosis-review--source "due") nil)
       (should (equal message "No Gnosis review items are available")))))
+
+(ert-deftest gnosis-review-active-session-action-uses-completion ()
+  (let (arguments)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest values)
+                 (setq arguments values)
+                 "Resume session")))
+      (should
+       (equal "Resume session"
+              (gnosis-review--read-active-session-action)))
+      (should
+       (equal
+        '("Active session found: "
+          ("Resume session" "Start new" "Cancel")
+          nil t nil nil "Resume session")
+        arguments)))))
+
+(ert-deftest gnosis-review-start-resumes-active-session ()
+  (let ((session (gnosis-test-review--session))
+        events)
+    (cl-letf (((symbol-function 'gnosis-core-status) #'ignore)
+              ((symbol-function 'gnosis-review--active-session)
+               (lambda () session))
+              ((symbol-function 'gnosis-review--read-active-session-action)
+               (lambda () "Resume session"))
+              ((symbol-function 'gnosis-review--resume-session)
+               (lambda (session-id)
+                 (push (list 'resume session-id) events)
+                 session))
+              ((symbol-function 'gnosis-review--open)
+               (lambda (value) (push (list 'open value) events)))
+              ((symbol-function 'gnosis-review--create)
+               (lambda (&rest _) (ert-fail "must not create"))))
+      (gnosis-review--start (gnosis-review--source "due") 20)
+      (should
+       (equal `((resume "session") (open ,session))
+              (nreverse events))))))
+
+(ert-deftest gnosis-review-start-quits-before-creating-new-session ()
+  (let ((source (gnosis-review--source "due"))
+        events)
+    (cl-letf (((symbol-function 'gnosis-core-status) #'ignore)
+              ((symbol-function 'gnosis-review--active-session)
+               (lambda () (gnosis-test-review--session)))
+              ((symbol-function 'gnosis-review--read-active-session-action)
+               (lambda () "Start new"))
+              ((symbol-function 'gnosis-review--quit-session)
+               (lambda (session-id)
+                 (push (list 'quit session-id) events)))
+              ((symbol-function 'gnosis-review--create)
+               (lambda (value count)
+                 (push (list 'create value count) events))))
+      (gnosis-review--start source 20)
+      (should
+       (equal `((quit "session") (create ,source 20))
+              (nreverse events))))))
+
+(ert-deftest gnosis-review-start-cancel-does-not-mutate ()
+  (let (mutated)
+    (cl-letf (((symbol-function 'gnosis-core-status) #'ignore)
+              ((symbol-function 'gnosis-review--active-session)
+               (lambda () (gnosis-test-review--session)))
+              ((symbol-function 'gnosis-review--read-active-session-action)
+               (lambda () "Cancel"))
+              ((symbol-function 'gnosis-review--quit-session)
+               (lambda (&rest _) (setq mutated t)))
+              ((symbol-function 'gnosis-review--resume-session)
+               (lambda (&rest _) (setq mutated t)))
+              ((symbol-function 'gnosis-review--create)
+               (lambda (&rest _) (setq mutated t)))
+              ((symbol-function 'message) #'ignore))
+      (gnosis-review--start (gnosis-review--source "due") nil)
+      (should-not mutated))))
+
+(ert-deftest gnosis-review-quit-uncertainty-confirms-inactive-session ()
+  (let (checked)
+    (cl-letf (((symbol-function 'gnosis-core-review-session-quit)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-mutation-uncertain '("unknown"))))
+              ((symbol-function 'gnosis-review--active-session)
+               (lambda ()
+                 (setq checked t)
+                 nil)))
+      (gnosis-review--quit-session "session")
+      (should checked))))
+
+(ert-deftest gnosis-review-quit-uncertainty-preserves-active-session ()
+  (cl-letf (((symbol-function 'gnosis-core-review-session-quit)
+             (lambda (&rest _)
+               (signal 'gnosis-core-mutation-uncertain '("unknown"))))
+            ((symbol-function 'gnosis-review--active-session)
+             (lambda () (gnosis-test-review--session))))
+    (should-error (gnosis-review--quit-session "session")
+                  :type 'gnosis-core-mutation-uncertain)))
 
 (ert-deftest gnosis-review-open-preserves-buffer-when-begin-fails ()
   (let ((buffer (get-buffer-create gnosis-review-buffer-name))
@@ -176,7 +299,7 @@
           (cl-letf (((symbol-function 'gnosis-core-review-attempt-begin)
                      (lambda (&rest _)
                        (signal 'gnosis-core-unavailable '("down"))))
-                    ((symbol-function 'pop-to-buffer)
+                    ((symbol-function 'pop-to-buffer-same-window)
                      (lambda (&rest _) (setq popped t))))
             (should-error
              (gnosis-review--open (gnosis-test-review--session))
@@ -186,16 +309,94 @@
             (should (equal "keep" (buffer-string)))))
       (kill-buffer buffer))))
 
+(ert-deftest gnosis-review-open-reports-skipped-terminal-items ()
+  (let ((session (gnosis-test-review--session))
+        message
+        popped)
+    (cl-letf (((symbol-function 'gnosis-core-review-attempt-begin)
+               (lambda (_)
+                 (gnosis-test-review--begin-result
+                  nil (gnosis-test-review--session "completed")
+                  [(:position 0 :thema_id "unsafe"
+                    :reason "unsafe_presentation")])))
+              ((symbol-function 'pop-to-buffer-same-window)
+               (lambda (&rest _) (setq popped t)))
+              ((symbol-function 'message)
+               (lambda (format &rest arguments)
+                 (setq message (apply #'format format arguments)))))
+      (gnosis-review--open session)
+      (should-not popped)
+      (should (equal message
+                     "No reviewable items; skipped 1 unavailable item")))))
+
+(ert-deftest gnosis-review-stale-answer-reconciles-to-next-attempt ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending"))
+    (let ((next-session (gnosis-test-review--session))
+          (next-attempt (gnosis-test-review--attempt "pending"))
+          presented)
+      (setf (plist-get next-session :current_position) 1
+            (plist-get next-attempt :attempt_id) "attempt-2")
+      (cl-letf (((symbol-function 'gnosis-review--read-answer)
+                 (lambda () '(:kind "text" :value "answer")))
+                ((symbol-function 'gnosis-core-review-attempt-answer)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-conflict
+                           '("Review attempt changed" "stale_attempt"))))
+                ((symbol-function 'gnosis-review--active-session)
+                 (lambda () next-session))
+                ((symbol-function 'gnosis-core-review-attempt-begin)
+                 (lambda (_)
+                   (gnosis-test-review--begin-result
+                    next-attempt next-session
+                    [(:position 0 :thema_id "stale"
+                      :reason "content_changed")])))
+                ((symbol-function 'gnosis-review--present)
+                 (lambda (&rest _) (setq presented t))))
+        (gnosis-review--answer)
+        (should presented)
+        (should (equal "attempt-2"
+                       (plist-get gnosis-review--attempt :attempt_id)))
+        (should-not gnosis-review--answer-locked-p)))))
+
+(ert-deftest gnosis-review-stale-finish-reconciles-without-commit ()
+  (with-temp-buffer
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded")
+          gnosis-review--attempt-revision 2)
+    (let (committed reconciled)
+      (cl-letf (((symbol-function
+                  'gnosis-core-review-attempt-set-accepted-success)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-conflict
+                           '("Review attempt changed" "stale_attempt"))))
+                ((symbol-function 'gnosis-core-review-attempt-commit)
+                 (lambda (&rest _) (setq committed t)))
+                ((symbol-function 'gnosis-review--next)
+                 (lambda () (setq reconciled t))))
+        (gnosis-review--finish t)
+        (should reconciled)
+        (should-not committed)))))
+
 (ert-deftest gnosis-review-open-pending-attempt-can-answer-immediately-once ()
   (let ((buffer (get-buffer-create gnosis-review-buffer-name))
-        (posts 0))
+        (posts 0)
+        events)
     (unwind-protect
-        (cl-letf (((symbol-function 'pop-to-buffer)
+        (cl-letf (((symbol-function 'pop-to-buffer-same-window)
                    (lambda (target &rest _) (set-buffer target)))
+                  ((symbol-function 'keymap-popup)
+                   (lambda (&rest _) (push 'popup events)))
                   ((symbol-function 'gnosis-core-review-attempt-begin)
-                   (lambda (_) (gnosis-test-review--attempt "pending")))
+                   (lambda (_)
+                     (gnosis-test-review--begin-result
+                      (gnosis-test-review--attempt "pending"))))
                   ((symbol-function 'gnosis-review--read-answer)
-                   (lambda () '(:kind "text" :value "response")))
+                   (lambda ()
+                     (push 'input events)
+                     '(:kind "text" :value "response")))
                   ((symbol-function 'gnosis-core-review-attempt-answer)
                    (lambda (&rest _)
                      (setq posts (1+ posts))
@@ -205,11 +406,60 @@
                      (list :attempt_revision 2
                            :attempt (gnosis-test-review--attempt "graded")))))
           (gnosis-review--open (gnosis-test-review--session))
-          (should (eq (keymap-lookup gnosis-review-mode-map "RET")
-                      #'gnosis-review--answer))
-          (gnosis-review--answer)
           (should (= posts 1))
-          (should-not (keymap-lookup gnosis-review-mode-map "RET")))
+          (should (equal '(input popup) (nreverse events)))
+          (should (eq (keymap-lookup gnosis-review-mode-map "RET")
+                      nil)))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gnosis-review-next-attempt-opens-input-by-default ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "committed"))
+    (let ((answers 0))
+      (cl-letf (((symbol-function 'gnosis-review--active-session)
+                 (lambda () (gnosis-test-review--session)))
+                ((symbol-function 'gnosis-core-review-attempt-begin)
+                 (lambda (&rest _)
+                   (gnosis-test-review--begin-result
+                    (gnosis-test-review--attempt "pending"))))
+                ((symbol-function 'gnosis-review--answer)
+                 (lambda (&optional _) (setq answers (1+ answers))))
+                ((symbol-function 'display-images-p) (lambda () nil)))
+        (gnosis-review--next)
+        (should (= answers 1))))))
+
+(ert-deftest gnosis-review-mode-disables-line-numbers ()
+  (with-temp-buffer
+    (setq display-line-numbers 'relative)
+    (gnosis-review-mode)
+    (should-not display-line-numbers)))
+
+(ert-deftest gnosis-review-reopening-preserves-local-state-and-opens-popup ()
+  (let ((buffer (get-buffer-create gnosis-review-buffer-name))
+        popups)
+    (unwind-protect
+        (cl-letf (((symbol-function 'pop-to-buffer-same-window)
+                   (lambda (target &rest _) (set-buffer target)))
+                  ((symbol-function 'keymap-popup)
+                   (lambda (map) (push map popups)))
+                  ((symbol-function 'gnosis-core-review-attempt-begin)
+                   (lambda (_)
+                     (gnosis-test-review--begin-result
+                      (gnosis-test-review--attempt "graded"))))
+                  ((symbol-function 'display-images-p) (lambda () nil)))
+          (gnosis-review--open (gnosis-test-review--session))
+          (with-current-buffer buffer
+            (setq-local gnosis-center-content nil)
+            (setq gnosis-review--answer-locked-p t))
+          (gnosis-review--open (gnosis-test-review--session))
+          (with-current-buffer buffer
+            (should-not gnosis-center-content)
+            (should-not gnosis-review--answer-locked-p))
+          (should (equal popups
+                         (list gnosis-review-mode-map
+                               gnosis-review-mode-map))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
@@ -252,11 +502,55 @@
               ((symbol-function 'gnosis-core-review-attempt-commit)
                (lambda (&rest _) (ert-fail "render committed"))))
       (gnosis-review--render)
-      (should (string-match-p "RET Answer" (buffer-string)))
+      (should-not (string-match-p "RET Answer\\|Actions" (buffer-string)))
       (should-not
        (string-match-p
         "SECRET\\|PRIVATE-HINT\\|PRIVATE-RESPONSE\\|success\\|suspend\\|session\\|attempt\\|thema"
         (buffer-string))))))
+
+(ert-deftest gnosis-review-render-faces-unlabelled-hint-between-sections ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-center-content nil)
+    (setf (plist-get (plist-get gnosis-review--attempt :presentation) :hint)
+          "Remember this")
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (should-not (string-match-p "Hint:" (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "Remember this")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-hint))
+      (should
+       (= 1
+          (cl-loop for position from (point-min) below (point-max)
+                   count (eq (get-text-property position 'face)
+                             'gnosis-face-separator)))))))
+
+(ert-deftest gnosis-review-render-separates-image-from-question ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-center-content nil)
+    (setf (plist-get
+           (plist-get gnosis-review--attempt :presentation) :review_image)
+          "assets/example.png")
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (should
+       (string-match-p
+        (concat "\\`\\[Review image available\\]\n\n"
+                (regexp-quote (gnosis--separator))
+                "\n\n" (regexp-quote "Question?") "\\'")
+        (buffer-string)))
+      (should
+       (= 1
+          (cl-loop for position from (point-min) below (point-max)
+                   count (eq (get-text-property position 'face)
+                             'gnosis-face-separator)))))))
 
 (ert-deftest gnosis-review-render-gives-graded-content-semantic-faces ()
   (with-temp-buffer
@@ -265,16 +559,64 @@
           gnosis-review--attempt (gnosis-test-review--attempt "graded"))
     (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
       (gnosis-review--render)
-      (dolist (expected '(("Answer:" . gnosis-face-directions)
-                          ("• Answer" . gnosis-face-correct)
-                          ("Your answer:" . gnosis-face-directions)
-                          ("response" . gnosis-face-correct)
-                          ("success" . gnosis-face-correct)))
+      (dolist (expected '(("Answer:" . gnosis-face-directions)))
         (goto-char (point-min))
         (search-forward (car expected))
-        (should (eq (get-text-property (1- (point)) 'face) (cdr expected)))))))
+        (should (eq (get-text-property (1- (point)) 'face) (cdr expected))))
+      (goto-char (point-min))
+      (search-forward "Answer: Answer")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-correct))
+      (should-not (string-match-p "•" (buffer-string)))
+      (should-not (string-match-p "Your answer:" (buffer-string))))))
 
-(ert-deftest gnosis-review-render-distinguishes-detected-and-accepted-results ()
+(ert-deftest gnosis-review-render-centers-every-visible-line ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 80))
+              ((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (dolist (line (split-string (buffer-string) "\n"))
+        (unless (string-blank-p line)
+          (let* ((text (string-trim-left line))
+                 (padding (- (length line) (length text))))
+            (should (= padding (/ (- 80 (string-width text)) 2)))))))))
+
+(ert-deftest gnosis-review-render-shows-centered-user-answer-on-failure ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+    (setf (plist-get gnosis-review--attempt :detected_success)
+          gnosis-core--json-false
+          (plist-get gnosis-review--attempt :accepted_success)
+          gnosis-core--json-false)
+    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 80))
+              ((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "Your answer: response")
+      (back-to-indentation)
+      (should (= 29 (current-column)))
+      (search-forward "response")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-false)))))
+
+(ert-deftest gnosis-review-render-omits-empty-parathema-section ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+    (setf (plist-get gnosis-review--attempt :revealed_parathema) "")
+    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 80))
+              ((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (dolist (line (split-string (buffer-string) "\n"))
+        (should-not (and (string-blank-p line) (> (length line) 1)))))))
+
+(ert-deftest gnosis-review-render-omits-operational-result-state ()
   (with-temp-buffer
     (gnosis-review-mode)
     (setq gnosis-review--session (gnosis-test-review--session)
@@ -283,25 +625,8 @@
           gnosis-core--json-false)
     (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
       (gnosis-review--render)
-      (should (string-match-p "Detected: success" (buffer-string)))
-      (should (string-match-p "Accepted: failure" (buffer-string)))
-      (should (string-match-p "Commit & next" (buffer-string))))))
-
-(ert-deftest gnosis-review-render-equal-results-and-suspension-action ()
-  (dolist (case `((t t ,gnosis-core--json-false "s Suspend")
-                  (,gnosis-core--json-false ,gnosis-core--json-false
-                   t "s Unsuspend")))
-    (with-temp-buffer
-      (gnosis-review-mode)
-      (setq gnosis-review--session (gnosis-test-review--session)
-            gnosis-review--attempt (gnosis-test-review--attempt "graded"))
-      (setf (plist-get gnosis-review--attempt :detected_success) (nth 0 case)
-            (plist-get gnosis-review--attempt :accepted_success) (nth 1 case)
-            (plist-get gnosis-review--attempt :desired_suspended) (nth 2 case))
-      (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
-        (gnosis-review--render)
-        (should (string-match-p (nth 3 case) (buffer-string)))
-        (should-not (string-match-p "Accepted:" (buffer-string)))))))
+      (dolist (label '("Detected:" "Accepted:" "Suspension:"))
+        (should-not (string-match-p label (buffer-string)))))))
 
 (ert-deftest gnosis-review-answer-submits-one-structured-mutation ()
   (with-temp-buffer
@@ -396,15 +721,15 @@
         (should-error (gnosis-review--answer) :type 'user-error)
         (should (= posts 1))))))
 
-(ert-deftest gnosis-review-render-locked-pending-attempt-offers-refresh-only ()
+(ert-deftest gnosis-review-locked-pending-popup-offers-refresh-only ()
   (with-temp-buffer
     (gnosis-review-mode)
     (setq gnosis-review--session (gnosis-test-review--session)
           gnosis-review--attempt (gnosis-test-review--attempt "pending")
           gnosis-review--answer-locked-p t)
     (gnosis-review--render)
-    (should (string-match-p "g Refresh" (buffer-string)))
-    (should-not (string-match-p "RET Answer" (buffer-string)))))
+    (should (string-suffix-p "refresh" (gnosis-review--popup-description)))
+    (should-not (string-match-p "Refresh\\|RET Answer" (buffer-string)))))
 
 (ert-deftest gnosis-review-answer-uncertainty-recovers-with-get-not-retry ()
   (with-temp-buffer
@@ -479,7 +804,7 @@
                                :target_count 100))))
               ((symbol-function 'gnosis-review--open)
                (lambda (_) (setq opened t))))
-      (should-error (gnosis-review--start source 20)
+      (should-error (gnosis-review--create source 20)
                     :type 'gnosis-core-mutation-uncertain)
       (should-not opened))))
 
@@ -496,7 +821,7 @@
                          (list :source source :target_count 100))))
               ((symbol-function 'gnosis-review--open)
                (lambda (_) (setq opened t))))
-      (gnosis-review--start source nil)
+      (gnosis-review--create source nil)
       (should opened))))
 
 (ert-deftest gnosis-review-create-uncertainty-rejects-wrong-default ()
@@ -512,7 +837,7 @@
                          (list :source source :target_count 1))))
               ((symbol-function 'gnosis-review--open)
                (lambda (_) (setq opened t))))
-      (should-error (gnosis-review--start source nil)
+      (should-error (gnosis-review--create source nil)
                     :type 'gnosis-core-mutation-uncertain)
       (should-not opened))))
 

@@ -77,6 +77,54 @@
       (should (proper-list-p (plist-get projection :queue)))
       (should (proper-list-p (plist-get projection :content))))))
 
+(ert-deftest gnosis-core-integration-zz-thema-management-journey ()
+  (skip-unless (gnosis-test-core-integration--available-p))
+  (gnosis-test-core-integration--with-client
+    (let* ((gnosis-core--contract-cache nil)
+           (created
+            (gnosis-core-thema-create
+             (gnosis-core-operation-id)
+             '(:kind "basic" :keimenon "Managed question"
+               :answer ["Managed answer"])))
+           (thema-id (plist-get created :thema_id))
+           (operation-id (gnosis-core-operation-id))
+           (suspended
+            (gnosis-core-thema-set-suspended
+             thema-id 0 t operation-id)))
+      (should (= 1 (plist-get (plist-get suspended :state)
+                              :state_revision)))
+      (should (eq t (plist-get (plist-get suspended :state) :suspended)))
+      (should
+       (equal suspended
+              (gnosis-core-thema-set-suspended
+               thema-id 0 t operation-id)))
+      (should-error
+       (gnosis-core-thema-set-suspended
+        thema-id 0 nil (gnosis-core-operation-id))
+       :type 'gnosis-core-conflict)
+      (let* ((write (gnosis-core-thema-write-view created))
+             (edited
+              (gnosis-core-thema-update
+               thema-id (gnosis-core-operation-id) 1
+               (plist-put write :keimenon "Managed edit")))
+             (unsuspended
+              (gnosis-core-thema-set-suspended
+               thema-id 1 nil (gnosis-core-operation-id)))
+             (catalog (gnosis-core-thema-catalog nil nil 500))
+             (record
+              (seq-find
+               (lambda (item) (equal thema-id (plist-get item :thema_id)))
+               (append (plist-get catalog :items) nil))))
+        (should (= 2 (plist-get edited :revision)))
+        (should (= 2 (plist-get (plist-get unsuspended :state)
+                                :state_revision)))
+        (should record)
+        (should (= 2 (plist-get record :thema_revision)))
+        (should (= 2 (plist-get record :state_revision)))
+        (should (equal "Managed edit" (plist-get record :keimenon)))
+        (should (eq gnosis-core--json-false
+                    (plist-get record :suspended)))))))
+
 (ert-deftest gnosis-core-integration-review-journey ()
   (skip-unless (gnosis-test-core-integration--available-p))
   (gnosis-test-core-integration--with-client
@@ -97,11 +145,13 @@
                   :topic_backward_depth gnosis-core--json-null
                   :manual_ids (vector thema-id)))
            (session (gnosis-core-review-session-create source))
-           (attempt
+           (attempt-result
             (gnosis-core-review-attempt-begin
              (plist-get session :session_id)))
+           (attempt (plist-get attempt-result :attempt))
            (attempt-id (plist-get attempt :attempt_id))
            state result)
+      (should (= 0 (length (plist-get attempt-result :skipped))))
       (setq attempt
             (gnosis-core-review-attempt-answer
              attempt-id '(:kind "text" :value "Answer")))

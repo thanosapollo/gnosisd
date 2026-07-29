@@ -63,6 +63,9 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 
 (defconst gnosis-core--default-online-review-target-count 100)
 
+(defconst gnosis-core--thema-catalog-page-limit 100
+  "Maximum themata requested in one management page.")
+
 (defconst gnosis-core--http-methods
   '("delete" "get" "head" "options" "patch" "post" "put" "trace"))
 
@@ -390,7 +393,8 @@ or `encoding' when content decoding is unsupported."
          (original (process-get process 'gnosis-core--original-filter))
          (header-status
           (unless (process-get process 'gnosis-core--headers-verified)
-            (gnosis-core--header-status data))))
+            (with-current-buffer (process-buffer process)
+              (gnosis-core--header-status data)))))
     (unless (aref state 0)
       (condition-case nil
           (if (memq header-status '(overflow encoding))
@@ -1407,6 +1411,62 @@ Optionally filter by DOCUMENT-ID, page after AFTER, and request LIMIT items."
       (gnosis-core--invalid "Invalid Gnosis node catalog page"))
     page))
 
+(defun gnosis-core--catalog-thema-p (thema)
+  "Return non-nil when THEMA has valid compact catalog metadata."
+  (and (gnosis-core--opaque-id-p (plist-get thema :thema_id))
+       (integerp (plist-get thema :thema_revision))
+       (> (plist-get thema :thema_revision) 0)
+       (natnump (plist-get thema :state_revision))
+       (member (plist-get thema :kind) '("basic" "cloze" "mcq" "mc-cloze"))
+       (stringp (plist-get thema :keimenon))
+       (vectorp (plist-get thema :hypothesis))
+       (vectorp (plist-get thema :answer))
+       (gnosis-core--unique-vector-p (plist-get thema :tags))
+       (memq (plist-get thema :archived) (list t gnosis-core--json-false))
+       (memq (plist-get thema :suspended) (list t gnosis-core--json-false))))
+
+(defun gnosis-core--increasing-thema-ids-p (items after)
+  "Return non-nil when catalog ITEMS increase strictly after AFTER."
+  (let ((previous after))
+    (cl-loop
+     for thema across items
+     for thema-id = (plist-get thema :thema_id)
+     always (prog1
+                (or (null previous) (string-lessp previous thema-id))
+              (setq previous thema-id)))))
+
+(defun gnosis-core--thema-catalog-page-p (page after limit)
+  "Return non-nil when catalog PAGE after AFTER fits LIMIT."
+  (let* ((items (plist-get page :items))
+         (next (plist-get page :next))
+         (last (and (vectorp items) (> (length items) 0)
+                    (plist-get (aref items (1- (length items))) :thema_id))))
+    (and (gnosis-core--catalog-generation-p (plist-get page :generation))
+         (vectorp items)
+         (<= (length items) limit)
+         (cl-every #'gnosis-core--catalog-thema-p items)
+         (gnosis-core--increasing-thema-ids-p items after)
+         (or (eq next gnosis-core--json-null)
+             (and last (equal next last))))))
+
+(defun gnosis-core-thema-catalog (&optional query after limit)
+  "Return a compact thema management page.
+Optionally filter by QUERY, page after AFTER, and request LIMIT items."
+  (let* ((parameters
+          (delq nil
+                (list (and query (cons "q" query))
+                      (and after (cons "after" after))
+                      (and limit (cons "limit" limit)))))
+         (page
+          (if parameters
+              (gnosis-core--typed-read-request
+               "get_themata_catalog" nil parameters)
+            (gnosis-core--typed-read-request "get_themata_catalog"))))
+    (unless (gnosis-core--thema-catalog-page-p
+             page after (or limit gnosis-core--thema-catalog-page-limit))
+      (gnosis-core--invalid "Invalid Gnosis thema catalog page"))
+    page))
+
 (defun gnosis-core-node (node-id)
   "Return the server projection for opaque NODE-ID."
   (let ((projection
@@ -1533,6 +1593,75 @@ Do not retry automatically."
           (gnosis-core--if-match-header revision)))
    operation-id thema-id revision))
 
+(defun gnosis-core--thema-suspension-result
+    (result thema-id operation-id state-revision suspended)
+  "Validate suspension RESULT for THEMA-ID and OPERATION-ID.
+STATE-REVISION is the requested base and SUSPENDED is the desired state."
+  (let ((status (plist-get result :status))
+        (cursor (plist-get result :cursor)))
+    (unless (and (gnosis-core--json-object-p result)
+                 (equal 1 (plist-get result :format_version))
+                 (equal operation-id (plist-get result :operation_id))
+                 (stringp cursor) (not (string-empty-p cursor)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis suspension response identity is invalid")))
+    (pcase status
+      ("applied"
+       (let* ((changed (plist-get result :changed))
+              (authority (plist-get result :authoritative))
+              (projection (plist-get authority :value))
+              (state (plist-get projection :state))
+              (expected (+ state-revision (if (eq changed t) 1 0))))
+         (unless (and (memq changed (list t gnosis-core--json-false))
+                      (equal "review_state" (plist-get authority :kind))
+                      (equal thema-id (plist-get projection :thema_id))
+                      (equal expected (plist-get state :state_revision))
+                      (eq suspended (eq t (plist-get state :suspended))))
+           (signal 'gnosis-core-mutation-uncertain
+                   '("Gnosis suspension projection is invalid")))
+         projection))
+      ("rejected"
+       (let* ((rejection (plist-get result :rejection))
+              (reason (plist-get rejection :reason)))
+         (unless (and (gnosis-core--json-object-p rejection)
+                      (member reason '("revision_conflict" "not_found"
+                                       "invalid_content"))
+                      (or (not (equal reason "revision_conflict"))
+                          (equal state-revision
+                                 (plist-get rejection :expected_revision))))
+           (signal 'gnosis-core-mutation-uncertain
+                   '("Gnosis suspension rejection is invalid")))
+         (pcase reason
+           ("revision_conflict"
+            (signal 'gnosis-core-conflict
+                    '("Gnosis review-state revision conflict")))
+           ("not_found"
+            (signal 'gnosis-core-not-found '("Gnosis thema not found")))
+           (_
+            (signal 'gnosis-core-validation-error
+                    '("Gnosis suspension mutation rejected"))))))
+      (_
+       (signal 'gnosis-core-mutation-uncertain
+               '("Gnosis suspension response status is invalid"))))))
+
+(defun gnosis-core-thema-set-suspended
+    (thema-id state-revision suspended &optional operation-id)
+  "Set THEMA-ID suspension at STATE-REVISION to SUSPENDED.
+Use optional OPERATION-ID and return the authoritative review-state projection."
+  (unless (memq suspended '(nil t))
+    (signal 'gnosis-core-validation-error
+            '("Invalid Gnosis suspension state")))
+  (let* ((operation-id (or operation-id (gnosis-core-operation-id)))
+         (wire-suspended (if suspended t gnosis-core--json-false))
+         (result
+          (gnosis-core--typed-request
+           "put_themata__id__suspension" (list (cons "id" thema-id)) nil
+           (list :suspended wire-suspended)
+           (list (gnosis-core--idempotency-key-header operation-id)
+                 (gnosis-core--if-match-header state-revision)))))
+    (gnosis-core--thema-suspension-result
+     result thema-id operation-id state-revision suspended)))
+
 (defun gnosis-core--review-session-valid-p (session expected-status)
   "Return non-nil when SESSION is a valid online EXPECTED-STATUS projection."
   (let ((session-id (plist-get session :session_id))
@@ -1605,15 +1734,25 @@ Do not retry automatically."
   (gnosis-core--review-session-action session-id "abort" "aborted"))
 
 (defun gnosis-core-review-attempt-begin (session-id)
-  "Begin or return the active attempt for review SESSION-ID."
-  (let ((attempt
+  "Reconcile and begin the active attempt for review SESSION-ID."
+  (let* ((result
          (gnosis-core--typed-request
           "post_review_sessions__id__attempts"
-          (list (cons "id" session-id)))))
-    (unless (equal session-id (plist-get attempt :session_id))
+          (list (cons "id" session-id))))
+         (session (plist-get result :session))
+         (attempt (plist-get result :attempt))
+         (status (plist-get session :status))
+         (attempt-present-p (not (eq attempt gnosis-core--json-null))))
+    (unless (and (equal session-id (plist-get session :session_id))
+                 (or (and (equal status "active")
+                          attempt-present-p
+                          (equal session-id
+                                 (plist-get attempt :session_id)))
+                     (and (equal status "completed")
+                          (not attempt-present-p))))
       (signal 'gnosis-core-mutation-uncertain
-              '("Gnosis review attempt session identity is invalid")))
-    attempt))
+              '("Gnosis review reconciliation identity is invalid")))
+    result))
 
 (defun gnosis-core-review-attempt-answer (attempt-id answer)
   "Submit structured ANSWER for ATTEMPT-ID without automatic retry."

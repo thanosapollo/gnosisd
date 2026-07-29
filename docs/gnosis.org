@@ -24,17 +24,20 @@ and scheduling.
 Customize =gnosis-nodes-dir= to a dedicated working directory, then run
 =M-x gnosis-nodes-bootstrap=.  Use =M-x gnosis-nodes-sync= to enroll and
 synchronize one file or all eligible Org files.  A prefix argument completes
-all available pull and local scan work.  Enable =gnosis-nodes-auto-sync-mode=
-for save hooks and one idle synchronization timer.  Private state records
-identity, cursor, document bases, pending operations, and conflicts; it is not a
-domain database.
+all available pull and local scan work.  Automatic synchronization is enabled
+by default.  Org files below =gnosis-nodes-dir= synchronize after each save, and
+the first save of a new file creates its canonical document.  Disable
+=gnosis-nodes-auto-sync-mode= to remove the save hooks and idle synchronization
+timer.  Private state records identity, cursor, document bases, pending
+operations, and conflicts; it is not a domain database.
 Delivery-unknown mutations are never retried automatically.
 Use =gnosis-nodes-track-file= for offline one-file enrollment and
 =gnosis-nodes-list-conflicts= before selecting a conflict resolution command.
 
-File discovery never implies create, rename, or deletion.  Use
-=M-x gnosis-nodes-rename-file= and =M-x gnosis-nodes-tombstone-file= for explicit
-lifecycle mutations; local files remain until the user moves or removes them.
+Opening or discovering files never implies create, rename, or deletion.  Saving
+a new Org file below =gnosis-nodes-dir= explicitly enrolls and creates it.  Use
+=M-x gnosis-nodes-rename-file= and =M-x gnosis-nodes-tombstone-file= for rename
+and deletion; local files remain until the user moves or removes them.
 
 Conflicts leave local content untouched.  Run =M-x gnosis-nodes-resolve-conflict=
 for three-way Ediff, edit and save Ediff's separate merge buffer, then run
@@ -80,7 +83,13 @@ Set authinfo file permissions to 0600.  Change the lookup user when required:
 
 * Dashboard
 
-Run =M-x gnosis= for due review.  Run =M-x gnosis-dashboard= for the server-projected dashboard.  It shows review, queue, content, activity, and active-session state without deriving domain data locally.  Press =r= for due review, =t= for topic review, =R= to resume an active session, =g= to refresh, =?= for actions, and =q= to close the buffer.
+Run =M-x gnosis= for the server-projected dashboard.  It shows review, queue,
+content, activity, and active-session state without deriving domain data
+locally.  Press =r= for due review, =T= for topic review, =R= to resume an
+active session, =t= for the paginated thema management list, =g= to refresh,
+=?= for actions, and =q= to close the buffer.  In the thema list, =RET= or =e=
+opens the shared editor and =s= suspends or unsuspends the row through
+=gnosisd=.  Run =M-x gnosis-review= for due review.
 
 * Review
 
@@ -149,8 +158,8 @@ nix flake check
 =make integration= builds or uses local =gnosisd= and =gnosis= binaries, starts
 an isolated temporary daemon/database/socket/token, fetches
 =/v1/openapi.json=, generates and byte-compiles a manifest, then checks public
-health, authenticated transport, dashboard projection, and isolated review and
-Org synchronization journeys.
+health, authenticated transport, dashboard and thema management projections,
+direct suspension, and isolated review and Org synchronization journeys.
 
 Runtime package contains exactly =gnosis.el=, =gnosis-core.el=,
 =gnosis-core-assets.el=, =gnosis-edit.el=, =gnosis-review.el=,

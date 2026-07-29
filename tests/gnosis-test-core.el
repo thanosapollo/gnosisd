@@ -42,6 +42,19 @@
       (setq node (plist-put node (pop overrides) (pop overrides))))
     node))
 
+(defun gnosis-test-core--catalog-thema (&rest overrides)
+  "Return a valid compact thema catalog item with OVERRIDES."
+  (let ((thema
+         (copy-tree
+          `(:thema_id "thema-a" :thema_revision 3 :state_revision 2
+            :kind "basic" :keimenon "Question" :hypothesis [,gnosis-core--json-null]
+            :answer ["Answer"] :tags ["tag"] :archived ,gnosis-core--json-false
+            :suspended ,gnosis-core--json-false)
+          t)))
+    (while overrides
+      (setq thema (plist-put thema (pop overrides) (pop overrides))))
+    thema))
+
 (defvar gnosis-core--contract-cache)
 
 (defun gnosis-test-core--http-buffer
@@ -577,6 +590,98 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
          (gnosis-core-node-catalog "document-a" "node-a" 2)
          :type 'gnosis-core-protocol-error)))))
 
+(ert-deftest gnosis-core-thema-catalog-validates-compact-pagination ()
+  (let ((first (gnosis-test-core--catalog-thema :thema_id "thema-b"))
+        (second (gnosis-test-core--catalog-thema :thema_id "thema-c")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest arguments)
+                 (should
+                  (equal
+                   '("get_themata_catalog" nil
+                     (("q" . "logic") ("after" . "thema-a") ("limit" . 2)))
+                   arguments))
+                 `(:generation "feed-3" :items [,first ,second]
+                   :next "thema-c"))))
+      (should
+       (equal "feed-3"
+              (plist-get
+               (gnosis-core-thema-catalog "logic" "thema-a" 2)
+               :generation))))
+    (dolist
+        (page
+         (list
+          `(:generation "" :items [,first] :next ,gnosis-core--json-null)
+          `(:generation "feed-3" :items [,second ,first] :next "thema-b")
+          `(:generation "feed-3" :items [,first] :next "wrong")
+          `(:generation "feed-3"
+            :items [,(plist-put (copy-tree first) :state_revision -1)]
+            :next ,gnosis-core--json-null)
+          `(:generation "feed-3"
+            :items [,(plist-put (copy-tree first) :suspended nil)]
+            :next ,gnosis-core--json-null)))
+      (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+                 (lambda (&rest _) page)))
+        (should-error
+         (gnosis-core-thema-catalog nil "thema-a" 2)
+         :type 'gnosis-core-protocol-error)))))
+
+(ert-deftest gnosis-core-thema-suspension-correlates-authoritative-state ()
+  (let (calls)
+    (cl-letf
+        (((symbol-function 'gnosis-core--typed-request)
+          (lambda (&rest arguments)
+            (push arguments calls)
+            `(:status "applied" :format_version 1
+              :operation_id "suspend:1" :changed t
+              :authoritative
+              (:kind "review_state"
+               :value
+               (:thema_id "thema-a"
+                :state (:state_revision 1 :suspended t)))
+              :cursor "feed-4"))))
+      (should
+       (equal
+        '(:thema_id "thema-a" :state (:state_revision 1 :suspended t))
+        (gnosis-core-thema-set-suspended "thema-a" 0 t "suspend:1"))))
+    (should
+     (equal
+      '(("put_themata__id__suspension" (("id" . "thema-a")) nil
+         (:suspended t)
+         (("Idempotency-Key" . "suspend:1") ("If-Match" . "\"0\""))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-thema-suspension-rejects-stale-or-uncorrelated-results ()
+  (let ((result
+         '(:status "rejected" :format_version 1
+           :operation_id "suspend:1"
+           :rejection (:reason "revision_conflict"
+                       :expected_revision 0 :current_revision 1)
+           :cursor "feed-4")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _) result)))
+      (should-error
+       (gnosis-core-thema-set-suspended "thema-a" 0 nil "suspend:1")
+       :type 'gnosis-core-conflict)
+      (setf (plist-get (plist-get result :rejection) :expected_revision) 2)
+      (should-error
+       (gnosis-core-thema-set-suspended "thema-a" 0 nil "suspend:1")
+       :type 'gnosis-core-mutation-uncertain)))
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               `(:status "applied" :format_version 1
+                 :operation_id "suspend:1" :changed t
+                 :authoritative
+                 (:kind "review_state"
+                  :value
+                  (:thema_id "other"
+                   :state
+                   (:state_revision 1 :suspended
+                    ,gnosis-core--json-false)))
+                 :cursor "feed-4"))))
+    (should-error
+     (gnosis-core-thema-set-suspended "thema-a" 0 nil "suspend:1")
+     :type 'gnosis-core-mutation-uncertain)))
+
 (ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
         (created '(:thema_id "created" :revision 1))
@@ -868,6 +973,31 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (insert "123")
       (should-not (gnosis-core--header-status "4"))
       (should (eq (gnosis-core--header-status "56") 'overflow)))))
+
+(ert-deftest gnosis-core-bounds-headers-in-the-process-buffer ()
+  (let ((response-buffer (generate-new-buffer " *gnosis-response*"))
+        (gnosis-core--response-header-limit 64)
+        process)
+    (unwind-protect
+        (with-temp-buffer
+          (insert (make-string 128 ?x))
+          (setq process
+                (make-pipe-process
+                 :name "gnosis-header-buffer-test"
+                 :buffer response-buffer
+                 :noquery t))
+          (let ((state (vector nil nil nil nil)))
+            (process-put process 'gnosis-core--state state)
+            (process-put process 'gnosis-core--limit 1024)
+            (process-put process 'gnosis-core--headers-verified nil)
+            (process-put process 'gnosis-core--original-filter
+                         (lambda (_process _data)))
+            (gnosis-core--bounded-process-filter
+             process "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+            (should-not (aref state 2))
+            (should (process-live-p process))))
+      (when (process-live-p process) (delete-process process))
+      (when (buffer-live-p response-buffer) (kill-buffer response-buffer)))))
 
 (ert-deftest gnosis-core-rejects-content-encoding-before-decoding ()
   (with-temp-buffer
@@ -1186,7 +1316,9 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                       :source ,source :target_count 12
                       :current_position 0 :queue_length 1 :started_at_us 1))
                    ("post_review_sessions__id__attempts"
-                    '(:attempt_id "attempt" :session_id "session"))
+                    '(:session (:session_id "session" :status "active")
+                      :attempt (:attempt_id "attempt" :session_id "session")
+                      :skipped []))
                    ("post_review_attempts__id__answer"
                     (list :attempt_id "attempt" :status "graded"
                           :response (nth 3 arguments)))
@@ -1237,6 +1369,18 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       '(:session_id "session" :mode "online" :status "completed"
         :current_position 1 :queue_length 1 :started_at_us 1)
       "completed"))))
+
+(ert-deftest gnosis-core-review-begin-rejects-incoherent-terminal-state ()
+  (dolist (result
+           `((:session (:session_id "session" :status "active")
+              :attempt ,gnosis-core--json-null :skipped [])
+             (:session (:session_id "session" :status "completed")
+              :attempt (:attempt_id "attempt" :session_id "session")
+              :skipped [])))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _arguments) result)))
+      (should-error (gnosis-core-review-attempt-begin "session")
+                    :type 'gnosis-core-mutation-uncertain))))
 
 (ert-deftest gnosis-core-review-session-rejects-invalid-id-or-start-time ()
   (dolist (session
