@@ -971,38 +971,70 @@ fn question_hint(content: &ThemaContent) -> Option<String> {
 }
 
 fn concealed_question(content: &ThemaContent, add_hints: bool) -> Result<String, ReviewError> {
-    let mut question = content.keimenon.clone();
-    for answer in &content.answer {
-        question = conceal_first(question, answer)?;
-    }
-    if add_hints {
-        Ok(add_cloze_hints(question, &content.hypothesis))
-    } else {
-        Ok(question)
-    }
+    materialize_cloze_question(content, None, add_hints)
 }
 
 fn progressive_cloze_question(
     content: &ThemaContent,
     revealed: &[bool],
 ) -> Result<String, ReviewError> {
-    let mut question = concealed_question(content, false)?;
-    let mut cursor = 0;
-    for (index, answer) in content.answer.iter().enumerate() {
-        let relative = question[cursor..]
-            .find("(...)")
-            .ok_or(ReviewError::Content)?;
-        let start = cursor + relative;
-        let hint = content.hypothesis.get(index).and_then(Option::as_deref);
-        let replacement = if revealed[index] {
-            trim_outer_quotes(answer).trim().to_owned()
-        } else {
-            hint.filter(|value| !matches!(*value, "" | "nil" | "\"\""))
-                .map_or_else(|| "(...)".to_owned(), |value| format!("({value})"))
-        };
-        question.replace_range(start..start + "(...)".len(), &replacement);
-        cursor = start + replacement.len();
+    materialize_cloze_question(content, Some(revealed), true)
+}
+
+fn materialize_cloze_question(
+    content: &ThemaContent,
+    revealed: Option<&[bool]>,
+    add_hints: bool,
+) -> Result<String, ReviewError> {
+    if revealed.is_some_and(|values| values.len() != content.answer.len()) {
+        return Err(ReviewError::Content);
     }
+    let mut spans: Vec<(std::ops::Range<usize>, usize)> = Vec::with_capacity(content.answer.len());
+    for (answer_index, captured_answer) in content.answer.iter().enumerate() {
+        let answer = trim_outer_quotes(captured_answer);
+        if answer.trim().is_empty() {
+            return Err(ReviewError::Content);
+        }
+        let range = case_folded_literal(answer)?
+            .find_iter(&content.keimenon)
+            .map(|found| found.range())
+            .find(|candidate| {
+                spans.iter().all(|(existing, _)| {
+                    candidate.end <= existing.start || candidate.start >= existing.end
+                })
+            })
+            .ok_or(ReviewError::Content)?;
+        spans.push((range, answer_index));
+    }
+    spans.sort_by_key(|(range, _)| range.start);
+
+    let mut question = String::with_capacity(content.keimenon.len());
+    let mut cursor = 0;
+    for (range, answer_index) in spans {
+        question.push_str(&content.keimenon[cursor..range.start]);
+        if revealed.is_some_and(|values| values[answer_index]) {
+            question.push_str(&content.keimenon[range.clone()]);
+        } else {
+            let answer = trim_outer_quotes(&content.answer[answer_index]);
+            let hint = add_hints
+                .then(|| {
+                    content
+                        .hypothesis
+                        .get(answer_index)
+                        .and_then(Option::as_deref)
+                })
+                .flatten()
+                .filter(|value| !matches!(*value, "" | "nil" | "\"\""))
+                .unwrap_or("...");
+            question.push_str(leading_whitespace(answer));
+            question.push('(');
+            question.push_str(hint);
+            question.push(')');
+            question.push_str(trailing_whitespace(answer));
+        }
+        cursor = range.end;
+    }
+    question.push_str(&content.keimenon[cursor..]);
     Ok(question)
 }
 
@@ -1019,34 +1051,11 @@ fn ensure_question_is_safe(content: &ThemaContent, question: &str) -> Result<(),
     Ok(())
 }
 
-fn conceal_first(question: String, captured_answer: &str) -> Result<String, ReviewError> {
-    let answer = trim_outer_quotes(captured_answer);
-    if answer.is_empty() {
-        return Err(ReviewError::Content);
-    }
-    let replacement = format!(
-        "{}(...){}",
-        leading_whitespace(answer),
-        trailing_whitespace(answer)
-    );
-    let expression = case_folded_literal(answer)?;
-    let range = match expression.find(&question) {
-        Some(found) => found.range(),
-        None => return Ok(question),
-    };
-    Ok(replace_range(question, range, &replacement))
-}
-
 fn case_folded_literal(value: &str) -> Result<regex::Regex, ReviewError> {
     RegexBuilder::new(&regex::escape(value))
         .case_insensitive(true)
         .build()
         .map_err(|_| ReviewError::Content)
-}
-
-fn replace_range(mut value: String, range: std::ops::Range<usize>, replacement: &str) -> String {
-    value.replace_range(range, replacement);
-    value
 }
 
 fn trim_outer_quotes(value: &str) -> &str {
@@ -1067,27 +1076,6 @@ fn trailing_whitespace(value: &str) -> &str {
         .rfind(|(_, character)| !character.is_whitespace())
         .map_or(0, |(index, character)| index + character.len_utf8());
     &value[start..]
-}
-
-fn add_cloze_hints(mut question: String, hints: &[Option<String>]) -> String {
-    let mut cursor = 0;
-    for hint in hints {
-        let Some(relative) = question[cursor..].find("(...)") else {
-            break;
-        };
-        let start = cursor + relative;
-        cursor = replace_hint(&mut question, start, hint.as_deref());
-    }
-    question
-}
-
-fn replace_hint(question: &mut String, start: usize, hint: Option<&str>) -> usize {
-    let Some(hint) = hint.filter(|value| !matches!(*value, "" | "nil" | "\"\"")) else {
-        return start + "(...)".len();
-    };
-    let replacement = format!("({hint})");
-    question.replace_range(start..start + "(...)".len(), &replacement);
-    start + replacement.len()
 }
 
 fn response_prompt(content: &ThemaContent) -> ReviewResponsePrompt {
@@ -1245,6 +1233,21 @@ mod tests {
         assert_eq!(check.next_input_script.as_deref(), Some("greek"));
         assert_eq!(check.matches, vec![true]);
         assert!(!check.complete);
+    }
+
+    #[test]
+    fn progressive_cloze_question_preserves_literal_placeholder_text() {
+        let mut captured = presentation("cloze", "Literal (...) then secret");
+        captured.answer = vec!["secret".into()];
+        captured.hypothesis = vec![None];
+
+        let check = super::progressive_cloze_check(
+            &captured,
+            crate::domain::check_clozes(&captured.answer, &["secret".into()]),
+        )
+        .unwrap();
+
+        assert_eq!(check.question, "Literal (...) then secret");
     }
 
     #[test]
