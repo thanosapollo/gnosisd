@@ -467,12 +467,16 @@
   (let ((gnosis-review--attempt
          (gnosis-test-review--attempt
           "pending" (list :kind "texts"
-                          :input_scripts [gnosis-core--json-null "greek"])))
+                          :input_scripts
+                          (vector gnosis-core--json-null "cyrillic"))))
         (answers '("one" "δύο"))
         checks
+        scripts
         questions)
     (cl-letf (((symbol-function 'gnosis-review--read-string)
-               (lambda (&rest _) (pop answers)))
+               (lambda (_prompt script)
+                 (push script scripts)
+                 (pop answers)))
               ((symbol-function 'gnosis-core-review-attempt-check-cloze)
                (lambda (_attempt-id inputs)
                  (push inputs checks)
@@ -493,6 +497,8 @@
        (equal '(:kind "texts" :value ["one" "δύο"])
               (gnosis-review--read-answer)))
       (should (equal '(["one"] ["one" "δύο"]) (nreverse checks)))
+      (should (equal (list gnosis-core--json-null "greek")
+                     (nreverse scripts)))
       (should (equal '("one and (...)" "one and δύο")
                      (nreverse questions)))))
   (let ((gnosis-review--attempt

@@ -25,7 +25,7 @@ The client resolves operation identities and strict schemas from the daemon's
 live OpenAPI document; it has no handwritten Gnosis DTOs or direct route
 bindings.  There is no SQLite access and no local fallback.  During review,
 =RET= answers,
-=n= commits the current accepted result, =o= inverts and commits that result,
+=n= commits the current accepted result, =o= overrides the accepted result without committing,
 =s= changes suspension, =g= refreshes or continues a committed attempt, =?=
 shows actions, and =q= closes the local buffer without aborting the session.
 

@@ -100,8 +100,9 @@ and submits structured text, text-vector, or choice responses.  The daemon
 alone grades, reveals answers, applies accepted-result overrides and desired
 suspension, schedules, persists, and commits.
 
-=RET= answers.  =n= commits the current accepted result.  =o= inverts and
-commits that result.  =s= changes suspension.  =g= refreshes authoritative
+=RET= answers.  =n= commits the current accepted result.
+=o= overrides the accepted result without committing.  =s= changes suspension.
+=g= refreshes authoritative
 state or continues a committed attempt.  =?= shows actions.  =q= closes the
 local buffer without aborting the durable session.
 

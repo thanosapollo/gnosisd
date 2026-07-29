@@ -79,6 +79,8 @@
                "M-x gnosis= for the server-projected dashboard" nil t))
       (should (search-forward "M-x gnosis-review= for due review" nil t))
       (should (re-search-forward "=n= commits the current accepted result" nil t))
+      (should (search-forward
+               "=o= overrides the accepted result without committing" nil t))
       (should (search-forward "=g= refreshes" nil t))
       (should (search-forward "committed attempt" nil t))
       (goto-char (point-min))
