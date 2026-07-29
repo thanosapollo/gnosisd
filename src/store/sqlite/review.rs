@@ -2974,9 +2974,15 @@ mod tests {
 
     #[test]
     fn malformed_stored_presentations_do_not_create_attempts() {
-        for (kind, question, hypotheses) in [
-            ("basic", "", r#"[null]"#),
-            ("mcq", "Question", r#"["only"]"#),
+        for (kind, question, hypotheses, answers) in [
+            ("basic", "", r#"[null]"#, r#"["only"]"#),
+            ("mcq", "Question", r#"["only"]"#, r#"["only"]"#),
+            (
+                "cloze",
+                "Only first",
+                r#"[null,null]"#,
+                r#"["first","missing"]"#,
+            ),
         ] {
             let mut store = SqliteStore::open_in_memory().unwrap();
             add_thema(&mut store, "thema", "Question", None);
@@ -2984,9 +2990,9 @@ mod tests {
                 .connection
                 .execute(
                     "UPDATE thema SET kind = ?1, keimenon = ?2,
-                     hypothesis_json = ?3, answer_json = '[\"only\"]'
+                     hypothesis_json = ?3, answer_json = ?4
                      WHERE thema_id = 'thema'",
-                    params![kind, question, hypotheses],
+                    params![kind, question, hypotheses, answers],
                 )
                 .unwrap();
             let session = store
