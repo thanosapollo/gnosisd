@@ -360,29 +360,12 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
          nil
        (signal (car condition) (cdr condition))))))
 
-(defun gnosis-review--begin (session-id)
-  "Return reconciled session and optional attempt for SESSION-ID."
-  (let* ((result (gnosis-core-review-attempt-begin session-id))
-         (attempt (plist-get result :attempt)))
-    (list :session (plist-get result :session)
-          :attempt (unless (eq attempt gnosis-core--json-null) attempt)
-          :skipped (plist-get result :skipped))))
-
-(defun gnosis-review--skipped-message (skipped complete-p)
-  "Report SKIPPED review items, noting completion when COMPLETE-P."
-  (let ((count (length skipped)))
-    (when (> count 0)
-      (message "%s; skipped %d unavailable review item%s"
-               (if complete-p "Gnosis review complete" "Continuing review")
-               count (if (= count 1) "" "s")))))
-
-(defun gnosis-review--complete (&optional skipped)
-  "Clear the current review, report SKIPPED items, and close its buffer."
+(defun gnosis-review--complete ()
+  "Clear the current review and close its buffer."
   (setq gnosis-review--session nil
         gnosis-review--attempt nil
         gnosis-review--attempt-revision nil)
-  (unless (gnosis-review--skipped-message skipped t)
-    (message "Gnosis review complete"))
+  (message "Gnosis review complete")
   (kill-buffer (current-buffer)))
 
 (defun gnosis-review--next ()
@@ -394,40 +377,29 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
       (gnosis-core--invalid "Gnosis active review session identity mismatch"))
     (if (null session)
         (gnosis-review--complete)
-      (let* ((result (gnosis-review--begin session-id))
-             (attempt (plist-get result :attempt)))
-        (if (null attempt)
-            (gnosis-review--complete (plist-get result :skipped))
-          (gnosis-review--skipped-message (plist-get result :skipped) nil)
-          (setq gnosis-review--session (plist-get result :session)
-                gnosis-review--attempt attempt
-                gnosis-review--attempt-revision nil
-                gnosis-review--answer-locked-p nil)
-          (gnosis-review--present t))))))
+      (setq gnosis-review--session session
+            gnosis-review--attempt
+            (gnosis-core-review-attempt-begin session-id)
+            gnosis-review--attempt-revision nil
+            gnosis-review--answer-locked-p nil)
+      (gnosis-review--present t))))
 
 (defun gnosis-review--open (session)
   "Open a review buffer for active SESSION."
   (if (gnosis-review--session-complete-p session)
       (message "No Gnosis review items are available")
-    (let* ((result (gnosis-review--begin (plist-get session :session_id)))
-           (attempt (plist-get result :attempt)))
-      (if (null attempt)
-          (let ((skipped (plist-get result :skipped)))
-            (if (> (length skipped) 0)
-                (message "No reviewable items; skipped %d unavailable item%s"
-                         (length skipped)
-                         (if (= (length skipped) 1) "" "s"))
-              (message "No Gnosis review items are available")))
-        (gnosis-review--skipped-message (plist-get result :skipped) nil)
-        (let ((buffer (get-buffer-create gnosis-review-buffer-name)))
-          (pop-to-buffer-same-window buffer)
-          (unless (derived-mode-p 'gnosis-review-mode)
-            (gnosis-review-mode))
-          (setq gnosis-review--session (plist-get result :session)
-                gnosis-review--attempt attempt
-                gnosis-review--attempt-revision nil
-                gnosis-review--answer-locked-p nil)
-          (gnosis-review--present t))))))
+    (let* ((attempt
+            (gnosis-core-review-attempt-begin
+             (plist-get session :session_id)))
+           (buffer (get-buffer-create gnosis-review-buffer-name)))
+      (pop-to-buffer-same-window buffer)
+      (unless (derived-mode-p 'gnosis-review-mode)
+        (gnosis-review-mode))
+      (setq gnosis-review--session session
+            gnosis-review--attempt attempt
+            gnosis-review--attempt-revision nil
+            gnosis-review--answer-locked-p nil)
+      (gnosis-review--present t))))
 
 (defun gnosis-review--create (source target-count)
   "Create and open a review for SOURCE and optional TARGET-COUNT."

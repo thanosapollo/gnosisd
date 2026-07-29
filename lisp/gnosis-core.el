@@ -1734,25 +1734,16 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
   (gnosis-core--review-session-action session-id "abort" "aborted"))
 
 (defun gnosis-core-review-attempt-begin (session-id)
-  "Reconcile and begin the active attempt for review SESSION-ID."
-  (let* ((result
+  "Begin and return the active attempt for review SESSION-ID."
+  (let ((attempt
          (gnosis-core--typed-request
           "post_review_sessions__id__attempts"
-          (list (cons "id" session-id))))
-         (session (plist-get result :session))
-         (attempt (plist-get result :attempt))
-         (status (plist-get session :status))
-         (attempt-present-p (not (eq attempt gnosis-core--json-null))))
-    (unless (and (equal session-id (plist-get session :session_id))
-                 (or (and (equal status "active")
-                          attempt-present-p
-                          (equal session-id
-                                 (plist-get attempt :session_id)))
-                     (and (equal status "completed")
-                          (not attempt-present-p))))
+          (list (cons "id" session-id)))))
+    (unless (and (equal session-id (plist-get attempt :session_id))
+                 (equal "pending" (plist-get attempt :status)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review reconciliation identity is invalid")))
-    result))
+    attempt))
 
 (defun gnosis-core-review-attempt-answer (attempt-id answer)
   "Submit structured ANSWER for ATTEMPT-ID without automatic retry."

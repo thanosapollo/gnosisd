@@ -1316,9 +1316,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                       :source ,source :target_count 12
                       :current_position 0 :queue_length 1 :started_at_us 1))
                    ("post_review_sessions__id__attempts"
-                    '(:session (:session_id "session" :status "active")
-                      :attempt (:attempt_id "attempt" :session_id "session")
-                      :skipped []))
+                    '(:attempt_id "attempt" :session_id "session"
+                      :status "pending"))
                    ("post_review_attempts__id__answer"
                     (list :attempt_id "attempt" :status "graded"
                           :response (nth 3 arguments)))
@@ -1377,13 +1376,10 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         :current_position 1 :queue_length 1 :started_at_us 1)
       "completed"))))
 
-(ert-deftest gnosis-core-review-begin-rejects-incoherent-terminal-state ()
+(ert-deftest gnosis-core-review-begin-rejects-uncorrelated-attempt ()
   (dolist (result
-           `((:session (:session_id "session" :status "active")
-              :attempt ,gnosis-core--json-null :skipped [])
-             (:session (:session_id "session" :status "completed")
-              :attempt (:attempt_id "attempt" :session_id "session")
-              :skipped [])))
+           '((:attempt_id "attempt" :session_id "other" :status "pending")
+             (:attempt_id "attempt" :session_id "session" :status "graded")))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _arguments) result)))
       (should-error (gnosis-core-review-attempt-begin "session")
