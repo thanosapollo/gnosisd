@@ -1376,10 +1376,17 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         :current_position 1 :queue_length 1 :started_at_us 1)
       "completed"))))
 
+(ert-deftest gnosis-core-review-begin-accepts-graded-current-attempt ()
+  (let ((attempt '(:attempt_id "attempt" :session_id "session"
+                   :status "graded")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _arguments) attempt)))
+      (should (eq attempt (gnosis-core-review-attempt-begin "session"))))))
+
 (ert-deftest gnosis-core-review-begin-rejects-uncorrelated-attempt ()
   (dolist (result
            '((:attempt_id "attempt" :session_id "other" :status "pending")
-             (:attempt_id "attempt" :session_id "session" :status "graded")))
+             (:attempt_id "attempt" :session_id "session" :status "committed")))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _arguments) result)))
       (should-error (gnosis-core-review-attempt-begin "session")

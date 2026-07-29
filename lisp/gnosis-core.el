@@ -1740,7 +1740,7 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
           "post_review_sessions__id__attempts"
           (list (cons "id" session-id)))))
     (unless (and (equal session-id (plist-get attempt :session_id))
-                 (equal "pending" (plist-get attempt :status)))
+                 (member (plist-get attempt :status) '("pending" "graded")))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review reconciliation identity is invalid")))
     attempt))

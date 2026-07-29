@@ -236,22 +236,40 @@
       (should (equal '("(Greek hint) and beta" "alpha and beta")
                      (nreverse questions)))
       (should (equal "graded" (plist-get attempt :status)))
-      (let* ((state (gnosis-core-review-attempt-state attempt-id))
-             (gnosis-review--attempt attempt)
-             (gnosis-review--attempt-revision
-              (plist-get state :attempt_revision)))
-        (cl-letf (((symbol-function 'gnosis-review--render) #'ignore)
-                  ((symbol-function 'message) #'ignore))
-          (gnosis-review--override))
-        (setq state (gnosis-core-review-attempt-state attempt-id))
-        (should (equal "graded"
-                       (plist-get (plist-get state :attempt) :status)))
-        (should (eq gnosis-core--json-false
-                    (plist-get (plist-get state :attempt)
-                               :accepted_success))))
-      (should (stringp
-               (plist-get (gnosis-core-review-attempt-commit attempt-id)
-                          :event_id))))))
+      (let ((buffer (get-buffer-create gnosis-review-buffer-name))
+            advanced)
+        (unwind-protect
+            (cl-letf (((symbol-function 'pop-to-buffer-same-window)
+                       (lambda (target &rest _) (set-buffer target)))
+                      ((symbol-function 'keymap-popup) #'ignore)
+                      ((symbol-function 'display-images-p) (lambda () nil)))
+              (gnosis-review--open session)
+              (with-current-buffer buffer
+                (should (equal "graded"
+                               (plist-get gnosis-review--attempt :status)))
+                (gnosis-review--load-revision)
+                (cl-letf (((symbol-function 'gnosis-review--render) #'ignore)
+                          ((symbol-function 'message) #'ignore))
+                  (gnosis-review--override))
+                (let ((state (gnosis-core-review-attempt-state attempt-id)))
+                  (should (equal "graded"
+                                 (plist-get (plist-get state :attempt)
+                                            :status)))
+                  (should (eq gnosis-core--json-false
+                              (plist-get (plist-get state :attempt)
+                                         :accepted_success))))
+                (cl-letf (((symbol-function 'gnosis-review--next)
+                           (lambda () (setq advanced t))))
+                  (gnosis-review--commit-next))
+                (should advanced)
+                (should (equal
+                         "committed"
+                         (plist-get
+                          (plist-get
+                           (gnosis-core-review-attempt-state attempt-id)
+                           :attempt)
+                          :status)))))
+          (when (buffer-live-p buffer) (kill-buffer buffer)))))))
 
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
