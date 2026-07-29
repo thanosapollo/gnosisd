@@ -23,6 +23,7 @@ pub(crate) struct ClozeCheck {
     pub(crate) matches: Vec<bool>,
     pub(crate) all_entered_correct: bool,
     pub(crate) complete: bool,
+    pub(crate) revealed: Vec<bool>,
 }
 
 pub(crate) fn grade(
@@ -68,6 +69,7 @@ pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck 
             &mut visited,
         );
     }
+    let revealed = answer_owners.iter().map(Option::is_some).collect();
     let mut matches = vec![false; inputs.len()];
     for input_index in answer_owners.into_iter().flatten() {
         matches[input_index] = true;
@@ -77,6 +79,7 @@ pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck 
         complete: inputs.len() == answers.len() && all_entered_correct,
         matches,
         all_entered_correct,
+        revealed,
     }
 }
 
@@ -242,6 +245,7 @@ mod tests {
                 matches: vec![true],
                 all_entered_correct: true,
                 complete: false,
+                revealed: vec![false, true],
             }
         );
         assert_eq!(

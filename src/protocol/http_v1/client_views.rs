@@ -5,10 +5,10 @@ use super::{
     ReviewSessionV1, ReviewSourceInputV1, ReviewSourceV1, ReviewStateV1, ReviewTransitionV1,
 };
 use crate::application::{
-    ContentCounts, DashboardSummary, ReviewHistoryEvent, ReviewQueueCounts, ReviewQueueSummary,
-    ReviewSessionSummary, ReviewTotals, ReviewWindow, ThemaReviewState,
+    ContentCounts, DashboardSummary, ReviewClozeCheck, ReviewHistoryEvent, ReviewQueueCounts,
+    ReviewQueueSummary, ReviewSessionSummary, ReviewTotals, ReviewWindow, ThemaReviewState,
 };
-use crate::domain::{ClozeCheck, DocumentId, DocumentProjection, DueThema};
+use crate::domain::{DocumentId, DocumentProjection, DueThema};
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -316,14 +316,20 @@ pub struct ReviewClozeCheckV1 {
     pub matches: Vec<bool>,
     pub all_entered_correct: bool,
     pub complete: bool,
+    pub question: String,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub next_input_script: Option<String>,
 }
 
-impl From<ClozeCheck> for ReviewClozeCheckV1 {
-    fn from(value: ClozeCheck) -> Self {
+impl From<ReviewClozeCheck> for ReviewClozeCheckV1 {
+    fn from(value: ReviewClozeCheck) -> Self {
         Self {
             matches: value.matches,
             all_entered_correct: value.all_entered_correct,
             complete: value.complete,
+            question: value.question,
+            next_input_script: value.next_input_script,
         }
     }
 }

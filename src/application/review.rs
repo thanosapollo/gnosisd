@@ -174,6 +174,15 @@ pub(crate) struct ReviewQuestion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewClozeCheck {
+    pub(crate) matches: Vec<bool>,
+    pub(crate) all_entered_correct: bool,
+    pub(crate) complete: bool,
+    pub(crate) question: String,
+    pub(crate) next_input_script: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewResponsePrompt {
     Text { input_script: Option<String> },
     Texts { input_scripts: Vec<Option<String>> },
@@ -868,6 +877,31 @@ pub(crate) fn review_question(
     Ok(ReviewQuestion { text, response })
 }
 
+pub(crate) fn progressive_cloze_check(
+    presentation: &PresentationSnapshot,
+    check: crate::domain::ClozeCheck,
+) -> Result<ReviewClozeCheck, ReviewError> {
+    let content = presentation_content(presentation)?
+        .validate()
+        .map_err(|_| ReviewError::Content)?;
+    if content.kind != ThemaKind::Cloze || check.revealed.len() != content.answer.len() {
+        return Err(ReviewError::Content);
+    }
+    let question = progressive_cloze_question(&content, &check.revealed)?;
+    let next_input_script = check
+        .revealed
+        .iter()
+        .position(|revealed| !revealed)
+        .and_then(|index| dominant_non_latin_script(&content.answer[index]));
+    Ok(ReviewClozeCheck {
+        matches: check.matches,
+        all_entered_correct: check.all_entered_correct,
+        complete: check.complete,
+        question,
+        next_input_script,
+    })
+}
+
 fn question_text(content: &ThemaContent) -> Result<String, ReviewError> {
     match content.kind {
         ThemaKind::Basic => Ok(basic_question(content)),
@@ -898,6 +932,30 @@ fn concealed_question(content: &ThemaContent, add_hints: bool) -> Result<String,
     } else {
         Ok(question)
     }
+}
+
+fn progressive_cloze_question(
+    content: &ThemaContent,
+    revealed: &[bool],
+) -> Result<String, ReviewError> {
+    let mut question = concealed_question(content, false)?;
+    let mut cursor = 0;
+    for (index, answer) in content.answer.iter().enumerate() {
+        let relative = question[cursor..]
+            .find("(...)")
+            .ok_or(ReviewError::Content)?;
+        let start = cursor + relative;
+        let hint = content.hypothesis.get(index).and_then(Option::as_deref);
+        let replacement = if revealed[index] {
+            trim_outer_quotes(answer).trim().to_owned()
+        } else {
+            hint.filter(|value| !matches!(*value, "" | "nil" | "\"\""))
+                .map_or_else(|| "(...)".to_owned(), |value| format!("({value})"))
+        };
+        question.replace_range(start..start + "(...)".len(), &replacement);
+        cursor = start + replacement.len();
+    }
+    Ok(question)
 }
 
 fn ensure_question_is_safe(content: &ThemaContent, question: &str) -> Result<(), ReviewError> {
@@ -1121,6 +1179,24 @@ mod tests {
                 input_scripts: vec![Some("greek".into()), Some("cyrillic".into())],
             }
         );
+    }
+
+    #[test]
+    fn progressive_cloze_question_reveals_matches_and_selects_next_script() {
+        let mut captured = presentation("cloze", "Question with μυστικό and тайна");
+        captured.hypothesis = vec![Some("Greek hint".into()), Some("Cyrillic hint".into())];
+        captured.answer = vec!["μυστικό".into(), "тайна".into()];
+
+        let check = super::progressive_cloze_check(
+            &captured,
+            crate::domain::check_clozes(&captured.answer, &["тайна".into()]),
+        )
+        .unwrap();
+
+        assert_eq!(check.question, "Question with (Greek hint) and тайна");
+        assert_eq!(check.next_input_script.as_deref(), Some("greek"));
+        assert_eq!(check.matches, vec![true]);
+        assert!(!check.complete);
     }
 
     #[test]

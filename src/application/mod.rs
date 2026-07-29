@@ -70,11 +70,11 @@ pub(crate) use review::{
     OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot,
     RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
     ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
-    ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
-    ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
-    ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation,
-    presentation_content, review_day_at, review_question, valid_operation_id,
-    validate_review_pack_projection,
+    ReviewAttemptView, ReviewClozeCheck, ReviewError, ReviewOperationAuthority, ReviewPackAsset,
+    ReviewPackItem, ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView,
+    ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
+    prepare_offline_operation, presentation_content, progressive_cloze_check, review_day_at,
+    review_question, valid_operation_id, validate_review_pack_projection,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord};
 pub(crate) use sync::{

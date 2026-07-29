@@ -45,15 +45,15 @@ use crate::{
         PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
         PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
         ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewHistoryEvent, ReviewHistoryQuery,
-        ReviewOperationAuthority, ReviewPackAsset, ReviewPackView, ReviewQueueSummary,
-        ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError,
-        SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition, ThemaRecord,
-        ThemaReviewState, prepare_offline_document, retained_asset_paths, token_digest,
-        validate_asset_path, validate_blob_metadata,
+        ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck, ReviewError, ReviewHistoryEvent,
+        ReviewHistoryQuery, ReviewOperationAuthority, ReviewPackAsset, ReviewPackView,
+        ReviewQueueSummary, ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView,
+        ReviewSource, SettingsError, SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition,
+        ThemaRecord, ThemaReviewState, prepare_offline_document, retained_asset_paths,
+        token_digest, validate_asset_path, validate_blob_metadata,
     },
     blob::{BlobError, BlobMeta, BlobStore},
-    domain::{ClozeCheck, DocumentId, DueThema},
+    domain::{DocumentId, DueThema},
     protocol::MAX_REPAIR_BATCH_SIZE,
     store::{
         DeviceMutationExecution, DocumentAssetAssociation, DocumentAssetSource, SqliteStore,
@@ -785,7 +785,7 @@ impl ServiceHandle {
         attempt_id: String,
         actor_device_id: Option<String>,
         inputs: Vec<String>,
-    ) -> Result<ClozeCheck, ServiceError> {
+    ) -> Result<ReviewClozeCheck, ServiceError> {
         request(&self.sender, |response| StoreCommand::CheckClozeAttempt {
             attempt_id,
             actor_device_id,
@@ -1672,7 +1672,7 @@ enum StoreCommand {
         attempt_id: String,
         actor_device_id: Option<String>,
         inputs: Vec<String>,
-        response: oneshot::Sender<StoreResult<ClozeCheck>>,
+        response: oneshot::Sender<StoreResult<ReviewClozeCheck>>,
     },
     CreateDevice {
         device: NewDevice,
