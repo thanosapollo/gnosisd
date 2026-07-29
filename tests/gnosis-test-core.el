@@ -1322,6 +1322,10 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                    ("post_review_attempts__id__answer"
                     (list :attempt_id "attempt" :status "graded"
                           :response (nth 3 arguments)))
+                   ("post_review_attempts__id__cloze-check"
+                    `(:matches [t] :all_entered_correct t
+                      :complete ,gnosis-core--json-false
+                      :question "one and (...)" :next_input_script "greek"))
                    ("get_review_attempt_state"
                     '(:version 1 :attempt_revision 3
                       :attempt (:attempt_id "attempt")))
@@ -1335,6 +1339,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (gnosis-core-review-attempt-begin "session")
       (gnosis-core-review-attempt-answer
        "attempt" '(:kind "texts" :value ["one" "two"]))
+      (gnosis-core-review-attempt-check-cloze "attempt" ["one"])
       (gnosis-core-review-attempt-state "attempt")
       (gnosis-core-review-attempt-commit "attempt"))
     (should
@@ -1348,6 +1353,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         ("post_review_sessions__id__attempts" (("id" . "session")))
         ("post_review_attempts__id__answer" (("id" . "attempt")) nil
          (:kind "texts" :value ["one" "two"]))
+        ("post_review_attempts__id__cloze-check" (("id" . "attempt")) nil
+         (:inputs ["one"]))
         ("get_review_attempt_state" (("id" . "attempt")))
         ("post_review_attempts__id__commit" (("id" . "attempt"))))
       (nreverse calls)))))

@@ -192,6 +192,58 @@
           (should killed)
           (should-not gnosis-review--session))))))
 
+(ert-deftest gnosis-core-integration-progressive-cloze-check ()
+  (skip-unless (gnosis-test-core-integration--available-p))
+  (gnosis-test-core-integration--with-client
+    (let* ((gnosis-core--contract-cache nil)
+           (thema
+            (gnosis-core--typed-request
+             "post_themata" nil nil
+             '(:kind "cloze" :keimenon "alpha and beta"
+               :answer ["alpha" "beta"]
+               :hypothesis ["Greek hint" "Cyrillic hint"])
+             (list (gnosis-core--idempotency-key-header
+                    (gnosis-core-operation-id)))))
+           (thema-id
+            (plist-get (plist-get (plist-get thema :authoritative) :value)
+                       :thema_id))
+           (source
+            (list :kind "manual" :tags [] :exclude_tags []
+                  :topic_node_id gnosis-core--json-null
+                  :topic_forward_depth gnosis-core--json-null
+                  :topic_backward_depth gnosis-core--json-null
+                  :manual_ids (vector thema-id)))
+           (session (gnosis-core-review-session-create source))
+           (attempt
+            (gnosis-core--typed-request
+             "post_review_sessions__id__attempts"
+             (list (cons "id" (plist-get session :session_id)))))
+           (attempt-id (plist-get attempt :attempt_id))
+           (partial
+            (gnosis-core-review-attempt-check-cloze attempt-id ["beta"]))
+           (complete
+            (gnosis-core-review-attempt-check-cloze
+             attempt-id ["beta" "alpha"])))
+      (should (equal [t] (plist-get partial :matches)))
+      (should (equal "(Greek hint) and beta"
+                     (plist-get partial :question)))
+      (should (eq gnosis-core--json-null
+                  (plist-get partial :next_input_script)))
+      (should (eq t (plist-get complete :complete)))
+      (should (equal "alpha and beta" (plist-get complete :question)))
+      (should (eq gnosis-core--json-null
+                  (plist-get complete :next_input_script)))
+      (should (equal "pending"
+                     (plist-get
+                      (plist-get (gnosis-core-review-attempt-state attempt-id)
+                                 :attempt)
+                      :status)))
+      (should (equal "aborted"
+                     (plist-get
+                      (gnosis-core-review-session-abort
+                       (plist-get session :session_id))
+                      :status))))))
+
 (ert-deftest gnosis-core-integration-generated-manifest ()
   (skip-unless (gnosis-test-core-integration--available-p))
   (load-file (getenv "GNOSIS_OPENAPI_GENERATED"))

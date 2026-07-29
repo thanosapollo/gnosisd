@@ -1767,6 +1767,29 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
               '("Gnosis review answer response is not correlated")))
     attempt))
 
+(defun gnosis-core-review-attempt-check-cloze (attempt-id inputs)
+  "Check cumulative cloze INPUTS for ATTEMPT-ID without mutating it."
+  (let ((check
+         (gnosis-core--typed-request
+          "post_review_attempts__id__cloze-check"
+          (list (cons "id" attempt-id)) nil (list :inputs inputs))))
+    (unless (and (vectorp inputs)
+                 (vectorp (plist-get check :matches))
+                 (= (length inputs) (length (plist-get check :matches)))
+                 (seq-every-p (lambda (value)
+                                (memq value (list t gnosis-core--json-false)))
+                              (plist-get check :matches))
+                 (memq (plist-get check :all_entered_correct)
+                       (list t gnosis-core--json-false))
+                 (memq (plist-get check :complete)
+                       (list t gnosis-core--json-false))
+                 (stringp (plist-get check :question))
+                 (let ((script (plist-get check :next_input_script)))
+                   (or (eq script gnosis-core--json-null)
+                       (stringp script))))
+      (gnosis-core--invalid "Invalid Gnosis cloze-check response"))
+    check))
+
 (defun gnosis-core-review-attempt-state (attempt-id)
   "Return authoritative revisioned state for ATTEMPT-ID."
   (let ((state

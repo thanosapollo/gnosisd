@@ -72,14 +72,15 @@
                                  row))
                        rows)))))
 
-(ert-deftest gnosis-review-advancing-actions-close-popup-before-input ()
+(ert-deftest gnosis-review-actions-preserve-popup-only-for-local-state ()
   (let ((rows (keymap-popup--meta gnosis-review-mode-map 'descriptions)))
-    (dolist (key '("RET" "n" "o" "g"))
+    (dolist (key '("RET" "n" "g"))
       (should-not
        (plist-get (keymap-popup--find-entry-by-key rows key) :stay-open)))
-    (should
-     (plist-get
-      (keymap-popup--find-entry-by-key rows "s") :stay-open))))
+    (dolist (key '("o" "s"))
+      (should
+       (plist-get
+        (keymap-popup--find-entry-by-key rows key) :stay-open)))))
 
 (ert-deftest gnosis-review-pending-attempt-keeps-mutations-visible-but-inapt ()
   (with-temp-buffer
@@ -467,12 +468,33 @@
          (gnosis-test-review--attempt
           "pending" (list :kind "texts"
                           :input_scripts [gnosis-core--json-null "greek"])))
-        (answers '("one" "δύο")))
+        (answers '("one" "δύο"))
+        checks
+        questions)
     (cl-letf (((symbol-function 'gnosis-review--read-string)
-               (lambda (&rest _) (pop answers))))
+               (lambda (&rest _) (pop answers)))
+              ((symbol-function 'gnosis-core-review-attempt-check-cloze)
+               (lambda (_attempt-id inputs)
+                 (push inputs checks)
+                 (if (= (length inputs) 1)
+                     '(:matches [t] :all_entered_correct t :complete nil
+                       :question "one and (...)"
+                       :next_input_script "greek")
+                   `(:matches [t t] :all_entered_correct t :complete t
+                     :question "one and δύο"
+                     :next_input_script ,gnosis-core--json-null))))
+              ((symbol-function 'gnosis-review--render)
+               (lambda (&rest _)
+                 (push (plist-get
+                        (plist-get gnosis-review--attempt :presentation)
+                        :question)
+                       questions))))
       (should
        (equal '(:kind "texts" :value ["one" "δύο"])
-              (gnosis-review--read-answer)))))
+              (gnosis-review--read-answer)))
+      (should (equal '(["one"] ["one" "δύο"]) (nreverse checks)))
+      (should (equal '("one and (...)" "one and δύο")
+                     (nreverse questions)))))
   (let ((gnosis-review--attempt
          (gnosis-test-review--attempt
           "pending" (list :kind "choice" :choices ["A" "B"])))
@@ -483,6 +505,27 @@
                      (gnosis-review--read-answer)))
       (should (listp (nth 1 arguments)))
       (should (eq t (nth 2 arguments))))))
+
+(ert-deftest gnosis-review-stops-progressive-cloze-input-on-first-failure ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt
+          (gnosis-test-review--attempt
+           "pending" '(:kind "texts" :input_scripts [nil nil])))
+    (let ((reads 0))
+      (cl-letf (((symbol-function 'gnosis-review--read-string)
+                 (lambda (&rest _) (cl-incf reads) "wrong"))
+                ((symbol-function 'gnosis-core-review-attempt-check-cloze)
+                 (lambda (&rest _)
+                   `(:matches [,gnosis-core--json-false]
+                     :all_entered_correct ,gnosis-core--json-false
+                     :complete ,gnosis-core--json-false
+                     :question "(...) and (...)"
+                     :next_input_script ,gnosis-core--json-null)))
+                ((symbol-function 'gnosis-review--render) #'ignore))
+        (should (equal '(:kind "texts" :value ["wrong"])
+                       (gnosis-review--read-answer)))
+        (should (= reads 1))))))
 
 (ert-deftest gnosis-review-render-never-grades-or-discloses-pending-answer ()
   (with-temp-buffer
@@ -907,26 +950,32 @@
                       :type 'gnosis-core-mutation-uncertain)
         (should (= commits 0))))))
 
-(ert-deftest gnosis-review-commit-and-override-use-accepted-result ()
-  (dolist (case `((,#'gnosis-review--commit-next . ,gnosis-core--json-false)
-                  (,#'gnosis-review--override . t)))
-    (with-temp-buffer
-      (gnosis-review-mode)
-      (setq gnosis-review--attempt
-            (plist-put (gnosis-test-review--attempt "graded")
-                       :accepted_success gnosis-core--json-false)
-            gnosis-review--attempt-revision 4)
-      (let (desired)
-        (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
-                   (lambda (_ _ value)
-                     (setq desired value)
-                     (list :attempt_revision 5
-                           :attempt (plist-put gnosis-review--attempt
-                                               :accepted_success value))))
-                  ((symbol-function 'gnosis-core-review-attempt-commit) #'ignore)
-                  ((symbol-function 'gnosis-review--next) #'ignore))
-          (funcall (car case))
-          (should (eq desired (cdr case))))))))
+(ert-deftest gnosis-review-override-updates-result-without-advancing ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt
+          (plist-put (gnosis-test-review--attempt "graded")
+                     :accepted_success gnosis-core--json-false)
+          gnosis-review--attempt-revision 4)
+    (let (events)
+      (cl-letf (((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
+                 (lambda (_ _ value)
+                   (push (list 'set value) events)
+                   (list :attempt_revision 5
+                         :attempt (plist-put gnosis-review--attempt
+                                             :accepted_success value))))
+                ((symbol-function 'gnosis-core-review-attempt-commit)
+                 (lambda (&rest _) (push 'commit events)))
+                ((symbol-function 'gnosis-review--next)
+                 (lambda () (push 'next events)))
+                ((symbol-function 'gnosis-review--render)
+                 (lambda () (push 'render events)))
+                ((symbol-function 'message) #'ignore))
+        (gnosis-review--override)
+        (should (equal '((set t) render) (nreverse events)))
+        (should (= 5 gnosis-review--attempt-revision))
+        (should (eq t (plist-get gnosis-review--attempt
+                                 :accepted_success)))))))
 
 (ert-deftest gnosis-review-commit-uncertainty-recovers-committed-attempt ()
   (with-temp-buffer

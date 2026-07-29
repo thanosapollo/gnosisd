@@ -84,8 +84,8 @@
   "n" ("Commit & next" gnosis-review--commit-next
        :inapt-if #'gnosis-review--pending-p)
   :group "State"
-  "o" ("Override & next" gnosis-review--override
-       :inapt-if #'gnosis-review--pending-p)
+  "o" ("Override" gnosis-review--override
+       :inapt-if #'gnosis-review--pending-p :stay-open t)
   "s" (#'gnosis-review--suspension-description gnosis-review--toggle-suspension
        :inapt-if #'gnosis-review--pending-p :stay-open t)
   :group "Session"
@@ -272,21 +272,41 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
                   (format "Answer (%s): " script))
                 script))))
       ("texts"
-       (list :kind "texts" :value
-             (cl-loop for script across (plist-get prompt :input_scripts)
-                      for index from 1
-                      collect (gnosis-review--read-string
-                               (if (eq script gnosis-core--json-null)
-                                   (format "Answer %d: " index)
-                                 (format "Answer %d (%s): " index script))
-                               script)
-                      into answers
-                      finally return (vconcat answers))))
+       (gnosis-review--read-cloze-answer prompt))
       ("choice"
        (list :kind "choice" :value
              (gnosis-completing-read
               "Answer: " (append (plist-get prompt :choices) nil) t)))
       (_ (user-error "Unsupported review response prompt")))))
+
+(defun gnosis-review--read-cloze-answer (prompt)
+  "Read and progressively check the cloze answer requested by PROMPT."
+  (let ((attempt-id (plist-get gnosis-review--attempt :attempt_id))
+        (script (aref (plist-get prompt :input_scripts) 0))
+        (inputs [])
+        continue)
+    (setq continue t)
+    (while continue
+      (let* ((index (1+ (length inputs)))
+             (input (gnosis-review--read-string
+                     (if (eq script gnosis-core--json-null)
+                         (format "Answer %d: " index)
+                       (format "Answer %d (%s): " index script))
+                     script))
+             (next-inputs (vconcat inputs (vector input)))
+             (check (gnosis-core-review-attempt-check-cloze
+                     attempt-id next-inputs))
+             (matches (plist-get check :matches)))
+        (setq inputs next-inputs
+              script (plist-get check :next_input_script)
+              continue
+              (and (eq t (aref matches (1- (length matches))))
+                   (not (eq t (plist-get check :complete)))))
+        (setf (plist-get
+               (plist-get gnosis-review--attempt :presentation) :question)
+              (plist-get check :question))
+        (gnosis-review--render)))
+    (list :kind "texts" :value inputs)))
 
 (defun gnosis-review--load-revision ()
   "Refresh and return authoritative state for the current attempt."
@@ -583,12 +603,26 @@ When a review is active, prompt to resume it, replace it, or cancel."
    (plist-get gnosis-review--attempt :accepted_success)))
 
 (defun gnosis-review--override ()
-  "Invert the current accepted result, commit it, and continue."
+  "Invert the current accepted result without committing the attempt."
   (interactive)
-  (gnosis-review--finish
-   (if (eq (plist-get gnosis-review--attempt :accepted_success) t)
-       gnosis-core--json-false
-     t)))
+  (unless (gnosis-review--graded-p)
+    (user-error "Current attempt is not graded"))
+  (unless gnosis-review--attempt-revision (gnosis-review--load-revision))
+  (let* ((desired
+          (if (eq (plist-get gnosis-review--attempt :accepted_success) t)
+              gnosis-core--json-false
+            t))
+         (result
+          (gnosis-review--revisioned-operation
+           (lambda ()
+             (gnosis-core-review-attempt-set-accepted-success
+              (plist-get gnosis-review--attempt :attempt_id)
+              gnosis-review--attempt-revision desired))
+           :accepted_success desired)))
+    (setq gnosis-review--attempt (plist-get result :attempt)
+          gnosis-review--attempt-revision (plist-get result :attempt_revision))
+    (gnosis-review--render)
+    (message "Gnosis result overridden")))
 
 (defun gnosis-review--toggle-suspension ()
   "Toggle desired suspension for the current graded attempt."
