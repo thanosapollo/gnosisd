@@ -387,7 +387,18 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                  :properties (:kind (:const "allowed")))])
       contract))
     (should-not (gnosis-core--schema-valid-p
-                 "blocked" '(:not (:enum ["blocked"])) contract))))
+                  "blocked" '(:not (:enum ["blocked"])) contract))))
+
+(ert-deftest gnosis-core-validates-uint32-schema-format ()
+  (let ((schema '(:type "integer" :format "uint32")))
+    (should (gnosis-core--schema-valid-p 0 schema nil))
+    (should (gnosis-core--schema-valid-p #xffffffff schema nil))
+    (should-not (gnosis-core--schema-valid-p -1 schema nil))
+    (should-not (gnosis-core--schema-valid-p #x100000000 schema nil))
+    (should
+     (gnosis-core--schema-valid-p
+      gnosis-core--json-null
+      '(:type ["integer" "null"] :format "uint32") nil))))
 
 (ert-deftest gnosis-core-refreshes-contract-when-authority-changes ()
   (let ((gnosis-core--contract-cache nil)
@@ -1487,6 +1498,57 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         (cl-letf (((symbol-function 'gnosis-core--typed-request)
                    (lambda (&rest _) result)))
           (should (eq result (gnosis-core-review-attempt-begin "session"))))))))
+
+(ert-deftest gnosis-core-review-begin-bounds-uint32-positions ()
+  (let ((attempt '(:attempt_id "attempt" :session_id "session"
+                   :thema_id "thema" :status "pending")))
+    (let* ((session `(:session_id "session" :mode "online" :status "completed"
+                      :current_position ,gnosis-core--uint32-max
+                      :queue_length ,gnosis-core--uint32-max :started_at_us 1))
+           (result (list :session session :attempt gnosis-core--json-null
+                         :start_position gnosis-core--uint32-max :skipped [])))
+      (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                 (lambda (&rest _) result)))
+        (should (eq result (gnosis-core-review-attempt-begin "session")))))
+    (dolist
+        (result
+         (list
+          `(:session
+            (:session_id "session" :mode "online" :status "completed"
+             :current_position ,gnosis-core--uint32-max
+             :queue_length ,gnosis-core--uint32-max :started_at_us 1)
+            :attempt ,gnosis-core--json-null
+            :start_position ,#x100000000 :skipped [])
+          `(:session
+            (:session_id "session" :mode "online" :status "completed"
+             :current_position ,#x100000000 :queue_length ,#x100000000
+             :started_at_us 1)
+            :attempt ,gnosis-core--json-null
+            :start_position ,#x100000000 :skipped [])
+          `(:session
+            (:session_id "session" :mode "online" :status "active"
+             :current_position 0 :queue_length ,#x100000000 :started_at_us 1)
+            :attempt ,attempt :start_position 0 :skipped [])
+          `(:session
+            (:session_id "session" :mode "online" :status "completed"
+             :current_position ,gnosis-core--uint32-max
+             :queue_length ,gnosis-core--uint32-max :started_at_us 1)
+            :attempt ,gnosis-core--json-null
+            :start_position ,(1- gnosis-core--uint32-max)
+            :skipped [(:position ,#x100000000 :thema_id "thema"
+                       :reason "archived")])
+          `(:session
+            (:session_id "session" :mode "online" :status "completed"
+             :current_position ,gnosis-core--uint32-max
+             :queue_length ,gnosis-core--uint32-max :started_at_us 1)
+            :attempt ,gnosis-core--json-null
+            :start_position ,gnosis-core--uint32-max
+            :skipped [(:position ,gnosis-core--uint32-max :thema_id "thema"
+                       :reason "archived")])))
+      (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                 (lambda (&rest _) result)))
+        (should-error (gnosis-core-review-attempt-begin "session")
+                      :type 'gnosis-core-mutation-uncertain)))))
 
 (ert-deftest gnosis-core-review-begin-rejects-invalid-attempt-identities ()
   (let ((session '(:session_id "session" :mode "online" :status "active"

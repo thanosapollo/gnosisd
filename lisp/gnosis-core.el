@@ -63,6 +63,8 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 
 (defconst gnosis-core--default-online-review-target-count 100)
 
+(defconst gnosis-core--uint32-max #xffffffff)
+
 (defconst gnosis-core--thema-catalog-page-limit 100
   "Maximum themata requested in one management page.")
 
@@ -650,6 +652,17 @@ EXPECTED-ETAG requires an exact successful response ETag."
     ("string" (stringp value))
     (_ nil)))
 
+(defun gnosis-core--uint32-p (value)
+  "Return non-nil when VALUE is representable by Core as uint32."
+  (and (integerp value) (<= 0 value gnosis-core--uint32-max)))
+
+(defun gnosis-core--schema-format-valid-p (value schema)
+  "Return non-nil when VALUE satisfies supported format rules in SCHEMA."
+  (pcase (plist-get schema :format)
+    ("uint32" (or (eq value gnosis-core--json-null)
+                  (gnosis-core--uint32-p value)))
+    (_ t)))
+
 (defun gnosis-core--schema-bounds-valid-p (value schema)
   "Return non-nil when VALUE respects simple bounds in SCHEMA."
   (and
@@ -731,6 +744,7 @@ ADDITIONAL defines unknown-key handling using CONTRACT at DEPTH."
            (gnosis-core--schema-type-valid-p value type))
          (gnosis-core--schema-enum-valid-p value schema)
          (gnosis-core--schema-bounds-valid-p value schema)
+         (gnosis-core--schema-format-valid-p value schema)
          (or (not (vectorp value))
              (gnosis-core--schema-array-valid-p value schema contract depth))
          (or (not (gnosis-core--json-object-p value))
@@ -1680,8 +1694,8 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
          (equal "online" (plist-get session :mode))
          (equal expected-status status)
          (integerp started-at) (> started-at 0)
-         (integerp position) (>= position 0)
-         (integerp length) (>= length 0)
+         (gnosis-core--uint32-p position)
+         (gnosis-core--uint32-p length)
          (pcase status
            ("active" (< position length))
            ("completed" (= position length))
@@ -1742,7 +1756,7 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
   (let ((position (plist-get item :position))
         (thema-id (plist-get item :thema_id)))
     (and (gnosis-core--json-object-p item)
-         (integerp position) (>= position 0)
+         (gnosis-core--uint32-p position)
          (gnosis-core--review-id-valid-p thema-id)
          (member (plist-get item :reason)
                  '("archived" "suspended" "content_changed"
@@ -1752,17 +1766,19 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
     (items start-position current-position)
   "Return non-nil when ITEMS cover START-POSITION to CURRENT-POSITION."
   (and (vectorp items)
-       (integerp start-position)
-       (>= start-position 0)
-       (= (+ start-position (length items)) current-position)
-       (let ((expected start-position))
-         (seq-every-p
-          (lambda (item)
-            (let ((position (plist-get item :position)))
-              (and (gnosis-core--review-skipped-item-valid-p item)
-                   (= position expected)
-                   (progn (setq expected (1+ expected)) t))))
-          items))))
+       (gnosis-core--uint32-p start-position)
+       (gnosis-core--uint32-p current-position)
+       (let ((end (+ start-position (length items))))
+         (and (gnosis-core--uint32-p end)
+              (= end current-position)
+              (let ((expected start-position))
+                (seq-every-p
+                 (lambda (item)
+                   (let ((position (plist-get item :position)))
+                     (and (gnosis-core--review-skipped-item-valid-p item)
+                          (= position expected)
+                          (progn (setq expected (1+ expected)) t))))
+                 items))))))
 
 (defun gnosis-core-review-attempt-begin (session-id)
   "Begin and return the reconciliation envelope for review SESSION-ID."
