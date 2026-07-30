@@ -33,6 +33,7 @@ TEST_FILES := tests/gnosis-test-core.el \
 	tests/gnosis-test-core-integration.el
 TEST_FEATURES := $(basename $(notdir $(TEST_FILES)))
 TEST ?=
+ERT_SELECTOR ?= t
 SELECTED_TEST_FILES = $(if $(TEST),$(TEST),$(TEST_FILES))
 SELECTED_TEST_FEATURES = $(basename $(notdir $(SELECTED_TEST_FILES)))
 
@@ -66,9 +67,9 @@ do-test:
 	$(EMACS) --batch -q \
 		--eval "(setq byte-compile-error-on-warn t byte-compile-warnings t)" \
 		-L "$$build" -f batch-byte-compile "$$build"/*.el; \
-	$(EMACS) --batch -q -L "$$build" \
+	ERT_SELECTOR="$(ERT_SELECTOR)" $(EMACS) --batch -q -L "$$build" \
 		--eval "(mapc #'require '($(SELECTED_TEST_FEATURES)))" \
-		-f ert-run-tests-batch-and-exit
+		--eval "(ert-run-tests-batch-and-exit (read (getenv \"ERT_SELECTOR\")))"
 
 test-oneshot: test
 
