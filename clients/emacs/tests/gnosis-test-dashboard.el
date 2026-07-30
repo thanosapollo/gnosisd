@@ -48,7 +48,9 @@
           (should (derived-mode-p 'gnosis-dashboard-mode))
           (should (eq 'gnosis-face-dashboard-header
                       (get-text-property (point-min) 'face)))
-          (dolist (text '("Today: 8 reviews"
+          (dolist (text '("Connection: Ready"
+                          "Reviewed today: 8 (New: 2)"
+                          "Due themata: 4 (Overdue: 1)"
                           "Content: 12 themata, 3 archived, 2 documents, 7 nodes"
                           "Last 30 days: 20 reviews, success rate 0.75"))
             (should (string-match-p (regexp-quote text) (buffer-string))))
@@ -102,18 +104,20 @@
     (let ((inhibit-read-only t)) (insert "existing projection"))
     (cl-letf (((symbol-function 'gnosis-core-dashboard)
                (lambda (&rest _) (signal 'gnosis-core-unavailable '("down")))))
-      (should-error (gnosis-dashboard-refresh) :type 'gnosis-core-unavailable)
+      (let ((condition (should-error (gnosis-dashboard-refresh)
+                                     :type 'user-error)))
+        (should
+         (equal (cadr condition)
+                "gnosisd unavailable. Check service and gnosis-core-base-url.")))
       (should (equal "existing projection" (buffer-string))))))
 
 (ert-deftest gnosis-dashboard-keymap-is-direct-and-discoverable ()
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "g")
               #'gnosis-dashboard-refresh))
-  (should (eq (keymap-lookup gnosis-dashboard-mode-map "r") 'gnosis-review))
-  (with-temp-buffer
-    (setq gnosis-dashboard--projection
-          (list :active_session '(:status "active")))
-  (should (eq (keymap-lookup gnosis-dashboard-mode-map "R")
-                'gnosis-review-resume)))
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "r")
+              'gnosis-dashboard-review))
+  (should (eq (keymap-lookup gnosis-dashboard-mode-map "n")
+              'gnosis-nodes-find))
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "t")
               'gnosis-dashboard-themata))
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "T")
@@ -122,32 +126,44 @@
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "?")
               'gnosis-dashboard-mode-map-popup)))
 
-(ert-deftest gnosis-dashboard-popup-describes-resume-exactly ()
+(ert-deftest gnosis-dashboard-popup-describes-start-resume-exactly ()
   (let* ((rows (keymap-popup--meta gnosis-dashboard-mode-map 'descriptions))
          (review-group (car (car rows)))
          (entry (seq-find
-                 (lambda (item) (equal (plist-get item :key) "R"))
+                 (lambda (item) (equal (plist-get item :key) "r"))
                  (plist-get review-group :entries))))
-    (should (equal (plist-get entry :description) "Resume review"))
-    (should (eq (plist-get entry :if)
-                #'gnosis-dashboard--active-session-p))))
+    (should (eq (plist-get entry :description)
+                #'gnosis-dashboard--review-description))
+    (with-temp-buffer
+      (should (equal "Start review" (gnosis-dashboard--review-description)))
+      (setq gnosis-dashboard--projection
+            (list :active_session '(:status "active")))
+      (should (equal "Resume review" (gnosis-dashboard--review-description))))
+    (dolist (row rows)
+      (dolist (group row)
+        (should (<= (length (plist-get group :entries)) 4))))))
 
 (ert-deftest gnosis-dashboard-renders-minimal-summary-with-state-faces ()
   (with-temp-buffer
     (gnosis-dashboard-mode)
     (gnosis--render-dashboard (gnosis-test-dashboard--projection))
-    (dolist (text '("Today" "Content" "Last 30 days"))
+    (dolist (text '("Connection" "Reviewed today" "Due themata"
+                    "Content" "Last 30 days"))
       (should (string-search text (buffer-string))))
     (dolist (text '("Review day" "Queue:" "Active session"
                     "Review due" "Refresh" "Actions" "Quit"))
       (should-not (string-search text (buffer-string))))
     (goto-char (point-min))
-    (search-forward "Today:")
+    (search-forward "Connection:")
     (should (eq (get-text-property (1- (point)) 'face) 'shadow))
+    (search-forward "Ready")
+    (should (eq (get-text-property (1- (point)) 'face) 'success))
     (search-forward "6 successful")
     (should (eq (get-text-property (1- (point)) 'face) 'success))
     (search-forward "2 failed")
     (should (eq (get-text-property (1- (point)) 'face) 'error))
+    (search-forward "4")
+    (should (eq (get-text-property (1- (point)) 'face) 'warning))
     (search-forward "3 archived")
     (should (eq (get-text-property (1- (point)) 'face) 'shadow))))
 
@@ -156,7 +172,7 @@
     (gnosis-dashboard-mode)
     (gnosis--render-dashboard (gnosis-test-dashboard--projection))
     (goto-char (point-min))
-    (search-forward "Gnosis")
+    (search-forward "Gnosis Dashboard")
     (forward-line 1)
     (should (equal (get-text-property (point) 'display)
                    '(space :width text)))
@@ -184,7 +200,7 @@
           (with-current-buffer buffer
             (should-not gnosis-center-content)
             (goto-char (point-min))
-            (should (looking-at "Gnosis"))))
+            (should (looking-at "Gnosis Dashboard"))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-dashboard-opens-command-popup ()
@@ -252,6 +268,53 @@
                #'gnosis-test-dashboard--projection))
       (gnosis-dashboard-refresh))
     (should (= (point) 25))))
+
+(ert-deftest gnosis-dashboard-refresh-restores-window-start ()
+  (with-temp-buffer
+    (gnosis-dashboard-mode)
+    (let (restored)
+      (cl-letf (((symbol-function 'selected-window) (lambda () 'window))
+                ((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'window-start) (lambda (&rest _) 11))
+                ((symbol-function 'set-window-start)
+                 (lambda (&rest arguments) (setq restored arguments)))
+                ((symbol-function 'window-body-width) (lambda (&rest _) 80))
+                ((symbol-function 'gnosis-core-dashboard)
+                 #'gnosis-test-dashboard--projection))
+        (gnosis-dashboard-refresh))
+      (should (equal restored '(window 11 t))))))
+
+(ert-deftest gnosis-dashboard-initial-failure-opens-safe-corrective-state ()
+  (let ((buffer (get-buffer-create gnosis-dashboard-buffer-name)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-dashboard)
+                   (lambda (&rest _)
+                     (signal 'gnosis-core-authentication-error
+                             '("secret server detail"))))
+                  ((symbol-function 'pop-to-buffer-same-window)
+                   (lambda (target &rest _) (set-buffer target)))
+                  ((symbol-function 'keymap-popup) #'ignore))
+          (gnosis-dashboard)
+          (with-current-buffer buffer
+            (should (derived-mode-p 'gnosis-dashboard-mode))
+            (should-not gnosis-dashboard--projection)
+            (should
+             (string-search
+              "Gnosis authentication failed. Check auth-source token for gnosisd."
+              (buffer-string)))
+            (should-not (string-search "secret server detail" (buffer-string)))
+            (goto-char (point-min))
+            (search-forward "authentication failed")
+            (should (eq (get-text-property (1- (point)) 'face) 'error))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gnosis-dashboard-primary-actions-dispatch-existing-journeys ()
+  (let (review-arguments)
+    (cl-letf (((symbol-function 'gnosis-review)
+               (lambda (&rest arguments) (setq review-arguments arguments))))
+      (gnosis-dashboard-review))
+    (should (equal review-arguments '(nil)))))
 
 (ert-deftest gnosis-themata-fetches-every-generation-bound-page ()
   (let ((first (gnosis-test-dashboard--thema))

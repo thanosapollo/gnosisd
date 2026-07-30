@@ -57,8 +57,7 @@
   :group 'gnosis)
 
 (defface gnosis-face-separator
-  '((((background light)) :strike-through "gray70" :foreground "gray70")
-    (t :strike-through "gray30" :foreground "gray30"))
+  '((t :inherit shadow :strike-through t))
   "Face reserved for review separators."
   :group 'gnosis)
 
@@ -113,9 +112,18 @@
 
 (defun gnosis-dashboard--popup-description ()
   "Return context text for dashboard popup help."
-  (if (gnosis-dashboard--active-session-p)
-      "Gnosis Dashboard — active review"
-    "Gnosis Dashboard — no active review"))
+  (cond ((not gnosis-dashboard--projection) "Gnosis Dashboard — unavailable")
+        ((gnosis-dashboard--active-session-p) "Gnosis Dashboard — active review")
+        (t "Gnosis Dashboard — ready")))
+
+(defun gnosis-dashboard--review-description ()
+  "Return the review action appropriate for the dashboard projection."
+  (if (gnosis-dashboard--active-session-p) "Resume review" "Start review"))
+
+(defun gnosis-dashboard-review ()
+  "Start or resume the server-owned due review flow."
+  (interactive)
+  (gnosis-review nil))
 
 (keymap-popup-define gnosis-dashboard-mode-map
   "Keymap for `gnosis-dashboard-mode'."
@@ -123,11 +131,10 @@
   :exit-key "C-g"
   :description #'gnosis-dashboard--popup-description
   :group "Review"
-  "r" ("Review due" gnosis-review)
+  "r" (#'gnosis-dashboard--review-description gnosis-dashboard-review)
   "T" ("Review topic" gnosis-review-topic)
-  "R" ("Resume review" gnosis-review-resume
-       :if #'gnosis-dashboard--active-session-p)
   :group "View"
+  "n" ("Nodes / documents" gnosis-nodes-find)
   "t" ("Themata" gnosis-dashboard-themata)
   "g" ("Refresh" gnosis-dashboard-refresh :stay-open t)
   "q" ("Quit" quit-window))
@@ -420,12 +427,21 @@
         (gnosis--dashboard-style "unavailable" 'shadow)
       (gnosis--dashboard-style (format "%.2f" rate) 'success))))
 
+(defun gnosis--dashboard-connection-text ()
+  "Return the successful authenticated connection state."
+  (format "%s %s"
+          (gnosis--dashboard-style "Connection:" 'shadow)
+          (gnosis--dashboard-style "Ready" 'success)))
+
 (defun gnosis--dashboard-today-text (today)
   "Return the dashboard summary for TODAY."
-  (format "%s %s, %s, %s"
-          (gnosis--dashboard-style "Today:" 'shadow)
+  (format "%s %s (New: %s); %s, %s"
+          (gnosis--dashboard-style "Reviewed today:" 'shadow)
           (gnosis--dashboard-style
-           (format "%d reviews" (plist-get today :review_count))
+           (number-to-string (plist-get today :review_count))
+           'font-lock-type-face)
+          (gnosis--dashboard-style
+           (number-to-string (plist-get today :new_count))
            'font-lock-type-face)
           (gnosis--dashboard-style
            (format "%d successful" (plist-get today :success_count))
@@ -433,6 +449,17 @@
           (gnosis--dashboard-style
            (format "%d failed" (plist-get today :failure_count))
            'error)))
+
+(defun gnosis--dashboard-queue-text (queue)
+  "Return review availability text for server-projected QUEUE."
+  (let ((due (plist-get queue :due_count))
+        (overdue (plist-get queue :overdue_count)))
+    (format "%s %s (Overdue: %s)"
+            (gnosis--dashboard-style "Due themata:" 'shadow)
+            (gnosis--dashboard-style
+             (number-to-string due) (if (> due 0) 'warning 'success))
+            (gnosis--dashboard-style
+             (number-to-string overdue) (if (> overdue 0) 'error 'success)))))
 
 (defun gnosis--dashboard-content-text (content)
   "Return the dashboard summary for CONTENT."
@@ -474,11 +501,14 @@
   "Return display text for server dashboard projection STATE."
   (let ((today (plist-get state :today))
         (window (plist-get state :window))
+        (queue (plist-get state :queue))
         (content (plist-get state :content))
         (session (plist-get state :active_session)))
     (string-join
      (append
-      (list (gnosis--dashboard-today-text today)
+      (list (gnosis--dashboard-connection-text)
+            (gnosis--dashboard-today-text today)
+            (gnosis--dashboard-queue-text queue)
             (gnosis--dashboard-content-text content)
             (gnosis--dashboard-window-text window))
       (when-let* ((warning (gnosis--dashboard-session-text session)))
@@ -494,7 +524,7 @@
               (window-start)))
         (text
          (concat
-          (propertize (gnosis--center-text "Gnosis")
+          (propertize (gnosis--center-text "Gnosis Dashboard")
                       'face 'gnosis-face-dashboard-header)
           "\n" (gnosis--separator) "\n\n"
           (gnosis--center-text (gnosis--dashboard-text state)))))
@@ -508,26 +538,59 @@
                           (min old-window-start (point-max)))
                         t))))
 
+(defun gnosis-dashboard--failure-message (condition)
+  "Return public-safe corrective text for typed CONDITION."
+  (pcase (car condition)
+    ('gnosis-core-authentication-error
+     "Gnosis authentication failed. Check auth-source token for gnosisd.")
+    ('gnosis-core-authorization-error
+     "Gnosis access denied. Check gnosisd token scopes.")
+    ((or 'gnosis-core-unavailable 'gnosis-core-timeout
+         'gnosis-core-transport-error)
+     "gnosisd unavailable. Check service and gnosis-core-base-url.")
+    (_ "Gnosis dashboard unavailable. Check gnosisd and client/server versions.")))
+
+(defun gnosis--render-dashboard-failure (condition)
+  "Render a safe corrective dashboard for typed CONDITION."
+  (let ((inhibit-read-only t))
+    (erase-buffer)
+    (insert
+     (propertize (gnosis--center-text "Gnosis Dashboard")
+                 'face 'gnosis-face-dashboard-header)
+     "\n" (gnosis--separator) "\n\n"
+     (gnosis--center-text
+      (propertize (gnosis-dashboard--failure-message condition) 'face 'error)))
+    (goto-char (point-min))))
+
+(defun gnosis-dashboard--load (&optional start-at-top)
+  "Load and render the authenticated dashboard, optionally START-AT-TOP."
+  (let ((state (gnosis-core-dashboard)))
+    (gnosis--render-dashboard state start-at-top)
+    (setq gnosis-dashboard--projection state)))
+
 (defun gnosis-dashboard-refresh ()
   "Refresh the current Gnosis dashboard from the server projection."
   (interactive)
   (unless (derived-mode-p 'gnosis-dashboard-mode)
     (user-error "Not in a Gnosis dashboard"))
-  (let ((state (gnosis-core-dashboard)))
-    (gnosis--render-dashboard state)
-    (setq gnosis-dashboard--projection state)))
+  (condition-case condition
+      (gnosis-dashboard--load)
+    (gnosis-core-error
+     (user-error "%s" (gnosis-dashboard--failure-message condition)))))
 
 ;;;###autoload
 (defun gnosis-dashboard ()
   "Open the server-projected Gnosis dashboard."
   (interactive)
-  (let ((state (gnosis-core-dashboard))
-        (buffer (get-buffer-create gnosis-dashboard-buffer-name)))
+  (let ((buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (unless (derived-mode-p 'gnosis-dashboard-mode)
       (gnosis-dashboard-mode))
-    (gnosis--render-dashboard state t)
-    (setq gnosis-dashboard--projection state)
+    (condition-case condition
+        (gnosis-dashboard--load t)
+      (gnosis-core-error
+       (setq gnosis-dashboard--projection nil)
+       (gnosis--render-dashboard-failure condition)))
     (keymap-popup gnosis-dashboard-mode-map)))
 
 ;;;###autoload
