@@ -1151,13 +1151,23 @@ pub enum ReviewResponsePromptV1 {
         input_script: Option<String>,
     },
     Texts {
-        #[schemars(length(min = 1))]
+        #[schemars(schema_with = "review_cloze_input_scripts_schema")]
         input_scripts: Vec<Option<String>>,
     },
     Choice {
         #[schemars(length(min = 2))]
         choices: Vec<String>,
     },
+}
+
+fn review_cloze_input_scripts_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Vec::<Option<String>>::json_schema(generator);
+    schema.insert("minItems".into(), 1.into());
+    schema.insert(
+        "maxItems".into(),
+        crate::domain::MAX_REVIEW_CLOZE_INPUTS.into(),
+    );
+    schema
 }
 
 impl ReviewResponsePromptV1 {

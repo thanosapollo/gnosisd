@@ -1177,7 +1177,7 @@ pub(crate) enum ReviewError {
 mod tests {
     use serde::Deserialize;
 
-    use crate::application::MAX_REVIEW_PACK_ITEMS;
+    use crate::{application::MAX_REVIEW_PACK_ITEMS, domain::MAX_REVIEW_CLOZE_INPUTS};
 
     use super::{
         PresentationSnapshot, ReviewAttemptMutation, ReviewAttemptOperation, ReviewResponsePrompt,
@@ -1233,6 +1233,26 @@ mod tests {
         assert_eq!(check.next_input_script.as_deref(), Some("greek"));
         assert_eq!(check.matches, vec![true]);
         assert!(!check.complete);
+    }
+
+    #[test]
+    fn maximum_progressive_cloze_can_complete() {
+        let answers = (0..MAX_REVIEW_CLOZE_INPUTS)
+            .map(|index| format!("answer-{index:03}"))
+            .collect::<Vec<_>>();
+        let mut captured = presentation("cloze", &answers.join(" "));
+        captured.answer = answers.clone();
+
+        let check = super::progressive_cloze_check(
+            &captured,
+            crate::domain::check_clozes(&answers, &answers),
+        )
+        .unwrap();
+
+        assert_eq!(check.matches.len(), MAX_REVIEW_CLOZE_INPUTS);
+        assert!(check.all_entered_correct);
+        assert!(check.complete);
+        assert_eq!(check.next_input_script, None);
     }
 
     #[test]

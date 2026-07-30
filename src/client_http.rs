@@ -31,8 +31,8 @@ use crate::{
         DeviceUploadKind, DeviceUploadResult, PendingAssetUpload, PendingDeviceUpload,
     },
     domain::{
-        DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
-        SourceSpan, ThemaId, TitlePath,
+        DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence,
+        MAX_REVIEW_CLOZE_INPUTS, Node, NodeId, SourceSpan, ThemaId, TitlePath,
     },
     is_canonical_sha256,
     parser::{supported_content_type, validate_document_path},
@@ -1133,12 +1133,13 @@ impl HttpClient {
         input: &ReviewClozeCheckRequestV1,
     ) -> Result<ReviewClozeCheckV1, HttpClientError> {
         require_review_id(attempt_id)?;
-        if input.inputs.is_empty() || input.inputs.len() > 500 {
+        if input.inputs.is_empty() || input.inputs.len() > MAX_REVIEW_CLOZE_INPUTS {
             return Err(HttpClientError::InvalidReview);
         }
         let url = self.review_resource_endpoint("attempts", attempt_id, Some("cloze-check"))?;
         let request = json_request(self.client.post(url), encode_review_body(input)?);
-        execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await
+        let result = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
+        checked_cloze_check(result, input.inputs.len())
     }
 
     pub async fn review_attempt_state(
@@ -2004,6 +2005,29 @@ fn valid_session_position(session: &ReviewSessionV1) -> bool {
         ReviewSessionStatusV1::Quit | ReviewSessionStatusV1::Aborted => {
             session.current_position <= session.queue_length
         }
+    }
+}
+
+fn checked_cloze_check(
+    result: ReviewClozeCheckV1,
+    input_count: usize,
+) -> Result<ReviewClozeCheckV1, HttpClientError> {
+    let all_entered_correct = result.matches.iter().all(|matched| *matched);
+    let script_is_valid = result.next_input_script.as_ref().is_none_or(|script| {
+        !script.is_empty()
+            && script
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    });
+    if result.matches.len() == input_count
+        && result.all_entered_correct == all_entered_correct
+        && (!result.complete || (all_entered_correct && result.next_input_script.is_none()))
+        && !result.question.trim().is_empty()
+        && script_is_valid
+    {
+        Ok(result)
+    } else {
+        Err(invalid_response())
     }
 }
 
@@ -2939,6 +2963,69 @@ mod tests {
         },
         service::ServiceRuntime,
     };
+
+    async fn cloze_check_response(
+        body: serde_json::Value,
+    ) -> Result<ReviewClozeCheckV1, HttpClientError> {
+        let body = body.to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let token = SecretToken::new(format!("gnosis_{}", "a".repeat(43))).unwrap();
+        let client = HttpClient::new(&format!("http://{address}/"), token).unwrap();
+        let result = client
+            .check_review_clozes(
+                "attempt",
+                &ReviewClozeCheckRequestV1 {
+                    inputs: vec!["answer".into()],
+                },
+            )
+            .await;
+        server.await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn cloze_check_client_rejects_uncorrelated_responses() {
+        let response = |matches, all_entered_correct, complete, question, next_input_script| {
+            serde_json::json!({
+                "matches": matches,
+                "all_entered_correct": all_entered_correct,
+                "complete": complete,
+                "question": question,
+                "next_input_script": next_input_script
+            })
+        };
+
+        assert!(
+            cloze_check_response(response(vec![true], true, false, "Question", Some("greek")))
+                .await
+                .is_ok()
+        );
+        for malformed in [
+            response(vec![], true, false, "Question", Some("greek")),
+            response(vec![false], true, false, "Question", Some("greek")),
+            response(vec![true], true, true, "Question", Some("greek")),
+            response(vec![true], true, false, "", Some("greek")),
+            response(vec![true], true, false, "Question", Some("Greek")),
+        ] {
+            assert!(matches!(
+                cloze_check_response(malformed).await,
+                Err(HttpClientError::InvalidResponse {
+                    delivery: DeliveryStatus::Unknown
+                })
+            ));
+        }
+    }
 
     #[test]
     fn begin_result_rejects_noncontiguous_skipped_positions() {

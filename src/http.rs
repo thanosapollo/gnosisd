@@ -4457,6 +4457,16 @@ mod tests {
             api["components"]["schemas"]["ReviewClozeCheckRequestV1"]["properties"]["inputs"]["minItems"],
             1
         );
+        let text_prompt = api["components"]["schemas"]["ReviewResponsePromptV1"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"].get("input_scripts").is_some())
+            .unwrap();
+        assert_eq!(
+            text_prompt["properties"]["input_scripts"]["maxItems"],
+            crate::domain::MAX_REVIEW_CLOZE_INPUTS
+        );
         let event = &api["components"]["schemas"]["ReviewHistoryEventV1"];
         assert!(event["properties"].get("response").is_none());
         assert_local_refs_resolve(&api, &api);

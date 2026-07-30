@@ -22,7 +22,10 @@ use crate::{
         presentation_content, progressive_cloze_check, review_day_at, review_question,
         validate_offline_thema_assets, validate_review_pack_projection,
     },
-    domain::{GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition, grade},
+    domain::{
+        GradeError, MATCHER_VERSION, MAX_REVIEW_CLOZE_INPUTS, ThemaKind, check_clozes,
+        compute_transition, grade,
+    },
 };
 
 #[derive(Serialize)]
@@ -515,7 +518,7 @@ impl SqliteStore {
         let content = presentation_content(&row.presentation).map_err(StoreError::storage)?;
         if content.kind != ThemaKind::Cloze
             || inputs.is_empty()
-            || inputs.len() > 500
+            || inputs.len() > MAX_REVIEW_CLOZE_INPUTS
             || inputs.len() > content.answer.len()
         {
             return Err(StoreError::InvalidReviewResponse);
@@ -2970,6 +2973,7 @@ mod tests {
         prepare_thema, presentation_content, review_day_at, thema_content,
     };
     use crate::blob::BlobMeta;
+    use crate::domain::MAX_REVIEW_CLOZE_INPUTS;
     use crate::store::StoreError;
 
     fn add_thema_with_tags(
@@ -3193,6 +3197,8 @@ mod tests {
 
     #[test]
     fn malformed_stored_presentations_complete_without_creating_attempts() {
+        let oversized_answers =
+            serde_json::to_string(&vec!["answer"; MAX_REVIEW_CLOZE_INPUTS + 1]).unwrap();
         for (kind, question, hypotheses, answers) in [
             ("basic", "", r#"[null]"#, r#"["only"]"#),
             ("mcq", "Question", r#"["only"]"#, r#"["only"]"#),
@@ -3202,6 +3208,7 @@ mod tests {
                 r#"[null,null]"#,
                 r#"["first","missing"]"#,
             ),
+            ("cloze", "answer", "[]", oversized_answers.as_str()),
         ] {
             let mut store = SqliteStore::open_in_memory().unwrap();
             add_thema(&mut store, "thema", "Question", None);
