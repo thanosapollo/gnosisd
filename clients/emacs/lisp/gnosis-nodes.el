@@ -2292,7 +2292,7 @@ Return match, next cursor, remaining count, and visits."
 
 (defun gnosis-nodes--prune-unchanged-applied (state entry authoritative)
   "Prune unchanged applied ENTRY when STATE base confirms AUTHORITATIVE."
-  (if (when-let ((base (gnosis-nodes--base
+  (if (when-let* ((base (gnosis-nodes--base
                         state (plist-get authoritative :document_id))))
         (gnosis-nodes--unchanged-head-matches-base-p base authoritative))
       (let ((operation-id (plist-get entry :operation-id)))
@@ -2423,7 +2423,7 @@ Return match, next cursor, remaining count, and visits."
           (setq state (plist-put state :outbox-scan-index
                                  (mod (+ index 1) length)))
           (when (eq :applied (plist-get entry :status))
-            (when-let ((authoritative
+            (when-let* ((authoritative
                         (plist-get (plist-get entry :result) :authoritative)))
               (setq state
                     (gnosis-nodes--start-applied-recovery
@@ -2956,7 +2956,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 
 (defun gnosis-nodes--dispose-ediff-session (session-id)
   "Remove disposable artifacts for Ediff SESSION-ID."
-  (when-let ((session (gethash session-id gnosis-nodes--ediff-sessions)))
+  (when-let* ((session (gethash session-id gnosis-nodes--ediff-sessions)))
     (remhash session-id gnosis-nodes--ediff-sessions)
     (let ((merge-file (plist-get session :merge-file)))
       (when (and (stringp merge-file)
@@ -2969,7 +2969,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 
 (defun gnosis-nodes--abandon-ediff-session (session-id)
   "Invalidate and remove abandoned Ediff SESSION-ID artifacts."
-  (when-let ((session (gethash session-id gnosis-nodes--ediff-sessions)))
+  (when-let* ((session (gethash session-id gnosis-nodes--ediff-sessions)))
     (condition-case nil
         (progn
           (gnosis-nodes--with-lock
