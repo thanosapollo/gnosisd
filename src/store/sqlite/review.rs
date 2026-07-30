@@ -333,12 +333,16 @@ impl SqliteStore {
             ReviewSessionMode::Online,
         )?;
         let transaction = self.write_transaction()?;
-        let queue_length = load_session(&transaction, session_id)?
-            .ok_or(StoreError::NotFound)?
-            .queue_length;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::NotFound)?;
+        let remaining = session
+            .queue_length
+            .checked_sub(session.current_position)
+            .ok_or(StoreError::CorruptData {
+                field: "review session position",
+            })?;
         let mut skipped = Vec::new();
         let mut attempt = None;
-        for _ in 0..queue_length {
+        for _ in 0..remaining {
             if let Some(current) = current_attempt(&transaction, session_id)? {
                 if let Some(reason) = attempt_skip_reason(&transaction, &current)? {
                     skipped.push(skip_current_item(
@@ -3305,6 +3309,62 @@ mod tests {
         assert_eq!(retry.attempt.unwrap().attempt_id, attempt.attempt_id);
         assert!(retry.skipped.is_empty());
         assert_eq!(retry.session.current_position, 3);
+    }
+
+    #[test]
+    fn final_unusable_item_completes_after_earlier_progress() {
+        for materialized in [false, true] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            add_thema(&mut store, "first", "First", None);
+            add_thema(&mut store, "final", "Final", None);
+            let session = store
+                .create_review_session(&manual_source_many(&["first", "final"]), Some(2), None, 2)
+                .unwrap();
+            grade_and_commit(&mut store, &session.session_id, "answer", 3);
+
+            let expected_reason = if materialized {
+                let attempt = store
+                    .begin_http_review_attempt(&session.session_id, None, 6)
+                    .unwrap()
+                    .attempt
+                    .unwrap();
+                assert_eq!(attempt.thema_id, "final");
+                add_thema(&mut store, "final", "Changed", Some(1));
+                ReviewItemSkipReason::ContentChanged
+            } else {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE review_state SET suspended = 1, state_revision = state_revision + 1
+                         WHERE thema_id = 'final'",
+                        [],
+                    )
+                    .unwrap();
+                ReviewItemSkipReason::Suspended
+            };
+
+            let result = store
+                .begin_http_review_attempt(&session.session_id, None, 7)
+                .unwrap();
+            assert_eq!(result.session.status, "completed");
+            assert_eq!(result.session.current_position, 2);
+            assert!(result.attempt.is_none());
+            assert_eq!(result.skipped.len(), 1);
+            assert_eq!(result.skipped[0].position, 1);
+            assert_eq!(result.skipped[0].reason, expected_reason);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT disposition FROM review_session_item
+                         WHERE session_id = ?1 AND position = 1",
+                        [&session.session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "skipped"
+            );
+        }
     }
 
     #[test]
