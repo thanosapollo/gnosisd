@@ -265,7 +265,7 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         "started_at_us":1
     });
     let attempt = review_attempt_result()["attempt"].clone();
-    let committed = json!({"event_id":"event"});
+    let committed = json!({"attempt_id":"attempt","event_id":"event"});
 
     assert_round_trip::<ReviewSessionRequestV1>(request);
     assert_round_trip::<ReviewSessionV1>(session);

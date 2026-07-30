@@ -793,6 +793,7 @@ pub struct ActiveReviewSessionV1 {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewCommitResponseV1 {
+    pub attempt_id: String,
     pub event_id: String,
 }
 

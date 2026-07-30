@@ -25,8 +25,9 @@ use gnosis_core::{
             ApiErrorCodeV1, AssetHeadV1, DesiredStateMutationProjectionV1,
             DesiredStateMutationResultV1, DocumentImportRequestV1, DocumentMutationResultV1,
             NoteRenameRequestV1, NoteWriteRequestV1, ReviewAnswerV1, ReviewPackAssetV2,
-            ReviewSessionRequestV1, ReviewSourceInputV1, ReviewSourceKindV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, ThemaWriteRequestV1,
+            ReviewQueueSummaryRequestV1, ReviewSessionRequestV1, ReviewSourceInputV1,
+            ReviewSourceKindV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+            ThemaWriteRequestV1,
         },
         request,
     },
@@ -1798,6 +1799,89 @@ async fn review_session_client_enforces_request_and_normalized_response_targets(
         }
         raw.task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn review_clients_reject_uncorrelated_success_responses() {
+    let source = manual_source("thema".into());
+    let session = |source_id: &str, status: &str| {
+        json!({
+            "session_id": "session",
+            "mode": "online",
+            "source": {
+                "kind": "manual",
+                "tags": [],
+                "exclude_tags": [],
+                "topic_node_id": null,
+                "topic_forward_depth": null,
+                "topic_backward_depth": null,
+                "manual_ids": [source_id]
+            },
+            "target_count": 1,
+            "status": status,
+            "current_position": 0,
+            "queue_length": 1,
+            "started_at_us": 1,
+            "owner_device_id": null
+        })
+    };
+
+    for response in [session("other", "active"), session("thema", "quit")] {
+        let raw = spawn_json_response("201 Created", response).await;
+        let client = HttpClient::new(&raw.base_url, token()).unwrap();
+        assert_invalid_response(
+            client
+                .create_review_session(&ReviewSessionRequestV1 {
+                    source: source.clone(),
+                    target_count: Some(1),
+                })
+                .await,
+        );
+        raw.task.await.unwrap();
+    }
+
+    let raw = spawn_json_server(json!({
+        "source": {
+            "kind": "manual",
+            "tags": [],
+            "exclude_tags": [],
+            "topic_node_id": null,
+            "topic_forward_depth": null,
+            "topic_backward_depth": null,
+            "manual_ids": ["other"]
+        },
+        "matched_count": 1
+    }))
+    .await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(
+        client
+            .review_queue_summary(&ReviewQueueSummaryRequestV1 {
+                source: source.clone(),
+            })
+            .await,
+    );
+    raw.task.await.unwrap();
+
+    let mut attempt = review_operation_json(1, "operation", "attempt", 2)["attempt"].clone();
+    attempt["response"] = json!({"kind": "text", "value": "other"});
+    let raw = spawn_json_server(attempt).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(
+        client
+            .answer_review_attempt("attempt", &ReviewAnswerV1::Text("Answer".into()))
+            .await,
+    );
+    raw.task.await.unwrap();
+
+    let raw = spawn_json_server(json!({
+        "attempt_id": "other-attempt",
+        "event_id": "event"
+    }))
+    .await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(client.commit_review_attempt("attempt").await);
+    raw.task.await.unwrap();
 }
 
 #[tokio::test]

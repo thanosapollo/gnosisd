@@ -55,11 +55,11 @@ use crate::{
             ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2,
             ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
             ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
-            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1, ReviewStateV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SetThemaSuspensionRequestV1,
-            SettingsV1, StagedBlobV1, ThemaCatalogItemV1, ThemaCatalogPageV1, ThemaKindV1,
-            ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
-            valid_bearer_token,
+            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1, ReviewSourceV1,
+            ReviewStateV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+            SetThemaSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogItemV1,
+            ThemaCatalogPageV1, ThemaKindV1, ThemaPageV1, ThemaReviewStateV1, ThemaV1,
+            ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
     },
 };
@@ -723,13 +723,19 @@ impl HttpClient {
         &self,
         input: &ReviewSessionRequestV1,
     ) -> Result<ReviewSessionV1, HttpClientError> {
-        if input.source.clone().into_application().validate().is_err()
-            || input
-                .target_count
-                .is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        let source = input
+            .source
+            .clone()
+            .into_application()
+            .validate()
+            .map_err(|_| HttpClientError::InvalidReview)?;
+        if input
+            .target_count
+            .is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
         {
             return Err(HttpClientError::InvalidReview);
         }
+        let expected_source = ReviewSourceV1::from(&source);
         let request = self.post_review_json("v1/review/sessions", input)?;
         let session = checked_online_session(
             execute_json_exact(
@@ -739,6 +745,8 @@ impl HttpClient {
             )
             .await?,
             None,
+            Some(ReviewSessionStatusV1::Active),
+            Some(&expected_source),
         )?;
         if session.target_count
             != Some(
@@ -1051,8 +1059,18 @@ impl HttpClient {
         &self,
         input: &ReviewQueueSummaryRequestV1,
     ) -> Result<ReviewQueueSummaryV1, HttpClientError> {
+        let source = input
+            .source
+            .clone()
+            .into_application()
+            .validate()
+            .map_err(|_| HttpClientError::InvalidReview)?;
+        let expected_source = ReviewSourceV1::from(&source);
         let request = self.post_review_json("v1/review/queue/summary", input)?;
-        execute_json(request, MAX_REPLICA_PAGE_BYTES).await
+        let result: ReviewQueueSummaryV1 = execute_json(request, MAX_REPLICA_PAGE_BYTES).await?;
+        (result.source == expected_source)
+            .then_some(result)
+            .ok_or_else(invalid_response)
     }
 
     pub async fn thema_review_state(
@@ -1071,7 +1089,9 @@ impl HttpClient {
 
     pub async fn active_review_session(&self) -> Result<ActiveReviewSessionV1, HttpClientError> {
         let active: ActiveReviewSessionV1 = self.get_json("v1/review/sessions/active").await?;
-        if active.session.as_ref().is_none_or(valid_online_session) {
+        if active.session.as_ref().is_none_or(|session| {
+            valid_online_session(session) && session.status == ReviewSessionStatusV1::Active
+        }) {
             Ok(active)
         } else {
             Err(invalid_response())
@@ -1082,21 +1102,24 @@ impl HttpClient {
         &self,
         session_id: &str,
     ) -> Result<ReviewSessionV1, HttpClientError> {
-        self.review_session_action(session_id, "resume").await
+        self.review_session_action(session_id, "resume", ReviewSessionStatusV1::Active)
+            .await
     }
 
     pub async fn quit_review_session(
         &self,
         session_id: &str,
     ) -> Result<ReviewSessionV1, HttpClientError> {
-        self.review_session_action(session_id, "quit").await
+        self.review_session_action(session_id, "quit", ReviewSessionStatusV1::Quit)
+            .await
     }
 
     pub async fn abort_review_session(
         &self,
         session_id: &str,
     ) -> Result<ReviewSessionV1, HttpClientError> {
-        self.review_session_action(session_id, "abort").await
+        self.review_session_action(session_id, "abort", ReviewSessionStatusV1::Aborted)
+            .await
     }
 
     pub async fn begin_review_attempt(
@@ -1124,7 +1147,10 @@ impl HttpClient {
         let body = encode_review_body(answer)?;
         let request = json_request(self.client.post(url), body);
         let attempt = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
-        checked_attempt(attempt, Some(attempt_id), None)
+        let attempt = checked_attempt(attempt, Some(attempt_id), None)?;
+        (attempt.response.as_ref() == Some(answer))
+            .then_some(attempt)
+            .ok_or_else(invalid_response)
     }
 
     pub async fn check_review_clozes(
@@ -1192,8 +1218,7 @@ impl HttpClient {
         let url = self.review_resource_endpoint("attempts", attempt_id, Some("commit"))?;
         let result: ReviewCommitResponseV1 =
             execute_json(self.client.post(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
-        require_review_id(&result.event_id)
-            .is_ok()
+        (require_review_id(&result.event_id).is_ok() && result.attempt_id == attempt_id)
             .then_some(result)
             .ok_or_else(invalid_response)
     }
@@ -1318,12 +1343,13 @@ impl HttpClient {
         &self,
         session_id: &str,
         action: &str,
+        expected_status: ReviewSessionStatusV1,
     ) -> Result<ReviewSessionV1, HttpClientError> {
         require_review_id(session_id)?;
         let url = self.review_resource_endpoint("sessions", session_id, Some(action))?;
         let session: ReviewSessionV1 =
             execute_json(self.client.post(url), MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
-        checked_online_session(session, Some(session_id))
+        checked_online_session(session, Some(session_id), Some(expected_status), None)
     }
 
     async fn set_review_attempt_state(
@@ -1981,9 +2007,13 @@ fn checked_pack_asset(
 fn checked_online_session(
     session: ReviewSessionV1,
     expected_id: Option<&str>,
+    expected_status: Option<ReviewSessionStatusV1>,
+    expected_source: Option<&ReviewSourceV1>,
 ) -> Result<ReviewSessionV1, HttpClientError> {
     if valid_online_session(&session)
         && expected_id.is_none_or(|expected| session.session_id == expected)
+        && expected_status.is_none_or(|expected| session.status == expected)
+        && expected_source.is_none_or(|expected| session.source == *expected)
     {
         Ok(session)
     } else {

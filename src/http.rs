@@ -1974,13 +1974,17 @@ async fn commit_attempt(
 ) -> Result<Json<ReviewCommitResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     require_safe_http_attempt(&state, &id).await?;
+    let attempt_id = id.clone();
     let event = state
         .service
         .commit_review_attempt(id, online_review_actor(), now_us()?)
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(ReviewCommitResponseV1 { event_id: event }))
+    Ok(Json(ReviewCommitResponseV1 {
+        attempt_id,
+        event_id: event,
+    }))
 }
 
 async fn require_safe_http_attempt(
