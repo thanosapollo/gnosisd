@@ -118,6 +118,11 @@
               'gnosis-dashboard-review))
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "n")
               'gnosis-nodes-find))
+  (with-temp-buffer
+    (setq gnosis-dashboard--projection
+          (list :active_session '(:status "active")))
+    (should (eq (keymap-lookup gnosis-dashboard-mode-map "R")
+                'gnosis-review-resume)))
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "t")
               'gnosis-dashboard-themata))
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "T")
@@ -310,11 +315,18 @@
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-dashboard-primary-actions-dispatch-existing-journeys ()
-  (let (review-arguments)
+  (let (review-arguments resumed)
     (cl-letf (((symbol-function 'gnosis-review)
-               (lambda (&rest arguments) (setq review-arguments arguments))))
-      (gnosis-dashboard-review))
-    (should (equal review-arguments '(nil)))))
+               (lambda (&rest arguments) (setq review-arguments arguments)))
+              ((symbol-function 'gnosis-review-resume)
+               (lambda () (interactive) (setq resumed t))))
+      (gnosis-dashboard-review)
+      (with-temp-buffer
+        (setq gnosis-dashboard--projection
+              (list :active_session '(:status "active")))
+        (call-interactively (keymap-lookup gnosis-dashboard-mode-map "R"))))
+    (should (equal review-arguments '(nil)))
+    (should resumed)))
 
 (ert-deftest gnosis-themata-fetches-every-generation-bound-page ()
   (let ((first (gnosis-test-dashboard--thema))

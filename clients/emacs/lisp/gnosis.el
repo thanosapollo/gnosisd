@@ -133,6 +133,8 @@
   :group "Review"
   "r" (#'gnosis-dashboard--review-description gnosis-dashboard-review)
   "T" ("Review topic" gnosis-review-topic)
+  "R" ("Active review controls" gnosis-review-resume
+       :if #'gnosis-dashboard--active-session-p)
   :group "View"
   "n" ("Nodes / documents" gnosis-nodes-find)
   "t" ("Themata" gnosis-dashboard-themata)

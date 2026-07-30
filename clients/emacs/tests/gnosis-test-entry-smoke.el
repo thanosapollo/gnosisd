@@ -22,12 +22,14 @@
                (lambda () (interactive) (push 'themata called)))
               ((symbol-function 'gnosis-review-topic)
                (lambda () (interactive) (push 'topic called)))
+              ((symbol-function 'gnosis-review-resume)
+               (lambda () (interactive) (push 'resume called)))
               ((symbol-function 'gnosis-nodes-find)
                (lambda () (interactive) (push 'nodes called))))
       (call-interactively #'gnosis)
-      (dolist (key '("r" "T" "n" "t"))
+      (dolist (key '("r" "T" "R" "n" "t"))
         (call-interactively (keymap-lookup gnosis-dashboard-mode-map key)))
-      (should (equal '(themata nodes topic due dashboard) called)))))
+      (should (equal '(themata nodes resume topic due dashboard) called)))))
 
 (provide 'gnosis-test-entry-smoke)
 ;;; gnosis-test-entry-smoke.el ends here

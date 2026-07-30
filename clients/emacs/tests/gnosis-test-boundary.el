@@ -77,6 +77,12 @@
       (goto-char (point-min))
       (should (search-forward
                "M-x gnosis= for the server-projected dashboard" nil t))
+      (goto-char (point-min))
+      (should (re-search-forward "start\\(?:s\\)? or resume\\(?:s\\)?" nil t))
+      (should (search-forward "=R=" nil t))
+      (should (search-forward "active review controls" nil t))
+      (should (search-forward "=n=" nil t))
+      (should (search-forward "nodes and documents" nil t))
       (should (search-forward "M-x gnosis-review= for due review" nil t))
       (should (re-search-forward "=n= commits the current accepted result" nil t))
       (should (search-forward

@@ -10,9 +10,10 @@ history, authoring rules, and persistence.
 
 ** Current scope
 
-Run =M-x gnosis= for the server-projected dashboard; =r= starts review, =T=
-starts topic review, =R= resumes an active session, =t= opens the thema
-management list, =g= refreshes, =?= shows actions, and =q= closes it.  Run
+Run =M-x gnosis= for the server-projected dashboard; =r= starts or resumes
+review, =T= starts topic review, =R= opens active review controls, =n= opens
+nodes and documents, =t= opens the thema management list, =g= refreshes, =?=
+shows actions, and =q= closes it.  Run
 =M-x gnosis-review= for due review.  For an
 offline-editable Org working tree, customize =gnosis-nodes-dir= and run
 =M-x gnosis-nodes-bootstrap=.  Edit Org files normally; each save durably queues
