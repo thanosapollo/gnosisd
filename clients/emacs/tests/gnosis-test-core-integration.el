@@ -132,7 +132,7 @@
            (thema
             (gnosis-core--typed-request
              "post_themata" nil nil
-             '(:kind "basic" :keimenon "Question" :answer ["Answer"])
+             '(:kind "basic" :keimenon "Question" :answer ["пилет"])
              (list (gnosis-core--idempotency-key-header
                     (gnosis-core-operation-id)))))
            (thema-id
@@ -153,7 +153,7 @@
            state result)
       (setq attempt
             (gnosis-core-review-attempt-answer
-             attempt-id '(:kind "text" :value "Answer")))
+             attempt-id '(:kind "text" :value "пилет")))
       (should (equal "graded" (plist-get attempt :status)))
       (setq state (gnosis-core-review-attempt-state attempt-id)
             result

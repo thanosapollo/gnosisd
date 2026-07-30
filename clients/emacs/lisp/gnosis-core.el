@@ -145,7 +145,7 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
     (unless (gnosis-core--valid-token-p token)
       (signal 'gnosis-core-authentication-error
               '("No valid Gnosis token in auth-source")))
-    token))
+    (encode-coding-string token 'us-ascii)))
 
 (defun gnosis-core--json-body (value)
   "Return UTF-8 JSON bytes for VALUE."

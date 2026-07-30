@@ -517,13 +517,16 @@ When a review is active, prompt to resume it, replace it, or cancel."
       (when (and answered-attempt
                  (equal "pending" (plist-get attempt :status)))
         (error "Authoritative attempt state did not advance"))
+      (setq gnosis-review--attempt attempt
+            gnosis-review--attempt-revision
+            (plist-get state :attempt_revision))
       (when (and uncertain
                  (or (equal "pending" (plist-get attempt :status))
                      (not (equal answer (plist-get attempt :response)))))
-        (signal (car uncertain) (cdr uncertain)))
-      (setq gnosis-review--attempt attempt
-            gnosis-review--attempt-revision
-            (plist-get state :attempt_revision))))
+        (when (equal "pending" (plist-get attempt :status))
+          (setq gnosis-review--answer-locked-p nil))
+        (gnosis-review--render)
+        (signal (car uncertain) (cdr uncertain)))))
   (gnosis-review--render)
   (when show-popup
     (keymap-popup gnosis-review-mode-map)))

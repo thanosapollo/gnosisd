@@ -82,6 +82,26 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                   (copy-marker (1- (- (point-max) (string-bytes body))))))
     buffer))
 
+(defun gnosis-test-core--serve-json-once (server client _message)
+  "Configure CLIENT accepted by SERVER to return one JSON response."
+  (set-process-coding-system client 'binary 'binary)
+  (set-process-filter
+   client
+   (lambda (process data)
+     (let ((request (concat (or (process-get process 'request) "") data)))
+       (process-put process 'request request)
+       (when-let* ((header-end (string-match "\r\n\r\n" request))
+                   ((string-match
+                     "\r\nContent-length: \\([0-9]+\\)" request))
+                   (content-length (string-to-number (match-string 1 request)))
+                   ((>= (string-bytes request)
+                        (+ header-end 4 content-length))))
+         (process-put server 'request request)
+         (process-send-string
+          process
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}")
+         (delete-process process))))))
+
 (defun gnosis-test-core--contract ()
   "Return a small live-contract fixture for typed request tests."
   `(:openapi "3.1.0"
@@ -233,6 +253,34 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                      (cdr (assoc "Content-Type" headers))))
       (should (equal "application/json" (cdr (assoc "Accept" headers))))
       (should (string-match-p "\\\"value\\\":1" data)))))
+
+(ert-deftest gnosis-core-sends-utf8-json-with-multibyte-ascii-token ()
+  (let* ((server
+          (make-network-process
+           :name "gnosis-test-http-server" :server t :host "127.0.0.1"
+           :service t :family 'ipv4 :coding 'binary :noquery t
+           :log #'gnosis-test-core--serve-json-once))
+         (port (process-contact server :service))
+         (gnosis-core-base-url (format "http://127.0.0.1:%d" port))
+         (gnosis-core-connect-timeout 0.5))
+    (unwind-protect
+        (cl-letf (((symbol-function 'auth-source-search)
+                   (lambda (&rest _)
+                     (list (list :secret
+                                 (string-to-multibyte (make-string 40 ?x)))))))
+          (should
+           (eq t
+               (plist-get
+                (gnosis-core--perform-request
+                 "POST" "/test" '(:kind "text" :value "пилет") 200 nil t)
+                :ok)))
+          (should
+           (string-match-p
+            (regexp-quote
+             (encode-coding-string
+              "{\"kind\":\"text\",\"value\":\"пилет\"}" 'utf-8-unix))
+            (process-get server 'request))))
+      (delete-process server))))
 
 (ert-deftest gnosis-core-accepts-binary-responses-without-assuming-a-media-type ()
   (let (headers)
