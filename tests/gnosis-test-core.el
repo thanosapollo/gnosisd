@@ -1354,7 +1354,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                     '(:version 1 :attempt_revision 3
                       :attempt (:attempt_id "attempt")))
                    ("post_review_attempts__id__commit"
-                    '(:event_id "event"))))))
+                    '(:attempt_id "attempt" :event_id "event"))))))
       (gnosis-core-review-session-create source 12)
       (gnosis-core-review-session-active)
       (gnosis-core-review-session-resume "session")
@@ -1382,6 +1382,13 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         ("get_review_attempt_state" (("id" . "attempt")))
         ("post_review_attempts__id__commit" (("id" . "attempt"))))
       (nreverse calls)))))
+
+(ert-deftest gnosis-core-review-commit-rejects-uncorrelated-attempt ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               '(:attempt_id "other-attempt" :event_id "event"))))
+    (should-error (gnosis-core-review-attempt-commit "attempt")
+                  :type 'gnosis-core-mutation-uncertain)))
 
 (ert-deftest gnosis-core-review-cloze-check-rejects-uncorrelated-response ()
   (let ((valid `(:matches [t] :all_entered_correct t

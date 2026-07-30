@@ -1918,8 +1918,13 @@ Correlate the response with EXPECTED-REVISION and OPERATION-ID."
 
 (defun gnosis-core-review-attempt-commit (attempt-id)
   "Commit ATTEMPT-ID without automatic retry and return its event identity."
-  (gnosis-core--typed-request
-   "post_review_attempts__id__commit" (list (cons "id" attempt-id))))
+  (let ((result
+         (gnosis-core--typed-request
+          "post_review_attempts__id__commit" (list (cons "id" attempt-id)))))
+    (unless (equal attempt-id (plist-get result :attempt_id))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis review commit response correlation failed")))
+    result))
 
 (defun gnosis-core-api-unavailable (operation)
   "Signal that generated bindings for OPERATION are not available."
