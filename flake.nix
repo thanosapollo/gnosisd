@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     keymap-popup = {
-      url = "git+https://codeberg.org/thanosapollo/emacs-keymap-popup.git?ref=refs/tags/0.4.0";
+      url = "git+https://git.thanosapollo.org/emacs-keymap-popup?ref=refs/tags/0.4.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
