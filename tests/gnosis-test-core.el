@@ -1452,6 +1452,27 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         (should-error (gnosis-core-review-attempt-begin "session")
                       :type 'gnosis-core-mutation-uncertain)))))
 
+(ert-deftest gnosis-core-review-begin-requires-the-complete-skipped-suffix ()
+  (let ((session '(:session_id "session" :mode "online" :status "active"
+                   :current_position 3 :queue_length 4 :started_at_us 1))
+        (attempt '(:attempt_id "attempt" :session_id "session" :thema_id "thema"
+                   :status "pending")))
+    (dolist (skipped '([(:position 0 :thema_id "a" :reason "archived")]
+                       [(:position 0 :thema_id "a" :reason "archived")
+                        (:position 2 :thema_id "c" :reason "suspended")]))
+      (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                 (lambda (&rest _)
+                   (list :session session :attempt attempt :skipped skipped))))
+        (should-error (gnosis-core-review-attempt-begin "session")
+                      :type 'gnosis-core-mutation-uncertain)))
+    (dolist (skipped '([(:position 2 :thema_id "c" :reason "suspended")]
+                       [(:position 1 :thema_id "b" :reason "archived")
+                        (:position 2 :thema_id "c" :reason "suspended")]))
+      (let ((result (list :session session :attempt attempt :skipped skipped)))
+        (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                   (lambda (&rest _) result)))
+          (should (eq result (gnosis-core-review-attempt-begin "session"))))))))
+
 (ert-deftest gnosis-core-review-begin-rejects-invalid-attempt-identities ()
   (let ((session '(:session_id "session" :mode "online" :status "active"
                    :current_position 0 :queue_length 1 :started_at_us 1)))

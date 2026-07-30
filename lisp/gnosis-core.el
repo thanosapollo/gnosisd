@@ -1749,16 +1749,16 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
                    "scheduling_changed" "unsafe_presentation")))))
 
 (defun gnosis-core--review-skipped-valid-p (items current-position)
-  "Return non-nil when skipped ITEMS precede CURRENT-POSITION in order."
+  "Return non-nil when ITEMS are the skipped suffix before CURRENT-POSITION."
   (and (vectorp items)
-       (let ((previous -1))
+       (<= (length items) current-position)
+       (let ((expected (- current-position (length items))))
          (seq-every-p
           (lambda (item)
             (let ((position (plist-get item :position)))
               (and (gnosis-core--review-skipped-item-valid-p item)
-                   (> position previous)
-                   (< position current-position)
-                   (progn (setq previous position) t))))
+                   (= position expected)
+                   (progn (setq expected (1+ expected)) t))))
           items))))
 
 (defun gnosis-core-review-attempt-begin (session-id)
