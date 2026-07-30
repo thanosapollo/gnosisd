@@ -377,29 +377,37 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
       (gnosis-core--invalid "Gnosis active review session identity mismatch"))
     (if (null session)
         (gnosis-review--complete)
-      (setq gnosis-review--session session
-            gnosis-review--attempt
-            (gnosis-core-review-attempt-begin session-id)
-            gnosis-review--attempt-revision nil
-            gnosis-review--answer-locked-p nil)
-      (gnosis-review--present t))))
+      (let* ((result (gnosis-core-review-attempt-begin session-id))
+             (next-session (plist-get result :session))
+             (attempt (plist-get result :attempt)))
+        (if (gnosis-review--session-complete-p next-session)
+            (gnosis-review--complete)
+          (setq gnosis-review--session next-session
+                gnosis-review--attempt attempt
+                gnosis-review--attempt-revision nil
+                gnosis-review--answer-locked-p nil)
+          (gnosis-review--present t))))))
 
 (defun gnosis-review--open (session)
   "Open a review buffer for active SESSION."
   (if (gnosis-review--session-complete-p session)
       (message "No Gnosis review items are available")
-    (let* ((attempt
+    (let* ((result
             (gnosis-core-review-attempt-begin
              (plist-get session :session_id)))
-           (buffer (get-buffer-create gnosis-review-buffer-name)))
-      (pop-to-buffer-same-window buffer)
-      (unless (derived-mode-p 'gnosis-review-mode)
-        (gnosis-review-mode))
-      (setq gnosis-review--session session
-            gnosis-review--attempt attempt
-            gnosis-review--attempt-revision nil
-            gnosis-review--answer-locked-p nil)
-      (gnosis-review--present t))))
+           (next-session (plist-get result :session))
+           (attempt (plist-get result :attempt)))
+      (if (gnosis-review--session-complete-p next-session)
+          (message "No Gnosis review items are available")
+        (let ((buffer (get-buffer-create gnosis-review-buffer-name)))
+          (pop-to-buffer-same-window buffer)
+          (unless (derived-mode-p 'gnosis-review-mode)
+            (gnosis-review-mode))
+          (setq gnosis-review--session next-session
+                gnosis-review--attempt attempt
+                gnosis-review--attempt-revision nil
+                gnosis-review--answer-locked-p nil)
+          (gnosis-review--present t))))))
 
 (defun gnosis-review--create (source target-count)
   "Create and open a review for SOURCE and optional TARGET-COUNT."

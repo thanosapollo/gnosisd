@@ -1733,17 +1733,46 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
   "Abort review SESSION-ID."
   (gnosis-core--review-session-action session-id "abort" "aborted"))
 
+(defun gnosis-core--review-skipped-item-valid-p (item)
+  "Return non-nil when ITEM is a valid skipped-review projection."
+  (let ((position (plist-get item :position))
+        (thema-id (plist-get item :thema_id)))
+    (and (gnosis-core--json-object-p item)
+         (integerp position) (>= position 0)
+         (stringp thema-id) (not (string-empty-p thema-id))
+         (<= (string-bytes thema-id) 128)
+         (not (string-search "\0" thema-id))
+         (member (plist-get item :reason)
+                 '("archived" "suspended" "content_changed"
+                   "scheduling_changed" "unsafe_presentation")))))
+
 (defun gnosis-core-review-attempt-begin (session-id)
-  "Begin and return the active attempt for review SESSION-ID."
-  (let ((attempt
-         (gnosis-core--typed-request
-          "post_review_sessions__id__attempts"
-          (list (cons "id" session-id)))))
-    (unless (and (equal session-id (plist-get attempt :session_id))
-                 (member (plist-get attempt :status) '("pending" "graded")))
+  "Begin and return the reconciliation envelope for review SESSION-ID."
+  (let* ((result
+          (gnosis-core--typed-request
+           "post_review_sessions__id__attempts"
+           (list (cons "id" session-id))))
+         (session (plist-get result :session))
+         (attempt (plist-get result :attempt))
+         (skipped (plist-get result :skipped))
+         (active-p (gnosis-core--review-session-valid-p session "active"))
+         (completed-p
+          (gnosis-core--review-session-valid-p session "completed")))
+    (unless
+        (and (gnosis-core--json-object-p result)
+             (equal session-id (plist-get session :session_id))
+             (or active-p completed-p)
+             (vectorp skipped)
+             (seq-every-p #'gnosis-core--review-skipped-item-valid-p skipped)
+             (if active-p
+                 (and (gnosis-core--json-object-p attempt)
+                      (equal session-id (plist-get attempt :session_id))
+                      (member (plist-get attempt :status)
+                              '("pending" "graded")))
+               (eq attempt gnosis-core--json-null)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review reconciliation identity is invalid")))
-    attempt))
+    result))
 
 (defun gnosis-core-review-attempt-answer (attempt-id answer)
   "Submit structured ANSWER for ATTEMPT-ID without automatic retry."

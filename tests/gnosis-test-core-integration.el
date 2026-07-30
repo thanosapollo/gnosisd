@@ -145,9 +145,10 @@
                   :topic_backward_depth gnosis-core--json-null
                   :manual_ids (vector thema-id)))
            (session (gnosis-core-review-session-create source))
-           (attempt
+           (begin
             (gnosis-core-review-attempt-begin
              (plist-get session :session_id)))
+           (attempt (plist-get begin :attempt))
            (attempt-id (plist-get attempt :attempt_id))
            state result)
       (setq attempt
@@ -212,9 +213,10 @@
                   :topic_backward_depth gnosis-core--json-null
                   :manual_ids (vector thema-id)))
            (session (gnosis-core-review-session-create source))
-           (attempt
+           (begin
             (gnosis-core-review-attempt-begin
              (plist-get session :session_id)))
+           (attempt (plist-get begin :attempt))
            (attempt-id (plist-get attempt :attempt_id))
            (gnosis-review--attempt attempt)
            (answers '("beta" "alpha"))

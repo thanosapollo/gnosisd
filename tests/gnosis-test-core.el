@@ -6,6 +6,13 @@
 (require 'ert)
 (require 'gnosis-core)
 
+(defvar gnosis-test-core--begin-response nil
+  "Stubbed begin-attempt response for correlation tests.")
+
+(defun gnosis-test-core--return-begin-response (&rest _arguments)
+  "Return `gnosis-test-core--begin-response'."
+  gnosis-test-core--begin-response)
+
 (defun gnosis-test-core--node (&rest overrides)
   "Return a valid node projection with OVERRIDES."
   (let ((node
@@ -1316,8 +1323,14 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                       :source ,source :target_count 12
                       :current_position 0 :queue_length 1 :started_at_us 1))
                    ("post_review_sessions__id__attempts"
-                    '(:attempt_id "attempt" :session_id "session"
-                      :status "pending"))
+                    `(:session
+                      (:session_id "session" :mode "online" :status "active"
+                       :source ,source :target_count 12
+                       :current_position 0 :queue_length 1 :started_at_us 1)
+                      :attempt
+                      (:attempt_id "attempt" :session_id "session"
+                       :status "pending")
+                      :skipped []))
                    ("post_review_attempts__id__answer"
                     (list :attempt_id "attempt" :status "graded"
                           :response (nth 3 arguments)))
@@ -1377,20 +1390,51 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       "completed"))))
 
 (ert-deftest gnosis-core-review-begin-accepts-graded-current-attempt ()
-  (let ((attempt '(:attempt_id "attempt" :session_id "session"
-                   :status "graded")))
-    (cl-letf (((symbol-function 'gnosis-core--typed-request)
-               (lambda (&rest _arguments) attempt)))
-      (should (eq attempt (gnosis-core-review-attempt-begin "session"))))))
-
-(ert-deftest gnosis-core-review-begin-rejects-uncorrelated-attempt ()
-  (dolist (result
-           '((:attempt_id "attempt" :session_id "other" :status "pending")
-             (:attempt_id "attempt" :session_id "session" :status "committed")))
+  (let* ((session '(:session_id "session" :mode "online" :status "active"
+                    :current_position 0 :queue_length 1 :started_at_us 1))
+         (attempt '(:attempt_id "attempt" :session_id "session"
+                    :status "graded"))
+         (result (list :session session :attempt attempt :skipped [])))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _arguments) result)))
-      (should-error (gnosis-core-review-attempt-begin "session")
-                    :type 'gnosis-core-mutation-uncertain))))
+      (should (eq result (gnosis-core-review-attempt-begin "session"))))))
+
+(ert-deftest gnosis-core-review-begin-rejects-uncorrelated-attempt ()
+  (let ((session '(:session_id "session" :mode "online" :status "active"
+                   :current_position 0 :queue_length 1 :started_at_us 1)))
+    (dolist (result
+             (list
+              (list :session session :attempt
+                    '(:attempt_id "attempt" :session_id "other"
+                      :status "pending")
+                    :skipped [])
+              (list :session session :attempt
+                    '(:attempt_id "attempt" :session_id "session"
+                      :status "committed")
+                    :skipped [])
+              (list :session session :attempt gnosis-core--json-null
+                    :skipped [])
+              (list :session session :attempt
+                    '(:attempt_id "attempt" :session_id "session"
+                      :status "pending")
+                    :skipped [(:position 0 :thema_id "thema"
+                               :reason "unknown")])))
+      (let ((gnosis-test-core--begin-response result))
+        (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                   #'gnosis-test-core--return-begin-response))
+          (should-error (gnosis-core-review-attempt-begin "session")
+                        :type 'gnosis-core-mutation-uncertain))))))
+
+(ert-deftest gnosis-core-review-begin-accepts-completed-skip-envelope ()
+  (let* ((session '(:session_id "session" :mode "online" :status "completed"
+                    :current_position 1 :queue_length 1 :started_at_us 1))
+         (result
+          (list :session session :attempt gnosis-core--json-null
+                :skipped [(:position 0 :thema_id "thema"
+                           :reason "unsafe_presentation")])))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _arguments) result)))
+      (should (eq result (gnosis-core-review-attempt-begin "session"))))))
 
 (ert-deftest gnosis-core-review-session-rejects-invalid-id-or-start-time ()
   (dolist (session

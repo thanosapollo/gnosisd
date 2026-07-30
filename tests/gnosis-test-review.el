@@ -34,6 +34,12 @@
         :desired_suspended gnosis-core--json-false
         :status (or status "pending")))
 
+(defun gnosis-test-review--begin-result (&optional attempt session)
+  "Return a begin envelope for ATTEMPT and SESSION."
+  (list :session (or session (gnosis-test-review--session))
+        :attempt (or attempt (gnosis-test-review--attempt "pending"))
+        :skipped []))
+
 
 (ert-deftest gnosis-review-map-is-direct-state-aware-and-discoverable ()
   (dolist (case `(("pending" "RET" gnosis-review--answer)
@@ -120,7 +126,8 @@
       (cl-letf (((symbol-function 'gnosis-core-review-session-active)
                  (lambda (&rest _) (list :session next-session)))
                 ((symbol-function 'gnosis-core-review-attempt-begin)
-                 (lambda (&rest _) next-attempt))
+                 (lambda (&rest _)
+                   (gnosis-test-review--begin-result next-attempt next-session)))
                 ((symbol-function 'gnosis-core-review-attempt-set-accepted-success)
                  (lambda (&rest _) (push 'accepted mutations)))
                 ((symbol-function 'gnosis-core-review-attempt-set-suspension)
@@ -174,6 +181,25 @@
               ((symbol-function 'message) #'ignore))
       (gnosis-review--open session)
       (should-not began))))
+
+(ert-deftest gnosis-review-begin-skips-to-completion-without-opening-buffer ()
+  (let ((session (gnosis-test-review--session))
+        (completed (gnosis-test-review--session "completed"))
+        message
+        popped)
+    (setf (plist-get completed :current_position) 2)
+    (cl-letf (((symbol-function 'gnosis-core-review-attempt-begin)
+               (lambda (&rest _)
+                 (gnosis-test-review--begin-result
+                  gnosis-core--json-null completed)))
+              ((symbol-function 'pop-to-buffer-same-window)
+               (lambda (&rest _) (setq popped t)))
+              ((symbol-function 'message)
+               (lambda (format &rest arguments)
+                 (setq message (apply #'format format arguments)))))
+      (gnosis-review--open session)
+      (should-not popped)
+      (should (equal message "No Gnosis review items are available")))))
 
 (ert-deftest gnosis-review-empty-queue-is-a-normal-user-outcome ()
   (let (message)
@@ -323,7 +349,8 @@
                 ((symbol-function 'gnosis-review--active-session)
                  (lambda () next-session))
                 ((symbol-function 'gnosis-core-review-attempt-begin)
-                 (lambda (_) next-attempt))
+                 (lambda (_)
+                   (gnosis-test-review--begin-result next-attempt next-session)))
                 ((symbol-function 'gnosis-review--present)
                  (lambda (&rest _) (setq presented t))))
         (gnosis-review--answer)
@@ -361,7 +388,9 @@
                   ((symbol-function 'keymap-popup)
                    (lambda (&rest _) (push 'popup events)))
                   ((symbol-function 'gnosis-core-review-attempt-begin)
-                   (lambda (_) (gnosis-test-review--attempt "pending")))
+                   (lambda (_)
+                     (gnosis-test-review--begin-result
+                      (gnosis-test-review--attempt "pending"))))
                   ((symbol-function 'gnosis-review--read-answer)
                    (lambda ()
                      (push 'input events)
@@ -390,7 +419,9 @@
       (cl-letf (((symbol-function 'gnosis-review--active-session)
                  (lambda () (gnosis-test-review--session)))
                 ((symbol-function 'gnosis-core-review-attempt-begin)
-                 (lambda (&rest _) (gnosis-test-review--attempt "pending")))
+                 (lambda (&rest _)
+                   (gnosis-test-review--begin-result
+                    (gnosis-test-review--attempt "pending"))))
                 ((symbol-function 'gnosis-review--answer)
                  (lambda (&optional _) (setq answers (1+ answers))))
                 ((symbol-function 'display-images-p) (lambda () nil)))
@@ -412,7 +443,9 @@
                   ((symbol-function 'keymap-popup)
                    (lambda (map) (push map popups)))
                   ((symbol-function 'gnosis-core-review-attempt-begin)
-                   (lambda (_) (gnosis-test-review--attempt "graded")))
+                   (lambda (_)
+                     (gnosis-test-review--begin-result
+                      (gnosis-test-review--attempt "graded"))))
                   ((symbol-function 'display-images-p) (lambda () nil)))
           (gnosis-review--open (gnosis-test-review--session))
           (with-current-buffer buffer
