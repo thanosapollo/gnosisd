@@ -1328,7 +1328,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                        :source ,source :target_count 12
                        :current_position 0 :queue_length 1 :started_at_us 1)
                       :attempt
-                      (:attempt_id "attempt" :session_id "session"
+                      (:attempt_id "attempt" :session_id "session" :thema_id "thema"
                        :status "pending")
                       :skipped []))
                    ("post_review_attempts__id__answer"
@@ -1392,7 +1392,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
 (ert-deftest gnosis-core-review-begin-accepts-graded-current-attempt ()
   (let* ((session '(:session_id "session" :mode "online" :status "active"
                     :current_position 0 :queue_length 1 :started_at_us 1))
-         (attempt '(:attempt_id "attempt" :session_id "session"
+         (attempt '(:attempt_id "attempt" :session_id "session" :thema_id "thema"
                     :status "graded"))
          (result (list :session session :attempt attempt :skipped [])))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
@@ -1435,6 +1435,38 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _arguments) result)))
       (should (eq result (gnosis-core-review-attempt-begin "session"))))))
+
+(ert-deftest gnosis-core-review-begin-rejects-invalid-skip-order-or-position ()
+  (let ((session '(:session_id "session" :mode "online" :status "active"
+                   :current_position 2 :queue_length 3 :started_at_us 1))
+        (attempt '(:attempt_id "attempt" :session_id "session" :thema_id "thema"
+                   :status "pending")))
+    (dolist (skipped '([(:position 1 :thema_id "b" :reason "suspended")
+                        (:position 0 :thema_id "a" :reason "archived")]
+                       [(:position 0 :thema_id "a" :reason "archived")
+                        (:position 0 :thema_id "b" :reason "suspended")]
+                       [(:position 2 :thema_id "a" :reason "archived")]))
+      (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                 (lambda (&rest _)
+                   (list :session session :attempt attempt :skipped skipped))))
+        (should-error (gnosis-core-review-attempt-begin "session")
+                      :type 'gnosis-core-mutation-uncertain)))))
+
+(ert-deftest gnosis-core-review-begin-rejects-invalid-attempt-identities ()
+  (let ((session '(:session_id "session" :mode "online" :status "active"
+                   :current_position 0 :queue_length 1 :started_at_us 1)))
+    (dolist (case `((:attempt_id "" :thema_id "thema")
+                    (:attempt_id "bad\0id" :thema_id "thema")
+                    (:attempt_id ,(make-string 129 ?x) :thema_id "thema")
+                    (:attempt_id "attempt" :thema_id "")
+                    (:attempt_id "attempt" :thema_id "bad\0id")
+                    (:attempt_id "attempt" :thema_id ,(make-string 129 ?x))))
+      (let ((attempt (append case '(:session_id "session" :status "pending"))))
+        (cl-letf (((symbol-function 'gnosis-core--typed-request)
+                   (lambda (&rest _)
+                     (list :session session :attempt attempt :skipped []))))
+          (should-error (gnosis-core-review-attempt-begin "session")
+                        :type 'gnosis-core-mutation-uncertain))))))
 
 (ert-deftest gnosis-core-review-session-rejects-invalid-id-or-start-time ()
   (dolist (session

@@ -1662,6 +1662,13 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
     (gnosis-core--thema-suspension-result
      result thema-id operation-id state-revision suspended)))
 
+(defun gnosis-core--review-id-valid-p (value)
+  "Return non-nil when VALUE is a valid review identity."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (<= (string-bytes value) 128)
+       (not (string-search "\0" value))))
+
 (defun gnosis-core--review-session-valid-p (session expected-status)
   "Return non-nil when SESSION is a valid online EXPECTED-STATUS projection."
   (let ((session-id (plist-get session :session_id))
@@ -1669,10 +1676,7 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
         (position (plist-get session :current_position))
         (length (plist-get session :queue_length))
         (started-at (plist-get session :started_at_us)))
-    (and (stringp session-id)
-         (not (string-empty-p session-id))
-         (<= (string-bytes session-id) 128)
-         (not (string-search "\0" session-id))
+    (and (gnosis-core--review-id-valid-p session-id)
          (equal "online" (plist-get session :mode))
          (equal expected-status status)
          (integerp started-at) (> started-at 0)
@@ -1739,12 +1743,23 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
         (thema-id (plist-get item :thema_id)))
     (and (gnosis-core--json-object-p item)
          (integerp position) (>= position 0)
-         (stringp thema-id) (not (string-empty-p thema-id))
-         (<= (string-bytes thema-id) 128)
-         (not (string-search "\0" thema-id))
+         (gnosis-core--review-id-valid-p thema-id)
          (member (plist-get item :reason)
                  '("archived" "suspended" "content_changed"
                    "scheduling_changed" "unsafe_presentation")))))
+
+(defun gnosis-core--review-skipped-valid-p (items current-position)
+  "Return non-nil when skipped ITEMS precede CURRENT-POSITION in order."
+  (and (vectorp items)
+       (let ((previous -1))
+         (seq-every-p
+          (lambda (item)
+            (let ((position (plist-get item :position)))
+              (and (gnosis-core--review-skipped-item-valid-p item)
+                   (> position previous)
+                   (< position current-position)
+                   (progn (setq previous position) t))))
+          items))))
 
 (defun gnosis-core-review-attempt-begin (session-id)
   "Begin and return the reconciliation envelope for review SESSION-ID."
@@ -1762,10 +1777,14 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
         (and (gnosis-core--json-object-p result)
              (equal session-id (plist-get session :session_id))
              (or active-p completed-p)
-             (vectorp skipped)
-             (seq-every-p #'gnosis-core--review-skipped-item-valid-p skipped)
+             (gnosis-core--review-skipped-valid-p
+              skipped (plist-get session :current_position))
              (if active-p
                  (and (gnosis-core--json-object-p attempt)
+                      (gnosis-core--review-id-valid-p
+                       (plist-get attempt :attempt_id))
+                      (gnosis-core--review-id-valid-p
+                       (plist-get attempt :thema_id))
                       (equal session-id (plist-get attempt :session_id))
                       (member (plist-get attempt :status)
                               '("pending" "graded")))
