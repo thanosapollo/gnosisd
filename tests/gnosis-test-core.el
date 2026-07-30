@@ -1383,6 +1383,33 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
         ("post_review_attempts__id__commit" (("id" . "attempt"))))
       (nreverse calls)))))
 
+(ert-deftest gnosis-core-review-cloze-check-rejects-uncorrelated-response ()
+  (let ((valid `(:matches [t] :all_entered_correct t
+                 :complete ,gnosis-core--json-false
+                 :question "one and (...)" :next_input_script "greek")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _) valid)))
+      (should (eq valid
+                  (gnosis-core-review-attempt-check-cloze
+                   "attempt" ["one"])))))
+  (dolist (response
+           `((:matches [t] :all_entered_correct ,gnosis-core--json-false
+              :complete ,gnosis-core--json-false
+              :question "Question" :next_input_script "greek")
+             (:matches [t] :all_entered_correct t :complete t
+              :question "Question" :next_input_script "greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "" :next_input_script "greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "Question" :next_input_script "Greek")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _) response)))
+      (should-error
+       (gnosis-core-review-attempt-check-cloze "attempt" ["one"])
+       :type 'gnosis-core-protocol-error))))
+
 (ert-deftest gnosis-core-review-session-rejects-invalid-status-position ()
   (let ((invalid '(:session_id "session" :mode "online" :status "active"
                    :current_position 1 :queue_length 1 :started_at_us 1)))

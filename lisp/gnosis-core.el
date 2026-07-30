@@ -1826,26 +1826,43 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
               '("Gnosis review answer response is not correlated")))
     attempt))
 
+(defun gnosis-core--review-cloze-check-valid-p (check inputs)
+  "Return non-nil when CHECK is correlated with cloze INPUTS."
+  (let* ((matches (plist-get check :matches))
+         (all-entered-correct (plist-get check :all_entered_correct))
+         (complete (plist-get check :complete))
+         (question (plist-get check :question))
+         (script (plist-get check :next_input_script))
+         (expected-all-correct
+          (if (and (vectorp matches)
+                   (seq-every-p (lambda (value) (eq value t)) matches))
+              t
+            gnosis-core--json-false)))
+    (and (vectorp inputs)
+         (vectorp matches)
+         (= (length inputs) (length matches))
+         (seq-every-p (lambda (value)
+                        (memq value (list t gnosis-core--json-false)))
+                      matches)
+         (eq all-entered-correct expected-all-correct)
+         (memq complete (list t gnosis-core--json-false))
+         (or (eq complete gnosis-core--json-false)
+             (and (eq all-entered-correct t)
+                  (eq script gnosis-core--json-null)))
+         (stringp question)
+         (not (string-empty-p (string-trim question)))
+         (or (eq script gnosis-core--json-null)
+             (and (stringp script)
+                  (let ((case-fold-search nil))
+                    (string-match-p "\\`[a-z-]+\\'" script)))))))
+
 (defun gnosis-core-review-attempt-check-cloze (attempt-id inputs)
   "Check cumulative cloze INPUTS for ATTEMPT-ID without mutating it."
   (let ((check
          (gnosis-core--typed-request
           "post_review_attempts__id__cloze-check"
           (list (cons "id" attempt-id)) nil (list :inputs inputs))))
-    (unless (and (vectorp inputs)
-                 (vectorp (plist-get check :matches))
-                 (= (length inputs) (length (plist-get check :matches)))
-                 (seq-every-p (lambda (value)
-                                (memq value (list t gnosis-core--json-false)))
-                              (plist-get check :matches))
-                 (memq (plist-get check :all_entered_correct)
-                       (list t gnosis-core--json-false))
-                 (memq (plist-get check :complete)
-                       (list t gnosis-core--json-false))
-                 (stringp (plist-get check :question))
-                 (let ((script (plist-get check :next_input_script)))
-                   (or (eq script gnosis-core--json-null)
-                       (stringp script))))
+    (unless (gnosis-core--review-cloze-check-valid-p check inputs)
       (gnosis-core--invalid "Invalid Gnosis cloze-check response"))
     check))
 
