@@ -36,9 +36,11 @@
 
 (defun gnosis-test-review--begin-result (&optional attempt session)
   "Return a begin envelope for ATTEMPT and SESSION."
-  (list :session (or session (gnosis-test-review--session))
-        :attempt (or attempt (gnosis-test-review--attempt "pending"))
-        :skipped []))
+  (let ((session (or session (gnosis-test-review--session))))
+    (list :session session
+          :attempt (or attempt (gnosis-test-review--attempt "pending"))
+          :start_position (plist-get session :current_position)
+          :skipped [])))
 
 
 (ert-deftest gnosis-review-map-is-direct-state-aware-and-discoverable ()

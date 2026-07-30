@@ -1748,11 +1748,14 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
                  '("archived" "suspended" "content_changed"
                    "scheduling_changed" "unsafe_presentation")))))
 
-(defun gnosis-core--review-skipped-valid-p (items current-position)
-  "Return non-nil when ITEMS are the skipped suffix before CURRENT-POSITION."
+(defun gnosis-core--review-skipped-valid-p
+    (items start-position current-position)
+  "Return non-nil when ITEMS cover START-POSITION to CURRENT-POSITION."
   (and (vectorp items)
-       (<= (length items) current-position)
-       (let ((expected (- current-position (length items))))
+       (integerp start-position)
+       (>= start-position 0)
+       (= (+ start-position (length items)) current-position)
+       (let ((expected start-position))
          (seq-every-p
           (lambda (item)
             (let ((position (plist-get item :position)))
@@ -1778,7 +1781,8 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
              (equal session-id (plist-get session :session_id))
              (or active-p completed-p)
              (gnosis-core--review-skipped-valid-p
-              skipped (plist-get session :current_position))
+              skipped (plist-get result :start_position)
+              (plist-get session :current_position))
              (if active-p
                  (and (gnosis-core--json-object-p attempt)
                       (gnosis-core--review-id-valid-p

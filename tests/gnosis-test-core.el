@@ -1330,6 +1330,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                       :attempt
                       (:attempt_id "attempt" :session_id "session" :thema_id "thema"
                        :status "pending")
+                      :start_position 0
                       :skipped []))
                    ("post_review_attempts__id__answer"
                     (list :attempt_id "attempt" :status "graded"
@@ -1394,7 +1395,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                     :current_position 0 :queue_length 1 :started_at_us 1))
          (attempt '(:attempt_id "attempt" :session_id "session" :thema_id "thema"
                     :status "graded"))
-         (result (list :session session :attempt attempt :skipped [])))
+         (result (list :session session :attempt attempt
+                       :start_position 0 :skipped [])))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _arguments) result)))
       (should (eq result (gnosis-core-review-attempt-begin "session"))))))
@@ -1407,16 +1409,17 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
               (list :session session :attempt
                     '(:attempt_id "attempt" :session_id "other"
                       :status "pending")
-                    :skipped [])
+                    :start_position 0 :skipped [])
               (list :session session :attempt
                     '(:attempt_id "attempt" :session_id "session"
                       :status "committed")
-                    :skipped [])
+                    :start_position 0 :skipped [])
               (list :session session :attempt gnosis-core--json-null
-                    :skipped [])
+                    :start_position 0 :skipped [])
               (list :session session :attempt
                     '(:attempt_id "attempt" :session_id "session"
                       :status "pending")
+                    :start_position 0
                     :skipped [(:position 0 :thema_id "thema"
                                :reason "unknown")])))
       (let ((gnosis-test-core--begin-response result))
@@ -1430,6 +1433,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                     :current_position 1 :queue_length 1 :started_at_us 1))
          (result
           (list :session session :attempt gnosis-core--json-null
+                :start_position 0
                 :skipped [(:position 0 :thema_id "thema"
                            :reason "unsafe_presentation")])))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
@@ -1448,27 +1452,38 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                        [(:position 2 :thema_id "a" :reason "archived")]))
       (cl-letf (((symbol-function 'gnosis-core--typed-request)
                  (lambda (&rest _)
-                   (list :session session :attempt attempt :skipped skipped))))
+                   (list :session session :attempt attempt
+                         :start_position 0 :skipped skipped))))
         (should-error (gnosis-core-review-attempt-begin "session")
                       :type 'gnosis-core-mutation-uncertain)))))
 
-(ert-deftest gnosis-core-review-begin-requires-the-complete-skipped-suffix ()
+(ert-deftest gnosis-core-review-begin-correlates-the-complete-skipped-range ()
   (let ((session '(:session_id "session" :mode "online" :status "active"
                    :current_position 3 :queue_length 4 :started_at_us 1))
         (attempt '(:attempt_id "attempt" :session_id "session" :thema_id "thema"
                    :status "pending")))
-    (dolist (skipped '([(:position 0 :thema_id "a" :reason "archived")]
-                       [(:position 0 :thema_id "a" :reason "archived")
-                        (:position 2 :thema_id "c" :reason "suspended")]))
+    (dolist (case '((0 [(:position 0 :thema_id "a" :reason "archived")])
+                    (0 [(:position 0 :thema_id "a" :reason "archived")
+                        (:position 2 :thema_id "c" :reason "suspended")])
+                    (2 [(:position 1 :thema_id "b" :reason "archived")])
+                    (-1 [(:position 0 :thema_id "a" :reason "archived")])
+                    (4 [])
+                    (nil [])))
       (cl-letf (((symbol-function 'gnosis-core--typed-request)
                  (lambda (&rest _)
-                   (list :session session :attempt attempt :skipped skipped))))
+                   (list :session session :attempt attempt
+                         :start_position (car case) :skipped (cadr case)))))
         (should-error (gnosis-core-review-attempt-begin "session")
                       :type 'gnosis-core-mutation-uncertain)))
-    (dolist (skipped '([(:position 2 :thema_id "c" :reason "suspended")]
-                       [(:position 1 :thema_id "b" :reason "archived")
-                        (:position 2 :thema_id "c" :reason "suspended")]))
-      (let ((result (list :session session :attempt attempt :skipped skipped)))
+    (dolist (case '((3 [])
+                    (2 [(:position 2 :thema_id "c" :reason "suspended")])
+                    (1 [(:position 1 :thema_id "b" :reason "archived")
+                        (:position 2 :thema_id "c" :reason "suspended")])
+                    (0 [(:position 0 :thema_id "a" :reason "archived")
+                        (:position 1 :thema_id "b" :reason "archived")
+                        (:position 2 :thema_id "c" :reason "suspended")])))
+      (let ((result (list :session session :attempt attempt
+                          :start_position (car case) :skipped (cadr case))))
         (cl-letf (((symbol-function 'gnosis-core--typed-request)
                    (lambda (&rest _) result)))
           (should (eq result (gnosis-core-review-attempt-begin "session"))))))))
@@ -1485,7 +1500,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (let ((attempt (append case '(:session_id "session" :status "pending"))))
         (cl-letf (((symbol-function 'gnosis-core--typed-request)
                    (lambda (&rest _)
-                     (list :session session :attempt attempt :skipped []))))
+                     (list :session session :attempt attempt
+                           :start_position 0 :skipped []))))
           (should-error (gnosis-core-review-attempt-begin "session")
                         :type 'gnosis-core-mutation-uncertain))))))
 
