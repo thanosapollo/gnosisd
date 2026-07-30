@@ -3292,7 +3292,16 @@ mod tests {
         let attempt = first.attempt.unwrap();
 
         assert_eq!(attempt.thema_id, "ready");
+        assert_eq!(first.start_position, 0);
         assert_eq!(first.session.current_position, 3);
+        assert_eq!(
+            first
+                .skipped
+                .iter()
+                .map(|item| item.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         assert_eq!(
             first
                 .skipped
@@ -3308,6 +3317,7 @@ mod tests {
         let retry = store
             .begin_http_review_attempt(&session.session_id, None, 4)
             .unwrap();
+        assert_eq!(retry.start_position, 3);
         assert_eq!(retry.attempt.unwrap().attempt_id, attempt.attempt_id);
         assert!(retry.skipped.is_empty());
         assert_eq!(retry.session.current_position, 3);

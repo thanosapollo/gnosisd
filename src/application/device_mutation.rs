@@ -842,12 +842,13 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        DeviceMutationCursor, DeviceMutationError, DeviceMutationKind, DeviceMutationProjection,
-        DeviceMutationRejection, DeviceMutationResult, prepare_device_document_mutation,
+        DeviceDesiredStateMutation, DeviceMutationCursor, DeviceMutationError, DeviceMutationKind,
+        DeviceMutationProjection, DeviceMutationRejection, DeviceMutationResult,
+        desired_state_wire_request_sha256, prepare_device_document_mutation,
         prepare_device_document_rename, prepare_device_document_tombstone,
     };
     use crate::{
-        application::{DocumentHead, prepare_note},
+        application::{DocumentHead, prepare_note, prepare_thema, thema_content},
         domain::DocumentId,
     };
 
@@ -960,6 +961,51 @@ mod tests {
                 .request_json
                 .contains("\"logical_path\":null")
         );
+    }
+
+    #[test]
+    fn thema_create_wire_digest_excludes_only_generated_identity() {
+        let mutation = |thema_id: &str, answer: &str, expected_revision| {
+            DeviceDesiredStateMutation::PutThema {
+                prepared: prepare_thema(
+                    Some(thema_id.into()),
+                    thema_content(
+                        "basic",
+                        "Question".into(),
+                        vec![],
+                        vec![answer.into()],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    expected_revision,
+                )
+                .unwrap(),
+                initial_review_day: 0,
+            }
+        };
+
+        let first_create =
+            desired_state_wire_request_sha256(1, &mutation("server-generated", "Answer", None))
+                .unwrap();
+        let second_create =
+            desired_state_wire_request_sha256(1, &mutation("client-generated", "Answer", None))
+                .unwrap();
+        let changed_create =
+            desired_state_wire_request_sha256(1, &mutation("client-generated", "Changed", None))
+                .unwrap();
+        let first_replace =
+            desired_state_wire_request_sha256(1, &mutation("thema-a", "Answer", Some(7))).unwrap();
+        let second_replace =
+            desired_state_wire_request_sha256(1, &mutation("thema-b", "Answer", Some(7))).unwrap();
+
+        assert_eq!(first_create, second_create);
+        assert_ne!(first_create, changed_create);
+        assert_ne!(first_replace, second_replace);
     }
 
     #[test]

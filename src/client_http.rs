@@ -2961,6 +2961,21 @@ mod tests {
         }))
         .unwrap();
 
+        let mut valid = result.clone();
+        valid.session.target_count = Some(3);
+        valid.session.current_position = 3;
+        valid.session.queue_length = 3;
+        valid.skipped = serde_json::from_value(serde_json::json!([
+            {"position": 0, "thema_id": "thema-a", "reason": "archived"},
+            {"position": 1, "thema_id": "thema-b", "reason": "suspended"},
+            {"position": 2, "thema_id": "thema-c", "reason": "archived"}
+        ]))
+        .unwrap();
+        assert!(checked_begin_result(valid.clone(), "session").is_ok());
+
+        valid.start_position = 3;
+        valid.skipped.clear();
+        assert!(checked_begin_result(valid, "session").is_ok());
         assert!(checked_begin_result(result, "session").is_err());
     }
 
