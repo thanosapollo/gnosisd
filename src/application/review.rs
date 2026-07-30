@@ -170,6 +170,7 @@ pub(crate) struct SkippedReviewItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ReviewAttemptBeginResult {
+    pub(crate) start_position: u32,
     pub(crate) session: ReviewSessionView,
     pub(crate) attempt: Option<ReviewAttemptView>,
     pub(crate) skipped: Vec<SkippedReviewItem>,

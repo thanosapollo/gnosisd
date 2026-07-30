@@ -43,9 +43,9 @@ pub(crate) use device_mutation::{
     DeviceMutationError, DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
     DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDesiredStateMutation,
     PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
-    ThemaMutationProjection, prepare_device_desired_state_mutation,
-    prepare_device_document_mutation, prepare_device_document_rename,
-    prepare_device_document_tombstone,
+    ThemaMutationProjection, desired_state_wire_request_sha256,
+    prepare_device_desired_state_mutation, prepare_device_document_mutation,
+    prepare_device_document_rename, prepare_device_document_tombstone,
 };
 pub use import_document::ApplicationError;
 #[cfg(test)]

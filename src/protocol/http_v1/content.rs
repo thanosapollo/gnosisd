@@ -251,6 +251,8 @@ pub enum DesiredStateMutationResultV1 {
             regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
         )]
         operation_id: String,
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        request_sha256: String,
         rejection: DocumentMutationRejectionV1,
         #[schemars(length(min = 1, max = 512))]
         cursor: String,
@@ -258,7 +260,10 @@ pub enum DesiredStateMutationResultV1 {
 }
 
 impl DesiredStateMutationResultV1 {
-    pub(crate) fn from_application(value: &DeviceMutationResult) -> Result<Self, ContentWireError> {
+    pub(crate) fn from_application(
+        value: &DeviceMutationResult,
+        request_sha256: &str,
+    ) -> Result<Self, ContentWireError> {
         match value {
             DeviceMutationResult::Applied {
                 format_version,
@@ -281,6 +286,7 @@ impl DesiredStateMutationResultV1 {
             } => Ok(Self::Rejected {
                 format_version: *format_version,
                 operation_id: operation_id.clone(),
+                request_sha256: request_sha256.to_owned(),
                 rejection: mutation_rejection(rejection),
                 cursor: mutation_cursor(cursor)?,
             }),

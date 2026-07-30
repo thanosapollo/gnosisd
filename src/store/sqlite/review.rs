@@ -334,6 +334,7 @@ impl SqliteStore {
         )?;
         let transaction = self.write_transaction()?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::NotFound)?;
+        let start_position = session.current_position;
         let remaining = session
             .queue_length
             .checked_sub(session.current_position)
@@ -392,6 +393,7 @@ impl SqliteStore {
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::NotFound)?;
         transaction.commit().map_err(StoreError::storage)?;
         Ok(ReviewAttemptBeginResult {
+            start_position,
             session,
             attempt,
             skipped,

@@ -904,6 +904,11 @@ async fn apply_desired_state_mutation(
                 }
                 _ => ApiError::bad_request("invalid device mutation"),
             })?;
+    let request_sha256 = crate::application::desired_state_wire_request_sha256(
+        operation.identity.format_version,
+        &operation.mutation,
+    )
+    .map_err(|_| ApiError::internal())?;
     let execution = state
         .service
         .apply_device_desired_state_mutation(operation, asset_bytes, now_us_i64()?)
@@ -912,7 +917,7 @@ async fn apply_desired_state_mutation(
     if !execution.replayed && execution.result.changed() {
         announce(state).await;
     }
-    let result = DesiredStateMutationResultV1::from_application(&execution.result)
+    let result = DesiredStateMutationResultV1::from_application(&execution.result, &request_sha256)
         .map_err(|_| ApiError::internal())?;
     Ok(Json(result))
 }
@@ -3706,13 +3711,13 @@ mod tests {
     use super::{
         ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, MAX_NODE_CATALOG_PAGE, OPENAPI_OPERATIONS,
         bounded_due_page, bounded_projection_page, durable_created_thema_id,
-        ensure_thema_response_budget, openapi_document, optional_if_match, router,
+        ensure_thema_response_budget, openapi_document, optional_if_match, prepared_thema, router,
     };
     use crate::application::{
-        AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
-        PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
-        SettingsInput, generate_device, prepare_asset, prepare_document, prepare_thema,
-        presentation_content, review_day_at, thema_content,
+        AnswerInput, ApplicationError, DeviceDesiredStateMutation, OfflineAssetOperation,
+        OfflineReviewOperation, PresentationSnapshot, ReviewAttemptView, ReviewPackView,
+        ReviewSource, ReviewSourceKind, SettingsInput, generate_device, prepare_asset,
+        prepare_document, prepare_thema, presentation_content, review_day_at, thema_content,
     };
     use crate::domain::{DocumentId, DueThema, ThemaId, compute_transition, grade};
     use crate::protocol::{
@@ -6036,6 +6041,14 @@ mod tests {
             .await
             .unwrap();
         let app = router(service.clone());
+        let expected_request_sha256 = crate::application::desired_state_wire_request_sha256(
+            1,
+            &DeviceDesiredStateMutation::PutThema {
+                prepared: prepared_thema(Some(thema_id.clone()), input.clone(), None).unwrap(),
+                initial_review_day: 0,
+            },
+        )
+        .unwrap();
         let request = || {
             authorized_mutation(
                 "POST",
@@ -6051,6 +6064,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let first = response_json(first).await;
         assert_eq!(first["status"], "rejected");
+        assert_eq!(first["request_sha256"], expected_request_sha256);
         assert_eq!(first["rejection"]["reason"], "revision_conflict");
         assert!(first["rejection"]["expected_revision"].is_null());
         assert_eq!(first["rejection"]["current_revision"], 1);
@@ -7036,6 +7050,7 @@ mod tests {
             first["attempt"]["presentation"]["response"],
             response_prompt
         );
+        assert_eq!(first["start_position"], 0);
         assert_eq!(first["skipped"], json!([]));
         let (_, retry) = begin_http_review_attempt(app, token, &uri).await;
         assert_eq!(retry, first);

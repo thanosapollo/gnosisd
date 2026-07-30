@@ -563,6 +563,22 @@ fn desired_state_request_json(
     format_version: u32,
     mutation: &DeviceDesiredStateMutation,
 ) -> Result<String, DeviceMutationError> {
+    desired_state_request_json_with_created_target(format_version, mutation, true)
+}
+
+pub(crate) fn desired_state_wire_request_sha256(
+    format_version: u32,
+    mutation: &DeviceDesiredStateMutation,
+) -> Result<String, DeviceMutationError> {
+    let request = desired_state_request_json_with_created_target(format_version, mutation, false)?;
+    Ok(format!("{:x}", Sha256::digest(request.as_bytes())))
+}
+
+fn desired_state_request_json_with_created_target(
+    format_version: u32,
+    mutation: &DeviceDesiredStateMutation,
+    include_created_target: bool,
+) -> Result<String, DeviceMutationError> {
     let payload = match mutation {
         DeviceDesiredStateMutation::PutAsset {
             prepared,
@@ -593,7 +609,8 @@ fn desired_state_request_json(
         DeviceDesiredStateMutation::PutThema { prepared, .. } => serde_json::json!({
             "format_version": format_version,
             "mutation_kind": mutation.kind(),
-            "thema_id": prepared.thema_id.as_str(),
+            "thema_id": (include_created_target || prepared.expected_revision.is_some())
+                .then(|| prepared.thema_id.as_str()),
             "kind": prepared.content.kind.as_str(),
             "keimenon": prepared.content.keimenon,
             "hypothesis": prepared.content.hypothesis,

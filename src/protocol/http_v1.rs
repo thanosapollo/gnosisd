@@ -757,6 +757,7 @@ impl From<&SkippedReviewItem> for SkippedReviewItemV1 {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewAttemptBeginResponseV1 {
+    pub start_position: u32,
     pub session: ReviewSessionV1,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<ReviewAttemptV1>", required)]
@@ -769,6 +770,7 @@ impl ReviewAttemptBeginResponseV1 {
         value: &ReviewAttemptBeginResult,
     ) -> Result<Self, ReviewAttemptWireError> {
         Ok(Self {
+            start_position: value.start_position,
             session: ReviewSessionV1::from_application(&value.session)?,
             attempt: value
                 .attempt
