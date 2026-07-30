@@ -46,8 +46,10 @@ tests=$(sed -n \
     tests/gnosis-test-core-integration.el)
 [ -n "$tests" ] || { echo "No integration tests found" >&2; exit 1; }
 
+case_number=0
 for test_name in $tests; do
-    state=$suite_state/$test_name
+    case_number=$((case_number + 1))
+    state=$suite_state/case-$case_number
     mkdir -m 700 "$state"
     attempt=0
     while :; do
