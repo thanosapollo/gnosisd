@@ -2180,7 +2180,18 @@ async fn execute_desired_state_mutation(
 ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
     let result: DesiredStateMutationResultV1 =
         execute_json_exact(request, MAX_FRAME_SIZE, StatusCode::OK).await?;
-    let valid = match &result {
+    valid_desired_result(&result, operation_id, request_sha256, &expectation)
+        .then_some(result)
+        .ok_or_else(invalid_response)
+}
+
+fn valid_desired_result(
+    result: &DesiredStateMutationResultV1,
+    operation_id: &str,
+    request_sha256: &str,
+    expectation: &DesiredMutationExpectation,
+) -> bool {
+    match result {
         DesiredStateMutationResultV1::Applied {
             format_version,
             operation_id: actual,
@@ -2191,7 +2202,7 @@ async fn execute_desired_state_mutation(
             *format_version == 1
                 && actual == operation_id
                 && valid_result_cursor(cursor)
-                && valid_desired_projection(authoritative, *changed, &expectation)
+                && valid_desired_projection(authoritative, *changed, expectation)
         }
         DesiredStateMutationResultV1::Rejected {
             format_version,
@@ -2203,11 +2214,10 @@ async fn execute_desired_state_mutation(
             *format_version == 1
                 && actual == operation_id
                 && actual_request_sha256 == request_sha256
-                && valid_desired_rejection(rejection, &expectation)
+                && valid_desired_rejection(rejection, expectation)
                 && valid_result_cursor(cursor)
         }
-    };
-    valid.then_some(result).ok_or_else(invalid_response)
+    }
 }
 
 fn valid_desired_rejection(
@@ -3675,6 +3685,44 @@ mod tests {
                 expected_revision: Some(999),
                 current_revision: Some(2),
             },
+            &settings_expectation,
+        ));
+        let rejected = DesiredStateMutationResultV1::Rejected {
+            format_version: 1,
+            operation_id: "operation".into(),
+            request_sha256: "a".repeat(64),
+            rejection: DocumentMutationRejectionV1::RevisionConflict {
+                expected_revision: Some(1),
+                current_revision: Some(2),
+            },
+            cursor: "cursor".into(),
+        };
+        assert!(valid_desired_result(
+            &rejected,
+            "operation",
+            &"a".repeat(64),
+            &settings_expectation,
+        ));
+        assert!(!valid_desired_result(
+            &rejected,
+            "operation",
+            &"b".repeat(64),
+            &settings_expectation,
+        ));
+        let wrong_revision = DesiredStateMutationResultV1::Rejected {
+            format_version: 1,
+            operation_id: "operation".into(),
+            request_sha256: "a".repeat(64),
+            rejection: DocumentMutationRejectionV1::RevisionConflict {
+                expected_revision: Some(999),
+                current_revision: Some(2),
+            },
+            cursor: "cursor".into(),
+        };
+        assert!(!valid_desired_result(
+            &wrong_revision,
+            "operation",
+            &"a".repeat(64),
             &settings_expectation,
         ));
         assert!(valid_desired_projection(
