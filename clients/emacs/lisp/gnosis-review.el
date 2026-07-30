@@ -633,8 +633,18 @@ When a review is active, prompt to resume it, replace it, or cancel."
   (interactive)
   (if (equal "committed" (plist-get gnosis-review--attempt :status))
       (gnosis-review--next)
-    (gnosis-review--load-revision)
-    (gnosis-review--present)))
+    (let ((attempt-id (plist-get gnosis-review--attempt :attempt_id))
+          (answer-locked-p gnosis-review--answer-locked-p))
+      (gnosis-review--load-revision)
+      (if (and answer-locked-p
+               (equal attempt-id
+                      (plist-get gnosis-review--attempt :attempt_id))
+               (gnosis-review--pending-p))
+          (progn
+            (setq gnosis-review--answer-locked-p nil)
+            (gnosis-review--render)
+            (keymap-popup gnosis-review-mode-map))
+        (gnosis-review--present)))))
 
 (defun gnosis-review--quit ()
   "Close the local review buffer without mutating its durable session."
