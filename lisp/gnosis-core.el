@@ -1921,7 +1921,9 @@ Correlate the response with EXPECTED-REVISION and OPERATION-ID."
   (let ((result
          (gnosis-core--typed-request
           "post_review_attempts__id__commit" (list (cons "id" attempt-id)))))
-    (unless (equal attempt-id (plist-get result :attempt_id))
+    (unless (and (equal attempt-id (plist-get result :attempt_id))
+                 (gnosis-core--review-id-valid-p
+                  (plist-get result :event_id)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review commit response correlation failed")))
     result))
