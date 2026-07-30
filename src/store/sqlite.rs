@@ -50,102 +50,9 @@ pub(crate) use mutation::DeviceMutationExecution;
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
 const SCHEMA_VERSION: u32 = 3;
+const THEMA_CATALOG_MATERIALIZED_BYTES: usize = 1024 * 1024;
 const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
-const MIGRATE_SCHEMA_V1_TO_V2: &str = "
-DROP TRIGGER device_mutation_receipt_immutable_update;
-DROP TRIGGER device_mutation_receipt_immutable_delete;
-ALTER TABLE device_mutation_receipt RENAME TO device_mutation_receipt_v1;
-CREATE TABLE device_mutation_receipt(
-  device_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL CHECK(length(operation_id) > 0 AND length(operation_id) <= 128
-AND instr(operation_id, char(0)) = 0
-AND substr(operation_id, 1, 1) GLOB '[A-Za-z0-9]'
-AND operation_id NOT GLOB '*[^A-Za-z0-9._:-]*'),
-format_version INTEGER NOT NULL CHECK(format_version = 1),
-mutation_kind TEXT NOT NULL CHECK(mutation_kind IN('document_create',
-'document_replace',
-'document_rename',
-'document_tombstone',
-'asset_create',
-'asset_replace',
-'asset_tombstone',
-'thema_create',
-'thema_replace',
-'thema_archive_set',
-'thema_suspension_set',
-'settings_replace')),
-request_sha256 TEXT NOT NULL CHECK(length(request_sha256) = 64
-AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
-request_json TEXT NOT NULL CHECK(length(request_json) > 0 AND json_valid(request_json)),
-result_kind TEXT NOT NULL CHECK(result_kind IN('applied', 'rejected')),
-result_json TEXT NOT NULL CHECK(length(result_json) > 0 AND json_valid(result_json)),
-created_at_us INTEGER NOT NULL CHECK(created_at_us > 0),
-PRIMARY KEY(device_id, operation_id),
-FOREIGN KEY(device_id) REFERENCES device(device_id) ON DELETE RESTRICT
-) STRICT;
-INSERT INTO device_mutation_receipt
-SELECT * FROM device_mutation_receipt_v1;
-DROP TABLE device_mutation_receipt_v1;
-CREATE TRIGGER device_mutation_receipt_immutable_update
-BEFORE UPDATE ON device_mutation_receipt
-BEGIN
-    SELECT RAISE(ABORT, 'device mutation receipt is immutable');
-END;
-CREATE TRIGGER device_mutation_receipt_immutable_delete
-BEFORE DELETE ON device_mutation_receipt
-BEGIN
-    SELECT RAISE(ABORT, 'device mutation receipt is immutable');
-END;
-PRAGMA user_version = 2;
-";
-const MIGRATE_SCHEMA_V2_TO_V3: &str = "
-ALTER TABLE review_session_item RENAME TO review_session_item_v2;
-CREATE TABLE review_session_item(
-  session_id TEXT NOT NULL,
-  position INTEGER NOT NULL CHECK(position >= 0),
-  thema_id TEXT NOT NULL,
-  completed_attempt_id TEXT,
-  disposition TEXT NOT NULL DEFAULT 'pending'
-  CHECK(disposition IN('pending', 'completed', 'skipped')),
-  skip_reason TEXT
-  CHECK(skip_reason IS NULL OR skip_reason IN(
-    'archived',
-    'suspended',
-    'content_changed',
-    'scheduling_changed',
-    'unsafe_presentation'
-  )),
-  skipped_at_us INTEGER CHECK(skipped_at_us IS NULL OR skipped_at_us > 0),
-  CHECK(
-    (disposition = 'pending' AND completed_attempt_id IS NULL
-      AND skip_reason IS NULL AND skipped_at_us IS NULL)
-    OR (disposition = 'completed' AND completed_attempt_id IS NOT NULL
-      AND skip_reason IS NULL AND skipped_at_us IS NULL)
-    OR (disposition = 'skipped' AND completed_attempt_id IS NULL
-      AND skip_reason IS NOT NULL AND skipped_at_us IS NOT NULL)
-  ),
-  PRIMARY KEY(session_id, position),
-  FOREIGN KEY(session_id) REFERENCES review_session(session_id) ON DELETE RESTRICT,
-  FOREIGN KEY(thema_id) REFERENCES thema(thema_id) ON DELETE RESTRICT
-) STRICT;
-INSERT INTO review_session_item(
-  session_id,
-  position,
-  thema_id,
-  completed_attempt_id,
-  disposition
-)
-SELECT
-  session_id,
-  position,
-  thema_id,
-  completed_attempt_id,
-  CASE WHEN completed_attempt_id IS NULL THEN 'pending' ELSE 'completed' END
-FROM review_session_item_v2;
-DROP TABLE review_session_item_v2;
-PRAGMA user_version = 3;
-";
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -1422,15 +1329,38 @@ impl SqliteStore {
         limit: u16,
         after: Option<&str>,
     ) -> Result<ThemaCatalogPage, StoreError> {
-        type CatalogRow = (String, i64, i64, String, String, String, String, bool, bool);
+        self.thema_catalog_with_byte_budget(
+            device_id,
+            query,
+            limit,
+            after,
+            THEMA_CATALOG_MATERIALIZED_BYTES,
+        )
+    }
+
+    fn thema_catalog_with_byte_budget(
+        &self,
+        device_id: &str,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+        byte_budget: usize,
+    ) -> Result<ThemaCatalogPage, StoreError> {
         let state = self.replica_state(device_id)?;
         let pattern = format!("%{}%", query.to_lowercase());
         let mut statement = self
             .connection
             .prepare(
-                "SELECT DISTINCT thema.thema_id, thema.revision, review_state.state_revision,
-                        thema.kind, thema.keimenon, thema.hypothesis_json, thema.answer_json,
-                        thema.archived_at_us IS NOT NULL, review_state.suspended
+                "SELECT DISTINCT thema.thema_id,
+                        length(CAST(thema.thema_id AS BLOB))
+                        + length(CAST(thema.kind AS BLOB))
+                        + length(CAST(thema.keimenon AS BLOB))
+                        + length(CAST(thema.hypothesis_json AS BLOB))
+                        + length(CAST(thema.answer_json AS BLOB))
+                        + coalesce((
+                            SELECT sum(length(CAST(tags.tag AS BLOB)))
+                            FROM thema_tag AS tags WHERE tags.thema_id = thema.thema_id
+                          ), 0) + 64
                  FROM thema
                  JOIN review_state USING(thema_id)
                  LEFT JOIN thema_tag USING(thema_id)
@@ -1440,49 +1370,31 @@ impl SqliteStore {
             )
             .map_err(StoreError::storage)?;
         let rows = statement
-            .query_map(
-                params![pattern, after, i64::from(limit) + 1],
-                |row| -> rusqlite::Result<CatalogRow> {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                    ))
-                },
-            )
+            .query_map(params![pattern, after, i64::from(limit) + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
             .map_err(StoreError::storage)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::storage)?;
         drop(statement);
-        let mut items = rows
-            .into_iter()
-            .map(|row| {
-                Ok(ThemaCatalogRecord {
-                    tags: query_strings(
-                        &self.connection,
-                        "SELECT tag FROM thema_tag WHERE thema_id = ?1 ORDER BY tag",
-                        &row.0,
-                    )?,
-                    thema_id: row.0,
-                    thema_revision: to_u64(row.1, "thema revision")?,
-                    state_revision: to_u64(row.2, "state revision")?,
-                    kind: ThemaKind::parse(&row.3).map_err(StoreError::storage)?,
-                    keimenon: row.4,
-                    hypothesis: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
-                    answer: serde_json::from_str(&row.6).map_err(StoreError::storage)?,
-                    archived: row.7,
-                    suspended: row.8,
-                })
-            })
-            .collect::<Result<Vec<_>, StoreError>>()?;
-        let has_more = items.len() > usize::from(limit);
-        items.truncate(usize::from(limit));
+        let mut items = Vec::new();
+        let mut materialized_bytes = 0usize;
+        let mut has_more = false;
+        for (thema_id, projected_bytes) in rows {
+            let projected_bytes =
+                usize::try_from(projected_bytes).map_err(|_| StoreError::CorruptData {
+                    field: "thema catalog size",
+                })?;
+            if items.len() == usize::from(limit)
+                || (!items.is_empty()
+                    && materialized_bytes.saturating_add(projected_bytes) > byte_budget)
+            {
+                has_more = true;
+                break;
+            }
+            items.push(load_thema_catalog_record(&self.connection, &thema_id)?);
+            materialized_bytes = materialized_bytes.saturating_add(projected_bytes);
+        }
         Ok(ThemaCatalogPage {
             state,
             items,
@@ -4078,20 +3990,13 @@ enum FailPoint {
 }
 
 fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
-    let mut found = schema_version(connection)?;
+    let found = schema_version(connection)?;
     if found == 0 && user_schema_is_empty(connection)? {
         connection
             .execute_batch(CURRENT_SCHEMA)
             .map_err(StoreError::storage)?;
-        found = schema_version(connection)?;
-    }
-    if found == 1 {
-        migrate_schema_v1_to_v2(connection)?;
-        found = schema_version(connection)?;
-    }
-    if found == 2 {
-        migrate_schema_v2_to_v3(connection)?;
-        found = schema_version(connection)?;
+        require_application_id(connection)?;
+        return require_current_schema_layout(connection);
     }
     match found {
         SCHEMA_VERSION => {
@@ -4103,46 +4008,6 @@ fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
             supported: SCHEMA_VERSION,
         }),
     }
-}
-
-fn migrate_schema_v1_to_v2(connection: &Connection) -> Result<(), StoreError> {
-    require_application_id(connection)?;
-    require_schema_layout(connection, &schema_v1())?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(StoreError::storage)?;
-    transaction
-        .execute_batch(MIGRATE_SCHEMA_V1_TO_V2)
-        .map_err(StoreError::storage)?;
-    transaction.commit().map_err(StoreError::storage)
-}
-
-fn migrate_schema_v2_to_v3(connection: &Connection) -> Result<(), StoreError> {
-    require_application_id(connection)?;
-    require_schema_layout(connection, &schema_v2())?;
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(StoreError::storage)?;
-    transaction
-        .execute_batch(MIGRATE_SCHEMA_V2_TO_V3)
-        .map_err(StoreError::storage)?;
-    transaction.commit().map_err(StoreError::storage)
-}
-
-fn schema_v1() -> String {
-    schema_v2()
-        .replacen("'thema_suspension_set',\n", "", 1)
-        .replacen("PRAGMA user_version = 2;", "PRAGMA user_version = 1;", 1)
-}
-
-fn schema_v2() -> String {
-    CURRENT_SCHEMA
-        .replacen(
-            "  disposition TEXT NOT NULL DEFAULT 'pending'\n  CHECK(disposition IN('pending', 'completed', 'skipped')),\n  skip_reason TEXT\n  CHECK(skip_reason IS NULL OR skip_reason IN(\n    'archived',\n    'suspended',\n    'content_changed',\n    'scheduling_changed',\n    'unsafe_presentation'\n  )),\n  skipped_at_us INTEGER CHECK(skipped_at_us IS NULL OR skipped_at_us > 0),\n  CHECK(\n    (disposition = 'pending' AND completed_attempt_id IS NULL\n      AND skip_reason IS NULL AND skipped_at_us IS NULL)\n    OR (disposition = 'completed' AND completed_attempt_id IS NOT NULL\n      AND skip_reason IS NULL AND skipped_at_us IS NULL)\n    OR (disposition = 'skipped' AND completed_attempt_id IS NULL\n      AND skip_reason IS NOT NULL AND skipped_at_us IS NOT NULL)\n  ),\n",
-            "",
-            1,
-        )
-        .replacen("PRAGMA user_version = 3;", "PRAGMA user_version = 2;", 1)
 }
 
 fn require_current_schema_layout(connection: &Connection) -> Result<(), StoreError> {
@@ -4229,6 +4094,51 @@ fn query_strings(
         .query_map([parameter], |row| row.get(0))
         .map_err(StoreError::storage)?;
     rows.map(|row| row.map_err(StoreError::storage)).collect()
+}
+
+fn load_thema_catalog_record(
+    connection: &Connection,
+    thema_id: &str,
+) -> Result<ThemaCatalogRecord, StoreError> {
+    type CatalogRow = (i64, i64, String, String, String, String, bool, bool);
+    let row = connection
+        .query_row(
+            "SELECT thema.revision, review_state.state_revision, thema.kind,
+                    thema.keimenon, thema.hypothesis_json, thema.answer_json,
+                    thema.archived_at_us IS NOT NULL, review_state.suspended
+             FROM thema JOIN review_state USING(thema_id)
+             WHERE thema.thema_id = ?1",
+            [thema_id],
+            |row| -> rusqlite::Result<CatalogRow> {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(StoreError::storage)?;
+    Ok(ThemaCatalogRecord {
+        tags: query_strings(
+            connection,
+            "SELECT tag FROM thema_tag WHERE thema_id = ?1 ORDER BY tag",
+            thema_id,
+        )?,
+        thema_id: thema_id.to_owned(),
+        thema_revision: to_u64(row.0, "thema revision")?,
+        state_revision: to_u64(row.1, "state revision")?,
+        kind: ThemaKind::parse(&row.2).map_err(StoreError::storage)?,
+        keimenon: row.3,
+        hypothesis: serde_json::from_str(&row.4).map_err(StoreError::storage)?,
+        answer: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
+        archived: row.6,
+        suspended: row.7,
+    })
 }
 
 fn load_due_legacy_themata(
@@ -5239,7 +5149,7 @@ mod tests {
     use super::{
         APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION,
         SqliteStore, StoreError, application_id, backup_database_with_step, initialize_schema,
-        replace_rows, retire_removed_nodes, schema_v1, schema_v2, schema_version,
+        replace_rows, retire_removed_nodes, schema_objects, schema_version,
     };
     use crate::application::{
         DeviceDesiredStateMutation, DeviceMutationProjection, DeviceMutationResult,
@@ -5408,8 +5318,16 @@ mod tests {
     }
 
     fn thema(question: &str, revision: Option<u64>) -> crate::application::PreparedThema {
+        thema_named("thema", question, revision)
+    }
+
+    fn thema_named(
+        thema_id: &str,
+        question: &str,
+        revision: Option<u64>,
+    ) -> crate::application::PreparedThema {
         prepare_thema(
-            Some("thema".into()),
+            Some(thema_id.into()),
             thema_content(
                 "basic",
                 question.into(),
@@ -5926,6 +5844,39 @@ mod tests {
     }
 
     #[test]
+    fn thema_catalog_stops_before_aggregate_materialization_exceeds_budget() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Reader".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        for (index, id) in ["thema-a", "thema-b", "thema-c"].into_iter().enumerate() {
+            store
+                .put_thema(
+                    &thema_named(id, &"x".repeat(128), None),
+                    20260730,
+                    i64::try_from(index + 2).unwrap(),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let first = store
+            .thema_catalog_with_byte_budget(&device_id, "", 10, None, 300)
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].thema_id, "thema-a");
+        assert!(first.has_more);
+        assert!(store.settings().is_ok());
+
+        let second = store
+            .thema_catalog_with_byte_budget(&device_id, "", 10, Some("thema-a"), 300)
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].thema_id, "thema-b");
+        assert!(second.has_more);
+    }
+
+    #[test]
     fn node_page_stops_before_aggregate_projection_decode_exceeds_its_budget() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let mut projection_size = 0;
@@ -6024,106 +5975,37 @@ mod tests {
     }
 
     #[test]
-    fn migrates_exact_v1_layout_and_preserves_mutation_receipts() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection.execute_batch(&schema_v1()).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO device(
-                   device_id, name, token_digest, scopes_json, created_at_us
-                 ) VALUES (
-                   'device', 'Device',
-                   '0000000000000000000000000000000000000000000000000000000000000000',
-                   '[\"read\"]', 1
-                 );
-                 INSERT INTO device_mutation_receipt(
-                   device_id, operation_id, format_version, mutation_kind,
-                   request_sha256, request_json, result_kind, result_json, created_at_us
-                 ) VALUES (
-                   'device', 'existing', 1, 'settings_replace',
-                   '0000000000000000000000000000000000000000000000000000000000000000',
-                   '{}', 'applied', '{}', 1
-                 );",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
-        assert_eq!(
+    fn rejects_prior_schema_versions_without_changes() {
+        for version in [1, 2] {
+            let connection = rusqlite::Connection::open_in_memory().unwrap();
+            connection.execute_batch(CURRENT_SCHEMA).unwrap();
             connection
-                .query_row(
-                    "SELECT mutation_kind FROM device_mutation_receipt
-                     WHERE operation_id = 'existing'",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .unwrap(),
-            "settings_replace"
-        );
-        connection
-            .execute(
-                "INSERT INTO device_mutation_receipt(
-                   device_id, operation_id, format_version, mutation_kind,
-                   request_sha256, request_json, result_kind, result_json, created_at_us
-                 ) VALUES (
-                   'device', 'suspension', 1, 'thema_suspension_set',
-                   '1111111111111111111111111111111111111111111111111111111111111111',
-                   '{}', 'applied', '{}', 2
-                 )",
-                [],
-            )
-            .unwrap();
-    }
+                .execute("INSERT INTO thema(thema_id) VALUES ('preserved')", [])
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            let objects = schema_objects(&connection).unwrap();
 
-    #[test]
-    fn migrates_v2_review_items_without_losing_progress() {
-        let connection = rusqlite::Connection::open_in_memory().unwrap();
-        connection.execute_batch(&schema_v2()).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO thema(thema_id) VALUES ('done'), ('pending');
-                 INSERT INTO review_session(
-                   session_id, source_kind, source_json, target_count,
-                   timezone, day_boundary_hour, scheduler_json, status,
-                   started_at_us, current_position
-                 ) VALUES (
-                   'session', 'manual', '{}', 2,
-                   'UTC', 0, '{}', 'active', 1, 1
-                 );
-                 INSERT INTO review_session_item(
-                   session_id, position, thema_id, completed_attempt_id
-                 ) VALUES
-                   ('session', 0, 'done', 'attempt'),
-                   ('session', 1, 'pending', NULL);",
-            )
-            .unwrap();
+            let error = initialize_schema(&connection).unwrap_err();
 
-        initialize_schema(&connection).unwrap();
-
-        let items = connection
-            .prepare(
-                "SELECT disposition, skip_reason, skipped_at_us
-                 FROM review_session_item ORDER BY position",
-            )
-            .unwrap()
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                ))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            items,
-            vec![
-                ("completed".to_owned(), None, None),
-                ("pending".to_owned(), None, None),
-            ]
-        );
+            assert!(matches!(
+                error,
+                StoreError::UnsupportedSchemaVersion {
+                    found,
+                    supported: SCHEMA_VERSION
+                } if found == version
+            ));
+            assert_eq!(schema_version(&connection).unwrap(), version);
+            assert_eq!(schema_objects(&connection).unwrap(), objects);
+            assert_eq!(
+                connection
+                    .query_row("SELECT thema_id FROM thema", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "preserved"
+            );
+        }
     }
 
     #[test]
