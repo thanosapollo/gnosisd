@@ -1199,7 +1199,7 @@ pub(crate) enum ReviewAttemptWireError {
 )]
 pub enum ReviewAnswerV1 {
     Text(String),
-    Texts(Vec<String>),
+    Texts(#[schemars(length(max = 500))] Vec<String>),
     Choice(String),
 }
 

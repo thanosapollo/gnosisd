@@ -4461,6 +4461,16 @@ mod tests {
             api["components"]["schemas"]["ReviewClozeCheckRequestV1"]["properties"]["inputs"]["minItems"],
             1
         );
+        let texts_answer = api["components"]["schemas"]["ReviewAnswerV1"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "texts")
+            .unwrap();
+        assert_eq!(
+            texts_answer["properties"]["value"]["maxItems"],
+            crate::domain::MAX_REVIEW_CLOZE_INPUTS
+        );
         let text_prompt = api["components"]["schemas"]["ReviewResponsePromptV1"]["oneOf"]
             .as_array()
             .unwrap()

@@ -1882,6 +1882,51 @@ async fn review_clients_reject_uncorrelated_success_responses() {
     let client = HttpClient::new(&raw.base_url, token()).unwrap();
     assert_invalid_response(client.commit_review_attempt("attempt").await);
     raw.task.await.unwrap();
+
+    let raw = spawn_json_server(review_operation_json(1, "operation", "attempt", 2)).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(
+        client
+            .set_review_accepted_success(
+                "attempt",
+                &SetAcceptedSuccessRequestV1 {
+                    version: 1,
+                    operation_id: "operation".into(),
+                    expected_attempt_revision: 1,
+                    accepted_success: false,
+                },
+            )
+            .await,
+    );
+    raw.task.await.unwrap();
+
+    let raw = spawn_json_server(review_operation_json(1, "operation", "attempt", 2)).await;
+    let client = HttpClient::new(&raw.base_url, token()).unwrap();
+    assert_invalid_response(
+        client
+            .set_review_suspension(
+                "attempt",
+                &SetSuspensionRequestV1 {
+                    version: 1,
+                    operation_id: "operation".into(),
+                    expected_attempt_revision: 1,
+                    desired_suspended: true,
+                },
+            )
+            .await,
+    );
+    raw.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn review_client_rejects_oversized_cloze_answer_before_transport() {
+    let client = HttpClient::new("http://127.0.0.1:1", token()).unwrap();
+    let answer = ReviewAnswerV1::Texts(vec!["answer".into(); 501]);
+
+    assert!(matches!(
+        client.answer_review_attempt("attempt", &answer).await,
+        Err(HttpClientError::InvalidReview)
+    ));
 }
 
 #[tokio::test]

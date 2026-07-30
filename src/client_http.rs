@@ -1143,6 +1143,10 @@ impl HttpClient {
         answer: &ReviewAnswerV1,
     ) -> Result<ReviewAttemptV1, HttpClientError> {
         require_review_id(attempt_id)?;
+        if matches!(answer, ReviewAnswerV1::Texts(inputs) if inputs.len() > MAX_REVIEW_CLOZE_INPUTS)
+        {
+            return Err(HttpClientError::InvalidReview);
+        }
         let url = self.review_resource_endpoint("attempts", attempt_id, Some("answer"))?;
         let body = encode_review_body(answer)?;
         let request = json_request(self.client.post(url), body);
@@ -1188,8 +1192,11 @@ impl HttpClient {
             "accepted-success",
             input.version,
             &input.operation_id,
-            input.expected_attempt_revision,
             input,
+            ReviewAttemptMutationExpectation::AcceptedSuccess {
+                expected_revision: input.expected_attempt_revision,
+                value: input.accepted_success,
+            },
         )
         .await
     }
@@ -1204,8 +1211,11 @@ impl HttpClient {
             "suspension",
             input.version,
             &input.operation_id,
-            input.expected_attempt_revision,
             input,
+            ReviewAttemptMutationExpectation::Suspension {
+                expected_revision: input.expected_attempt_revision,
+                value: input.desired_suspended,
+            },
         )
         .await
     }
@@ -1358,14 +1368,15 @@ impl HttpClient {
         action: &str,
         version: u32,
         operation_id: &str,
-        expected_revision: u64,
         input: &impl Serialize,
+        expectation: ReviewAttemptMutationExpectation,
     ) -> Result<ReviewAttemptOperationResponseV1, HttpClientError> {
+        let expected_revision = expectation.expected_revision();
         require_review_operation(attempt_id, version, operation_id, expected_revision)?;
         let url = self.review_resource_endpoint("attempts", attempt_id, Some(action))?;
         let request = json_request(self.client.put(url), encode_review_body(input)?);
         let result = execute_json(request, MAX_OFFLINE_REVIEW_RESULT_BYTES).await?;
-        checked_attempt_operation(result, operation_id, attempt_id, expected_revision)
+        checked_attempt_operation(result, operation_id, attempt_id, expectation)
     }
 
     fn review_resource_endpoint(
@@ -2135,18 +2146,46 @@ fn checked_attempt_operation(
     result: ReviewAttemptOperationResponseV1,
     operation_id: &str,
     attempt_id: &str,
-    expected_revision: u64,
+    expectation: ReviewAttemptMutationExpectation,
 ) -> Result<ReviewAttemptOperationResponseV1, HttpClientError> {
+    let expected_revision = expectation.expected_revision();
     if result.version == 1
         && result.operation_id == operation_id
         && expected_revision.checked_add(1) == Some(result.attempt_revision)
         && i64::try_from(result.attempt_revision).is_ok()
         && valid_attempt(&result.attempt)
         && result.attempt.attempt_id == attempt_id
+        && match expectation {
+            ReviewAttemptMutationExpectation::AcceptedSuccess { value, .. } => {
+                result.attempt.accepted_success == Some(value)
+            }
+            ReviewAttemptMutationExpectation::Suspension { value, .. } => {
+                result.attempt.desired_suspended == value
+            }
+        }
     {
         Ok(result)
     } else {
         Err(invalid_response())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReviewAttemptMutationExpectation {
+    AcceptedSuccess { expected_revision: u64, value: bool },
+    Suspension { expected_revision: u64, value: bool },
+}
+
+impl ReviewAttemptMutationExpectation {
+    fn expected_revision(self) -> u64 {
+        match self {
+            Self::AcceptedSuccess {
+                expected_revision, ..
+            }
+            | Self::Suspension {
+                expected_revision, ..
+            } => expected_revision,
+        }
     }
 }
 

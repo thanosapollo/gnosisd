@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use super::{ThemaContent, ThemaKind};
+use super::{MAX_REVIEW_CLOZE_INPUTS, ThemaContent, ThemaKind};
 
 pub(crate) const MATCHER_VERSION: u32 = 1;
 
@@ -39,7 +39,7 @@ pub(crate) fn grade(
             equivalent(&content.answer[0], input)
         }
         (ThemaKind::Cloze, StructuredResponse::Texts(inputs)) => {
-            grade_clozes(&content.answer, inputs)
+            grade_clozes(&content.answer, inputs)?
         }
         (ThemaKind::Mcq | ThemaKind::McCloze, StructuredResponse::Choice(choice)) => {
             grade_choice(content, choice)?
@@ -53,8 +53,11 @@ pub(crate) fn grade(
     })
 }
 
-fn grade_clozes(answers: &[String], inputs: &[String]) -> bool {
-    check_clozes(answers, inputs).complete
+fn grade_clozes(answers: &[String], inputs: &[String]) -> Result<bool, GradeError> {
+    if inputs.len() > MAX_REVIEW_CLOZE_INPUTS {
+        return Err(GradeError::ResponseShape);
+    }
+    Ok(check_clozes(answers, inputs).complete)
 }
 
 pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck {
@@ -353,6 +356,29 @@ mod tests {
         assert_eq!(adjacency.comparisons, answers.len() * inputs.len());
         assert!(adjacency.comparisons <= 250_000);
         assert!(check_clozes(&answers, &inputs).complete);
+    }
+
+    #[test]
+    fn final_cloze_grading_rejects_more_than_the_shared_input_limit() {
+        let answers = (0..crate::domain::MAX_REVIEW_CLOZE_INPUTS)
+            .map(|index| format!("answer-{index:03}"))
+            .collect::<Vec<_>>();
+        let content = thema_content(
+            "cloze",
+            answers.join(" "),
+            vec![None; answers.len()],
+            answers,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let inputs = vec!["answer".into(); crate::domain::MAX_REVIEW_CLOZE_INPUTS + 1];
+
+        assert_eq!(
+            grade(1, &content, &StructuredResponse::Texts(inputs)),
+            Err(super::GradeError::ResponseShape)
+        );
     }
 
     #[test]
