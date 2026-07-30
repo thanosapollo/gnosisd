@@ -31,10 +31,10 @@ pub(crate) use content::{
     DocumentReplicaRevision, DocumentRevision, MAX_DOCUMENT_PROJECTION_BYTES,
     MAX_DOCUMENT_SOURCE_BYTES, NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset,
     PreparedNote, PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
-    ThemaRecord, ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
-    prepare_document, prepare_thema, retained_asset_paths, stored_thema_content, thema_content,
-    validate_asset_path, validate_blob_metadata, validate_document_path,
-    validate_offline_thema_assets,
+    ThemaCatalogRecord, ThemaRecord, ThemaRevision, asset_paths_in_org, canonical_asset_path,
+    path_key, prepare_asset, prepare_document, prepare_thema, retained_asset_paths,
+    stored_thema_content, thema_content, validate_asset_path, validate_blob_metadata,
+    validate_document_path, validate_offline_thema_assets,
 };
 #[cfg(test)]
 pub(crate) use content::{ContentError, prepare_note};
@@ -68,16 +68,17 @@ pub(crate) use review::{
     AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
     FsrsModelSnapshot, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,
     OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot,
-    RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
-    ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
-    ReviewAttemptView, ReviewError, ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem,
-    ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource,
-    ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot, prepare_offline_operation,
+    RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptBeginResult, ReviewAttemptMutation,
+    ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
+    ReviewAttemptState, ReviewAttemptView, ReviewError, ReviewItemSkipReason,
+    ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
+    ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
+    ReviewStateSnapshot, SkippedReviewItem, TransitionSnapshot, prepare_offline_operation,
     presentation_content, review_day_at, review_question, valid_operation_id,
     validate_review_pack_projection,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord};
 pub(crate) use sync::{
     NodeCatalogPage, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision,
-    SettingsRevision, SnapshotPage, SnapshotPosition,
+    SettingsRevision, SnapshotPage, SnapshotPosition, ThemaCatalogPage,
 };

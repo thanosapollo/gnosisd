@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
+use super::review::set_thema_suspended_in;
 use super::{
     AssetWriteDecision, NoteWriteDecision, SqliteStore, StoreError, asset_write_decision,
     current_content_cursor, load_document_head, note_write_decision, put_asset_in, put_thema_in,
@@ -244,6 +245,26 @@ fn apply_desired_state_mutation(
                 author,
             )?)),
         )),
+        DeviceDesiredStateMutation::SetThemaSuspended {
+            thema_id,
+            expected_state_revision,
+            suspended,
+        } => {
+            let (state, changed) = set_thema_suspended_in(
+                transaction,
+                thema_id.as_str(),
+                *expected_state_revision,
+                *suspended,
+                created_at_us,
+            )?;
+            Ok((
+                changed,
+                DeviceMutationProjection::ReviewState {
+                    thema_id: thema_id.to_string(),
+                    state,
+                },
+            ))
+        }
         DeviceDesiredStateMutation::ReplaceSettings {
             input,
             expected_revision,

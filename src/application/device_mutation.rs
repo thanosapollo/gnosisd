@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
-    AssetHead, PreparedAsset, PreparedNote, PreparedThema, SettingsInput, SettingsRecord,
-    ThemaRecord, valid_operation_id, validate_document_path,
+    AssetHead, PreparedAsset, PreparedNote, PreparedThema, ReviewStateSnapshot, SettingsInput,
+    SettingsRecord, ThemaRecord, valid_operation_id, validate_document_path,
 };
 use crate::domain::{DocumentId, ThemaId};
 
@@ -30,6 +30,8 @@ pub(crate) enum DeviceMutationKind {
     ThemaReplace,
     #[serde(rename = "thema_archive_set")]
     ThemaArchiveSet,
+    #[serde(rename = "thema_suspension_set")]
+    ThemaSuspensionSet,
     #[serde(rename = "settings_replace")]
     SettingsReplace,
 }
@@ -47,6 +49,7 @@ impl DeviceMutationKind {
             Self::ThemaCreate => "thema_create",
             Self::ThemaReplace => "thema_replace",
             Self::ThemaArchiveSet => "thema_archive_set",
+            Self::ThemaSuspensionSet => "thema_suspension_set",
             Self::SettingsReplace => "settings_replace",
         }
     }
@@ -105,6 +108,11 @@ pub(crate) enum DeviceDesiredStateMutation {
         expected_revision: u64,
         archived: bool,
     },
+    SetThemaSuspended {
+        thema_id: ThemaId,
+        expected_state_revision: u64,
+        suspended: bool,
+    },
     ReplaceSettings {
         input: SettingsInput,
         expected_revision: u64,
@@ -124,6 +132,7 @@ impl DeviceDesiredStateMutation {
             }
             Self::PutThema { .. } => DeviceMutationKind::ThemaCreate,
             Self::SetThemaArchived { .. } => DeviceMutationKind::ThemaArchiveSet,
+            Self::SetThemaSuspended { .. } => DeviceMutationKind::ThemaSuspensionSet,
             Self::ReplaceSettings { .. } => DeviceMutationKind::SettingsReplace,
         }
     }
@@ -133,7 +142,9 @@ impl DeviceDesiredStateMutation {
             Self::PutAsset { prepared, .. } => prepared.logical_path.clone(),
             Self::TombstoneAsset { asset_path, .. } => asset_path.clone(),
             Self::PutThema { prepared, .. } => prepared.thema_id.to_string(),
-            Self::SetThemaArchived { thema_id, .. } => thema_id.to_string(),
+            Self::SetThemaArchived { thema_id, .. } | Self::SetThemaSuspended { thema_id, .. } => {
+                thema_id.to_string()
+            }
             Self::ReplaceSettings { .. } => "canonical".to_owned(),
         }
     }
@@ -244,6 +255,10 @@ pub(crate) enum DeviceMutationProjection {
     Document(super::DocumentHead),
     Asset(AssetHead),
     Thema(ThemaMutationProjection),
+    ReviewState {
+        thema_id: String,
+        state: ReviewStateSnapshot,
+    },
     Settings(SettingsRecord),
 }
 
@@ -416,6 +431,10 @@ impl DeviceMutationResult {
                     .target_id
                     .as_deref()
                     .is_some_and(|target| target == thema.thema_id),
+                DeviceMutationProjection::ReviewState { thema_id, .. } => identity
+                    .target_id
+                    .as_deref()
+                    .is_some_and(|target| target == thema_id),
                 DeviceMutationProjection::Settings(_) => {
                     identity.target_id.as_deref() == Some("canonical")
                 }
@@ -601,6 +620,17 @@ fn desired_state_request_json(
             "thema_id": thema_id.as_str(),
             "expected_revision": expected_revision,
             "archived": archived,
+        }),
+        DeviceDesiredStateMutation::SetThemaSuspended {
+            thema_id,
+            expected_state_revision,
+            suspended,
+        } => serde_json::json!({
+            "format_version": format_version,
+            "mutation_kind": mutation.kind(),
+            "thema_id": thema_id.as_str(),
+            "expected_state_revision": expected_state_revision,
+            "suspended": suspended,
         }),
         DeviceDesiredStateMutation::ReplaceSettings {
             input,

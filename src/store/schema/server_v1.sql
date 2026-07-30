@@ -209,6 +209,25 @@ CREATE TABLE review_session_item(
   position INTEGER NOT NULL CHECK(position >= 0),
   thema_id TEXT NOT NULL,
   completed_attempt_id TEXT,
+  disposition TEXT NOT NULL DEFAULT 'pending'
+  CHECK(disposition IN('pending', 'completed', 'skipped')),
+  skip_reason TEXT
+  CHECK(skip_reason IS NULL OR skip_reason IN(
+    'archived',
+    'suspended',
+    'content_changed',
+    'scheduling_changed',
+    'unsafe_presentation'
+  )),
+  skipped_at_us INTEGER CHECK(skipped_at_us IS NULL OR skipped_at_us > 0),
+  CHECK(
+    (disposition = 'pending' AND completed_attempt_id IS NULL
+      AND skip_reason IS NULL AND skipped_at_us IS NULL)
+    OR (disposition = 'completed' AND completed_attempt_id IS NOT NULL
+      AND skip_reason IS NULL AND skipped_at_us IS NULL)
+    OR (disposition = 'skipped' AND completed_attempt_id IS NULL
+      AND skip_reason IS NOT NULL AND skipped_at_us IS NOT NULL)
+  ),
   PRIMARY KEY(session_id, position),
   FOREIGN KEY(session_id) REFERENCES review_session(session_id) ON DELETE RESTRICT,
   FOREIGN KEY(thema_id) REFERENCES thema(thema_id) ON DELETE RESTRICT
@@ -740,6 +759,7 @@ mutation_kind TEXT NOT NULL CHECK(mutation_kind IN('document_create',
 'thema_create',
 'thema_replace',
 'thema_archive_set',
+'thema_suspension_set',
 'settings_replace')),
 request_sha256 TEXT NOT NULL CHECK(length(request_sha256) = 64
 AND request_sha256 NOT GLOB '*[^0-9a-f]*'),
@@ -790,6 +810,6 @@ SELECT
 FROM settings WHERE id = 1;
 
 PRAGMA application_id = 1196314451;
-PRAGMA user_version = 1;
+PRAGMA user_version = 3;
 
 COMMIT;

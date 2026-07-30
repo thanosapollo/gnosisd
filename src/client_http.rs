@@ -48,15 +48,17 @@ use crate::{
             DocumentImportRequestV1, DocumentMutationResultV1, FsrsConfigV1, NodePageV1,
             NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
-            ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
-            ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
-            ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
-            ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
-            ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
-            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-            ThemaKindV1, ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1,
-            UpdateSettingsRequestV1, valid_bearer_token,
+            ReviewAttemptBeginResponseV1, ReviewAttemptOperationResponseV1,
+            ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
+            ReviewClozeCheckV1, ReviewCommitResponseV1, ReviewHistoryPageV1,
+            ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2,
+            ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
+            ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
+            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1, ReviewStateV1,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SetThemaSuspensionRequestV1,
+            SettingsV1, StagedBlobV1, ThemaCatalogItemV1, ThemaCatalogPageV1, ThemaKindV1,
+            ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+            valid_bearer_token,
         },
     },
 };
@@ -626,6 +628,36 @@ impl HttpClient {
         .await
     }
 
+    pub async fn set_thema_suspended(
+        &self,
+        thema_id: &str,
+        operation_id: &str,
+        expected_state_revision: u64,
+        suspended: bool,
+    ) -> Result<DesiredStateMutationResultV1, HttpClientError> {
+        require_operation_id(operation_id)?;
+        ThemaId::new(thema_id.to_owned()).map_err(|_| HttpClientError::InvalidMutation)?;
+        let request = self
+            .client
+            .put(self.thema_endpoint(thema_id, Some("suspension"))?)
+            .header("Idempotency-Key", operation_id)
+            .header("If-Match", expected_state_revision)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(encode_document_mutation(&SetThemaSuspensionRequestV1 {
+                suspended,
+            })?);
+        execute_desired_state_mutation(
+            request,
+            operation_id,
+            DesiredMutationExpectation::ReviewState {
+                thema_id: thema_id.to_owned(),
+                suspended,
+                expected_state_revision,
+            },
+        )
+        .await
+    }
+
     pub async fn update_settings(
         &self,
         operation_id: &str,
@@ -746,6 +778,34 @@ impl HttpClient {
         drop(pairs);
         let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
         checked_thema_page(page, limit, after.as_ref())
+    }
+
+    pub async fn thema_catalog(
+        &self,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+        expected_generation: Option<&str>,
+    ) -> Result<ThemaCatalogPageV1, HttpClientError> {
+        if !(1..=500).contains(&limit)
+            || expected_generation.is_some_and(|value| !valid_result_cursor(value))
+        {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let after = after
+            .map(|value| ThemaId::new(value.to_owned()))
+            .transpose()
+            .map_err(|_| HttpClientError::InvalidCursor)?;
+        let mut url = self.endpoint("v1/themata/catalog")?;
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("q", query);
+        pairs.append_pair("limit", &limit.to_string());
+        if let Some(after) = &after {
+            pairs.append_pair("after", after.as_str());
+        }
+        drop(pairs);
+        let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        checked_thema_catalog_page(page, limit, after.as_ref(), expected_generation)
     }
 
     pub async fn document_source(
@@ -1001,16 +1061,16 @@ impl HttpClient {
     pub async fn begin_review_attempt(
         &self,
         session_id: &str,
-    ) -> Result<ReviewAttemptV1, HttpClientError> {
+    ) -> Result<ReviewAttemptBeginResponseV1, HttpClientError> {
         require_review_id(session_id)?;
         let url = self.review_resource_endpoint("sessions", session_id, Some("attempts"))?;
-        let attempt = execute_json_exact(
+        let result: ReviewAttemptBeginResponseV1 = execute_json_exact(
             self.client.post(url),
             MAX_OFFLINE_REVIEW_RESULT_BYTES,
             StatusCode::CREATED,
         )
         .await?;
-        checked_attempt(attempt, None, Some(session_id))
+        checked_begin_result(result, session_id)
     }
 
     pub async fn answer_review_attempt(
@@ -1449,6 +1509,73 @@ fn checked_thema_page(
     Ok(page)
 }
 
+fn checked_thema_catalog_page(
+    page: ThemaCatalogPageV1,
+    limit: u16,
+    after: Option<&ThemaId>,
+    expected_generation: Option<&str>,
+) -> Result<ThemaCatalogPageV1, HttpClientError> {
+    if !valid_result_cursor(&page.generation)
+        || expected_generation.is_some_and(|expected| page.generation != expected)
+        || page.items.len() > usize::from(limit)
+        || page.items.iter().any(|item| !valid_catalog_item(item))
+        || page
+            .items
+            .windows(2)
+            .any(|items| items[0].thema_id >= items[1].thema_id)
+        || after.is_some_and(|after| {
+            page.items
+                .first()
+                .is_some_and(|item| item.thema_id.as_str() <= after.as_str())
+        })
+        || page
+            .next
+            .as_deref()
+            .is_some_and(|next| Some(next) != page.items.last().map(|item| item.thema_id.as_str()))
+    {
+        return Err(invalid_response());
+    }
+    Ok(page)
+}
+
+fn valid_catalog_item(item: &ThemaCatalogItemV1) -> bool {
+    if ThemaId::new(item.thema_id.clone()).is_err()
+        || item.thema_revision == 0
+        || !all_unique(&item.tags)
+    {
+        return false;
+    }
+    let kind = match item.kind {
+        ThemaKindV1::Basic => "basic",
+        ThemaKindV1::Cloze => "cloze",
+        ThemaKindV1::Mcq => "mcq",
+        ThemaKindV1::McCloze => "mc-cloze",
+    };
+    thema_content(
+        kind,
+        item.keimenon.clone(),
+        item.hypothesis.clone(),
+        item.answer.clone(),
+        None,
+        None,
+        None,
+    )
+    .is_ok()
+}
+
+fn valid_review_state(state: &ReviewStateV1) -> bool {
+    state.total_successes.saturating_add(state.total_failures) == state.review_count
+        && state.last_reviewed_at_us.is_some() == state.last_review_day.is_some()
+        && state.interval_days.is_some() == state.stability.is_some()
+        && state.stability.is_some() == state.difficulty.is_some()
+        && state
+            .stability
+            .is_none_or(|value| value.is_finite() && value > 0.0)
+        && state
+            .difficulty
+            .is_none_or(|value| value.is_finite() && (1.0..=10.0).contains(&value))
+}
+
 fn node_span(node: &NodeV1) -> Result<Option<SourceSpan>, HttpClientError> {
     match (node.start_byte, node.end_byte) {
         (None, None) => Ok(None),
@@ -1841,6 +1968,36 @@ fn valid_session_position(session: &ReviewSessionV1) -> bool {
     }
 }
 
+fn checked_begin_result(
+    result: ReviewAttemptBeginResponseV1,
+    session_id: &str,
+) -> Result<ReviewAttemptBeginResponseV1, HttpClientError> {
+    let positions_are_ordered = result
+        .skipped
+        .windows(2)
+        .all(|items| items[0].position < items[1].position);
+    let skipped_are_valid = result.skipped.iter().all(|item| {
+        require_review_id(&item.thema_id).is_ok() && item.position < result.session.current_position
+    });
+    let attempt_is_valid = match (&result.session.status, &result.attempt) {
+        (ReviewSessionStatusV1::Active, Some(attempt)) => {
+            valid_attempt(attempt) && attempt.session_id == session_id
+        }
+        (ReviewSessionStatusV1::Completed, None) => true,
+        _ => false,
+    };
+    if result.session.session_id == session_id
+        && valid_online_session(&result.session)
+        && positions_are_ordered
+        && skipped_are_valid
+        && attempt_is_valid
+    {
+        Ok(result)
+    } else {
+        Err(invalid_response())
+    }
+}
+
 fn checked_attempt(
     attempt: ReviewAttemptV1,
     attempt_id: Option<&str>,
@@ -1923,6 +2080,11 @@ enum DesiredMutationExpectation {
         input: Option<ThemaWriteRequestV1>,
         archived: Option<bool>,
         expected_revision: Option<u64>,
+    },
+    ReviewState {
+        thema_id: String,
+        suspended: bool,
+        expected_state_revision: u64,
     },
     Settings {
         input: UpdateSettingsRequestV1,
@@ -2010,6 +2172,23 @@ fn valid_desired_projection(
         ) => {
             settings_matches_input(settings, input)
                 && valid_mutation_revision(settings.revision, Some(*expected_revision), changed)
+        }
+        (
+            DesiredStateMutationProjectionV1::ReviewState { thema_id, state },
+            DesiredMutationExpectation::ReviewState {
+                thema_id: expected_thema_id,
+                suspended,
+                expected_state_revision,
+            },
+        ) => {
+            thema_id == expected_thema_id
+                && state.suspended == *suspended
+                && valid_review_state(state)
+                && valid_mutation_revision(
+                    state.state_revision,
+                    Some(*expected_state_revision),
+                    changed,
+                )
         }
         _ => false,
     }

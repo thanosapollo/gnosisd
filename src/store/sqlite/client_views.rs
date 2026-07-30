@@ -476,6 +476,8 @@ mod tests {
             .unwrap();
         let attempt = store
             .begin_http_review_attempt(&session.session_id, None, REVIEWED_AT_US + 1)
+            .unwrap()
+            .attempt
             .unwrap();
         store
             .grade_review_attempt(

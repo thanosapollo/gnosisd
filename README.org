@@ -175,7 +175,8 @@ The ~/v1~ API provides:
 - device-bound replica state, resumable snapshots, exact revision deltas, and
   immutable blob downloads, with authenticated device identity checked before
   local state changes;
-- optimistic thema create, search, update, archive, and unarchive;
+- optimistic thema create, search, update, archive, unarchive, and direct
+  review-state suspension;
 - revisioned Org documents, renames, tombstones, and historical retrieval;
 - content-addressed managed assets;
 - durable change cursors and cursor-only SSE announcements;
@@ -218,8 +219,9 @@ resource and operation identities; and treats a timeout or invalid mutation
 response as unknown delivery. Clients recover session state through the
 active-session and attempt-state resources.
 
-Clients page the complete thema and node catalogs through ~GET /v1/themata~ and
-~GET /v1/nodes~. Each node result binds its byte range to a document revision
+Management clients page content, archive, and suspension state together through
+~GET /v1/themata/catalog~. General thema and node searches remain
+~GET /v1/themata~ and ~GET /v1/nodes~. Each node result binds its byte range to a document revision
 and SHA-256 digest. To jump to a node, fetch
 ~GET /v1/notes/{document_id}/revisions/{document_revision}~, require the
 revision ETag and digest to match, then select the half-open UTF-8 byte range
@@ -262,7 +264,7 @@ immutable. Normal replica synchronization never creates a review pack.
 
 * Storage
 
-The server's canonical schema v1 stores native themata, tags, node associations,
+The server's canonical schema v3 stores native themata, tags, node associations,
 scheduling state, exact review history, sessions, attempts, devices, settings,
 documents, and the node graph. It also stores replica snapshots and feed
 revisions, review packs, immutable offline operations and results, device

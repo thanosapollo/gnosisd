@@ -38,8 +38,9 @@ pub use content::{
     DocumentImportRequestV1, DocumentMutationRejectionV1, DocumentMutationResultV1,
     DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodeCatalogItemV1, NodeCatalogPageV1,
     NodePageV1, NodeThemaAssociationPageV1, NodeThemaAssociationV1, NodeV1, NoteRenameRequestV1,
-    NoteWriteRequestV1, SettingsV1, StagedBlobV1, ThemaConceptRelationV1, ThemaConceptV1,
-    ThemaPageV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
+    NoteWriteRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogItemV1, ThemaCatalogPageV1,
+    ThemaConceptRelationV1, ThemaConceptV1, ThemaPageV1, ThemaV1, ThemaWriteRequestV1,
+    UpdateSettingsRequestV1,
 };
 
 use std::borrow::Cow;
@@ -49,9 +50,10 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::application::{
     AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
-    FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot, ReviewAttemptOperationResult,
-    ReviewAttemptState, ReviewAttemptView, ReviewResponsePrompt, ReviewSessionMode,
-    ReviewSessionView, ReviewSource, ReviewSourceKind, TransitionSnapshot, review_question,
+    FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot, ReviewAttemptBeginResult,
+    ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewItemSkipReason,
+    ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
+    SkippedReviewItem, TransitionSnapshot, review_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -712,6 +714,72 @@ impl ReviewSessionStatusV1 {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewItemSkipReasonV1 {
+    Archived,
+    Suspended,
+    ContentChanged,
+    SchedulingChanged,
+    UnsafePresentation,
+}
+
+impl From<ReviewItemSkipReason> for ReviewItemSkipReasonV1 {
+    fn from(value: ReviewItemSkipReason) -> Self {
+        match value {
+            ReviewItemSkipReason::Archived => Self::Archived,
+            ReviewItemSkipReason::Suspended => Self::Suspended,
+            ReviewItemSkipReason::ContentChanged => Self::ContentChanged,
+            ReviewItemSkipReason::SchedulingChanged => Self::SchedulingChanged,
+            ReviewItemSkipReason::UnsafePresentation => Self::UnsafePresentation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkippedReviewItemV1 {
+    pub position: u32,
+    pub thema_id: String,
+    pub reason: ReviewItemSkipReasonV1,
+}
+
+impl From<&SkippedReviewItem> for SkippedReviewItemV1 {
+    fn from(value: &SkippedReviewItem) -> Self {
+        Self {
+            position: value.position,
+            thema_id: value.thema_id.clone(),
+            reason: value.reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAttemptBeginResponseV1 {
+    pub session: ReviewSessionV1,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<ReviewAttemptV1>", required)]
+    pub attempt: Option<ReviewAttemptV1>,
+    pub skipped: Vec<SkippedReviewItemV1>,
+}
+
+impl ReviewAttemptBeginResponseV1 {
+    pub(crate) fn from_application(
+        value: &ReviewAttemptBeginResult,
+    ) -> Result<Self, ReviewAttemptWireError> {
+        Ok(Self {
+            session: ReviewSessionV1::from_application(&value.session)?,
+            attempt: value
+                .attempt
+                .as_ref()
+                .map(ReviewAttemptV1::from_application)
+                .transpose()?,
+            skipped: value.skipped.iter().map(Into::into).collect(),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveReviewSessionV1 {
@@ -754,6 +822,12 @@ pub struct SetSuspensionRequestV1 {
     #[schemars(range(max = 9223372036854775807_u64))]
     pub expected_attempt_revision: u64,
     pub desired_suspended: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetThemaSuspensionRequestV1 {
+    pub suspended: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -1031,6 +1105,9 @@ pub struct ReviewPresentationV1 {
     pub kind: ThemaKindV1,
     #[schemars(length(min = 1))]
     pub question: String,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub hint: Option<String>,
     pub response: ReviewResponsePromptV1,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
@@ -1054,6 +1131,7 @@ impl ReviewPresentationV1 {
         Ok(Self {
             kind: ThemaKindV1::from_application(&presentation.kind)?,
             question: question.text,
+            hint: question.hint,
             response: ReviewResponsePromptV1::from_application(question.response),
             source_guid: presentation.source_guid.clone(),
             review_image: presentation.review_image.clone(),

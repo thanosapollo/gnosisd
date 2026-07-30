@@ -246,6 +246,20 @@ pub(crate) struct ThemaRecord {
     pub(crate) archived: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThemaCatalogRecord {
+    pub(crate) thema_id: String,
+    pub(crate) thema_revision: u64,
+    pub(crate) state_revision: u64,
+    pub(crate) kind: ThemaKind,
+    pub(crate) keimenon: String,
+    pub(crate) hypothesis: Vec<Option<String>>,
+    pub(crate) answer: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) archived: bool,
+    pub(crate) suspended: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ThemaRevision {
     pub(crate) record: ThemaRecord,

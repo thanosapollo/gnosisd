@@ -1,6 +1,6 @@
 use super::{
     AssetRevision, DocumentReplicaRevision, NodeCatalogRecord, ReviewStateSnapshot, SettingsRecord,
-    ThemaRevision,
+    ThemaCatalogRecord, ThemaRevision,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -47,6 +47,13 @@ pub(crate) struct ReplicaState {
 pub(crate) struct NodeCatalogPage {
     pub(crate) state: ReplicaState,
     pub(crate) items: Vec<NodeCatalogRecord>,
+    pub(crate) has_more: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThemaCatalogPage {
+    pub(crate) state: ReplicaState,
+    pub(crate) items: Vec<ThemaCatalogRecord>,
     pub(crate) has_more: bool,
 }
 

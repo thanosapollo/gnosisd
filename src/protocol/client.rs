@@ -4,7 +4,10 @@ use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
-use super::{PROTOCOL_VERSION, RequestEnvelope, ResponseEnvelope, frame};
+use super::{PROTOCOL_VERSION, Request, RequestEnvelope, ResponseEnvelope, frame};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAINTENANCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(25 * 60);
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -27,14 +30,25 @@ pub async fn request(
     request: &RequestEnvelope,
 ) -> Result<ResponseEnvelope, ClientError> {
     timeout(
-        Duration::from_secs(30),
-        request_with_timeout(socket_path.as_ref(), request),
+        request_timeout(&request.request),
+        exchange(socket_path.as_ref(), request),
     )
     .await
     .map_err(|_| ClientError::Timeout)?
 }
 
-async fn request_with_timeout(
+fn request_timeout(request: &Request) -> Duration {
+    match request {
+        Request::BackupCreate { .. }
+        | Request::BackupVerify { .. }
+        | Request::BackupPrune { .. }
+        | Request::BackupRestoreValidate { .. }
+        | Request::Repair { .. } => MAINTENANCE_REQUEST_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
+}
+
+async fn exchange(
     socket_path: &Path,
     request: &RequestEnvelope,
 ) -> Result<ResponseEnvelope, ClientError> {
@@ -67,7 +81,9 @@ fn validate_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientError, validate_response};
+    use std::time::Duration;
+
+    use super::{ClientError, request_timeout, validate_response};
     use crate::protocol::{
         PROTOCOL_VERSION, Request, RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo,
     };
@@ -90,5 +106,19 @@ mod tests {
             validate_response(&request, &response),
             Err(ClientError::UnsupportedResponseVersion)
         ));
+    }
+
+    #[test]
+    fn maintenance_requests_have_a_longer_bounded_timeout() {
+        assert_eq!(
+            request_timeout(&Request::BackupCreate {
+                destination: "/backup".into(),
+            }),
+            Duration::from_secs(25 * 60)
+        );
+        assert_eq!(
+            request_timeout(&Request::SystemInfo {}),
+            Duration::from_secs(30)
+        );
     }
 }

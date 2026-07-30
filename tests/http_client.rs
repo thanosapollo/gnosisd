@@ -487,6 +487,8 @@ async fn client_runs_the_typed_online_review_lifecycle() {
     let pending = client
         .begin_review_attempt(&session.session_id)
         .await
+        .unwrap()
+        .attempt
         .unwrap();
     let graded = client
         .answer_review_attempt(&pending.attempt_id, &ReviewAnswerV1::Text("Answer".into()))
@@ -554,6 +556,8 @@ async fn client_reports_the_appended_online_relearning_item() {
     let attempt = client
         .begin_review_attempt(&session.session_id)
         .await
+        .unwrap()
+        .attempt
         .unwrap();
     let graded = client
         .answer_review_attempt(&attempt.attempt_id, &ReviewAnswerV1::Text("wrong".into()))
@@ -578,6 +582,8 @@ async fn client_reports_the_appended_online_relearning_item() {
         client
             .begin_review_attempt(&active.session_id)
             .await
+            .unwrap()
+            .attempt
             .unwrap()
             .thema_id,
         thema_id
@@ -3187,6 +3193,79 @@ async fn ordinary_projection_commands_require_authenticated_http_and_never_fall_
 
     let thema_id = create_review_thema(&daemon.base_url, &token).await;
     assert_eq!(client.thema(&thema_id).await.unwrap().thema_id, thema_id);
+    let catalog = client.thema_catalog("", 500, None, None).await.unwrap();
+    assert!(catalog.items.iter().any(|item| item.thema_id == thema_id
+        && item.thema_revision == 1
+        && item.state_revision == 0
+        && !item.suspended));
+    assert!(matches!(
+        client
+            .thema_catalog("", 500, None, Some("different-generation"))
+            .await,
+        Err(HttpClientError::InvalidResponse { .. })
+    ));
+    let suspended = client
+        .set_thema_suspended(&thema_id, "typed-suspend", 0, true)
+        .await
+        .unwrap();
+    assert!(matches!(
+        suspended,
+        DesiredStateMutationResultV1::Applied {
+            changed: true,
+            authoritative:
+                DesiredStateMutationProjectionV1::ReviewState {
+                    thema_id: ref projection_id,
+                    ref state,
+                },
+            ..
+        } if projection_id == &thema_id
+            && state.state_revision == 1
+            && state.suspended
+    ));
+    let retry = client
+        .set_thema_suspended(&thema_id, "typed-suspend", 0, true)
+        .await
+        .unwrap();
+    assert_eq!(retry, suspended);
+    assert!(matches!(
+        client
+            .set_thema_suspended(&thema_id, "typed-stale", 0, false)
+            .await
+            .unwrap(),
+        DesiredStateMutationResultV1::Rejected { .. }
+    ));
+    client
+        .replace_thema(&thema_id, "typed-content-edit", 1, &review_thema_request())
+        .await
+        .unwrap();
+    let review_only = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(review_only_token.clone()).unwrap(),
+    )
+    .unwrap();
+    let unsuspended = review_only
+        .set_thema_suspended(&thema_id, "typed-unsuspend", 1, false)
+        .await
+        .unwrap();
+    assert!(matches!(
+        unsuspended,
+        DesiredStateMutationResultV1::Applied {
+            authoritative:
+                DesiredStateMutationProjectionV1::ReviewState { ref state, .. },
+            ..
+        } if state.state_revision == 2 && !state.suspended
+    ));
+    let read_only = HttpClient::new(
+        &daemon.base_url,
+        SecretToken::new(read_only_token.clone()).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        read_only
+            .set_thema_suspended(&thema_id, "typed-forbidden", 2, true)
+            .await,
+        Err(HttpClientError::Server(error)) if error.status() == 403
+    ));
     create_review_thema(&daemon.base_url, &token).await;
     create_review_thema(&daemon.base_url, &token).await;
     let due = client.due_page(20991231, 100, None).await.unwrap();
@@ -3469,6 +3548,8 @@ async fn graded_attempt(daemon: &RunningDaemon, client: &HttpClient, token: &str
     let attempt = client
         .begin_review_attempt(&session.session_id)
         .await
+        .unwrap()
+        .attempt
         .unwrap();
     client
         .answer_review_attempt(&attempt.attempt_id, &ReviewAnswerV1::Text("Answer".into()))
@@ -3940,6 +4021,7 @@ fn review_operation_json(
             "session_id":"session",
             "thema_id":"thema",
             "presentation":{"kind":"basic","question":"Question",
+                "hint":null,
                 "response":{"kind":"text","input_script":null},
                 "source_guid":null,"review_image":null,"tags":[]},
             "revealed_answer":["Answer"],

@@ -1,11 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{DocumentOperationV1, FsrsConfigV1, ThemaKindV1};
+use super::{DocumentOperationV1, FsrsConfigV1, ReviewStateV1, ThemaKindV1};
 use crate::application::{
     AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
     DeviceMutationResult, DocumentHead, DocumentRevision, NodeCatalogRecord, NodeRecord,
-    NodeThemaAssociation, SettingsInput, SettingsRecord, ThemaMutationProjection, ThemaRecord,
+    NodeThemaAssociation, SettingsInput, SettingsRecord, ThemaCatalogRecord,
+    ThemaMutationProjection, ThemaRecord,
 };
 use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
@@ -42,6 +43,7 @@ pub enum ContentOperationV1 {
     Archive,
     Unarchive,
     Commit,
+    Suspension,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -214,6 +216,10 @@ impl DocumentMutationResultV1 {
 pub enum DesiredStateMutationProjectionV1 {
     Asset(AssetHeadV1),
     Thema(ThemaV1),
+    ReviewState {
+        thema_id: String,
+        state: ReviewStateV1,
+    },
     Settings(SettingsV1),
 }
 
@@ -292,6 +298,12 @@ fn desired_state_projection(
         DeviceMutationProjection::Thema(thema) => Ok(DesiredStateMutationProjectionV1::Thema(
             ThemaV1::from_mutation_projection(thema)?,
         )),
+        DeviceMutationProjection::ReviewState { thema_id, state } => {
+            Ok(DesiredStateMutationProjectionV1::ReviewState {
+                thema_id: thema_id.clone(),
+                state: ReviewStateV1::from(state),
+            })
+        }
         DeviceMutationProjection::Settings(settings) => Ok(
             DesiredStateMutationProjectionV1::Settings(SettingsV1::from_application(settings)),
         ),
@@ -577,6 +589,69 @@ pub struct ThemaPageV1 {
     pub next: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaCatalogItemV1 {
+    pub thema_id: String,
+    pub thema_revision: u64,
+    pub state_revision: u64,
+    pub kind: ThemaKindV1,
+    pub keimenon: String,
+    pub hypothesis: Vec<Option<String>>,
+    pub answer: Vec<String>,
+    pub tags: Vec<String>,
+    pub archived: bool,
+    pub suspended: bool,
+}
+
+impl ThemaCatalogItemV1 {
+    fn from_application(value: &ThemaCatalogRecord) -> Self {
+        Self {
+            thema_id: value.thema_id.clone(),
+            thema_revision: value.thema_revision,
+            state_revision: value.state_revision,
+            kind: thema_kind(value.kind),
+            keimenon: value.keimenon.clone(),
+            hypothesis: value.hypothesis.clone(),
+            answer: value.answer.clone(),
+            tags: value.tags.clone(),
+            archived: value.archived,
+            suspended: value.suspended,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaCatalogPageV1 {
+    #[schemars(length(min = 1, max = 512))]
+    pub generation: String,
+    #[schemars(length(max = 500))]
+    pub items: Vec<ThemaCatalogItemV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub next: Option<String>,
+}
+
+impl ThemaCatalogPageV1 {
+    pub(crate) fn from_application(
+        items: &[ThemaCatalogRecord],
+        generation: String,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            generation,
+            items: items
+                .iter()
+                .map(ThemaCatalogItemV1::from_application)
+                .collect(),
+            next: has_more
+                .then(|| items.last().map(|item| item.thema_id.clone()))
+                .flatten(),
+        }
+    }
+}
+
 impl ThemaPageV1 {
     pub(crate) fn from_application(items: &[ThemaRecord]) -> Self {
         Self {
@@ -805,6 +880,7 @@ fn content_operation(value: &str) -> Result<ContentOperationV1, ContentWireError
         "archive" => Ok(ContentOperationV1::Archive),
         "unarchive" => Ok(ContentOperationV1::Unarchive),
         "commit" => Ok(ContentOperationV1::Commit),
+        "suspension" => Ok(ContentOperationV1::Suspension),
         _ => Err(ContentWireError),
     }
 }

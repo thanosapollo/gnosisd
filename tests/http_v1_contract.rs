@@ -9,9 +9,9 @@ use gnosis_core::protocol::http_v1::{
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
     ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, ReviewStateV1,
-    ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1,
-    StagedBlobV1, ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1,
-    UpdateSettingsRequestV1,
+    ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+    SetThemaSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogPageV1,
+    ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -282,6 +282,13 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         .unwrap()
         .remove("revealed_answer");
     assert!(serde_json::from_value::<ReviewAttemptV1>(missing_null).is_err());
+
+    let mut missing_hint = review_attempt_result()["attempt"].clone();
+    missing_hint["presentation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("hint");
+    assert!(serde_json::from_value::<ReviewAttemptV1>(missing_hint).is_err());
 
     assert_round_trip::<ReviewStateV1>(review_state_wire());
     for field in ["stability", "difficulty"] {
@@ -662,6 +669,15 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
         "content_sha256":"a".repeat(64),"size_bytes":12
     }));
     assert_round_trip::<ThemaPageV1>(json!({"items":[thema_wire()],"next":"thema"}));
+    assert_round_trip::<ThemaCatalogPageV1>(json!({
+        "generation":"opaque-generation",
+        "items":[{
+            "thema_id":"thema","thema_revision":1,"state_revision":0,
+            "kind":"basic","keimenon":"Question","hypothesis":[null],
+            "answer":["Answer"],"tags":["tag"],"archived":false,"suspended":true
+        }],
+        "next":null
+    }));
     assert_round_trip::<NodePageV1>(json!({
         "items":[{"node_id":"node","document_id":"document",
             "logical_path":"notes/example.org","title":"Node","title_path":["Parent"],
@@ -727,6 +743,7 @@ fn public_content_requests_are_strict_and_preserve_defaults() {
     assert_round_trip::<NoteRenameRequestV1>(json!({
         "logical_path":"notes/renamed.org"
     }));
+    assert_round_trip::<SetThemaSuspensionRequestV1>(json!({"suspended":true}));
 
     let thema: ThemaWriteRequestV1 = serde_json::from_value(json!({
         "kind":"basic","keimenon":"Question","answer":["Answer"],
@@ -859,6 +876,7 @@ fn review_attempt_result() -> Value {
             "presentation":{
                 "kind":"basic",
                 "question":"Question",
+                "hint":null,
                 "response":{"kind":"text","input_script":null},
                 "source_guid":null,
                 "review_image":null,
