@@ -8,14 +8,14 @@ if [ "$#" -ne 1 ]; then
 fi
 
 fixture=$1
-gnosis_dir=${GNOSIS_ELISP_DIR:-/home/thanos/Projects/emacs-lisp/gnosis}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+gnosis_dir=${GNOSIS_ELISP_DIR:-$project_dir/clients/emacs}
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/gnosis-org-parity.XXXXXX")
 trap 'rm -rf "$work_dir"' EXIT HUP INT TERM
 
 if [ ! -r "$gnosis_dir/lisp/gnosis-org.el" ]; then
-    echo "cannot read $gnosis_dir/lisp/gnosis-org.el" >&2
+    echo "cannot read $gnosis_dir/lisp/gnosis-org.el; set GNOSIS_ELISP_DIR" >&2
     exit 1
 fi
 

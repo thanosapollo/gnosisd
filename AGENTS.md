@@ -87,6 +87,9 @@ nix develop
 
 Focused checks:
 
+`tools/check-org-parity.sh` uses `clients/emacs` by default; set
+`GNOSIS_ELISP_DIR` to check another Emacs client tree.
+
 ```sh
 cargo test --lib domain::
 cargo test --lib parser::org_tests

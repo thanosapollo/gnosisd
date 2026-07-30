@@ -1,0 +1,49 @@
+{
+  "nodes": {
+    "keymap-popup": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1783912247,
+        "narHash": "sha256-kp3v0FHHVxsAYI+b30uJ8AInenYS1yc6/qKeKY+Az50=",
+        "ref": "refs/tags/0.4.0",
+        "rev": "d0b50926a186d2de72aa12c6d6b06e384731865a",
+        "revCount": 135,
+        "type": "git",
+        "url": "https://git.thanosapollo.org/emacs-keymap-popup"
+      },
+      "original": {
+        "ref": "refs/tags/0.4.0",
+        "type": "git",
+        "url": "https://git.thanosapollo.org/emacs-keymap-popup"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1781577229,
+        "narHash": "sha256-lrp67w8AulE9Ks53n27I45ADSzbOCn4H+CNW1Ck8B+8=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "567a49d1913ce81ac6e9582e3553dd90a955875f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "keymap-popup": "keymap-popup",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
