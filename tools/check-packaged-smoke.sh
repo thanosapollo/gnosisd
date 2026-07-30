@@ -193,9 +193,10 @@ session_id=$(printf %s "$session" | jq -er .session_id)
 stage review-begin
 attempt_json=$(curl --fail-with-body --silent --show-error -H "$auth" \
     -X POST "$api/review/sessions/$session_id/attempts")
-attempt_id=$(printf %s "$attempt_json" | jq -er .attempt_id)
+attempt_id=$(printf %s "$attempt_json" | jq -er .attempt.attempt_id)
 printf %s "$attempt_json" | jq -e \
-    '.revealed_answer == null and (.presentation.question | contains("yes") | not)' \
+    '.attempt.revealed_answer == null and
+     (.attempt.presentation.question | contains("yes") | not)' \
     >/dev/null
 
 stage review-grade

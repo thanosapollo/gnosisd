@@ -9,7 +9,9 @@
       "title_path": ["Compatibility"],
       "tags": [],
       "parent_id": null,
-      "level": 0
+      "level": 0,
+      "start_byte": 0,
+      "end_byte": 424
     },
     {
       "id": "active-id",
@@ -17,7 +19,9 @@
       "title_path": ["Compatibility", "Active"],
       "tags": [],
       "parent_id": "compatibility-root",
-      "level": 1
+      "level": 1,
+      "start_byte": 205,
+      "end_byte": 322
     },
     {
       "id": "concept-id",
@@ -25,7 +29,9 @@
       "title_path": ["Compatibility", "Concept"],
       "tags": [],
       "parent_id": "compatibility-root",
-      "level": 1
+      "level": 1,
+      "start_byte": 322,
+      "end_byte": 373
     },
     {
       "id": "hidden-id",
@@ -33,7 +39,9 @@
       "title_path": ["Compatibility", "Hidden"],
       "tags": [],
       "parent_id": "compatibility-root",
-      "level": 1
+      "level": 1,
+      "start_byte": 373,
+      "end_byte": 424
     }
   ],
   "link_occurrences": [

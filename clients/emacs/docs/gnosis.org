@@ -1,0 +1,167 @@
+#+title: Gnosis User Manual
+#+author: Thanos Apollo
+#+language: en
+#+options: ':t toc:t author:t email:t num:t
+#+texinfo_filename: gnosis.info
+#+texinfo_dir_category: Emacs misc features
+#+texinfo_dir_title: Gnosis: (gnosis)
+#+texinfo_dir_desc: Authenticated Gnosis client foundation
+
+* Introduction
+
+Gnosis is the GNU Emacs client for =gnosisd=.  The current 0.13 development
+tree provides the authenticated HTTP, OpenAPI, managed-asset, and presentation
+foundation.  The daemon owns persistence, content rules, grading, scheduling,
+history, session recovery, and mutations.  The client has no SQLite access and
+no local fallback.
+
+Offline-editable Org synchronization uses generated OpenAPI operations only.
+The daemon remains authority for parsing, projections, graph state, revisions,
+and scheduling.
+
+* Org synchronization
+
+Customize =gnosis-nodes-dir= to a dedicated working directory, then run
+=M-x gnosis-nodes-bootstrap=.  Use =M-x gnosis-nodes-sync= to enroll and
+synchronize one file or all eligible Org files.  A prefix argument completes
+all available pull and local scan work.  Automatic synchronization is enabled
+by default.  Org files below =gnosis-nodes-dir= synchronize after each save, and
+the first save of a new file creates its canonical document.  Disable
+=gnosis-nodes-auto-sync-mode= to remove the save hooks and idle synchronization
+timer.  Private state records identity, cursor, document bases, pending
+operations, and conflicts; it is not a domain database.
+Delivery-unknown mutations are never retried automatically.
+Use =gnosis-nodes-track-file= for offline one-file enrollment and
+=gnosis-nodes-list-conflicts= before selecting a conflict resolution command.
+
+Opening or discovering files never implies create, rename, or deletion.  Saving
+a new Org file below =gnosis-nodes-dir= explicitly enrolls and creates it.  Use
+=M-x gnosis-nodes-rename-file= and =M-x gnosis-nodes-tombstone-file= for rename
+and deletion; local files remain until the user moves or removes them.
+
+Conflicts leave local content untouched.  Run =M-x gnosis-nodes-resolve-conflict=
+for three-way Ediff, edit and save Ediff's separate merge buffer, then run
+=M-x gnosis-nodes-accept-conflict=.  Acceptance revalidates the current local
+merge buffer and remote head, then queues a revision-checked replacement.
+Use =M-x gnosis-nodes-keep-local-conflict= for explicit rename-back, recreate,
+replace, or tombstone intent.  Use =M-x gnosis-nodes-accept-remote-conflict= to
+accept the remote rename, content, missing-file restore, or tombstone; tombstone
+acceptance preserves local bytes in private conflict evidence before deletion.
+Periodic passes stop at =gnosis-nodes-max-pages-per-pass= remote pages and
+=gnosis-nodes-max-mutations-per-pass= pending mutations.
+
+* Installation and setup
+
+Gnosis requires GNU Emacs 29.1 or later and a reachable =gnosisd= HTTP service.
+Install from GNU ELPA with =M-x package-install RET gnosis RET=.
+
+** Service URL
+
+The default =gnosis-core-base-url= is =http://127.0.0.1:7842=.  Plain HTTP is
+allowed only for loopback hosts.  Remote services must use HTTPS.  URLs with
+credentials, paths, queries, or fragments are rejected.
+
+#+begin_src emacs-lisp
+(setopt gnosis-core-base-url "https://gnosis.example.org")
+#+end_src
+
+** Authentication
+
+Authenticated requests use an =Authorization: Bearer= header.  Gnosis resolves
+the token from =auth-source= for each request and does not retain it in package
+state.  The default auth-source user is =gnosis=.
+
+#+begin_src authinfo
+machine 127.0.0.1 login gnosis port 7842 password TOKEN
+#+end_src
+
+Set authinfo file permissions to 0600.  Change the lookup user when required:
+
+#+begin_src emacs-lisp
+(setopt gnosis-core-auth-user "review-device")
+#+end_src
+
+* Dashboard
+
+Run =M-x gnosis= for the server-projected dashboard.  It shows review, queue,
+content, activity, and active-session state without deriving domain data
+locally.  Press =r= for due review, =T= for topic review, =R= to resume an
+active session, =t= for the paginated thema management list, =g= to refresh,
+=?= for actions, and =q= to close the buffer.  In the thema list, =RET= or =e=
+opens the shared editor and =s= suspends or unsuspends the row through
+=gnosisd=.  Run =M-x gnosis-review= for due review.
+
+* Review
+
+Run =M-x gnosis-review= for the daemon's due queue, =M-x
+gnosis-review-topic= for one server topic node, or =M-x gnosis-review-resume=
+to inspect an active durable session.  The UI renders the server presentation
+and submits structured text, text-vector, or choice responses.  The daemon
+alone grades, reveals answers, applies accepted-result overrides and desired
+suspension, schedules, persists, and commits.
+
+=RET= answers.  =n= commits the current accepted result.
+=o= overrides the accepted result without committing.  =s= changes suspension.
+=g= refreshes authoritative
+state or continues a committed attempt.  =?= shows actions.  =q= closes the
+local buffer without aborting the durable session.
+
+Review writes are single-shot.  Revision conflicts refresh the authoritative
+attempt.  If delivery is unknown, Gnosis reads the active session or attempt
+state and never repeats the mutation automatically.
+
+* Managed assets
+
+Managed images use canonical =assets/DIGEST/NAME= logical references.  Gnosis
+fetches them from the project-mandated authenticated =/v1/assets= route, limits
+response size, checks the SHA-256 digest, and atomically publishes them under
+the private =gnosis-core-assets-cache-directory=.  Unsafe cache ownership,
+permissions, symlinks, names, and digest mismatches are rejected.
+
+* HTTP errors
+
+The transport maps authentication, authorization, missing-resource, conflict,
+validation, timeout, unavailable-service, and malformed-response failures to
+typed =gnosis-core-error= conditions.  Error envelopes accept future bounded
+codes rather than embedding a handwritten closed DTO list.  Redirects,
+oversized responses, unsupported content encodings, unexpected content types,
+invalid JSON, and unsafe base URLs are rejected.
+
+* OpenAPI generation
+
+The generator consumes the daemon's OpenAPI 3.1 document and emits a
+deterministic Emacs Lisp manifest containing operation identity, method, path,
+and authentication.  It validates document metadata, response declarations,
+and unique operation identities.
+
+#+begin_src sh
+make OPENAPI_FILE=/path/to/openapi.json \
+     OPENAPI_OUTPUT=build/gnosis-openapi-contract.el openapi
+#+end_src
+
+Generated manifests are temporary build artifacts.  They are not installed,
+do not add another runtime module, and do not bind dashboard, content,
+document, thema, review, or mutation flows while the API is changing.
+
+* Development
+
+Run the project-native checks:
+
+#+begin_src sh
+make clean && make test
+make integration
+make lint
+make doc
+nix build
+nix flake check
+#+end_src
+
+=make integration= builds or uses local =gnosisd= and =gnosis= binaries, starts
+an isolated temporary daemon/database/socket/token, fetches
+=/v1/openapi.json=, generates and byte-compiles a manifest, then checks public
+health, authenticated transport, dashboard and thema management projections,
+direct suspension, and isolated review and Org synchronization journeys.
+
+Runtime package contains exactly =gnosis.el=, =gnosis-core.el=,
+=gnosis-core-assets.el=, =gnosis-edit.el=, =gnosis-review.el=,
+=gnosis-completion.el=, and =gnosis-nodes.el=.

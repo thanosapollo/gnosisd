@@ -24,6 +24,8 @@ struct ExpectedNode {
     tags: Vec<String>,
     parent_id: Option<String>,
     level: u32,
+    start_byte: usize,
+    end_byte: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +60,8 @@ struct SharedNode<'a> {
     tags: &'a [String],
     parent_id: Option<&'a str>,
     level: u32,
+    start_byte: usize,
+    end_byte: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +94,32 @@ fn preserves_duplicate_occurrences_but_deduplicates_edges() {
 #[test]
 fn reports_byte_spans_for_unicode_input() {
     assert_fixture("unicode");
+}
+
+#[test]
+fn indexed_heading_spans_cover_complete_subtrees() {
+    let input = concat!(
+        "#+TITLE: Nested\n",
+        "* Parent\n:PROPERTIES:\n:ID: parent\n:END:\n",
+        "** Unindexed\ninside\n",
+        "*** Child\n:PROPERTIES:\n:ID: child\n:END:\n",
+        "body\n",
+        "* Outside\noutside",
+    );
+    let projection = parse_org(input).expect("document must parse");
+    let parent = &projection.nodes()[0];
+    let child = &projection.nodes()[1];
+
+    assert_eq!(
+        input.get(parent.source_span().unwrap().start()..parent.source_span().unwrap().end()),
+        Some(
+            "* Parent\n:PROPERTIES:\n:ID: parent\n:END:\n** Unindexed\ninside\n*** Child\n:PROPERTIES:\n:ID: child\n:END:\nbody\n"
+        )
+    );
+    assert_eq!(
+        input.get(child.source_span().unwrap().start()..child.source_span().unwrap().end()),
+        Some("*** Child\n:PROPERTIES:\n:ID: child\n:END:\nbody\n")
+    );
 }
 
 #[test]
@@ -312,6 +342,11 @@ fn assert_nodes(actual: &DocumentProjection, expected: &ExpectedProjection) {
             expected.parent_id.as_deref()
         );
         assert_eq!(actual.level(), expected.level);
+        let span = actual
+            .source_span()
+            .expect("parsed node must have a source span");
+        assert_eq!(span.start(), expected.start_byte);
+        assert_eq!(span.end(), expected.end_byte);
     }
 }
 
@@ -381,6 +416,9 @@ fn shared_projection(projection: &DocumentProjection) -> SharedProjection<'_> {
 }
 
 fn shared_node(node: &Node) -> SharedNode<'_> {
+    let span = node
+        .source_span()
+        .expect("parsed nodes must have source spans");
     SharedNode {
         id: node.id().as_str(),
         title: node.title(),
@@ -388,5 +426,7 @@ fn shared_node(node: &Node) -> SharedNode<'_> {
         tags: node.tags(),
         parent_id: node.parent_id().map(|id| id.as_str()),
         level: node.level(),
+        start_byte: span.start(),
+        end_byte: span.end(),
     }
 }

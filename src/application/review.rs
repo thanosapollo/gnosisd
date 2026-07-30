@@ -140,6 +140,44 @@ pub(crate) struct ReviewSessionView {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum ReviewItemSkipReason {
+    Archived,
+    Suspended,
+    ContentChanged,
+    SchedulingChanged,
+    UnsafePresentation,
+}
+
+impl ReviewItemSkipReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Archived => "archived",
+            Self::Suspended => "suspended",
+            Self::ContentChanged => "content_changed",
+            Self::SchedulingChanged => "scheduling_changed",
+            Self::UnsafePresentation => "unsafe_presentation",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SkippedReviewItem {
+    pub(crate) position: u32,
+    pub(crate) thema_id: String,
+    pub(crate) reason: ReviewItemSkipReason,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReviewAttemptBeginResult {
+    pub(crate) start_position: u32,
+    pub(crate) session: ReviewSessionView,
+    pub(crate) attempt: Option<ReviewAttemptView>,
+    pub(crate) skipped: Vec<SkippedReviewItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ReviewSessionMode {
     Online,
     Offline,
@@ -170,6 +208,7 @@ pub(crate) struct PresentationSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReviewQuestion {
     pub(crate) text: String,
+    pub(crate) hint: Option<String>,
     pub(crate) response: ReviewResponsePrompt,
 }
 
@@ -872,9 +911,17 @@ pub(crate) fn review_question(
         .validate()
         .map_err(|_| ReviewError::Content)?;
     let text = question_text(&content)?;
+    let hint = question_hint(&content);
     ensure_question_is_safe(&content, &text)?;
+    if let Some(hint) = hint.as_deref() {
+        ensure_question_is_safe(&content, hint)?;
+    }
     let response = response_prompt(&content);
-    Ok(ReviewQuestion { text, response })
+    Ok(ReviewQuestion {
+        text,
+        hint,
+        response,
+    })
 }
 
 pub(crate) fn progressive_cloze_check(
@@ -904,22 +951,23 @@ pub(crate) fn progressive_cloze_check(
 
 fn question_text(content: &ThemaContent) -> Result<String, ReviewError> {
     match content.kind {
-        ThemaKind::Basic => Ok(basic_question(content)),
+        ThemaKind::Basic => Ok(content.keimenon.clone()),
         ThemaKind::Cloze => concealed_question(content, true),
         ThemaKind::Mcq => Ok(content.keimenon.clone()),
         ThemaKind::McCloze => concealed_question(content, false),
     }
 }
 
-fn basic_question(content: &ThemaContent) -> String {
-    let Some(hint) = content.hypothesis.first().and_then(Option::as_deref) else {
-        return content.keimenon.clone();
-    };
-    if hint.is_empty() {
-        content.keimenon.clone()
-    } else {
-        format!("{}\n\nHint: {hint}", content.keimenon)
+fn question_hint(content: &ThemaContent) -> Option<String> {
+    if content.kind != ThemaKind::Basic {
+        return None;
     }
+    content
+        .hypothesis
+        .first()
+        .and_then(Option::as_ref)
+        .filter(|hint| !hint.is_empty())
+        .cloned()
 }
 
 fn concealed_question(content: &ThemaContent, add_hints: bool) -> Result<String, ReviewError> {
@@ -1129,7 +1177,7 @@ pub(crate) enum ReviewError {
 mod tests {
     use serde::Deserialize;
 
-    use crate::application::MAX_REVIEW_PACK_ITEMS;
+    use crate::{application::MAX_REVIEW_PACK_ITEMS, domain::MAX_REVIEW_CLOZE_INPUTS};
 
     use super::{
         PresentationSnapshot, ReviewAttemptMutation, ReviewAttemptOperation, ReviewResponsePrompt,
@@ -1188,6 +1236,26 @@ mod tests {
     }
 
     #[test]
+    fn maximum_progressive_cloze_can_complete() {
+        let answers = (0..MAX_REVIEW_CLOZE_INPUTS)
+            .map(|index| format!("answer-{index:03}"))
+            .collect::<Vec<_>>();
+        let mut captured = presentation("cloze", &answers.join(" "));
+        captured.answer = answers.clone();
+
+        let check = super::progressive_cloze_check(
+            &captured,
+            crate::domain::check_clozes(&answers, &answers),
+        )
+        .unwrap();
+
+        assert_eq!(check.matches.len(), MAX_REVIEW_CLOZE_INPUTS);
+        assert!(check.all_entered_correct);
+        assert!(check.complete);
+        assert_eq!(check.next_input_script, None);
+    }
+
+    #[test]
     fn progressive_cloze_question_preserves_literal_placeholder_text() {
         let mut captured = presentation("cloze", "Literal (...) then secret");
         captured.answer = vec!["secret".into()];
@@ -1210,7 +1278,8 @@ mod tests {
 
         let question = review_question(&captured).unwrap();
 
-        assert_eq!(question.text, "Question\n\nHint: Remember this");
+        assert_eq!(question.text, "Question");
+        assert_eq!(question.hint.as_deref(), Some("Remember this"));
         assert_eq!(
             question.response,
             ReviewResponsePrompt::Text { input_script: None }

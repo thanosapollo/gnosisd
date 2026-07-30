@@ -1,0 +1,489 @@
+
++ [[https://thanosapollo.org/projects/gnosis/][Homepage]]
++ [[https://git.thanosapollo.org/gnosis/][Upstream]]
++ [[https://thanosapollo.org/log/gnosis/][Changelog]]
+
+* 0.13.0
+#+date: 2026/07/16
+
+** Authenticated HTTP client
+
++ Added offline-editable Org synchronization through authenticated, generated
+  sync, blob, and mutation operations.  Minimal durable state tracks cursors,
+  bases, outbox entries, and explicit conflicts without duplicating daemon
+  parsing, projections, graph state, revisions, or scheduling.
++ Reduced the package to seven focused client modules.  Removed embedded
+  persistence, scheduling, grading, import, note, and compatibility backends.
++ Added bounded HTTP transport, bearer credentials resolved through
+  =auth-source=, future-compatible bounded error envelopes, safe GET retries,
+  and strict loopback/HTTPS authority validation.
++ Added a deterministic OpenAPI 3.1 operation-manifest generator and isolated
+  live contract harness.  Generated manifests remain build artifacts and do
+  not add another runtime module.
++ Removed handwritten success DTOs and direct route bindings.  Dashboard,
+  authoring, and review operations resolve through the live OpenAPI contract.
++ Restored server-authoritative review creation, resume, structured response,
+  accepted-result override, suspension, commit, and quit/abort.  Revision
+  conflicts refresh authoritative attempt state; delivery-unknown mutations
+  are never retried automatically and recover through server reads.
++ Added a foundation dashboard for daemon health and OpenAPI visibility.
++ Fetch managed review assets through authenticated HTTP and publish only
+  private SHA-256-verified cache entries.
+
+* 0.12.0
+#+date: 2026/07/14
+
+** Core review dogfood
+
++ Reviews can opt into a server-authoritative ~gnosisd~ backend over
+  ~$XDG_RUNTIME_DIR/gnosis/gnosis.sock~.  The established basic, cloze, MCQ,
+  and MC-cloze UI now submits structured responses while the daemon owns
+  grading, scheduling, override, suspension, session recovery, and commits.
++ Managed review assets are fetched in bounded chunks and published only after
+  digest verification into a private Emacs cache.
++ Core opt-in now requires the daemon's operational readiness response.
+  Unix-socket status remains a separate protocol liveness check.
++ The legacy review backend remains the default.  Core errors never fall back
+  to embedded SQLite, and review-loop edit and delete are disabled in core mode
+  until typed operations exist.
++ This is review dogfood, not a full frontend cutover.  Compatibility history,
+  dashboard, authoring, edit, archive, capture, import, note indexing, and link
+  maintenance do not mirror core review events and may remain stale.
+
+** Review history
+
++ Every accepted review now records one immutable event with its exact time,
+  session context, outcome, resolved parameters, and complete scheduling
+  transition.  Current state and daily activity update atomically with it.
++ The history browser drills down by day, thema, session, and linked node.
+  Node status and the dashboard expose due, new, failure, and derived Gnosis
+  scores.
++ Every history column is sortable.  Node learning metrics include unique
+  themata from all forward descendants, and node tables default to the highest
+  total Gnosis.
++ Archived themata retain their learning history.  Exact history has a separate
+  backed-up, strongly confirmed purge command.
+
+** Notes and review
+
++ ~gnosis-capture-thema~ creates a linked thema from the active region, current
+  heading, or note title and opens the existing editor for completion.
++ Ordinary note discovery can recurse below ~gnosis-nodes-dir~ while keeping the
+  journal directory and configured metadata directories special.
++ Failed basic reviews can continue into typing remediation after the accepted
+  result has been recorded.
++ History, node, and thema tables now reflow automatically when their window
+  width changes.
+
+** Data safety
+
++ Schema v9 introduces constrained review sessions, immutable review events,
+  explicit current review state, archived themata, and an honest exact-history
+  cutover.  Existing v6 and later databases upgrade through one atomic path.
++ ~gnosis-archive-create~ and ~gnosis-archive-restore~ provide verified private
+  full-database archives independently of Git.
++ Automatic Git commits run only in an existing repository.  Git failures do
+  not invalidate completed database work, and private archives are never staged.
++ Thema links to nodes or journal entries that are not currently indexed are
+  preserved as unresolved edges and resolve automatically when targets return.
+
+* 0.10.6
+#+date: 2026/05/08
+
++ Dashboard sub-views use dedicated major modes instead of minor modes.
+
+* 0.10.5
+#+date: 2026/05/05
+
+** Performance
++ Defer link-issues computation to idle timer for faster dashboard load.
++ Eliminate redundant database query per thema during review sessions.
+
+** Other
++ Dashboard popup menus show item counts in the modeline.
++ Improved error reporting in database migrations.
+
+* 0.10.3
+#+date: 2026/04/04
+
+** Bug fixes
++ Fix ~gnosis-table-exists-p~ failing to query =sqlite_master=.
++ Clean up orphaned =node-tag= and =node-links= rows on file deletion.
+
+* 0.10.2
+#+date: 2026/03/31
+
+** Performance
++ Eliminate redundant GPG decryption on save for =.org.gpg= files.
++ Git operations (add, commit, push) are now fully async.
+
+** Other
++ ~gnosis-journal-todo-keywords~ defaults to =("TODO")= instead of
+  inheriting ~org-todo-keywords~.
+
+* 0.10.1
+#+date: 2026/03/26
+
+** Algorithm
++ Cap post-failure interval at 7 days to prevent overly lenient
+  reschedules for mature cards.
+
+** Bug fixes
++ Fix ~gnosis-import-db~ initializing review state with wrong values,
+  causing errors on first review of imported themata.
+
+** Other
++ Demo collection shipped as =.gnosis= instead of org file.
+
+* 0.10.0
+#+date: 2026/03/25
+
+** Breaking changes
++ *Date storage migrated to integers*: review dates are now stored as
+  YYYYMMDD integers instead of Lisp lists.  Migration v7 converts
+  existing data automatically.
++ *Export/import rewritten*: export now produces a =.gnosis= SQLite
+  database.  Import shows a diff buffer before applying.
+  + Old org-file exports are no longer supported.
+
+** New features
++ *Anki GUID-based duplicate detection*: re-importing the same deck
+  skips already-imported notes (migration v8).
++ *Review progress header*: header-line shows reviewed/total as a
+  live counter.
++ *Import diff buffer*: ~gnosis-import-db~ shows NEW/CHANGED entries
+  with detail view on ~RET~ before applying.
++ *Anki import improvements*: template-aware field resolution,
+  NFC-normalized tags, system tag stripping (~marked~, ~leech~),
+  git commit after import.
+
+** Performance
++ Due/overdue queries use integer comparison in SQL instead of
+  Elisp filtering.
++ New indexes on ~review_log~, ~thema_tag~, ~thema_links~,
+  ~node_links~, and ~activity_log~.
++ N+1 queries eliminated in review session and Anki model parsing.
+
+** Bug fixes
++ Fix proto phase failures computing amnesia-based interval instead
+  of resetting to 0.
++ Fix bulk-link matching to be case-insensitive.
++ Fix duplicate node-link insertion for files.
++ Fix overdue exclusion: unreviewed themata (n=0) no longer counted
+  as overdue.
+
+* 0.9.0
+#+DATE: 2026/03/16
+
+** Breaking changes
++ *Dropped emacsql dependency*: gnosis now uses Emacs's built-in
+  =sqlite= module (requires Emacs 29+).  The new =gnosis-sqlite=
+  backend handles all database access.
++ *Unified database*: org-gnosis has been merged into gnosis.
+  A single =gnosis.db= stores both themata and nodes.  Existing
+  org-gnosis data is migrated automatically.
++ *Decks removed*: the deck abstraction is gone.  Existing deck names
+  are automatically converted into tags during the v6 migration, so
+  no data is lost.  Export and import are now thema-centric with tag
+  filtering.
+
+** New features
++ *Anki import*: import Anki decks or user collections directly with
+  ~gnosis-anki-import~.
++ *Tag filtering*: ~gnosis-tags-filter-prompt~ supports =+tag -tag=
+  syntax for include/exclude filtering.  Used in export and
+  ~gnosis-collect-thema-ids~.
++ *Day start hour*: ~gnosis-algorithm-day-start-hour~ (default 3)
+  lets you define when a new review day begins.
++ *Tag bulk operations*: rename, regex bulk rename (~R~), merge case
+  duplicates (~C~), bulk delete, and suspend/unsuspend from the
+  dashboard tags view.  Tag renames are merge-safe (handles UNIQUE
+  conflicts when target tag already exists).
++ *Elapsed time intervals*: the algorithm uses actual elapsed time
+  for interval calculation.
++ *Review transient menu*: ~gnosis-review~ uses transient instead of
+  completing-read.
++ *Template expansion*: ={*}= heading markers in templates are expanded
+  relative to insertion context via ~gnosis-org-expand-headings~.
++ *Export with tag filtering*: ~gnosis-export-themata~ supports tag
+  filtering and node export.
+
+** Dashboard
++ Tags view with regex filter (~l~), regex search (~SPC~), and tag
+  counts.
++ Bulk tag rename via regex pattern (~R~) using a temp-table approach
+  for O(1) SQL statements regardless of batch size.
++ Anki import keybinding in the dashboard menu.
++ Merge case-duplicate tags (~C~): groups tags by case, keeps the
+  most-used variant as canonical.
+  + Meant to simplify imports from anki decks hierarchical tag structure
++ Entry cache for themata view (avoids re-querying unchanged entries).
++ Cache invalidation on tag mutations so the themata view stays fresh.
+
+** Performance
++ *Batch SQL helpers*: ~gnosis-sqlite-execute-batch~ and
+  ~gnosis-sqlite-select-batch~ auto-chunk IN clauses to stay within
+  =SQLITE_MAX_VARIABLE_NUMBER=.
++ N+1 query patterns eliminated throughout: tag suspend, tag delete,
+  bulk link, export, and dashboard operations.
++ Bulk tag rename uses a temp mapping table (4 SQL statements for any
+  number of renames, instead of 2N).
++ =SELECT DISTINCT= replaces Elisp deduplication for tag lookups.
+
+** Bug fixes
++ Fix DST bug in ~gnosis-algorithm-date~.
++ Fix ~gnosis-review-topic~: flatten select results, fix y-or-n-p logic.
++ Fix ~gnosis-completing-read~ to use ~completing-read~ for require-match.
++ Fix force-sync purge and journal link FK violation.
++ Warn on duplicate filename when timestring is nil in node creation.
+
+* 0.8.0
+#+DATE: 2026/03/04
+
+** New features
++ Auto input-method detection: gnosis detects the script of the
+  expected answer (Greek, Cyrillic, etc.) and activates the
+  appropriate input method during review.
+  Configured via ~gnosis-script-input-method-alist~.
++ Change thema type and deck via ~gnosis-update-thema~.
++ Dashboard bulk-link action for currently displayed themata.
++ Dashboard header-line with entry count and context.
++ Asynchronous deck import with ~gnosis-import-deck-async~.
++ Demo deck included in =collections/demo.gnosis=.
+
+** Performance
++ New ~gnosis-tl~ module replaces ~tabulated-list-print~ for
+  dashboard rendering (3-4x faster).
++ Progressive async rendering for large dashboards.
++ Batch-fetch review data instead of per-thema queries.
+
+** Bug fixes
++ Fix anagnosis event calculation in the algorithm.
++ Fix cloze tag removal for edge cases and mc-cloze type.
++ Fix ~vc-pull~ to run migrations after pull.
+
+* 0.7.0
+#+DATE: 2026/02/24
+** New features
++ Review topic from dashboard nodes view (~r~), with configurable
+  forward-link and backlink depth (~R~ or ~C-u r~).
++ ~gnosis-review-topic~ accepts separate forward/backlink depth to
+  include themata from related nodes.
++ ~gnosis-save-hook~ runs after saving a thema, called with the
+  thema ID.
++ Link integrity detection and repair commands
+  (~gnosis-links-check~, ~gnosis-links-sync~).
++ Dashboard maintenance menu for syncing/rebuilding nodes and link
+  health checks.
++ Dashboard shows themata with orphaned links.
++ View due org-gnosis nodes linked to themata from dashboard.
++ Bulk replace string in keimenon with org-gnosis node link.
++ Custom ~gnosis-center-content-during-review~ option.
++ Delete action available during review.
++ Format org-gnosis links in keimenon during review output.
++ Export deck option to include or exclude suspended themata.
++ Exported decks include a =#+THEMATA:= header with thema count.
++ Importing into an existing deck prompts for confirmation.
++ Failed thema imports report the source file line number.
+
+** Dashboard
++ Added nodes dashboard, view org-gnosis nodes information including
+  backlinks and linked themata as well as start a review session.
++ Suspend column displays =Yes= =No= instead of =1= =0=.
++ Flatten Actions submenu into the home menu.
++ Separate Import/Export into its own menu column.
++ Four-column layout: Navigate, Actions, Import/Export, Maintenance.
+
+
+** Algorithm
++ Cap gnosis-synolon at =gnosis-algorithm-synolon-max= (default 3.0),
+  floor at 1.3.
++ Add interval fuzz to prevent review clustering.
++ Fix lethe event: properly reduce gnosis-plus on consecutive failures.
+
+** Performance
++ Dashboard suspend, delete, and edit update only the affected entry
+  instead of refreshing the entire buffer.
++ Dashboard nodes view uses bulk queries for link counts (2 queries
+  instead of 2N).
++ Deck export uses 2 bulk queries instead of 2 per thema (N+1 eliminated).
++ Deck export uses plain text insertion instead of per-thema buffer scans (O(n^2) eliminated).
++ Deck import wraps all operations in a single transaction with
+  pre-cached IDs (10K fsyncs reduced to 1).
++ Review updates use a single DB query.
++ Tag output uses a single DB call.
++ Average daily reviews computed with a single DB call.
+
+** Bug fixes
++ Fix ~gnosis-monkeytype~ hook leak (now buffer-local).
++ Fix ~vc-pull~ to reopen database properly after successful pull.
++ Pre-load ~emacsql-sqlite-builtin~ to fix ~cl-generic~ dispatch crash
+  on Emacs 29+.
+
+** Documentation
++ Update Introduction to describe the intended workflow with =org-gnosis=
+  (write notes, create themata, link, review).
++ Document the two separate databases (gnosis and org-gnosis).
++ Update dashboard section for new menu layout.
++ Add Import & Export section with export options and import behavior.
+
+* 0.6.0
+#+DATE: 2026/01/26
+** New features
++ View links to org-gnosis nodes during review.
++ /Monkeytype/ wrong answers upon failed recalls.
+
+** gnosis-modeline-mode
++ Add 'warning face property for due themata indication.
+
+** cloze themata
++ [fix] Properly center keimenon during reviews.
+
+** Other
++ gnosis-cloze-string value defaults to ="(...)"=.
+
+* 0.5.8
+#+DATE: 2025/11/08
++ Update database to version 5.
++ Restructure gnosis modules.
++ Add monkeytype functionality.
+* 0.5.7
+#+DATE: 2025/10/25
++ Resolve issues relating to selecting multiple questions on
+  dashboard.
++ Resolve issues for suspending content.
++ Improve performance for suspending multiple questions
+
+* 0.5.6
+#+DATE: 2025/10/13
++ Fix issues for clozes with multiple identical answers.
++ Improve performance for suspending multiple notes via the dashboard.
++ Display newlines when reviewing notes.
++ Add feature to mark all notes present at current dashboard.
+
+* 0.5.5
+#+DATE: 2025/08/13
++ Performance improvements for un/suspending decks.
++ Minor bug fixes & adjustments.
+* 0.5.4
+#+DATE: 2025/08/01
++ New feature: open of file links in a new buffer.
+  + This can be used to view images or pdf/ebooks.
++ Change syntax highlighting to org mode.
++ Quitting viewing notes/decks returns to dashboard home page.
++ Minor bug fixes & adjustments on dashboard.
+* 0.5.3
+#+DATE: 2025/07/02
++ Fix gnosis algorithm bug for failed reviews with custom amnesia
+  value of lower than 0.5.
++ Update documentation.
+
+* 0.5.2
+#+DATE: 2025/06/30
++ Fix importing deck issues with non-new gnosis ids.
++ Minor aesthetic changes on review header.
++ Remove modeline review indication when due reviews are 0.
+
+* 0.5.1
+#+DATE: 2025/06/18
++ Minor bug fixes & documentation update.
+
+* 0.5.0
+#+DATE: 2025/06/17
+[[http://thanosapollo.org/posts/gnosis-0-5-0-release/][Announcement post]]
+
++ Major rewrite of gnosis database
+  + All columns have the same value types
+  + Every note (/thema/) type will consist of
+    + *keimenon* (passage/document) a string value.
+    + *hypothesis* assumption/hint, string value related to keimenon
+      to help finding the right answer.
+    + *answer*, a string value, self explanatory.
+    + *parathema*, a string value, the "extras" with emphasis on adding
++ =Drop support for images=
+  + Image support will be rewritten in the next minor version, to
+    support them as file links via keimenon.
++ =Drop support y-or-n notes=
+  + With this update your current y-or-n notes will be converted into
+    MCQ type, with "Yes" & "No" choices.
++ =Support for org-mode=
+  + Create & edit notes in an org-mode buffer, replacing previous
+    emacs-lisp implementation.
+  + Export decks as org-mode files
+  + Import & Edit decks as org-mode files
++ =Support for linking gnosis notes with org-gnosis notes.=
+  + Adding an org link to either the keimenon or parathema of a gnosis
+    note to an [[https://thanosapollo.org/projects/org-gnosis/][org-gnosis]] note will link said notes, this way you can
+    do review gnosis notes that are related to a specific topic/note
+    of org-gnosis.
+
+* 0.4.10
+#+DATE: 2025/12/10
++ Implement major performance improvements in gnosis-dashboard.
+
+* 0.4.9
+#+DATE: 2024/12/10
+- Implement asynchronous dashboard creation
+- Minor bug fixes
+
+* 0.4.8
+#+DATE: 2024/11/08
++ Refactor average review output
+
+* 0.4.7
+#+DATE: 2024/11/07
++ Optimized performance for dashboard homepage
++ Fix face issues on emacs-30
+
+* 0.4.6
+#+DATE: 2024/10/23
++ Refactor gnosis-dashboard without using widgets
++ Improve searching of gnosis notes within dashboard
+
+* 0.4.5
+#+DATE: 2024/10/09
++ Fix cloze hint removal issues.
++ Update documentation
+  + Add Contributing section
++ Refactor gnosis-dashboard module as part of gnosis.el
+
+* 0.4.4
+#+DATE: 2024/10/06
++ Add clear-history.
++ *Refactor* review actions to use read-char-choice.
+  + This is done to allow users to switch buffers during review,
+    something that couldn't be done with read-multiple-choice
++ Add documentation for interactions with other software
+  + Add documentation for using gnosis with =emacs-no-literring=.
+
+* 0.4.3
+#+DATE: 2024/09/06
++ Fix breaking changes for editing cloze notes.
++ Refactor calculation of dates in gnosis algorithm.
+
+* 0.4.2.
+#+DATE: 2024/09/05
++ Fix display issues on non-grapical interface.
++ Add variable watchers for custom algorithm values.
++ Update assertions for editing notes
+
+* 0.4.1
+#+DATE: 2024/08/19
++  Update to emacsql-4.0.0
+
+* 0.4.0
+#+DATE: 2024/08/07
++ Major rewrite on gnosis algorithm.
+  + Add gnosis-score
+  + Add epignosis and agnoia
+  + Add lethe and anagnosis events
+    + Anagnosis events adjust gnosis-score
+      depending on review performance, using epignosis
+      and agnoia
+    + Lethe resets next interval to 0
+  + Refactor calculations of next interval and gnosis-score
++ Add custom variables for tags and decks, configured using emacs
+  lisp.
++ Rewrite gnosis database.
+  + Remove deck specific values.
+  + Use new algorithm variables.

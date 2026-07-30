@@ -39,18 +39,20 @@ use crate::{
         AnswerInput, ApplicationError, AssetHead, ContentChange,
         DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
         DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
-        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeRecord, NodeThemaAssociation,
-        OfflineAssetOperation, OfflineAssetResult, OfflineContentConflictReason,
-        OfflineContentOperation, OfflineContentResult, OfflineReviewOperation, OfflineReviewResult,
-        PreparedAsset, PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
+        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeCatalogPage, NodeRecord,
+        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
+        OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
+        OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
+        PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
         PreparedDeviceDocumentMutation, PreparedNote, PreparedThema, QueryDueThemataPage,
-        ReplicaChange, ReplicaState, ReviewAttemptOperation, ReviewAttemptOperationResult,
-        ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck, ReviewError, ReviewHistoryEvent,
-        ReviewHistoryQuery, ReviewOperationAuthority, ReviewPackAsset, ReviewPackView,
-        ReviewQueueSummary, ReviewSessionQuery, ReviewSessionSummary, ReviewSessionView,
-        ReviewSource, SettingsError, SettingsInput, SettingsRecord, SnapshotPage, SnapshotPosition,
-        ThemaRecord, ThemaReviewState, prepare_offline_document, retained_asset_paths,
-        token_digest, validate_asset_path, validate_blob_metadata,
+        ReplicaChange, ReplicaState, ReviewAttemptBeginResult, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck,
+        ReviewError, ReviewHistoryEvent, ReviewHistoryQuery, ReviewOperationAuthority,
+        ReviewPackAsset, ReviewPackView, ReviewQueueSummary, ReviewSessionQuery,
+        ReviewSessionSummary, ReviewSessionView, ReviewSource, SettingsError, SettingsInput,
+        SettingsRecord, SnapshotPage, SnapshotPosition, ThemaCatalogPage, ThemaRecord,
+        ThemaReviewState, prepare_offline_document, retained_asset_paths, token_digest,
+        validate_asset_path, validate_blob_metadata,
     },
     blob::{BlobError, BlobMeta, BlobStore},
     domain::{DocumentId, DueThema},
@@ -695,6 +697,42 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn node_catalog(
+        &self,
+        device_id: String,
+        document_id: Option<String>,
+        limit: u16,
+        after: Option<String>,
+    ) -> Result<NodeCatalogPage, ServiceError> {
+        request(&self.sender, |response| StoreCommand::NodeCatalog {
+            device_id,
+            document_id,
+            limit,
+            after,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn thema_catalog(
+        &self,
+        device_id: String,
+        query: String,
+        limit: u16,
+        after: Option<String>,
+    ) -> Result<ThemaCatalogPage, ServiceError> {
+        request(&self.sender, |response| StoreCommand::ThemaCatalog {
+            device_id,
+            query,
+            limit,
+            after,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn graph_nodes(
         &self,
         node_id: String,
@@ -932,7 +970,7 @@ impl ServiceHandle {
         session_id: String,
         actor_device_id: Option<String>,
         started_at_us: u64,
-    ) -> Result<ReviewAttemptView, ServiceError> {
+    ) -> Result<ReviewAttemptBeginResult, ServiceError> {
         request(&self.sender, |response| {
             StoreCommand::BeginHttpReviewAttempt {
                 session_id,
@@ -1635,6 +1673,20 @@ enum StoreCommand {
         after: Option<String>,
         response: oneshot::Sender<StoreResult<Vec<NodeRecord>>>,
     },
+    NodeCatalog {
+        device_id: String,
+        document_id: Option<String>,
+        limit: u16,
+        after: Option<String>,
+        response: oneshot::Sender<StoreResult<NodeCatalogPage>>,
+    },
+    ThemaCatalog {
+        device_id: String,
+        query: String,
+        limit: u16,
+        after: Option<String>,
+        response: oneshot::Sender<StoreResult<ThemaCatalogPage>>,
+    },
     GraphNodes {
         node_id: String,
         inbound: bool,
@@ -1719,7 +1771,7 @@ enum StoreCommand {
         session_id: String,
         actor_device_id: Option<String>,
         started_at_us: u64,
-        response: oneshot::Sender<StoreResult<ReviewAttemptView>>,
+        response: oneshot::Sender<StoreResult<ReviewAttemptBeginResult>>,
     },
     GradeReviewAttempt {
         attempt_id: String,
@@ -2558,6 +2610,26 @@ fn run_store_command(
         } => send(
             response,
             store.search_nodes(&query, limit, after.as_deref()),
+        ),
+        StoreCommand::NodeCatalog {
+            device_id,
+            document_id,
+            limit,
+            after,
+            response,
+        } => send(
+            response,
+            store.node_catalog(&device_id, document_id.as_deref(), limit, after.as_deref()),
+        ),
+        StoreCommand::ThemaCatalog {
+            device_id,
+            query,
+            limit,
+            after,
+            response,
+        } => send(
+            response,
+            store.thema_catalog(&device_id, &query, limit, after.as_deref()),
         ),
         StoreCommand::GraphNodes {
             node_id,

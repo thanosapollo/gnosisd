@@ -1,0 +1,101 @@
+* Gnosis
+
+Gnosis is the GNU Emacs client for =gnosisd=.  The current 0.13 development
+tree provides the authenticated HTTP, OpenAPI, asset-cache, and presentation
+foundation.  =gnosisd= remains the sole owner of data, scheduling, grading,
+history, authoring rules, and persistence.
+
++ [[https://elpa.gnu.org/packages/doc/gnosis.html][Manual]]
++ [[https://thanosapollo.org/projects/gnosis/][Homepage]]
+
+** Current scope
+
+Run =M-x gnosis= for the server-projected dashboard; =r= starts review, =T=
+starts topic review, =R= resumes an active session, =t= opens the thema
+management list, =g= refreshes, =?= shows actions, and =q= closes it.  Run
+=M-x gnosis-review= for due review.  For an
+offline-editable Org working tree, customize =gnosis-nodes-dir= and run
+=M-x gnosis-nodes-bootstrap=.  Edit Org files normally; each save durably queues
+the file and synchronizes it with =gnosisd=.  Saving a new Org file below
+=gnosis-nodes-dir= creates its canonical document.  =M-x gnosis-nodes-sync=
+remains available for explicit synchronization.  Conflicts preserve local
+content and require explicit Ediff resolution and acceptance.
+
+The client resolves operation identities and strict schemas from the daemon's
+live OpenAPI document; it has no handwritten Gnosis DTOs or direct route
+bindings.  There is no SQLite access and no local fallback.  During review,
+=RET= answers,
+=n= commits the current accepted result, =o= overrides the accepted result without committing,
+=s= changes suspension, =g= refreshes or continues a committed attempt, =?=
+shows actions, and =q= closes the local buffer without aborting the session.
+
+** Requirements
+
++ GNU Emacs 29.1 or later.
++ A reachable =gnosisd= HTTP service.
++ Bearer credentials in =auth-source= for authenticated operations.
+
+The default service URL is =http://127.0.0.1:7842=.  Plain HTTP is accepted only
+for loopback hosts; remote services require HTTPS.
+
+** Authentication
+
+Store the daemon token with =auth-source= rather than an Emacs customization:
+
+#+begin_src authinfo
+machine 127.0.0.1 login gnosis port 7842 password TOKEN
+machine gnosis.example.org login gnosis port 443 password TOKEN
+#+end_src
+
+Protect the authinfo file with mode 0600.  Customize the connection only when
+needed:
+
+#+begin_src emacs-lisp
+(setopt gnosis-core-base-url "https://gnosis.example.org"
+        gnosis-core-auth-user "gnosis")
+#+end_src
+
+Tokens are resolved per request and are never stored in package state, logs,
+or cache files.
+
+** Managed assets
+
+The project-mandated =assets/DIGEST/NAME= references are fetched through
+authenticated =/v1/assets= operations, verified against their SHA-256 path
+digest, and stored in a private local cache.
+
+** OpenAPI generation
+
+The daemon serves its contract at =/v1/openapi.json=.  Generate a deterministic
+temporary operation manifest with:
+
+#+begin_src sh
+make OPENAPI_FILE=/path/to/openapi.json \
+     OPENAPI_OUTPUT=build/gnosis-openapi-contract.el openapi
+#+end_src
+
+The manifest records operation identity, method, path, and authentication.  It
+is not a shipped seventh module and does not bind domain flows.  The integration
+harness starts an isolated daemon, fetches the live document, generates and
+byte-compiles the manifest, then checks health and authenticated transport.
+
+** Development
+
+#+begin_src sh
+make clean && make test
+make integration
+make lint
+make doc
+nix build
+nix flake check
+#+end_src
+
+Runtime source consists of exactly seven modules:
+
++ =gnosis.el=
++ =gnosis-core.el=
++ =gnosis-core-assets.el=
++ =gnosis-edit.el=
++ =gnosis-nodes.el=
++ =gnosis-review.el=
++ =gnosis-completion.el=

@@ -9,7 +9,9 @@
       "title_path": ["Γνῶσις"],
       "tags": ["ελληνικά"],
       "parent_id": null,
-      "level": 0
+      "level": 0,
+      "start_byte": 0,
+      "end_byte": 193
     },
     {
       "id": "knowledge-id",
@@ -17,7 +19,9 @@
       "title_path": ["Γνῶσις", "知識"],
       "tags": ["ελληνικά", "学習"],
       "parent_id": "unicode-root",
-      "level": 1
+      "level": 1,
+      "start_byte": 92,
+      "end_byte": 193
     }
   ],
   "link_occurrences": [

@@ -1,7 +1,7 @@
 use gnosis_core::protocol::http_v1::{
     ActiveReviewPackEnvelopeV2, ApiErrorCodeV1, ApiErrorResponseV1, AssetCapabilitiesV1,
     AssetHeadV1, ContentCapabilitiesV1, ContentChangePageV1, DocumentHeadV1,
-    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodePageV1,
+    DocumentMutationResultV1, DocumentRevisionPageV1, DuePageView, NodeCatalogPageV1, NodePageV1,
     NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
     OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
     OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
@@ -9,9 +9,9 @@ use gnosis_core::protocol::http_v1::{
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
     ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, ReviewStateV1,
-    ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1,
-    StagedBlobV1, ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1,
-    UpdateSettingsRequestV1,
+    ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+    SetThemaSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogPageV1,
+    ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
 use serde_json::{Value, json};
 
@@ -265,7 +265,7 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         "started_at_us":1
     });
     let attempt = review_attempt_result()["attempt"].clone();
-    let committed = json!({"event_id":"event"});
+    let committed = json!({"attempt_id":"attempt","event_id":"event"});
 
     assert_round_trip::<ReviewSessionRequestV1>(request);
     assert_round_trip::<ReviewSessionV1>(session);
@@ -282,6 +282,13 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         .unwrap()
         .remove("revealed_answer");
     assert!(serde_json::from_value::<ReviewAttemptV1>(missing_null).is_err());
+
+    let mut missing_hint = review_attempt_result()["attempt"].clone();
+    missing_hint["presentation"]
+        .as_object_mut()
+        .unwrap()
+        .remove("hint");
+    assert!(serde_json::from_value::<ReviewAttemptV1>(missing_hint).is_err());
 
     assert_round_trip::<ReviewStateV1>(review_state_wire());
     for field in ["stability", "difficulty"] {
@@ -662,12 +669,45 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
         "content_sha256":"a".repeat(64),"size_bytes":12
     }));
     assert_round_trip::<ThemaPageV1>(json!({"items":[thema_wire()],"next":"thema"}));
+    assert_round_trip::<ThemaCatalogPageV1>(json!({
+        "generation":"opaque-generation",
+        "items":[{
+            "thema_id":"thema","thema_revision":1,"state_revision":0,
+            "kind":"basic","keimenon":"Question","hypothesis":[null],
+            "answer":["Answer"],"tags":["tag"],"archived":false,"suspended":true
+        }],
+        "next":null
+    }));
     assert_round_trip::<NodePageV1>(json!({
         "items":[{"node_id":"node","document_id":"document",
             "logical_path":"notes/example.org","title":"Node","title_path":["Parent"],
-            "tags":[],"level":2,"active":true}],
+            "tags":[],"level":2,"document_revision":4,
+            "content_sha256":"a".repeat(64),"start_byte":10,"end_byte":20,
+            "active":true}],
         "next":"node"
     }));
+    assert_round_trip::<NodePageV1>(json!({
+        "items":[{"node_id":"legacy","document_id":"document",
+            "logical_path":"notes/example.org","title":"Legacy","title_path":["Legacy"],
+            "tags":[],"level":1,"document_revision":1,
+            "content_sha256":"a".repeat(64),"start_byte":null,"end_byte":null,
+            "active":false}],
+        "next":"legacy"
+    }));
+    assert_round_trip::<NodeCatalogPageV1>(json!({
+        "generation":"opaque-generation",
+        "items":[{"node_id":"node","document_id":"document",
+            "logical_path":"notes/example.org","title_path":["Parent","Node"],
+            "active":true}],
+        "next":"node"
+    }));
+    let missing_end = json!({
+        "node_id":"node","document_id":"document","logical_path":"notes/example.org",
+        "title":"Node","title_path":["Node"],"tags":[],"level":1,
+        "document_revision":1,"content_sha256":"a".repeat(64),
+        "start_byte":0,"active":true
+    });
+    assert!(serde_json::from_value::<NodeV1>(missing_end).is_err());
     assert_round_trip::<NodeThemaAssociationPageV1>(json!({
         "items":[
             {"thema_id":"thema-a","relation":"primary"},
@@ -679,7 +719,9 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
     assert!(
         serde_json::from_value::<NodeV1>(json!({
             "node_id":"node","document_id":"document","logical_path":"notes/example.org",
-            "title":"Node","title_path":["Parent"],"tags":[],"level":2,"active":true,
+            "title":"Node","title_path":["Parent"],"tags":[],"level":2,
+            "document_revision":4,"content_sha256":"a".repeat(64),
+            "start_byte":10,"end_byte":20,"active":true,
             "thema_ids":["thema"]
         }))
         .is_err()
@@ -701,6 +743,7 @@ fn public_content_requests_are_strict_and_preserve_defaults() {
     assert_round_trip::<NoteRenameRequestV1>(json!({
         "logical_path":"notes/renamed.org"
     }));
+    assert_round_trip::<SetThemaSuspensionRequestV1>(json!({"suspended":true}));
 
     let thema: ThemaWriteRequestV1 = serde_json::from_value(json!({
         "kind":"basic","keimenon":"Question","answer":["Answer"],
@@ -833,6 +876,7 @@ fn review_attempt_result() -> Value {
             "presentation":{
                 "kind":"basic",
                 "question":"Question",
+                "hint":null,
                 "response":{"kind":"text","input_script":null},
                 "source_guid":null,
                 "review_image":null,

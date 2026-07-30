@@ -93,9 +93,9 @@ fn readme_offline_answer_matches_the_fsrs_contract() {
 #[test]
 fn readme_storage_versions_match_the_canonical_schemas() {
     let readme = include_str!("../README.org");
-    assert!(readme.contains("server's canonical schema v1"));
+    assert!(readme.contains("server's canonical schema v3"));
     assert!(readme.contains("replica database retains its distinct canonical schema v1"));
-    assert!(include_str!("../src/store/sqlite.rs").contains("const SCHEMA_VERSION: u32 = 1;"));
+    assert!(include_str!("../src/store/sqlite.rs").contains("const SCHEMA_VERSION: u32 = 3;"));
     assert!(include_str!("../src/store/replica.rs").contains("const SCHEMA_VERSION: u32 = 1;"));
 }
 
@@ -289,6 +289,7 @@ fn question() -> Value {
         "presentation": {
             "kind": "basic",
             "question": "Question",
+            "hint": null,
             "response": {"kind": "text", "input_script": null},
             "source_guid": null,
             "review_image": null,

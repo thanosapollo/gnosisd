@@ -29,12 +29,12 @@ pub(crate) use client_views::{
 pub(crate) use content::{
     AssetHead, AssetRevision, ContentChange, DocumentHead, DocumentProjectionSnapshot,
     DocumentReplicaRevision, DocumentRevision, MAX_DOCUMENT_PROJECTION_BYTES,
-    MAX_DOCUMENT_SOURCE_BYTES, NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote,
-    PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode, ThemaRecord,
-    ThemaRevision, asset_paths_in_org, canonical_asset_path, path_key, prepare_asset,
-    prepare_document, prepare_thema, retained_asset_paths, stored_thema_content, thema_content,
-    validate_asset_path, validate_blob_metadata, validate_document_path,
-    validate_offline_thema_assets,
+    MAX_DOCUMENT_SOURCE_BYTES, NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset,
+    PreparedNote, PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
+    ThemaCatalogRecord, ThemaRecord, ThemaRevision, asset_paths_in_org, canonical_asset_path,
+    path_key, prepare_asset, prepare_document, prepare_thema, retained_asset_paths,
+    stored_thema_content, thema_content, validate_asset_path, validate_blob_metadata,
+    validate_document_path, validate_offline_thema_assets,
 };
 #[cfg(test)]
 pub(crate) use content::{ContentError, prepare_note};
@@ -43,9 +43,9 @@ pub(crate) use device_mutation::{
     DeviceMutationError, DeviceMutationIdentity, DeviceMutationKind, DeviceMutationProjection,
     DeviceMutationRejection, DeviceMutationResult, PreparedDeviceDesiredStateMutation,
     PreparedDeviceDocumentLifecycleMutation, PreparedDeviceDocumentMutation,
-    ThemaMutationProjection, prepare_device_desired_state_mutation,
-    prepare_device_document_mutation, prepare_device_document_rename,
-    prepare_device_document_tombstone,
+    ThemaMutationProjection, desired_state_wire_request_sha256,
+    prepare_device_desired_state_mutation, prepare_device_document_mutation,
+    prepare_device_document_rename, prepare_device_document_tombstone,
 };
 pub use import_document::ApplicationError;
 #[cfg(test)]
@@ -68,16 +68,17 @@ pub(crate) use review::{
     AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
     FsrsModelSnapshot, MAX_REVIEW_PACK_BYTES, OfflineAnswerError, OfflineAnswerInput,
     OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot,
-    RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
-    ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
-    ReviewAttemptView, ReviewClozeCheck, ReviewError, ReviewOperationAuthority, ReviewPackAsset,
-    ReviewPackItem, ReviewPackView, ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView,
-    ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
-    prepare_offline_operation, presentation_content, progressive_cloze_check, review_day_at,
-    review_question, valid_operation_id, validate_review_pack_projection,
+    RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptBeginResult, ReviewAttemptMutation,
+    ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
+    ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck, ReviewError, ReviewItemSkipReason,
+    ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
+    ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
+    ReviewStateSnapshot, SkippedReviewItem, TransitionSnapshot, prepare_offline_operation,
+    presentation_content, progressive_cloze_check, review_day_at, review_question,
+    valid_operation_id, validate_review_pack_projection,
 };
 pub(crate) use settings::{SettingsError, SettingsInput, SettingsRecord};
 pub(crate) use sync::{
-    ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsRevision,
-    SnapshotPage, SnapshotPosition,
+    NodeCatalogPage, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision,
+    SettingsRevision, SnapshotPage, SnapshotPosition, ThemaCatalogPage,
 };

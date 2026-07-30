@@ -17,5 +17,5 @@ pub use graph::{NodeEdge, project_unique_edges};
 pub use ids::{DocumentId, IdError, NodeId, ThemaId};
 pub(crate) use legacy::DueThema;
 pub(crate) use scheduling::{ReviewState, Transition, compute_transition, validate_state};
+pub(crate) use thema::{MAX_REVIEW_CLOZE_INPUTS, ThemaContent, ThemaContentError, ThemaKind};
 pub use thema::{ThemaConcept, ThemaConceptRelation};
-pub(crate) use thema::{ThemaContent, ThemaContentError, ThemaKind};

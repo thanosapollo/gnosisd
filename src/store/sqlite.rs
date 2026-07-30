@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     fs,
     os::unix::fs::PermissionsExt,
@@ -22,17 +22,19 @@ use uuid::Uuid;
 
 use crate::domain::{
     DocumentId, DocumentProjection, DocumentProjectionInput, DueThema, LinkOccurrence, Node,
-    NodeEdge, NodeId, SourceSpan, ThemaConcept, ThemaConceptRelation, ThemaId, TitlePath,
+    NodeEdge, NodeId, SourceSpan, ThemaConcept, ThemaConceptRelation, ThemaId, ThemaKind,
+    TitlePath,
 };
 use crate::{
     application::{
         AssetHead, AssetRevision, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead,
-        DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision, NewDevice,
-        NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote, PreparedThema,
-        ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision, SettingsInput,
-        SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition, ThemaRecord,
-        ThemaRevision, parse_stored_scopes, path_key, stored_scopes, stored_thema_content,
-        validate_document_path,
+        DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision,
+        MAX_DOCUMENT_PROJECTION_BYTES, MAX_DOCUMENT_SOURCE_BYTES, NewDevice, NodeCatalogPage,
+        NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote,
+        PreparedThema, ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateRevision,
+        SettingsInput, SettingsRecord, SettingsRevision, SnapshotPage, SnapshotPosition,
+        ThemaCatalogPage, ThemaCatalogRecord, ThemaRecord, ThemaRevision, parse_stored_scopes,
+        path_key, stored_scopes, stored_thema_content, validate_document_path,
     },
     blob::BlobMeta,
 };
@@ -47,7 +49,8 @@ pub(crate) use mutation::DeviceMutationExecution;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 3;
+const THEMA_CATALOG_MATERIALIZED_BYTES: usize = 1024 * 1024;
 const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -83,6 +86,8 @@ pub(crate) enum StoreError {
     ReplicaCursor,
     #[error("page cursor is not part of the requested collection")]
     InvalidCursor,
+    #[error("node page projection budget was reached")]
+    NodePageProjectionLimit,
     #[error("replica snapshot belongs to another server")]
     ReplicaServer,
     #[error("operation requires a staged blob")]
@@ -1317,6 +1322,86 @@ impl SqliteStore {
             .collect()
     }
 
+    pub(crate) fn thema_catalog(
+        &self,
+        device_id: &str,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<ThemaCatalogPage, StoreError> {
+        self.thema_catalog_with_byte_budget(
+            device_id,
+            query,
+            limit,
+            after,
+            THEMA_CATALOG_MATERIALIZED_BYTES,
+        )
+    }
+
+    fn thema_catalog_with_byte_budget(
+        &self,
+        device_id: &str,
+        query: &str,
+        limit: u16,
+        after: Option<&str>,
+        byte_budget: usize,
+    ) -> Result<ThemaCatalogPage, StoreError> {
+        let state = self.replica_state(device_id)?;
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT thema.thema_id,
+                        length(CAST(thema.thema_id AS BLOB))
+                        + length(CAST(thema.kind AS BLOB))
+                        + length(CAST(thema.keimenon AS BLOB))
+                        + length(CAST(thema.hypothesis_json AS BLOB))
+                        + length(CAST(thema.answer_json AS BLOB))
+                        + coalesce((
+                            SELECT sum(length(CAST(tags.tag AS BLOB)))
+                            FROM thema_tag AS tags WHERE tags.thema_id = thema.thema_id
+                          ), 0) + 64
+                 FROM thema
+                 JOIN review_state USING(thema_id)
+                 LEFT JOIN thema_tag USING(thema_id)
+                 WHERE thema.thema_id > coalesce(?2, '')
+                   AND (lower(thema.keimenon) LIKE ?1 OR lower(thema_tag.tag) LIKE ?1)
+                 ORDER BY thema.thema_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        let rows = statement
+            .query_map(params![pattern, after, i64::from(limit) + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)?;
+        drop(statement);
+        let mut items = Vec::new();
+        let mut materialized_bytes = 0usize;
+        let mut has_more = false;
+        for (thema_id, projected_bytes) in rows {
+            let projected_bytes =
+                usize::try_from(projected_bytes).map_err(|_| StoreError::CorruptData {
+                    field: "thema catalog size",
+                })?;
+            if items.len() == usize::from(limit)
+                || (!items.is_empty()
+                    && materialized_bytes.saturating_add(projected_bytes) > byte_budget)
+            {
+                has_more = true;
+                break;
+            }
+            items.push(load_thema_catalog_record(&self.connection, &thema_id)?);
+            materialized_bytes = materialized_bytes.saturating_add(projected_bytes);
+        }
+        Ok(ThemaCatalogPage {
+            state,
+            items,
+            has_more,
+        })
+    }
+
     pub(crate) fn get_node(&self, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
         load_node(&self.connection, node_id)
     }
@@ -1415,9 +1500,72 @@ impl SqliteStore {
             .map_err(StoreError::storage)?
             .collect::<Result<Vec<String>, _>>()
             .map_err(StoreError::storage)?;
-        ids.into_iter()
-            .map(|id| load_node(&self.connection, &id)?.ok_or(StoreError::NotFound))
-            .collect()
+        load_node_records(&self.connection, ids)
+    }
+
+    pub(crate) fn node_catalog(
+        &self,
+        device_id: &str,
+        document_id: Option<&str>,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<NodeCatalogPage, StoreError> {
+        let state = self.replica_state(device_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT node_id, document_id, logical_path, title_path_json, active
+                 FROM (
+                     SELECT node.node_id, node.document_id, document.logical_path,
+                            node.title_path_json, node.active
+                     FROM node JOIN document USING(document_id)
+                     UNION ALL
+                     SELECT retired.node_id, retired.document_id, retired.logical_path,
+                            retired.title_path_json, 0
+                     FROM retired_node AS retired
+                     WHERE NOT EXISTS(
+                         SELECT 1 FROM node WHERE node_id = retired.node_id
+                     )
+                 )
+                 WHERE (?1 IS NULL OR document_id = ?1)
+                   AND node_id > coalesce(?2, '')
+                 ORDER BY node_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        let rows = statement
+            .query_map(
+                params![document_id, after, i64::from(limit) + 1],
+                |row| -> rusqlite::Result<_> {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::storage)?;
+        let mut items = rows
+            .map(|row| {
+                let (node_id, document_id, logical_path, title_path, active) =
+                    row.map_err(StoreError::storage)?;
+                Ok(NodeCatalogRecord {
+                    node_id,
+                    document_id,
+                    logical_path,
+                    title_path: from_json(&title_path, "node title path")?,
+                    active,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let has_more = items.len() > usize::from(limit);
+        items.truncate(usize::from(limit));
+        Ok(NodeCatalogPage {
+            state,
+            items,
+            has_more,
+        })
     }
 
     pub(crate) fn graph_nodes(
@@ -1455,9 +1603,7 @@ impl SqliteStore {
             .map_err(StoreError::storage)?
             .collect::<Result<Vec<String>, _>>()
             .map_err(StoreError::storage)?;
-        ids.into_iter()
-            .map(|id| load_node(&self.connection, &id)?.ok_or(StoreError::NotFound))
-            .collect()
+        load_node_records(&self.connection, ids)
     }
 
     pub(crate) fn create_device(
@@ -3426,93 +3572,353 @@ fn materialize_thema_concepts(
 }
 
 fn load_node(connection: &Connection, node_id: &str) -> Result<Option<NodeRecord>, StoreError> {
-    if let Some(node) = load_current_node(connection, node_id)? {
+    let mut projections = NodeProjectionCache::unbounded();
+    load_node_cached(connection, node_id, &mut projections)
+}
+
+struct NodeProjectionCache {
+    locations: HashMap<(String, u64), Option<ProjectionNodeLocations>>,
+    decoded_bytes: usize,
+    max_decoded_bytes: Option<usize>,
+}
+
+impl NodeProjectionCache {
+    fn unbounded() -> Self {
+        Self {
+            locations: HashMap::new(),
+            decoded_bytes: 0,
+            max_decoded_bytes: None,
+        }
+    }
+
+    fn page() -> Self {
+        Self {
+            locations: HashMap::new(),
+            decoded_bytes: 0,
+            max_decoded_bytes: Some(MAX_DOCUMENT_PROJECTION_BYTES),
+        }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> bool {
+        let Some(limit) = self.max_decoded_bytes else {
+            return true;
+        };
+        let Some(total) = self.decoded_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > limit {
+            return false;
+        }
+        self.decoded_bytes = total;
+        true
+    }
+}
+
+struct ProjectionNodeLocations {
+    content_sha256: String,
+    spans: HashMap<String, Option<SourceSpan>>,
+}
+
+fn load_node_records(
+    connection: &Connection,
+    ids: Vec<String>,
+) -> Result<Vec<NodeRecord>, StoreError> {
+    let mut projections = NodeProjectionCache::page();
+    let mut records = Vec::with_capacity(ids.len());
+    for id in ids {
+        match load_node_cached(connection, &id, &mut projections) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => return Err(StoreError::NotFound),
+            Err(StoreError::NodePageProjectionLimit) => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(records)
+}
+
+fn load_node_cached(
+    connection: &Connection,
+    node_id: &str,
+    projections: &mut NodeProjectionCache,
+) -> Result<Option<NodeRecord>, StoreError> {
+    if let Some(node) = load_current_node(connection, node_id, projections)? {
         return Ok(Some(node));
     }
-    load_retired_node(connection, node_id)
+    load_retired_node(connection, node_id, projections)
 }
 
 fn load_current_node(
     connection: &Connection,
     node_id: &str,
+    projections: &mut NodeProjectionCache,
 ) -> Result<Option<NodeRecord>, StoreError> {
     let row = connection
         .query_row(
             "SELECT node.node_id, node.document_id, document.logical_path, node.title,
-                node.title_path_json, node.level, node.active
+                node.title_path_json, node.level, node.active, document.revision,
+                document.content_sha256
          FROM node JOIN document ON document.document_id = node.document_id
          WHERE node.node_id = ?1",
             [node_id],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, bool>(6)?,
-                ))
+                Ok(CurrentNodeRow {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    title_path: row.get(4)?,
+                    level: row.get(5)?,
+                    active: row.get(6)?,
+                    document_revision: row.get(7)?,
+                    fallback_digest: row.get(8)?,
+                })
             },
         )
         .optional()
         .map_err(StoreError::storage)?;
-    row.map(|row| materialize_current_node(connection, row))
+    row.map(|row| materialize_current_node(connection, row, projections))
         .transpose()
+}
+
+struct CurrentNodeRow {
+    id: String,
+    document_id: String,
+    path: String,
+    title: String,
+    title_path: String,
+    level: i64,
+    active: bool,
+    document_revision: i64,
+    fallback_digest: String,
 }
 
 fn materialize_current_node(
     connection: &Connection,
-    row: (String, String, String, String, String, i64, bool),
+    row: CurrentNodeRow,
+    projections: &mut NodeProjectionCache,
 ) -> Result<NodeRecord, StoreError> {
-    let (id, document_id, path, title, title_path, level, active) = row;
+    let head_revision = to_u64(row.document_revision, "document revision")?;
+    let revision = if row.active {
+        head_revision
+    } else {
+        head_revision
+            .checked_sub(1)
+            .ok_or(StoreError::CorruptData {
+                field: "node document revision",
+            })?
+    };
+    let location = load_node_location(
+        connection,
+        &row.document_id,
+        revision,
+        &row.id,
+        &row.fallback_digest,
+        projections,
+    )?;
     Ok(NodeRecord {
-        tags: query_node_tags(connection, &document_id, &id)?,
-        node_id: id,
-        document_id,
-        logical_path: path,
-        title,
-        title_path: serde_json::from_str(&title_path).map_err(StoreError::storage)?,
-        level: to_u32(level, "node level")?,
-        active,
+        tags: query_node_tags(connection, &row.document_id, &row.id)?,
+        node_id: row.id,
+        document_id: row.document_id,
+        logical_path: row.path,
+        document_revision: revision,
+        content_sha256: location.content_sha256,
+        title: row.title,
+        title_path: serde_json::from_str(&row.title_path).map_err(StoreError::storage)?,
+        level: to_u32(row.level, "node level")?,
+        start_byte: location.start_byte,
+        end_byte: location.end_byte,
+        active: row.active,
     })
 }
 
 fn load_retired_node(
     connection: &Connection,
     node_id: &str,
+    projections: &mut NodeProjectionCache,
 ) -> Result<Option<NodeRecord>, StoreError> {
-    connection
+    let row = connection
         .query_row(
-            "SELECT node_id, document_id, logical_path, title, title_path_json,
-                tags_json, level FROM retired_node WHERE node_id = ?1",
+            "SELECT retired_node.node_id, retired_node.document_id,
+                retired_node.logical_path, retired_node.title, retired_node.title_path_json,
+                retired_node.tags_json, retired_node.level, retired_node.retired_at_revision,
+                document.content_sha256
+             FROM retired_node JOIN document USING(document_id)
+             WHERE retired_node.node_id = ?1",
             [node_id],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                ))
+                Ok(RetiredNodeRow {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    title_path: row.get(4)?,
+                    tags: row.get(5)?,
+                    level: row.get(6)?,
+                    retired_at_revision: row.get(7)?,
+                    fallback_digest: row.get(8)?,
+                })
             },
         )
         .optional()
+        .map_err(StoreError::storage)?;
+    row.map(|row| materialize_retired_node(connection, row, projections))
+        .transpose()
+}
+
+struct RetiredNodeRow {
+    id: String,
+    document_id: String,
+    path: String,
+    title: String,
+    title_path: String,
+    tags: String,
+    level: i64,
+    retired_at_revision: i64,
+    fallback_digest: String,
+}
+
+fn materialize_retired_node(
+    connection: &Connection,
+    row: RetiredNodeRow,
+    projections: &mut NodeProjectionCache,
+) -> Result<NodeRecord, StoreError> {
+    let revision = to_u64(row.retired_at_revision, "retired revision")?
+        .checked_sub(1)
+        .ok_or(StoreError::CorruptData {
+            field: "node document revision",
+        })?;
+    let location = load_node_location(
+        connection,
+        &row.document_id,
+        revision,
+        &row.id,
+        &row.fallback_digest,
+        projections,
+    )?;
+    Ok(NodeRecord {
+        node_id: row.id,
+        document_id: row.document_id,
+        logical_path: row.path,
+        document_revision: revision,
+        content_sha256: location.content_sha256,
+        title: row.title,
+        title_path: serde_json::from_str(&row.title_path).map_err(StoreError::storage)?,
+        tags: serde_json::from_str(&row.tags).map_err(StoreError::storage)?,
+        level: to_u32(row.level, "node level")?,
+        start_byte: location.start_byte,
+        end_byte: location.end_byte,
+        active: false,
+    })
+}
+
+struct NodeLocation {
+    content_sha256: String,
+    start_byte: Option<usize>,
+    end_byte: Option<usize>,
+}
+
+fn load_node_location(
+    connection: &Connection,
+    document_id: &str,
+    revision: u64,
+    node_id: &str,
+    fallback_digest: &str,
+    projections: &mut NodeProjectionCache,
+) -> Result<NodeLocation, StoreError> {
+    let key = (document_id.to_owned(), revision);
+    if !projections.locations.contains_key(&key) {
+        let size = load_projection_snapshot_size(connection, document_id, revision)?;
+        if size.is_some_and(|size| size > MAX_DOCUMENT_PROJECTION_BYTES) {
+            return Err(StoreError::CorruptData {
+                field: "document projection size",
+            });
+        }
+        if size.is_some_and(|size| !projections.reserve(size)) {
+            return Err(StoreError::NodePageProjectionLimit);
+        }
+        let locations = load_projection_snapshot(connection, document_id, revision)?
+            .map(projection_node_locations)
+            .transpose()?;
+        projections.locations.insert(key.clone(), locations);
+    }
+    let Some(locations) = projections.locations.get(&key).and_then(Option::as_ref) else {
+        return Ok(NodeLocation {
+            content_sha256: fallback_digest.to_owned(),
+            start_byte: None,
+            end_byte: None,
+        });
+    };
+    let span = locations
+        .spans
+        .get(node_id)
+        .copied()
+        .ok_or(StoreError::CorruptData {
+            field: "node projection history",
+        })?;
+    Ok(NodeLocation {
+        content_sha256: locations.content_sha256.clone(),
+        start_byte: span.map(|value| value.start()),
+        end_byte: span.map(|value| value.end()),
+    })
+}
+
+fn load_projection_snapshot_size(
+    connection: &Connection,
+    document_id: &str,
+    revision: u64,
+) -> Result<Option<usize>, StoreError> {
+    connection
+        .query_row(
+            "SELECT length(CAST(projection_json AS BLOB))
+             FROM document_projection_revision
+             WHERE document_id = ?1 AND revision = ?2",
+            params![document_id, u64_to_i64(revision, "document revision")?],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
         .map_err(StoreError::storage)?
-        .map(|(id, document_id, path, title, title_path, tags, level)| {
-            Ok(NodeRecord {
-                node_id: id,
-                document_id,
-                logical_path: path,
-                title,
-                title_path: serde_json::from_str(&title_path).map_err(StoreError::storage)?,
-                tags: serde_json::from_str(&tags).map_err(StoreError::storage)?,
-                level: to_u32(level, "node level")?,
-                active: false,
-            })
-        })
+        .map(|size| to_usize(size, "document projection size"))
+        .transpose()
+}
+
+fn projection_node_locations(
+    projection: DocumentProjectionSnapshot,
+) -> Result<ProjectionNodeLocations, StoreError> {
+    if !crate::is_canonical_sha256(&projection.content_sha256) {
+        return Err(StoreError::CorruptData {
+            field: "document content digest",
+        });
+    }
+    let mut spans = HashMap::with_capacity(projection.nodes.len());
+    for node in projection.nodes {
+        let span = projection_node_span(node.start_byte, node.end_byte)?;
+        if spans.insert(node.node_id, span).is_some() {
+            return Err(StoreError::CorruptData {
+                field: "node projection history",
+            });
+        }
+    }
+    Ok(ProjectionNodeLocations {
+        content_sha256: projection.content_sha256,
+        spans,
+    })
+}
+
+fn load_projection_snapshot(
+    connection: &Connection,
+    document_id: &str,
+    revision: u64,
+) -> Result<Option<DocumentProjectionSnapshot>, StoreError> {
+    connection
+        .query_row(
+            "SELECT projection_json FROM document_projection_revision
+             WHERE document_id = ?1 AND revision = ?2",
+            params![document_id, u64_to_i64(revision, "document revision")?],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::storage)?
+        .map(|json| serde_json::from_str(&json).map_err(StoreError::storage))
         .transpose()
 }
 
@@ -3584,12 +3990,13 @@ enum FailPoint {
 }
 
 fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
-    let mut found = schema_version(connection)?;
+    let found = schema_version(connection)?;
     if found == 0 && user_schema_is_empty(connection)? {
         connection
             .execute_batch(CURRENT_SCHEMA)
             .map_err(StoreError::storage)?;
-        found = schema_version(connection)?;
+        require_application_id(connection)?;
+        return require_current_schema_layout(connection);
     }
     match found {
         SCHEMA_VERSION => {
@@ -3604,9 +4011,13 @@ fn initialize_schema(connection: &Connection) -> Result<(), StoreError> {
 }
 
 fn require_current_schema_layout(connection: &Connection) -> Result<(), StoreError> {
+    require_schema_layout(connection, CURRENT_SCHEMA)
+}
+
+fn require_schema_layout(connection: &Connection, schema: &str) -> Result<(), StoreError> {
     let expected = Connection::open_in_memory().map_err(StoreError::storage)?;
     expected
-        .execute_batch(CURRENT_SCHEMA)
+        .execute_batch(schema)
         .map_err(StoreError::storage)?;
     if schema_objects(connection)? == schema_objects(&expected)? {
         Ok(())
@@ -3683,6 +4094,51 @@ fn query_strings(
         .query_map([parameter], |row| row.get(0))
         .map_err(StoreError::storage)?;
     rows.map(|row| row.map_err(StoreError::storage)).collect()
+}
+
+fn load_thema_catalog_record(
+    connection: &Connection,
+    thema_id: &str,
+) -> Result<ThemaCatalogRecord, StoreError> {
+    type CatalogRow = (i64, i64, String, String, String, String, bool, bool);
+    let row = connection
+        .query_row(
+            "SELECT thema.revision, review_state.state_revision, thema.kind,
+                    thema.keimenon, thema.hypothesis_json, thema.answer_json,
+                    thema.archived_at_us IS NOT NULL, review_state.suspended
+             FROM thema JOIN review_state USING(thema_id)
+             WHERE thema.thema_id = ?1",
+            [thema_id],
+            |row| -> rusqlite::Result<CatalogRow> {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(StoreError::storage)?;
+    Ok(ThemaCatalogRecord {
+        tags: query_strings(
+            connection,
+            "SELECT tag FROM thema_tag WHERE thema_id = ?1 ORDER BY tag",
+            thema_id,
+        )?,
+        thema_id: thema_id.to_owned(),
+        thema_revision: to_u64(row.0, "thema revision")?,
+        state_revision: to_u64(row.1, "state revision")?,
+        kind: ThemaKind::parse(&row.2).map_err(StoreError::storage)?,
+        keimenon: row.3,
+        hypothesis: serde_json::from_str(&row.4).map_err(StoreError::storage)?,
+        answer: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
+        archived: row.6,
+        suspended: row.7,
+    })
 }
 
 fn load_due_legacy_themata(
@@ -4233,6 +4689,7 @@ fn retire_removed_nodes(
                      tags_json, level, retired_at_revision
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(node_id) DO UPDATE SET
+                     document_id = excluded.document_id,
                      logical_path = excluded.logical_path,
                      title = excluded.title,
                      title_path_json = excluded.title_path_json,
@@ -4422,7 +4879,8 @@ fn materialize_document(
 ) -> Result<StoredDocument, StoreError> {
     let revision =
         u64::try_from(row.revision).map_err(|_| StoreError::CorruptData { field: "revision" })?;
-    let nodes = load_nodes(connection, document_id)?;
+    let node_spans = load_projection_node_spans(connection, document_id, revision)?;
+    let nodes = load_nodes(connection, document_id, node_spans.as_ref())?;
     let link_occurrences = load_occurrences(connection, document_id)?;
     let stored_edges = load_edges(connection, document_id)?;
     let projection = DocumentProjection::new(DocumentProjectionInput {
@@ -4448,7 +4906,41 @@ fn materialize_document(
     })
 }
 
-fn load_nodes(connection: &Connection, document_id: &DocumentId) -> Result<Vec<Node>, StoreError> {
+fn load_projection_node_spans(
+    connection: &Connection,
+    document_id: &DocumentId,
+    revision: u64,
+) -> Result<Option<HashMap<String, Option<SourceSpan>>>, StoreError> {
+    load_projection_snapshot(connection, document_id.as_str(), revision)?
+        .map(projection_node_locations)
+        .transpose()
+        .map(|locations| locations.map(|locations| locations.spans))
+}
+
+fn projection_node_span(
+    start_byte: Option<usize>,
+    end_byte: Option<usize>,
+) -> Result<Option<SourceSpan>, StoreError> {
+    match (start_byte, end_byte) {
+        (Some(start), Some(end)) if end <= MAX_DOCUMENT_SOURCE_BYTES => {
+            SourceSpan::from_offsets(start, end)
+                .map(Some)
+                .map_err(|_| StoreError::CorruptData {
+                    field: "node source span",
+                })
+        }
+        (None, None) => Ok(None),
+        _ => Err(StoreError::CorruptData {
+            field: "node source span",
+        }),
+    }
+}
+
+fn load_nodes(
+    connection: &Connection,
+    document_id: &DocumentId,
+    node_spans: Option<&HashMap<String, Option<SourceSpan>>>,
+) -> Result<Vec<Node>, StoreError> {
     let mut statement = connection
         .prepare(
             "SELECT node_id, title, title_path_json, parent_id, level \
@@ -4466,8 +4958,15 @@ fn load_nodes(connection: &Connection, document_id: &DocumentId) -> Result<Vec<N
             })
         })
         .map_err(StoreError::storage)?;
-    rows.map(|row| materialize_node(connection, document_id, row.map_err(StoreError::storage)?))
-        .collect()
+    rows.map(|row| {
+        materialize_node(
+            connection,
+            document_id,
+            row.map_err(StoreError::storage)?,
+            node_spans,
+        )
+    })
+    .collect()
 }
 
 struct NodeRow {
@@ -4482,7 +4981,16 @@ fn materialize_node(
     connection: &Connection,
     document_id: &DocumentId,
     row: NodeRow,
+    node_spans: Option<&HashMap<String, Option<SourceSpan>>>,
 ) -> Result<Node, StoreError> {
+    let source_span = node_spans
+        .map(|spans| {
+            spans.get(&row.id).copied().ok_or(StoreError::CorruptData {
+                field: "node projection history",
+            })
+        })
+        .transpose()?
+        .flatten();
     let id = node_id(row.id)?;
     let title_path =
         TitlePath::new(from_json(&row.title_path_json, "title path")?).map_err(|_| {
@@ -4493,8 +5001,12 @@ fn materialize_node(
     let tags = load_node_tags(connection, document_id, &id)?;
     let parent = row.parent_id.map(node_id).transpose()?;
     let level = u32::try_from(row.level).map_err(|_| StoreError::CorruptData { field: "level" })?;
-    Node::new(id, row.title, title_path, tags, parent, level)
-        .map_err(|_| StoreError::CorruptData { field: "node" })
+    match source_span {
+        Some(span) => Node::new(id, row.title, title_path, tags, parent, level)
+            .map(|node| node.with_source_span(span)),
+        None => Node::new(id, row.title, title_path, tags, parent, level),
+    }
+    .map_err(|_| StoreError::CorruptData { field: "node" })
 }
 
 fn load_node_tags(
@@ -4637,16 +5149,18 @@ mod tests {
     use super::{
         APPLICATION_ID, CURRENT_SCHEMA, DocumentAssetAssociation, FailPoint, SCHEMA_VERSION,
         SqliteStore, StoreError, application_id, backup_database_with_step, initialize_schema,
-        replace_rows, retire_removed_nodes, schema_version,
+        replace_rows, retire_removed_nodes, schema_objects, schema_version,
     };
     use crate::application::{
-        NodeThemaAssociation, PreparedNote, ReplicaProjection, ReviewSource, ReviewSourceKind,
-        SettingsInput, generate_device, prepare_asset, prepare_note, prepare_thema, thema_content,
+        DeviceDesiredStateMutation, DeviceMutationProjection, DeviceMutationResult,
+        MAX_DOCUMENT_PROJECTION_BYTES, NodeThemaAssociation, PreparedNote, ReplicaProjection,
+        ReviewSource, ReviewSourceKind, SettingsInput, generate_device, prepare_asset,
+        prepare_device_desired_state_mutation, prepare_note, prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
-        SourceSpan, ThemaConceptRelation, TitlePath,
+        SourceSpan, ThemaConceptRelation, ThemaId, TitlePath,
     };
 
     #[test]
@@ -4804,8 +5318,16 @@ mod tests {
     }
 
     fn thema(question: &str, revision: Option<u64>) -> crate::application::PreparedThema {
+        thema_named("thema", question, revision)
+    }
+
+    fn thema_named(
+        thema_id: &str,
+        question: &str,
+        revision: Option<u64>,
+    ) -> crate::application::PreparedThema {
         prepare_thema(
-            Some("thema".into()),
+            Some(thema_id.into()),
             thema_content(
                 "basic",
                 question.into(),
@@ -5021,6 +5543,397 @@ mod tests {
     }
 
     #[test]
+    fn reopened_document_retains_revisioned_node_source_spans() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gnosis.db");
+        let input = concat!(
+            ":PROPERTIES:\n:ID: root\n:END:\n#+TITLE: Note\n",
+            "* Child\n:PROPERTIES:\n:ID: child\n:END:\nbody\n",
+        );
+        let prepared = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            input.into(),
+            None,
+        )
+        .unwrap();
+        let projection = prepared.projection.clone();
+        let blob = BlobMeta {
+            sha256: prepared.blob_sha256.clone(),
+            size_bytes: prepared.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        let id = DocumentId::new("document").unwrap();
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.replace_note(&prepared, &blob, 1, None).unwrap();
+        drop(store);
+
+        let mut reopened = SqliteStore::open(&path).unwrap();
+        let stored = reopened.get_document(&id).unwrap().unwrap();
+
+        assert_eq!(stored.projection(), &projection);
+        assert!(
+            stored
+                .projection()
+                .nodes()
+                .iter()
+                .all(|node| node.source_span().is_some())
+        );
+        let child = reopened.get_node("child").unwrap().unwrap();
+        assert_eq!(child.document_revision, 1);
+        assert_eq!(child.content_sha256, prepared.blob_sha256);
+        assert_eq!((child.start_byte, child.end_byte), (Some(43), Some(86)));
+        assert!(child.active);
+
+        let replacement = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            ":PROPERTIES:\n:ID: root\n:END:\n#+TITLE: Note\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let replacement_blob = BlobMeta {
+            sha256: replacement.blob_sha256.clone(),
+            size_bytes: replacement.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        reopened
+            .replace_note(&replacement, &replacement_blob, 2, None)
+            .unwrap();
+
+        let retired = reopened.get_node("child").unwrap().unwrap();
+        assert_eq!(retired.document_revision, 1);
+        assert_eq!(retired.content_sha256, prepared.blob_sha256);
+        assert_eq!((retired.start_byte, retired.end_byte), (Some(43), Some(86)));
+        assert!(!retired.active);
+
+        reopened.tombstone_document(&id, 2, 3, None).unwrap();
+        let tombstoned = reopened.get_node("root").unwrap().unwrap();
+        assert_eq!(tombstoned.document_revision, 2);
+        assert_eq!(tombstoned.content_sha256, replacement.blob_sha256);
+        assert_eq!(
+            (tombstoned.start_byte, tombstoned.end_byte),
+            (Some(0), Some(replacement.source.len()))
+        );
+        assert!(!tombstoned.active);
+    }
+
+    #[test]
+    fn node_search_reads_legacy_projection_compatibility_digest() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let prepared = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Note\n\n* Node\n:PROPERTIES:\n:ID: node\n:END:\n".into(),
+            None,
+        )
+        .unwrap();
+        let blob = BlobMeta {
+            sha256: prepared.blob_sha256.clone(),
+            size_bytes: prepared.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&prepared, &blob, 1, None).unwrap();
+        let stored: String = store
+            .connection
+            .query_row(
+                "SELECT projection_json FROM document_projection_revision
+                 WHERE document_id = 'document' AND revision = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        legacy["compatibility_sha1"] = serde_json::Value::String("a".repeat(40));
+        for node in legacy["nodes"].as_array_mut().unwrap() {
+            node.as_object_mut().unwrap().remove("start_byte");
+            node.as_object_mut().unwrap().remove("end_byte");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE document_projection_revision SET projection_json = ?1
+                 WHERE document_id = 'document' AND revision = 1",
+                [serde_json::to_string(&legacy).unwrap()],
+            )
+            .unwrap();
+
+        let records = store.search_nodes("", 1, None).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].node_id, "node");
+        assert_eq!(records[0].document_revision, 1);
+        assert_eq!(records[0].content_sha256, prepared.blob_sha256);
+        assert_eq!((records[0].start_byte, records[0].end_byte), (None, None));
+    }
+
+    #[test]
+    fn node_catalog_is_compact_filterable_and_generation_bound() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Catalog".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let first = prepare_note(
+            Some("document-a".into()),
+            "notes/a.org".into(),
+            concat!(
+                ":PROPERTIES:\n:ID: a-root\n:END:\n#+title: A\n",
+                "* Child\n:PROPERTIES:\n:ID: a-child\n:END:\n"
+            )
+            .into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&first, &first_blob, 2, None).unwrap();
+        let second = prepare_note(
+            Some("document-b".into()),
+            "notes/b.org".into(),
+            ":PROPERTIES:\n:ID: b-root\n:END:\n#+title: B\n".into(),
+            None,
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&second, &second_blob, 3, None).unwrap();
+        let replacement = prepare_note(
+            Some("document-a".into()),
+            "notes/a.org".into(),
+            ":PROPERTIES:\n:ID: a-root\n:END:\n#+title: A\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let replacement_blob = BlobMeta {
+            sha256: replacement.blob_sha256.clone(),
+            size_bytes: replacement.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&replacement, &replacement_blob, 4, None)
+            .unwrap();
+
+        let first_page = store.node_catalog(&device_id, None, 2, None).unwrap();
+        assert_eq!(first_page.state.cursor, 3);
+        assert!(first_page.has_more);
+        assert_eq!(
+            first_page
+                .items
+                .iter()
+                .map(|item| (item.node_id.as_str(), item.active))
+                .collect::<Vec<_>>(),
+            vec![("a-child", false), ("a-root", true)]
+        );
+        assert_eq!(first_page.items[0].logical_path, "notes/a.org");
+        assert_eq!(first_page.items[0].title_path, ["A", "Child"]);
+
+        let remainder = store
+            .node_catalog(&device_id, None, 2, Some("a-root"))
+            .unwrap();
+        assert_eq!(remainder.state, first_page.state);
+        assert_eq!(remainder.items[0].node_id, "b-root");
+        assert!(!remainder.has_more);
+
+        let filtered = store
+            .node_catalog(&device_id, Some("document-a"), 10, None)
+            .unwrap();
+        assert_eq!(filtered.items.len(), 2);
+        assert!(!filtered.has_more);
+        assert!(
+            filtered
+                .items
+                .iter()
+                .all(|item| item.document_id == "document-a")
+        );
+    }
+
+    #[test]
+    fn thema_catalog_and_suspension_share_authoritative_review_state() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device =
+            generate_device("Manager".into(), vec!["read".into(), "review".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        store
+            .put_thema(&thema("Question", None), 20260726, 2, None)
+            .unwrap();
+        let operation = prepare_device_desired_state_mutation(
+            1,
+            "suspend-thema".into(),
+            device_id.clone(),
+            DeviceDesiredStateMutation::SetThemaSuspended {
+                thema_id: ThemaId::new("thema").unwrap(),
+                expected_state_revision: 0,
+                suspended: true,
+            },
+        )
+        .unwrap();
+
+        let applied = store
+            .apply_device_desired_state_mutation(&operation, 3)
+            .unwrap();
+        assert!(!applied.replayed);
+        assert!(matches!(
+            applied.result,
+            DeviceMutationResult::Applied {
+                changed: true,
+                authoritative: DeviceMutationProjection::ReviewState { ref state, .. },
+                ..
+            } if state.state_revision == 1 && state.suspended
+        ));
+        let replay = store
+            .apply_device_desired_state_mutation(&operation, 4)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.result, applied.result);
+
+        let stale = prepare_device_desired_state_mutation(
+            1,
+            "stale-suspend".into(),
+            device_id.clone(),
+            DeviceDesiredStateMutation::SetThemaSuspended {
+                thema_id: ThemaId::new("thema").unwrap(),
+                expected_state_revision: 0,
+                suspended: false,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .apply_device_desired_state_mutation(&stale, 5)
+                .unwrap()
+                .result,
+            DeviceMutationResult::Rejected { .. }
+        ));
+
+        store.set_thema_archived("thema", 1, true, 6, None).unwrap();
+        let page = store.thema_catalog(&device_id, "", 10, None).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].thema_revision, 2);
+        assert_eq!(page.items[0].state_revision, 1);
+        assert!(page.items[0].archived);
+        assert!(page.items[0].suspended);
+        let history: (i64, Option<String>, String) = store
+            .connection
+            .query_row(
+                "SELECT state_revision, event_id, state_json
+                 FROM review_state_revision
+                 WHERE thema_id = 'thema'
+                 ORDER BY state_revision DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(history.0, 1);
+        assert_eq!(history.1, None);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&history.2).unwrap()["suspended"],
+            true
+        );
+        assert!(
+            store.content_changes(0, 100).unwrap().iter().any(|change| {
+                change.entity_kind == "review" && change.operation == "suspension"
+            })
+        );
+    }
+
+    #[test]
+    fn thema_catalog_stops_before_aggregate_materialization_exceeds_budget() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Reader".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        for (index, id) in ["thema-a", "thema-b", "thema-c"].into_iter().enumerate() {
+            store
+                .put_thema(
+                    &thema_named(id, &"x".repeat(128), None),
+                    20260730,
+                    i64::try_from(index + 2).unwrap(),
+                    None,
+                )
+                .unwrap();
+        }
+
+        let first = store
+            .thema_catalog_with_byte_budget(&device_id, "", 10, None, 300)
+            .unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].thema_id, "thema-a");
+        assert!(first.has_more);
+        assert!(store.settings().is_ok());
+
+        let second = store
+            .thema_catalog_with_byte_budget(&device_id, "", 10, Some("thema-a"), 300)
+            .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].thema_id, "thema-b");
+        assert!(second.has_more);
+    }
+
+    #[test]
+    fn node_page_stops_before_aggregate_projection_decode_exceeds_its_budget() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut projection_size = 0;
+        for index in 0..8 {
+            let document_id = format!("document-{index}");
+            let node_id = format!("node-{index}");
+            let prepared = prepare_note(
+                Some(document_id.clone()),
+                format!("{document_id}.org"),
+                format!("#+title: {document_id}\n\n* Node\n:PROPERTIES:\n:ID: {node_id}\n:END:\n"),
+                None,
+            )
+            .unwrap();
+            let blob = BlobMeta {
+                sha256: prepared.blob_sha256.clone(),
+                size_bytes: prepared.source.len() as u64,
+                media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+            };
+            store
+                .replace_note(&prepared, &blob, i64::from(index + 1), None)
+                .unwrap();
+            let stored: String = store
+                .connection
+                .query_row(
+                    "SELECT projection_json FROM document_projection_revision
+                     WHERE document_id = ?1 AND revision = 1",
+                    [&document_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let mut padded: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            padded["title"] = serde_json::Value::String("x".repeat(180_000));
+            let padded = serde_json::to_string(&padded).unwrap();
+            projection_size = padded.len();
+            let stored = if index == 5 {
+                "x".repeat(projection_size)
+            } else {
+                padded
+            };
+            store
+                .connection
+                .execute(
+                    "UPDATE document_projection_revision SET projection_json = ?1
+                     WHERE document_id = ?2 AND revision = 1",
+                    rusqlite::params![stored, document_id],
+                )
+                .unwrap();
+        }
+        assert!(projection_size * 5 < MAX_DOCUMENT_PROJECTION_BYTES);
+        assert!(projection_size * 6 > MAX_DOCUMENT_PROJECTION_BYTES);
+
+        let page = store.search_nodes("", 500, None).unwrap();
+        assert_eq!(page.len(), 5);
+        assert_eq!(page.last().unwrap().node_id, "node-4");
+    }
+
+    #[test]
     fn initializes_and_reopens_database() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("gnosis.db");
@@ -5041,7 +5954,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v1_schema_contains_document_content_types() {
+    fn canonical_schema_contains_document_content_types() {
         let connection = rusqlite::Connection::open_in_memory().unwrap();
         connection.execute_batch(CURRENT_SCHEMA).unwrap();
 
@@ -5058,7 +5971,41 @@ mod tests {
             assert_eq!(count, 1, "{table} must require content_type");
         }
         assert!(!CURRENT_SCHEMA.contains("CHECK(content_type ="));
-        assert_eq!(schema_version(&connection).unwrap(), 1);
+        assert_eq!(schema_version(&connection).unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn rejects_prior_schema_versions_without_changes() {
+        for version in [1, 2] {
+            let connection = rusqlite::Connection::open_in_memory().unwrap();
+            connection.execute_batch(CURRENT_SCHEMA).unwrap();
+            connection
+                .execute("INSERT INTO thema(thema_id) VALUES ('preserved')", [])
+                .unwrap();
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            let objects = schema_objects(&connection).unwrap();
+
+            let error = initialize_schema(&connection).unwrap_err();
+
+            assert!(matches!(
+                error,
+                StoreError::UnsupportedSchemaVersion {
+                    found,
+                    supported: SCHEMA_VERSION
+                } if found == version
+            ));
+            assert_eq!(schema_version(&connection).unwrap(), version);
+            assert_eq!(schema_objects(&connection).unwrap(), objects);
+            assert_eq!(
+                connection
+                    .query_row("SELECT thema_id FROM thema", [], |row| row
+                        .get::<_, String>(0))
+                    .unwrap(),
+                "preserved"
+            );
+        }
     }
 
     #[test]
@@ -5068,7 +6015,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE marker(value TEXT);
                  INSERT INTO marker VALUES ('preserved');
-                 PRAGMA user_version = 3;",
+                 PRAGMA user_version = 4;",
             )
             .unwrap();
 
@@ -5077,11 +6024,11 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::UnsupportedSchemaVersion {
-                found: 3,
+                found: 4,
                 supported: SCHEMA_VERSION
             }
         ));
-        assert_eq!(schema_version(&connection).unwrap(), 3);
+        assert_eq!(schema_version(&connection).unwrap(), 4);
         assert_eq!(
             connection
                 .query_row("SELECT value FROM marker", [], |row| row

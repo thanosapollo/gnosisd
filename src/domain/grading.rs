@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use super::{ThemaContent, ThemaKind};
+use super::{MAX_REVIEW_CLOZE_INPUTS, ThemaContent, ThemaKind};
 
 pub(crate) const MATCHER_VERSION: u32 = 1;
 
@@ -39,7 +39,7 @@ pub(crate) fn grade(
             equivalent(&content.answer[0], input)
         }
         (ThemaKind::Cloze, StructuredResponse::Texts(inputs)) => {
-            grade_clozes(&content.answer, inputs)
+            grade_clozes(&content.answer, inputs)?
         }
         (ThemaKind::Mcq | ThemaKind::McCloze, StructuredResponse::Choice(choice)) => {
             grade_choice(content, choice)?
@@ -53,18 +53,29 @@ pub(crate) fn grade(
     })
 }
 
-fn grade_clozes(answers: &[String], inputs: &[String]) -> bool {
-    check_clozes(answers, inputs).complete
+fn grade_clozes(answers: &[String], inputs: &[String]) -> Result<bool, GradeError> {
+    if inputs.len() > MAX_REVIEW_CLOZE_INPUTS {
+        return Err(GradeError::ResponseShape);
+    }
+    Ok(check_clozes(answers, inputs).complete)
 }
 
 pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck {
+    let normalized_answers = answers
+        .iter()
+        .map(|answer| normalize(answer))
+        .collect::<Vec<_>>();
+    let normalized_inputs = inputs
+        .iter()
+        .map(|input| normalize(input))
+        .collect::<Vec<_>>();
+    let adjacency = cloze_adjacency(&normalized_answers, &normalized_inputs);
     let mut answer_owners = vec![None; answers.len()];
     for input_index in 0..inputs.len() {
         let mut visited = vec![false; answers.len()];
         assign_cloze(
             input_index,
-            answers,
-            inputs,
+            &adjacency.edges,
             &mut answer_owners,
             &mut visited,
         );
@@ -83,21 +94,52 @@ pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck 
     }
 }
 
+struct ClozeAdjacency {
+    edges: Vec<Vec<usize>>,
+    #[cfg(test)]
+    comparisons: usize,
+}
+
+fn cloze_adjacency(answers: &[Vec<char>], inputs: &[Vec<char>]) -> ClozeAdjacency {
+    #[cfg(test)]
+    let mut comparisons = 0;
+    let edges = inputs
+        .iter()
+        .map(|input| {
+            answers
+                .iter()
+                .enumerate()
+                .filter_map(|(answer_index, answer)| {
+                    #[cfg(test)]
+                    {
+                        comparisons += 1;
+                    }
+                    equivalent_normalized(answer, input).then_some(answer_index)
+                })
+                .collect()
+        })
+        .collect();
+    ClozeAdjacency {
+        edges,
+        #[cfg(test)]
+        comparisons,
+    }
+}
+
 fn assign_cloze(
     input_index: usize,
-    answers: &[String],
-    inputs: &[String],
+    adjacency: &[Vec<usize>],
     answer_owners: &mut [Option<usize>],
     visited: &mut [bool],
 ) -> bool {
-    for answer_index in 0..answers.len() {
-        if visited[answer_index] || !equivalent(&answers[answer_index], &inputs[input_index]) {
+    for &answer_index in &adjacency[input_index] {
+        if visited[answer_index] {
             continue;
         }
         visited[answer_index] = true;
         // Reassign earlier fuzzy matches so input order cannot change the result.
         let available = answer_owners[answer_index]
-            .is_none_or(|owner| assign_cloze(owner, answers, inputs, answer_owners, visited));
+            .is_none_or(|owner| assign_cloze(owner, adjacency, answer_owners, visited));
         if available {
             answer_owners[answer_index] = Some(input_index);
             return true;
@@ -122,15 +164,19 @@ fn grade_choice(content: &ThemaContent, choice: &str) -> Result<bool, GradeError
 fn equivalent(left: &str, right: &str) -> bool {
     let left = normalize(left);
     let right = normalize(right);
-    let maximum = left.chars().count().max(right.chars().count());
+    equivalent_normalized(&left, &right)
+}
+
+fn equivalent_normalized(left: &[char], right: &[char]) -> bool {
+    let maximum = left.len().max(right.len());
     if maximum > 1 {
-        levenshtein(&left, &right) <= 1
+        distance_at_most_one(left, right)
     } else {
         left == right
     }
 }
 
-fn normalize(value: &str) -> String {
+fn normalize(value: &str) -> Vec<char> {
     let value = value.strip_suffix('"').unwrap_or(value);
     let value = value.strip_prefix('"').unwrap_or(value);
     value
@@ -140,23 +186,36 @@ fn normalize(value: &str) -> String {
         .collect()
 }
 
-fn levenshtein(left: &str, right: &str) -> usize {
-    let right = right.chars().collect::<Vec<_>>();
-    let mut previous = (0..=right.len()).collect::<Vec<_>>();
-    for (left_index, left_character) in left.chars().enumerate() {
-        let mut current = vec![left_index + 1];
-        for (right_index, right_character) in right.iter().enumerate() {
-            let substitution =
-                previous[right_index] + usize::from(left_character != *right_character);
-            current.push(
-                substitution
-                    .min(current[right_index] + 1)
-                    .min(previous[right_index + 1] + 1),
-            );
-        }
-        previous = current;
+fn distance_at_most_one(left: &[char], right: &[char]) -> bool {
+    if left.len().abs_diff(right.len()) > 1 {
+        return false;
     }
-    previous[right.len()]
+    if left.len() == right.len() {
+        return left
+            .iter()
+            .zip(right)
+            .filter(|(left, right)| left != right)
+            .count()
+            <= 1;
+    }
+    let (shorter, longer) = if left.len() < right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let (mut shorter_index, mut longer_index, mut edits) = (0, 0, 0);
+    while shorter_index < shorter.len() && longer_index < longer.len() {
+        if shorter[shorter_index] == longer[longer_index] {
+            shorter_index += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+        }
+        longer_index += 1;
+    }
+    true
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -200,6 +259,20 @@ mod tests {
                 .unwrap()
                 .success
         );
+        for (left, right, matches) in [
+            ("", "a", false),
+            ("a", "ab", true),
+            ("ab", "a", true),
+            ("ab", "ac", true),
+            ("ab", "cd", false),
+            ("ab", "ba", false),
+        ] {
+            assert_eq!(
+                super::equivalent(left, right),
+                matches,
+                "{left:?} {right:?}"
+            );
+        }
     }
 
     #[test]
@@ -230,9 +303,16 @@ mod tests {
             None,
         )
         .unwrap();
-        let response = StructuredResponse::Texts(vec!["cot".into(), "bat".into()]);
-
-        assert!(grade(1, &content, &response).unwrap().success);
+        for inputs in [
+            vec!["cot".into(), "bat".into()],
+            vec!["bat".into(), "cot".into()],
+        ] {
+            assert!(
+                grade(1, &content, &StructuredResponse::Texts(inputs))
+                    .unwrap()
+                    .success
+            );
+        }
     }
 
     #[test]
@@ -251,6 +331,53 @@ mod tests {
         assert_eq!(
             check_clozes(&answers, &["alpha".into(), "alpha".into()]).matches,
             vec![true, false]
+        );
+    }
+
+    #[test]
+    fn cloze_matching_normalizes_once_and_bounds_edge_comparisons() {
+        let answers = (0..500)
+            .map(|index| format!("\"Απάντηση {index:03}\""))
+            .collect::<Vec<_>>();
+        let inputs = (0..500)
+            .map(|index| format!("αΠΑΝΤΗΣΗ{index:03}"))
+            .collect::<Vec<_>>();
+        let normalized_answers = answers
+            .iter()
+            .map(|answer| super::normalize(answer))
+            .collect::<Vec<_>>();
+        let normalized_inputs = inputs
+            .iter()
+            .map(|input| super::normalize(input))
+            .collect::<Vec<_>>();
+
+        let adjacency = super::cloze_adjacency(&normalized_answers, &normalized_inputs);
+
+        assert_eq!(adjacency.comparisons, answers.len() * inputs.len());
+        assert!(adjacency.comparisons <= 250_000);
+        assert!(check_clozes(&answers, &inputs).complete);
+    }
+
+    #[test]
+    fn final_cloze_grading_rejects_more_than_the_shared_input_limit() {
+        let answers = (0..crate::domain::MAX_REVIEW_CLOZE_INPUTS)
+            .map(|index| format!("answer-{index:03}"))
+            .collect::<Vec<_>>();
+        let content = thema_content(
+            "cloze",
+            answers.join(" "),
+            vec![None; answers.len()],
+            answers,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let inputs = vec!["answer".into(); crate::domain::MAX_REVIEW_CLOZE_INPUTS + 1];
+
+        assert_eq!(
+            grade(1, &content, &StructuredResponse::Texts(inputs)),
+            Err(super::GradeError::ResponseShape)
         );
     }
 

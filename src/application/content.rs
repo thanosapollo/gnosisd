@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, path::Path, sync::LazyLock};
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -103,6 +103,10 @@ pub(crate) struct ProjectionNode {
     pub(crate) tags: Vec<String>,
     pub(crate) parent_id: Option<String>,
     pub(crate) level: u32,
+    #[serde(default)]
+    pub(crate) start_byte: Option<usize>,
+    #[serde(default)]
+    pub(crate) end_byte: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -131,6 +135,31 @@ pub(crate) struct DocumentProjectionSnapshot {
     pub(crate) link_occurrences: Vec<ProjectionLinkOccurrence>,
     pub(crate) semantic_edges: Vec<ProjectionEdge>,
     pub(crate) content_sha256: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_legacy_compatibility_sha1",
+        skip_serializing,
+        rename = "compatibility_sha1"
+    )]
+    pub(crate) _compatibility_sha1: Option<String>,
+}
+
+fn deserialize_legacy_compatibility_sha1<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.as_deref().is_some_and(|digest| {
+        digest.len() != 40
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(D::Error::custom("invalid legacy compatibility digest"));
+    }
+    Ok(value)
 }
 
 impl From<&DocumentProjection> for DocumentProjectionSnapshot {
@@ -149,6 +178,8 @@ impl From<&DocumentProjection> for DocumentProjectionSnapshot {
                     tags: node.tags().to_vec(),
                     parent_id: node.parent_id().map(ToString::to_string),
                     level: node.level(),
+                    start_byte: node.source_span().map(|span| span.start()),
+                    end_byte: node.source_span().map(|span| span.end()),
                 })
                 .collect(),
             link_occurrences: value
@@ -170,6 +201,7 @@ impl From<&DocumentProjection> for DocumentProjectionSnapshot {
                 })
                 .collect(),
             content_sha256: value.content_sha256().to_owned(),
+            _compatibility_sha1: None,
         }
     }
 }
@@ -214,6 +246,20 @@ pub(crate) struct ThemaRecord {
     pub(crate) archived: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ThemaCatalogRecord {
+    pub(crate) thema_id: String,
+    pub(crate) thema_revision: u64,
+    pub(crate) state_revision: u64,
+    pub(crate) kind: ThemaKind,
+    pub(crate) keimenon: String,
+    pub(crate) hypothesis: Vec<Option<String>>,
+    pub(crate) answer: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) archived: bool,
+    pub(crate) suspended: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ThemaRevision {
     pub(crate) record: ThemaRecord,
@@ -227,10 +273,23 @@ pub(crate) struct NodeRecord {
     pub(crate) node_id: String,
     pub(crate) document_id: String,
     pub(crate) logical_path: String,
+    pub(crate) document_revision: u64,
+    pub(crate) content_sha256: String,
     pub(crate) title: String,
     pub(crate) title_path: Vec<String>,
     pub(crate) tags: Vec<String>,
     pub(crate) level: u32,
+    pub(crate) start_byte: Option<usize>,
+    pub(crate) end_byte: Option<usize>,
+    pub(crate) active: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NodeCatalogRecord {
+    pub(crate) node_id: String,
+    pub(crate) document_id: String,
+    pub(crate) logical_path: String,
+    pub(crate) title_path: Vec<String>,
     pub(crate) active: bool,
 }
 
@@ -690,13 +749,61 @@ pub(crate) enum ContentError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use crate::domain::ThemaConceptRelation;
 
     use super::{
-        ContentError, MAX_DOCUMENT_SOURCE_BYTES, MAX_OFFLINE_ASSET_BYTES, canonical_asset_path,
-        prepare_document, prepare_note, prepare_thema, thema_content, validate_asset_path,
-        validate_blob_metadata,
+        ContentError, DocumentProjectionSnapshot, MAX_DOCUMENT_SOURCE_BYTES,
+        MAX_OFFLINE_ASSET_BYTES, canonical_asset_path, prepare_document, prepare_note,
+        prepare_thema, thema_content, validate_asset_path, validate_blob_metadata,
     };
+
+    #[test]
+    fn projection_snapshots_store_node_source_spans_and_read_legacy_nodes() {
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            concat!(
+                ":PROPERTIES:\n:ID: root\n:END:\n#+TITLE: Note\n",
+                "* Child\n:PROPERTIES:\n:ID: child\n:END:\nbody\n",
+            )
+            .into(),
+            None,
+        )
+        .unwrap();
+        let snapshot = DocumentProjectionSnapshot::from(&note.projection);
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        let nodes = json["nodes"].as_array_mut().unwrap();
+
+        assert_eq!(nodes[0]["start_byte"], 0);
+        assert_eq!(nodes[0]["end_byte"], note.source.len());
+        assert_eq!(nodes[1]["start_byte"], 43);
+        assert_eq!(nodes[1]["end_byte"], note.source.len());
+
+        for node in nodes {
+            node.as_object_mut().unwrap().remove("start_byte");
+            node.as_object_mut().unwrap().remove("end_byte");
+        }
+        json["compatibility_sha1"] = Value::String("a".repeat(40));
+        let legacy: DocumentProjectionSnapshot = serde_json::from_value(json).unwrap();
+        assert!(
+            legacy
+                .nodes
+                .iter()
+                .all(|node| node.start_byte.is_none() && node.end_byte.is_none())
+        );
+        let serialized: Value = serde_json::to_value(legacy).unwrap();
+        assert!(serialized.get("compatibility_sha1").is_none());
+
+        let mut malformed = serialized.clone();
+        malformed["compatibility_sha1"] = Value::String("not-a-digest".into());
+        assert!(serde_json::from_value::<DocumentProjectionSnapshot>(malformed).is_err());
+
+        let mut unknown = serialized;
+        unknown["future_field"] = Value::Bool(true);
+        assert!(serde_json::from_value::<DocumentProjectionSnapshot>(unknown).is_err());
+    }
 
     #[test]
     fn document_preparation_is_content_type_driven_and_source_bounded() {

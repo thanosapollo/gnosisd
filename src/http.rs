@@ -52,20 +52,20 @@ use crate::{
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
             ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DesiredStateMutationResultV1,
             DeviceIdentityV1, DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
-            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodePageV1,
+            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodeCatalogPageV1, NodePageV1,
             NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
             OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
             OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
             OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
-            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1, ReviewAttemptBeginResponseV1,
             ReviewAttemptOperationResponseV1, ReviewAttemptStateResponseV1, ReviewAttemptV1,
             ReviewClozeCheckRequestV1, ReviewClozeCheckV1, ReviewCommitResponseV1,
             ReviewHistoryPageV1, ReviewPackEnvelopeV2, ReviewQueueSummaryRequestV1,
             ReviewQueueSummaryV1, ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
             ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
-            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SettingsV1, StagedBlobV1,
-            ThemaPageV1, ThemaReviewStateV1, ThemaV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
-            valid_bearer_token,
+            SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SetThemaSuspensionRequestV1,
+            SettingsV1, StagedBlobV1, ThemaCatalogPageV1, ThemaPageV1, ThemaReviewStateV1, ThemaV1,
+            ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_response, offline_content_capabilities,
         offline_content_result_response, offline_result_response, replica_change_page,
@@ -77,6 +77,7 @@ use crate::{
 
 const MAX_BODY: usize = MAX_OFFLINE_ASSET_BYTES as usize;
 const MAX_PAGE: u16 = 500;
+const MAX_NODE_CATALOG_PAGE: u16 = 5000;
 const MAX_REPLICA_PAGE: u16 = 32;
 
 #[derive(Clone)]
@@ -236,11 +237,14 @@ fn data_router() -> Router<HttpState> {
             post(reconcile_asset),
         )
         .route("/v1/themata", post(create_thema).get(search_themata))
+        .route("/v1/themata/catalog", get(thema_catalog))
         .route("/v1/themata/{id}", get(get_thema).put(update_thema))
         .route("/v1/themata/{id}/review-state", get(get_thema_review_state))
+        .route("/v1/themata/{id}/suspension", put(set_thema_suspension))
         .route("/v1/themata/{id}/archive", post(archive_thema))
         .route("/v1/themata/{id}/unarchive", post(unarchive_thema))
         .route("/v1/nodes", get(search_nodes))
+        .route("/v1/nodes/catalog", get(node_catalog))
         .route("/v1/nodes/{id}", get(get_node))
         .route("/v1/nodes/{id}/themata", get(node_themata))
         .route("/v1/nodes/{id}/inbound", get(inbound_nodes))
@@ -355,6 +359,22 @@ fn replica_page_limit(value: Option<u16>) -> Result<u16, ApiError> {
         Ok(value)
     } else {
         Err(ApiError::bad_request("invalid replica page limit"))
+    }
+}
+
+#[derive(Deserialize)]
+struct NodeCatalogQuery {
+    document_id: Option<String>,
+    after: Option<String>,
+    limit: Option<u16>,
+}
+
+fn node_catalog_limit(value: Option<u16>) -> Result<u16, ApiError> {
+    let value = value.unwrap_or(MAX_NODE_CATALOG_PAGE);
+    if (1..=MAX_NODE_CATALOG_PAGE).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request("invalid node catalog page limit"))
     }
 }
 
@@ -884,6 +904,11 @@ async fn apply_desired_state_mutation(
                 }
                 _ => ApiError::bad_request("invalid device mutation"),
             })?;
+    let request_sha256 = crate::application::desired_state_wire_request_sha256(
+        operation.identity.format_version,
+        &operation.mutation,
+    )
+    .map_err(|_| ApiError::internal())?;
     let execution = state
         .service
         .apply_device_desired_state_mutation(operation, asset_bytes, now_us_i64()?)
@@ -892,7 +917,7 @@ async fn apply_desired_state_mutation(
     if !execution.replayed && execution.result.changed() {
         announce(state).await;
     }
-    let result = DesiredStateMutationResultV1::from_application(&execution.result)
+    let result = DesiredStateMutationResultV1::from_application(&execution.result, &request_sha256)
         .map_err(|_| ApiError::internal())?;
     Ok(Json(result))
 }
@@ -1319,6 +1344,46 @@ async fn search_themata(
     .map(Json)
 }
 
+async fn thema_catalog(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<ThemaCatalogPageV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    if let Some(after) = query.after.as_deref() {
+        ThemaId::new(after.to_owned()).map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    }
+    let page = state
+        .service
+        .thema_catalog(
+            principal.device_id,
+            query.q.unwrap_or_default(),
+            page_limit(query.limit)?,
+            query.after,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    let generation = replica_state_response(&page.state)
+        .map_err(ApiError::replica_wire)?
+        .cursor;
+    let item_count = page.items.len();
+    run_blocking(move || {
+        bounded_projection_page(
+            &page.items,
+            |items| {
+                Ok(ThemaCatalogPageV1::from_application(
+                    items,
+                    generation.clone(),
+                    page.has_more || items.len() < item_count,
+                ))
+            },
+            "thema catalog item exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
+}
+
 async fn archive_thema(
     state: State<HttpState>,
     principal: Extension<DevicePrincipal>,
@@ -1348,6 +1413,31 @@ async fn get_thema_review_state(
         .await
         .map_err(ApiError::service)?;
     Ok(Json(ThemaReviewStateV1::from(&state)))
+}
+
+async fn set_thema_suspension(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    ApiJson(request): ApiJson<SetThemaSuspensionRequestV1>,
+) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let operation_id = idempotency_key(&headers)?;
+    let expected_state_revision = if_match(&headers)?;
+    let thema_id = ThemaId::new(id).map_err(|_| ApiError::bad_request("invalid thema ID"))?;
+    apply_desired_state_mutation(
+        &state,
+        principal,
+        operation_id,
+        DeviceDesiredStateMutation::SetThemaSuspended {
+            thema_id,
+            expected_state_revision,
+            suspended: request.suspended,
+        },
+        None,
+    )
+    .await
 }
 
 async fn set_archive(
@@ -1440,6 +1530,51 @@ async fn search_nodes(
     .await
     .map(Json)
 }
+
+async fn node_catalog(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<NodeCatalogQuery>,
+) -> Result<Json<NodeCatalogPageV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    if let Some(document_id) = query.document_id.as_deref() {
+        DocumentId::new(document_id.to_owned())
+            .map_err(|_| ApiError::bad_request("invalid document ID"))?;
+    }
+    if let Some(after) = query.after.as_deref() {
+        NodeId::new(after.to_owned()).map_err(|_| ApiError::bad_request("invalid cursor"))?;
+    }
+    let page = state
+        .service
+        .node_catalog(
+            principal.device_id,
+            query.document_id,
+            node_catalog_limit(query.limit)?,
+            query.after,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    let generation = replica_state_response(&page.state)
+        .map_err(ApiError::replica_wire)?
+        .cursor;
+    let item_count = page.items.len();
+    run_blocking(move || {
+        bounded_projection_page(
+            &page.items,
+            |items| {
+                Ok(NodeCatalogPageV1::from_application(
+                    items,
+                    generation.clone(),
+                    page.has_more || items.len() < item_count,
+                ))
+            },
+            "node catalog item exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
+}
+
 async fn inbound_nodes(
     state: State<HttpState>,
     principal: Extension<DevicePrincipal>,
@@ -1690,16 +1825,19 @@ async fn begin_attempt(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
     Path(id): Path<String>,
-) -> Result<(StatusCode, Json<ReviewAttemptV1>), ApiError> {
+) -> Result<(StatusCode, Json<ReviewAttemptBeginResponseV1>), ApiError> {
     require(&principal, DeviceScope::Review)?;
-    let attempt = state
+    let result = state
         .service
         .begin_http_review_attempt(id, online_review_actor(), now_us()?)
         .await
         .map_err(ApiError::service)?;
     Ok((
         StatusCode::CREATED,
-        Json(ReviewAttemptV1::from_application(&attempt).map_err(|_| ApiError::internal())?),
+        Json(
+            ReviewAttemptBeginResponseV1::from_application(&result)
+                .map_err(|_| ApiError::internal())?,
+        ),
     ))
 }
 async fn answer_attempt(
@@ -1836,13 +1974,17 @@ async fn commit_attempt(
 ) -> Result<Json<ReviewCommitResponseV1>, ApiError> {
     require(&principal, DeviceScope::Review)?;
     require_safe_http_attempt(&state, &id).await?;
+    let attempt_id = id.clone();
     let event = state
         .service
         .commit_review_attempt(id, online_review_actor(), now_us()?)
         .await
         .map_err(ApiError::service)?;
     announce(&state).await;
-    Ok(Json(ReviewCommitResponseV1 { event_id: event }))
+    Ok(Json(ReviewCommitResponseV1 {
+        attempt_id,
+        event_id: event,
+    }))
 }
 
 async fn require_safe_http_attempt(
@@ -2362,6 +2504,7 @@ impl ApiError {
             },
             StoreError::ReplicaCursor | StoreError::ReplicaServer => Self::snapshot_required(),
             StoreError::InvalidCursor => Self::bad_request("invalid cursor"),
+            StoreError::NodePageProjectionLimit => Self::internal(),
             StoreError::BlobRequired { digest } => Self {
                 status: StatusCode::CONFLICT,
                 code: ApiErrorCodeV1::BlobRequired,
@@ -2761,6 +2904,13 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "ThemaPageV1",
             &["400", "401", "403", "408", "500", "503"],
         )),
+        ("/v1/themata/catalog", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "ThemaCatalogPageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
         ("/v1/themata", "post") => Some(json_contract(
             "content:write",
             Some("ThemaWriteRequestV1"),
@@ -2797,11 +2947,27 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
                 ],
             ))
         }
+        ("/v1/themata/{id}/suspension", "put") => Some(json_contract(
+            "review",
+            Some("SetThemaSuspensionRequestV1"),
+            "200",
+            "DesiredStateMutationResultV1",
+            &[
+                "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
+            ],
+        )),
         ("/v1/nodes", "get") => Some(json_contract(
             "read",
             None,
             "200",
             "NodePageV1",
+            &["400", "401", "403", "408", "500", "503"],
+        )),
+        ("/v1/nodes/catalog", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "NodeCatalogPageV1",
             &["400", "401", "403", "408", "500", "503"],
         )),
         ("/v1/nodes/{id}", "get") => Some(json_contract(
@@ -2949,6 +3115,7 @@ fn content_requires_idempotency(path: &str, method: &str) -> bool {
             | ("/v1/themata/{id}", "put")
             | ("/v1/themata/{id}/archive", "post")
             | ("/v1/themata/{id}/unarchive", "post")
+            | ("/v1/themata/{id}/suspension", "put")
             | ("/v1/settings", "put")
     )
 }
@@ -2975,11 +3142,19 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
             json!({"name":"after","in":"query","required":false,"schema":{"type":"string","minLength":1,"maxLength":MAX_DUE_CURSOR_BYTES}}),
         ];
     }
+    if path == "/v1/nodes/catalog" {
+        return vec![
+            json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
+            json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_NODE_CATALOG_PAGE,"default":MAX_NODE_CATALOG_PAGE}}),
+            json!({"name":"document_id","in":"query","required":false,"schema":{"type":"string"}}),
+        ];
+    }
     let paged = matches!(
         path,
         "/v1/changes"
             | "/v1/notes/{id}/revisions"
             | "/v1/themata"
+            | "/v1/themata/catalog"
             | "/v1/nodes"
             | "/v1/nodes/{id}/themata"
             | "/v1/nodes/{id}/inbound"
@@ -2993,7 +3168,7 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
         content_after_parameter(numeric),
         json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
     ];
-    if matches!(path, "/v1/themata" | "/v1/nodes") {
+    if matches!(path, "/v1/themata" | "/v1/themata/catalog" | "/v1/nodes") {
         parameters
             .push(json!({"name":"q","in":"query","required":false,"schema":{"type":"string"}}));
     }
@@ -3021,6 +3196,7 @@ fn content_requires_if_match(path: &str, method: &str) -> bool {
             | ("/v1/themata/{id}", "put")
             | ("/v1/themata/{id}/archive", "post")
             | ("/v1/themata/{id}/unarchive", "post")
+            | ("/v1/themata/{id}/suspension", "put")
     )
 }
 
@@ -3118,7 +3294,7 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
             "review",
             None,
             "201",
-            "ReviewAttemptV1",
+            "ReviewAttemptBeginResponseV1",
             &["400", "401", "403", "404", "408", "500", "503"],
         )),
         ("/v1/review/history", "get") => Some(json_contract(
@@ -3339,7 +3515,9 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<AssetHeadV1>();
     generator.subschema_for::<StagedBlobV1>();
     generator.subschema_for::<ThemaPageV1>();
+    generator.subschema_for::<ThemaCatalogPageV1>();
     generator.subschema_for::<ThemaV1>();
+    generator.subschema_for::<NodeCatalogPageV1>();
     generator.subschema_for::<NodePageV1>();
     generator.subschema_for::<NodeV1>();
     generator.subschema_for::<NodeThemaAssociationPageV1>();
@@ -3355,6 +3533,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ThemaReviewStateV1>();
     generator.subschema_for::<ActiveReviewSessionV1>();
     generator.subschema_for::<ReviewSessionV1>();
+    generator.subschema_for::<ReviewAttemptBeginResponseV1>();
     generator.subschema_for::<ReviewAttemptV1>();
     generator.subschema_for::<ReviewCommitResponseV1>();
     generator.subschema_for::<ReviewAttemptStateResponseV1>();
@@ -3380,6 +3559,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<ReviewAnswerV1>();
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
+    requests.subschema_for::<SetThemaSuspensionRequestV1>();
     requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
     requests.subschema_for::<OfflineContentOperationEnvelopeV1>();
     requests.subschema_for::<OfflineAssetOperationEnvelopeV1>();
@@ -3482,12 +3662,15 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/content/offline-asset-operations", "post"),
     ("/v1/themata", "get"),
     ("/v1/themata", "post"),
+    ("/v1/themata/catalog", "get"),
     ("/v1/themata/{id}", "get"),
     ("/v1/themata/{id}", "put"),
     ("/v1/themata/{id}/review-state", "get"),
+    ("/v1/themata/{id}/suspension", "put"),
     ("/v1/themata/{id}/archive", "post"),
     ("/v1/themata/{id}/unarchive", "post"),
     ("/v1/nodes", "get"),
+    ("/v1/nodes/catalog", "get"),
     ("/v1/nodes/{id}", "get"),
     ("/v1/nodes/{id}/themata", "get"),
     ("/v1/nodes/{id}/inbound", "get"),
@@ -3530,15 +3713,15 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, OPENAPI_OPERATIONS, bounded_due_page,
-        bounded_projection_page, durable_created_thema_id, ensure_thema_response_budget,
-        openapi_document, optional_if_match, router,
+        ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, MAX_NODE_CATALOG_PAGE, OPENAPI_OPERATIONS,
+        bounded_due_page, bounded_projection_page, durable_created_thema_id,
+        ensure_thema_response_budget, openapi_document, optional_if_match, prepared_thema, router,
     };
     use crate::application::{
-        AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
-        PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
-        SettingsInput, generate_device, prepare_asset, prepare_thema, presentation_content,
-        review_day_at, thema_content,
+        AnswerInput, ApplicationError, DeviceDesiredStateMutation, OfflineAssetOperation,
+        OfflineReviewOperation, PresentationSnapshot, ReviewAttemptView, ReviewPackView,
+        ReviewSource, ReviewSourceKind, SettingsInput, generate_device, prepare_asset,
+        prepare_document, prepare_thema, presentation_content, review_day_at, thema_content,
     };
     use crate::domain::{DocumentId, DueThema, ThemaId, compute_transition, grade};
     use crate::protocol::{
@@ -3846,6 +4029,12 @@ mod tests {
         for (name, field) in [
             ("DocumentView", "file_node_id"),
             ("NodeView", "parent_id"),
+            ("NodeView", "start_byte"),
+            ("NodeView", "end_byte"),
+            ("ProjectionNodeV1", "start_byte"),
+            ("ProjectionNodeV1", "end_byte"),
+            ("NodeV1", "start_byte"),
+            ("NodeV1", "end_byte"),
             ("DuePageView", "next"),
         ] {
             assert!(
@@ -3856,10 +4045,37 @@ mod tests {
                 "{name}.{field}"
             );
         }
+        for field in [
+            "document_revision",
+            "content_sha256",
+            "start_byte",
+            "end_byte",
+        ] {
+            assert!(
+                schemas["NodeV1"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!(field)),
+                "NodeV1.{field}"
+            );
+        }
         assert_eq!(
             response_statuses(&api["paths"]["/v1/documents/{id}"]["get"]),
             set(&[
                 "200", "400", "401", "403", "404", "408", "422", "500", "503"
+            ])
+        );
+    }
+
+    #[test]
+    fn openapi_types_node_catalog_query_exactly() {
+        let api = openapi_document();
+        assert_eq!(
+            api["paths"]["/v1/nodes/catalog"]["get"]["parameters"],
+            json!([
+                {"name":"after","in":"query","required":false,"schema":{"type":"string"}},
+                {"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_NODE_CATALOG_PAGE,"default":MAX_NODE_CATALOG_PAGE}},
+                {"name":"document_id","in":"query","required":false,"schema":{"type":"string"}}
             ])
         );
     }
@@ -4051,7 +4267,7 @@ mod tests {
         let begin = &api["paths"]["/v1/review/sessions/{id}/attempts"]["post"];
         assert_eq!(
             begin["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ReviewAttemptV1"
+            "#/components/schemas/ReviewAttemptBeginResponseV1"
         );
         let answer = &api["paths"]["/v1/review/attempts/{id}/answer"]["post"];
         assert_eq!(
@@ -4149,6 +4365,16 @@ mod tests {
         assert!(presentation["properties"].get("keimenon").is_none());
         assert!(presentation["properties"].get("hypothesis").is_none());
         assert_eq!(
+            presentation["properties"]["hint"]["type"],
+            json!(["string", "null"])
+        );
+        assert!(
+            presentation["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("hint"))
+        );
+        assert_eq!(
             presentation["properties"]["response"]["$ref"],
             "#/components/schemas/ReviewResponsePromptV1"
         );
@@ -4234,6 +4460,26 @@ mod tests {
         assert_eq!(
             api["components"]["schemas"]["ReviewClozeCheckRequestV1"]["properties"]["inputs"]["minItems"],
             1
+        );
+        let texts_answer = api["components"]["schemas"]["ReviewAnswerV1"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == "texts")
+            .unwrap();
+        assert_eq!(
+            texts_answer["properties"]["value"]["maxItems"],
+            crate::domain::MAX_REVIEW_CLOZE_INPUTS
+        );
+        let text_prompt = api["components"]["schemas"]["ReviewResponsePromptV1"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|variant| variant["properties"].get("input_scripts").is_some())
+            .unwrap();
+        assert_eq!(
+            text_prompt["properties"]["input_scripts"]["maxItems"],
+            crate::domain::MAX_REVIEW_CLOZE_INPUTS
         );
         let event = &api["components"]["schemas"]["ReviewHistoryEventV1"];
         assert!(event["properties"].get("response").is_none());
@@ -4742,6 +4988,15 @@ mod tests {
                 ],
             ),
             expected_json_contract(
+                "/v1/themata/catalog",
+                "get",
+                "read",
+                None,
+                "200",
+                "ThemaCatalogPageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
                 "/v1/themata/{id}",
                 "get",
                 "read",
@@ -4784,12 +5039,32 @@ mod tests {
                 ],
             ),
             expected_json_contract(
+                "/v1/themata/{id}/suspension",
+                "put",
+                "review",
+                Some("SetThemaSuspensionRequestV1"),
+                "200",
+                "DesiredStateMutationResultV1",
+                &[
+                    "200", "400", "401", "403", "408", "409", "413", "422", "428", "500", "503",
+                ],
+            ),
+            expected_json_contract(
                 "/v1/nodes",
                 "get",
                 "read",
                 None,
                 "200",
                 "NodePageV1",
+                &["200", "400", "401", "403", "408", "500", "503"],
+            ),
+            expected_json_contract(
+                "/v1/nodes/catalog",
+                "get",
+                "read",
+                None,
+                "200",
+                "NodeCatalogPageV1",
                 &["200", "400", "401", "403", "408", "500", "503"],
             ),
             expected_json_contract(
@@ -4871,6 +5146,13 @@ mod tests {
             &api,
             "/v1/themata/{id}/unarchive",
             "post",
+            "Idempotency-Key",
+        );
+        assert_required_header(&api, "/v1/themata/{id}/suspension", "put", "If-Match");
+        assert_required_header(
+            &api,
+            "/v1/themata/{id}/suspension",
+            "put",
             "Idempotency-Key",
         );
         assert_required_header(&api, "/v1/settings", "put", "Idempotency-Key");
@@ -5378,6 +5660,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_catalog_route_returns_compact_filterable_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("catalog".into(), vec!["read".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        for (document_id, path, node_id, title) in [
+            ("document-a", "notes/a.org", "node-a", "Alpha"),
+            ("document-b", "notes/b.org", "node-b", "Beta"),
+        ] {
+            let prepared = prepare_document(
+                Some(document_id.into()),
+                path.into(),
+                "text/org; charset=utf-8".into(),
+                format!(":PROPERTIES:\n:ID: {node_id}\n:END:\n#+title: {title}\n"),
+                None,
+            )
+            .unwrap();
+            service.replace_note(prepared, 2, None).await.unwrap();
+        }
+        let app = router(service.clone());
+
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/catalog?document_id=document-a&limit=5000",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert!(
+            body["generation"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+        assert_eq!(body["items"][0]["node_id"], "node-a");
+        assert_eq!(body["items"][0]["title_path"], json!(["Alpha"]));
+        assert!(body["items"][0].get("document_revision").is_none());
+        assert!(body["items"][0].get("content_sha256").is_none());
+        assert!(body["next"].is_null());
+
+        let invalid = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/catalog?limit=5001",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn invalid_settings_mutations_are_rejected_before_persistence() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
@@ -5712,6 +6065,14 @@ mod tests {
             .await
             .unwrap();
         let app = router(service.clone());
+        let expected_request_sha256 = crate::application::desired_state_wire_request_sha256(
+            1,
+            &DeviceDesiredStateMutation::PutThema {
+                prepared: prepared_thema(Some(thema_id.clone()), input.clone(), None).unwrap(),
+                initial_review_day: 0,
+            },
+        )
+        .unwrap();
         let request = || {
             authorized_mutation(
                 "POST",
@@ -5727,6 +6088,7 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let first = response_json(first).await;
         assert_eq!(first["status"], "rejected");
+        assert_eq!(first["request_sha256"], expected_request_sha256);
         assert_eq!(first["rejection"]["reason"], "revision_conflict");
         assert!(first["rejection"]["expected_revision"].is_null());
         assert_eq!(first["rejection"]["current_revision"], 1);
@@ -5802,6 +6164,175 @@ mod tests {
                 "not_found"
             );
         }
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_suspension_is_revisioned_idempotent_and_separate_from_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let manager = generate_device(
+            "manager".into(),
+            vec!["read".into(), "review".into(), "content:write".into()],
+        )
+        .unwrap();
+        let manager_token = manager.token.clone();
+        service.create_device(manager, 1).await.unwrap();
+        let content_only = generate_device("content".into(), vec!["content:write".into()]).unwrap();
+        let content_token = content_only.token.clone();
+        service.create_device(content_only, 2).await.unwrap();
+        put_review_thema(&service, "Question", None, 3).await;
+        put_custom_review_thema(
+            &service,
+            "z-thema",
+            "basic",
+            "Second",
+            vec![None],
+            vec!["answer".into()],
+            None,
+        )
+        .await;
+        let app = router(service.clone());
+
+        let initial = authenticated_json(&app, &manager_token, "/v1/themata/catalog?limit=1").await;
+        assert_eq!(initial["items"][0]["state_revision"], 0);
+        assert_eq!(initial["items"][0]["suspended"], false);
+        assert!(
+            initial["generation"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(initial["next"], "thema");
+        let remainder = authenticated_json(
+            &app,
+            &manager_token,
+            "/v1/themata/catalog?limit=1&after=thema",
+        )
+        .await;
+        assert_eq!(remainder["generation"], initial["generation"]);
+        assert_eq!(remainder["items"][0]["thema_id"], "z-thema");
+        assert!(remainder["next"].is_null());
+
+        let forbidden = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "PUT",
+                "/v1/themata/thema/suspension",
+                &content_token,
+                "forbidden-suspend",
+                Some("0"),
+                Body::from(r#"{"suspended":true}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let suspend_request = || {
+            authorized_mutation(
+                "PUT",
+                "/v1/themata/thema/suspension",
+                &manager_token,
+                "suspend-thema",
+                Some("0"),
+                Body::from(r#"{"suspended":true}"#),
+            )
+        };
+        let suspended = app.clone().oneshot(suspend_request()).await.unwrap();
+        assert_eq!(suspended.status(), StatusCode::OK);
+        let suspended = response_json(suspended).await;
+        assert_eq!(suspended["status"], "applied");
+        assert_eq!(suspended["changed"], true);
+        assert_eq!(suspended["authoritative"]["kind"], "review_state");
+        assert_eq!(
+            suspended["authoritative"]["value"]["state"]["state_revision"],
+            1
+        );
+        assert_eq!(
+            suspended["authoritative"]["value"]["state"]["suspended"],
+            true
+        );
+        let replay = app.clone().oneshot(suspend_request()).await.unwrap();
+        assert_eq!(response_json(replay).await, suspended);
+
+        let reused = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "PUT",
+                "/v1/themata/thema/suspension",
+                &manager_token,
+                "suspend-thema",
+                Some("0"),
+                Body::from(r#"{"suspended":false}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(reused).await["error"]["code"],
+            "idempotency_conflict"
+        );
+
+        let stale = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "PUT",
+                "/v1/themata/thema/suspension",
+                &manager_token,
+                "stale-unsuspend",
+                Some("0"),
+                Body::from(r#"{"suspended":false}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::OK);
+        let stale = response_json(stale).await;
+        assert_eq!(stale["status"], "rejected");
+        assert_eq!(stale["rejection"]["reason"], "revision_conflict");
+        assert_eq!(stale["rejection"]["expected_revision"], 0);
+        assert_eq!(stale["rejection"]["current_revision"], 1);
+
+        service
+            .archive_thema("thema".into(), 1, true, 4, None)
+            .await
+            .unwrap();
+        let unsuspended = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "PUT",
+                "/v1/themata/thema/suspension",
+                &manager_token,
+                "unsuspend-thema",
+                Some("1"),
+                Body::from(r#"{"suspended":false}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unsuspended.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(unsuspended).await["authoritative"]["value"]["state"]["state_revision"],
+            2
+        );
+        put_review_thema(&service, "Edited", Some(2), 5).await;
+
+        let catalog = authenticated_json(&app, &manager_token, "/v1/themata/catalog").await;
+        assert_eq!(catalog["items"][0]["thema_revision"], 3);
+        assert_eq!(catalog["items"][0]["state_revision"], 2);
+        assert_eq!(catalog["items"][0]["keimenon"], "Edited");
+        assert_eq!(catalog["items"][0]["suspended"], false);
+        let changes = authenticated_json(&app, &manager_token, "/v1/changes?limit=100").await;
+        assert!(changes["items"].as_array().unwrap().iter().any(|change| {
+            change["entity_kind"] == "review" && change["operation"] == "suspension"
+        }));
 
         drop(app);
         drop(service);
@@ -6163,7 +6694,7 @@ mod tests {
             .await
             .unwrap();
         let attempt = response_json(attempt).await;
-        let attempt_id = attempt["attempt_id"].as_str().unwrap();
+        let attempt_id = attempt["attempt"]["attempt_id"].as_str().unwrap();
         let answer = app
             .clone()
             .oneshot(authorized(
@@ -6266,7 +6797,8 @@ mod tests {
         .await;
         let app = router(service.clone());
         let (_, attempts_uri) = start_http_review(&app, &token, "multi-cloze").await;
-        let (_, attempt) = begin_http_review_attempt(&app, &token, &attempts_uri).await;
+        let (_, result) = begin_http_review_attempt(&app, &token, &attempts_uri).await;
+        let attempt = &result["attempt"];
         let attempt_id = attempt["attempt_id"].as_str().unwrap();
 
         let empty = app
@@ -6365,6 +6897,8 @@ mod tests {
         let attempt = service
             .begin_http_review_attempt(session_id.clone(), Some(device_id.to_owned()), attempt_time)
             .await
+            .unwrap()
+            .attempt
             .unwrap();
         (session_id, attempt.attempt_id)
     }
@@ -6526,18 +7060,25 @@ mod tests {
         runtime.finish().await.unwrap();
     }
 
-    async fn assert_case_folded_http_attempt(
+    async fn assert_http_attempt_presentation(
         app: &axum::Router,
         token: &str,
         thema_id: &str,
         question: &str,
+        hint: Option<&str>,
         response_prompt: serde_json::Value,
     ) {
         let (session_id, uri) = start_http_review(app, token, thema_id).await;
         let (status, first) = begin_http_review_attempt(app, token, &uri).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(first["presentation"]["question"], question);
-        assert_eq!(first["presentation"]["response"], response_prompt);
+        assert_eq!(first["attempt"]["presentation"]["question"], question);
+        assert_eq!(first["attempt"]["presentation"]["hint"], json!(hint));
+        assert_eq!(
+            first["attempt"]["presentation"]["response"],
+            response_prompt
+        );
+        assert_eq!(first["start_position"], 0);
+        assert_eq!(first["skipped"], json!([]));
         let (_, retry) = begin_http_review_attempt(app, token, &uri).await;
         assert_eq!(retry, first);
         abort_http_review(app, token, &session_id).await;
@@ -7976,7 +8517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_begin_attempt_conceals_case_folded_answers_and_recovers_safely() {
+    async fn http_begin_attempt_materializes_safe_presentations_and_recovers_safely() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServiceRuntime::start(
             directory.path().join("gnosis.sqlite"),
@@ -8001,12 +8542,33 @@ mod tests {
             None,
         )
         .await;
-        assert_case_folded_http_attempt(
+        assert_http_attempt_presentation(
             &app,
             &token,
             "mixed-cloze",
             "(hint)",
+            None,
             json!({"kind":"texts","input_scripts":[null]}),
+        )
+        .await;
+
+        put_custom_review_thema(
+            &service,
+            "basic-hint",
+            "basic",
+            "Question",
+            vec![Some("Remember this".into())],
+            vec!["answer".into()],
+            None,
+        )
+        .await;
+        assert_http_attempt_presentation(
+            &app,
+            &token,
+            "basic-hint",
+            "Question",
+            Some("Remember this"),
+            json!({"kind":"text","input_script":null}),
         )
         .await;
 
@@ -8020,11 +8582,12 @@ mod tests {
             None,
         )
         .await;
-        assert_case_folded_http_attempt(
+        assert_http_attempt_presentation(
             &app,
             &token,
             "mixed-choice",
             "(...)",
+            None,
             json!({"kind":"choice","choices":["alpha","beta"]}),
         )
         .await;
@@ -8040,8 +8603,11 @@ mod tests {
         )
         .await;
         let (_, uri) = start_http_review(&app, &token, "unsafe").await;
-        let (status, _) = begin_http_review_attempt(&app, &token, &uri).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, skipped) = begin_http_review_attempt(&app, &token, &uri).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(skipped["attempt"], Value::Null);
+        assert_eq!(skipped["session"]["status"], "completed");
+        assert_eq!(skipped["skipped"][0]["reason"], "unsafe_presentation");
 
         put_custom_review_thema(
             &service,
@@ -8053,9 +8619,13 @@ mod tests {
             Some(1),
         )
         .await;
+        let (_, uri) = start_http_review(&app, &token, "unsafe").await;
         let (status, recovered) = begin_http_review_attempt(&app, &token, &uri).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(recovered["presentation"]["question"], "(...) once");
+        assert_eq!(
+            recovered["attempt"]["presentation"]["question"],
+            "(...) once"
+        );
 
         drop(app);
         drop(service);
@@ -8096,6 +8666,7 @@ mod tests {
             pending["presentation"]["question"],
             "Question with (Greek hint) and (Cyrillic hint)"
         );
+        assert!(pending["presentation"]["hint"].is_null());
         assert_eq!(
             pending["presentation"]["response"],
             json!({"kind":"texts","input_scripts":["greek","cyrillic"]})

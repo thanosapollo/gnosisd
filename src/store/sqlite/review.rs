@@ -13,15 +13,19 @@ use crate::{
         AnswerInput, DEFAULT_ONLINE_REVIEW_TARGET_COUNT, FsrsConfigSnapshot,
         MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, MAX_REVIEW_PACK_BYTES,
         MAX_REVIEW_PACK_ITEMS, OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult,
-        PresentationSnapshot, RecallOutcomeSnapshot, ReconciliationStatus, ReviewAttemptMutation,
-        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
-        ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck, ReviewOperationAuthority,
+        PresentationSnapshot, RecallOutcomeSnapshot, ReconciliationStatus,
+        ReviewAttemptBeginResult, ReviewAttemptMutation, ReviewAttemptOperation,
+        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
+        ReviewAttemptView, ReviewClozeCheck, ReviewItemSkipReason, ReviewOperationAuthority,
         ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView,
-        ReviewSource, ReviewSourceKind, ReviewStateSnapshot, TransitionSnapshot,
+        ReviewSource, ReviewSourceKind, ReviewStateSnapshot, SkippedReviewItem, TransitionSnapshot,
         presentation_content, progressive_cloze_check, review_day_at, review_question,
         validate_offline_thema_assets, validate_review_pack_projection,
     },
-    domain::{GradeError, MATCHER_VERSION, ThemaKind, check_clozes, compute_transition, grade},
+    domain::{
+        GradeError, MATCHER_VERSION, MAX_REVIEW_CLOZE_INPUTS, ThemaKind, check_clozes,
+        compute_transition, grade,
+    },
 };
 
 #[derive(Serialize)]
@@ -322,10 +326,82 @@ impl SqliteStore {
         session_id: &str,
         actor_device_id: Option<&str>,
         started_at_us: u64,
-    ) -> Result<ReviewAttemptView, StoreError> {
-        self.begin_review_attempt_with_contract(session_id, actor_device_id, started_at_us, true)
+    ) -> Result<ReviewAttemptBeginResult, StoreError> {
+        require_session_actor(
+            &self.connection,
+            session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
+        let transaction = self.write_transaction()?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::NotFound)?;
+        let start_position = session.current_position;
+        let remaining = session
+            .queue_length
+            .checked_sub(session.current_position)
+            .ok_or(StoreError::CorruptData {
+                field: "review session position",
+            })?;
+        let mut skipped = Vec::new();
+        let mut attempt = None;
+        for _ in 0..remaining {
+            if let Some(current) = current_attempt(&transaction, session_id)? {
+                if let Some(reason) = attempt_skip_reason(&transaction, &current)? {
+                    skipped.push(skip_current_item(
+                        &transaction,
+                        session_id,
+                        reason,
+                        started_at_us,
+                    )?);
+                    continue;
+                }
+                attempt = Some(attempt_view(current));
+                break;
+            }
+            let (position, thema_id) = current_session_item(&transaction, session_id)?;
+            let thema = load_thema(&transaction, &thema_id)?.ok_or(StoreError::NotFound)?;
+            let state = load_review_state(&transaction, &thema_id)?;
+            let presentation = presentation(&thema);
+            let reason = if thema.archived {
+                Some(ReviewItemSkipReason::Archived)
+            } else if state.suspended {
+                Some(ReviewItemSkipReason::Suspended)
+            } else if review_question(&presentation).is_err() {
+                Some(ReviewItemSkipReason::UnsafePresentation)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                skipped.push(skip_current_item(
+                    &transaction,
+                    session_id,
+                    reason,
+                    started_at_us,
+                )?);
+                continue;
+            }
+            attempt = Some(insert_review_attempt(
+                &transaction,
+                session_id,
+                position,
+                &thema,
+                &state,
+                &presentation,
+                started_at_us,
+            )?);
+            break;
+        }
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::NotFound)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(ReviewAttemptBeginResult {
+            start_position,
+            session,
+            attempt,
+            skipped,
+        })
     }
 
+    #[cfg(test)]
     fn begin_review_attempt_with_contract(
         &mut self,
         session_id: &str,
@@ -341,7 +417,7 @@ impl SqliteStore {
         )?;
         if let Some(attempt) = current_attempt(&self.connection, session_id)? {
             require_safe_review_question(&attempt.presentation, require_safe_question)?;
-            return Ok(attempt);
+            return Ok(attempt_view(attempt));
         }
         let (position, thema_id) = current_session_item(&self.connection, session_id)?;
         let thema = load_thema(&self.connection, &thema_id)?.ok_or(StoreError::NotFound)?;
@@ -351,32 +427,15 @@ impl SqliteStore {
         let state = load_review_state(&self.connection, &thema_id)?;
         let presentation = presentation(&thema);
         require_safe_review_question(&presentation, require_safe_question)?;
-        let config = resolved_config(&self.connection, session_id)?;
-        let attempt_id = Uuid::now_v7().to_string();
-        self.connection
-            .execute(
-                "INSERT INTO review_attempt(
-                 attempt_id, session_id, session_position, thema_id, thema_revision, state_revision,
-                 content_sha256, presentation_json, config_json, matcher_version,
-                 desired_suspended, status, started_at_us
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'pending', ?11)",
-                params![
-                    attempt_id,
-                    session_id,
-                    position,
-                    thema_id,
-                    u64_to_i64(thema.revision, "thema revision")?,
-                    u64_to_i64(state.state_revision, "state revision")?,
-                    thema.content_sha256,
-                    serde_json::to_string(&presentation).map_err(StoreError::storage)?,
-                    serde_json::to_string(&FsrsConfigSnapshot::from(&config))
-                        .map_err(StoreError::storage)?,
-                    i64::from(state.suspended),
-                    u64_to_i64(started_at_us, "attempt start")?,
-                ],
-            )
-            .map_err(StoreError::storage)?;
-        load_attempt(&self.connection, &attempt_id)?.ok_or(StoreError::NotFound)
+        insert_review_attempt(
+            &self.connection,
+            session_id,
+            position,
+            &thema,
+            &state,
+            &presentation,
+            started_at_us,
+        )
     }
 
     pub(crate) fn grade_review_attempt(
@@ -459,7 +518,7 @@ impl SqliteStore {
         let content = presentation_content(&row.presentation).map_err(StoreError::storage)?;
         if content.kind != ThemaKind::Cloze
             || inputs.is_empty()
-            || inputs.len() > 500
+            || inputs.len() > MAX_REVIEW_CLOZE_INPUTS
             || inputs.len() > content.answer.len()
         {
             return Err(StoreError::InvalidReviewResponse);
@@ -559,7 +618,7 @@ impl SqliteStore {
             &transaction,
             &row.thema_id,
             &transition.after,
-            &event_id,
+            Some(&event_id),
             committed_at_us,
         )?;
         if row.accepted_success == Some(false) && !row.desired_suspended {
@@ -880,7 +939,7 @@ fn accept_offline_operation(
         transaction,
         &row.thema_id,
         &transition.after,
-        &event_id,
+        Some(&event_id),
         reconciled_at_us,
     )?;
     finish_attempt(transaction, &row, &event_id, reconciled_at_us)?;
@@ -1164,6 +1223,7 @@ impl PackIds {
     }
 }
 
+#[cfg(test)]
 fn require_safe_review_question(
     presentation: &PresentationSnapshot,
     required: bool,
@@ -1172,6 +1232,43 @@ fn require_safe_review_question(
         review_question(presentation).map_err(|_| StoreError::InvalidReviewState)?;
     }
     Ok(())
+}
+
+fn insert_review_attempt(
+    connection: &Connection,
+    session_id: &str,
+    position: i64,
+    thema: &crate::application::ThemaRecord,
+    state: &crate::domain::ReviewState,
+    presentation: &PresentationSnapshot,
+    started_at_us: u64,
+) -> Result<ReviewAttemptView, StoreError> {
+    let config = resolved_config(connection, session_id)?;
+    let attempt_id = Uuid::now_v7().to_string();
+    connection
+        .execute(
+            "INSERT INTO review_attempt(
+             attempt_id, session_id, session_position, thema_id, thema_revision, state_revision,
+             content_sha256, presentation_json, config_json, matcher_version,
+             desired_suspended, status, started_at_us
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 'pending', ?11)",
+            params![
+                attempt_id,
+                session_id,
+                position,
+                thema.thema_id.as_str(),
+                u64_to_i64(thema.revision, "thema revision")?,
+                u64_to_i64(state.state_revision, "state revision")?,
+                thema.content_sha256,
+                serde_json::to_string(presentation).map_err(StoreError::storage)?,
+                serde_json::to_string(&FsrsConfigSnapshot::from(&config))
+                    .map_err(StoreError::storage)?,
+                i64::from(state.suspended),
+                u64_to_i64(started_at_us, "attempt start")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    load_attempt(connection, &attempt_id)?.ok_or(StoreError::NotFound)
 }
 
 fn require_review_device(connection: &Connection, device_id: &str) -> Result<(), StoreError> {
@@ -1851,7 +1948,7 @@ fn require_session_actor(
 fn current_attempt(
     connection: &Connection,
     session_id: &str,
-) -> Result<Option<ReviewAttemptView>, StoreError> {
+) -> Result<Option<AttemptRow>, StoreError> {
     let id = connection
         .query_row(
             "SELECT attempt.attempt_id FROM review_attempt AS attempt
@@ -1863,7 +1960,7 @@ fn current_attempt(
         )
         .optional()
         .map_err(StoreError::storage)?;
-    id.map(|id| load_attempt(connection, &id).map(Option::unwrap))
+    id.map(|id| load_attempt_row(connection, &id).map(Option::unwrap))
         .transpose()
 }
 
@@ -1883,6 +1980,61 @@ fn current_session_item(
         .optional()
         .map_err(StoreError::storage)?
         .ok_or(StoreError::InvalidReviewState)
+}
+
+fn attempt_skip_reason(
+    connection: &Connection,
+    attempt: &AttemptRow,
+) -> Result<Option<ReviewItemSkipReason>, StoreError> {
+    let thema = load_thema(connection, &attempt.thema_id)?.ok_or(StoreError::StaleAttempt)?;
+    let state = load_review_state(connection, &attempt.thema_id)?;
+    let reason = if thema.archived {
+        Some(ReviewItemSkipReason::Archived)
+    } else if state.suspended {
+        Some(ReviewItemSkipReason::Suspended)
+    } else if thema.revision != attempt.thema_revision
+        || thema.content_sha256 != attempt.content_sha256
+    {
+        Some(ReviewItemSkipReason::ContentChanged)
+    } else if state.state_revision != attempt.state_revision {
+        Some(ReviewItemSkipReason::SchedulingChanged)
+    } else if review_question(&attempt.presentation).is_err() {
+        Some(ReviewItemSkipReason::UnsafePresentation)
+    } else {
+        None
+    };
+    Ok(reason)
+}
+
+fn skip_current_item(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    reason: ReviewItemSkipReason,
+    skipped_at_us: u64,
+) -> Result<SkippedReviewItem, StoreError> {
+    let (position, thema_id) = current_session_item(transaction, session_id)?;
+    let changed = transaction
+        .execute(
+            "UPDATE review_session_item
+             SET disposition = 'skipped', skip_reason = ?3, skipped_at_us = ?4
+             WHERE session_id = ?1 AND position = ?2 AND disposition = 'pending'",
+            params![
+                session_id,
+                position,
+                reason.as_str(),
+                u64_to_i64(skipped_at_us, "review item skip timestamp")?
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    if changed != 1 {
+        return Err(StoreError::InvalidReviewState);
+    }
+    advance_review_session(transaction, session_id, skipped_at_us)?;
+    Ok(SkippedReviewItem {
+        position: to_u32(position, "review item position")?,
+        thema_id,
+        reason,
+    })
 }
 
 fn presentation(thema: &crate::application::ThemaRecord) -> PresentationSnapshot {
@@ -2466,22 +2618,24 @@ fn load_attempt(
     connection: &Connection,
     attempt_id: &str,
 ) -> Result<Option<ReviewAttemptView>, StoreError> {
-    load_attempt_row(connection, attempt_id).map(|row| {
-        row.map(|row| ReviewAttemptView {
-            attempt_id: row.attempt_id,
-            session_id: row.session_id,
-            thema_id: row.thema_id,
-            presentation: row.presentation,
-            matcher_version: row.matcher_version,
-            response: row.response,
-            detected_success: row.detected_success,
-            accepted_success: row.accepted_success,
-            override_count: row.override_count,
-            proposed_transition: row.transition,
-            desired_suspended: row.desired_suspended,
-            status: row.status,
-        })
-    })
+    load_attempt_row(connection, attempt_id).map(|row| row.map(attempt_view))
+}
+
+fn attempt_view(row: AttemptRow) -> ReviewAttemptView {
+    ReviewAttemptView {
+        attempt_id: row.attempt_id,
+        session_id: row.session_id,
+        thema_id: row.thema_id,
+        presentation: row.presentation,
+        matcher_version: row.matcher_version,
+        response: row.response,
+        detected_success: row.detected_success,
+        accepted_success: row.accepted_success,
+        override_count: row.override_count,
+        proposed_transition: row.transition,
+        desired_suspended: row.desired_suspended,
+        status: row.status,
+    }
 }
 
 fn verify_live_attempt(connection: &Connection, row: &AttemptRow) -> Result<(), StoreError> {
@@ -2625,7 +2779,7 @@ fn insert_review_state_history(
     transaction: &Transaction<'_>,
     thema_id: &str,
     state: &ReviewStateSnapshot,
-    event_id: &str,
+    event_id: Option<&str>,
     created_at_us: u64,
 ) -> Result<(), StoreError> {
     transaction
@@ -2643,6 +2797,62 @@ fn insert_review_state_history(
         )
         .map_err(StoreError::storage)?;
     Ok(())
+}
+
+pub(super) fn set_thema_suspended_in(
+    transaction: &Transaction<'_>,
+    thema_id: &str,
+    expected_state_revision: u64,
+    suspended: bool,
+    created_at_us: i64,
+) -> Result<(ReviewStateSnapshot, bool), StoreError> {
+    let mut state = load_review_state(transaction, thema_id)?;
+    if state.state_revision != expected_state_revision {
+        return Err(StoreError::Conflict {
+            expected: expected_state_revision,
+            actual: Some(state.state_revision),
+        });
+    }
+    if state.suspended == suspended {
+        return Ok((ReviewStateSnapshot::from(&state), false));
+    }
+    state.state_revision = state
+        .state_revision
+        .checked_add(1)
+        .ok_or(StoreError::CorruptData {
+            field: "state revision",
+        })?;
+    state.suspended = suspended;
+    let changed = transaction
+        .execute(
+            "UPDATE review_state SET state_revision = ?2, suspended = ?3
+             WHERE thema_id = ?1 AND state_revision = ?4",
+            params![
+                thema_id,
+                u64_to_i64(state.state_revision, "state revision")?,
+                i64::from(suspended),
+                u64_to_i64(expected_state_revision, "state revision")?,
+            ],
+        )
+        .map_err(StoreError::storage)?;
+    if changed != 1 {
+        return Err(StoreError::Conflict {
+            expected: expected_state_revision,
+            actual: None,
+        });
+    }
+    let snapshot = ReviewStateSnapshot::from(&state);
+    let created_at_us = to_u64(created_at_us, "review state timestamp")?;
+    insert_review_state_history(transaction, thema_id, &snapshot, None, created_at_us)?;
+    super::insert_content_change(
+        transaction,
+        "review",
+        thema_id,
+        snapshot.state_revision,
+        "suspension",
+        u64_to_i64(created_at_us, "review state timestamp")?,
+    )?;
+    Ok((snapshot, true))
 }
 
 fn finish_attempt(
@@ -2664,15 +2874,27 @@ fn finish_attempt(
         )
         .map_err(StoreError::storage)?;
     require_attempt_updated(transaction, row, changed)?;
-    transaction
+    let item_changed = transaction
         .execute(
-            "UPDATE review_session_item SET completed_attempt_id = ?3
+            "UPDATE review_session_item
+         SET completed_attempt_id = ?3, disposition = 'completed'
          WHERE session_id = ?1 AND position = (
              SELECT session_position FROM review_attempt WHERE attempt_id = ?2
-         )",
+         ) AND disposition = 'pending'",
             params![row.session_id, row.attempt_id, row.attempt_id],
         )
         .map_err(StoreError::storage)?;
+    if item_changed != 1 {
+        return Err(StoreError::InvalidReviewState);
+    }
+    advance_review_session(transaction, &row.session_id, committed_at_us)
+}
+
+fn advance_review_session(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    ended_at_us: u64,
+) -> Result<(), StoreError> {
     transaction
         .execute(
             "UPDATE review_session SET
@@ -2685,8 +2907,8 @@ fn finish_attempt(
              ) THEN ?2 ELSE ended_at_us END
          WHERE session_id = ?1",
             params![
-                row.session_id,
-                u64_to_i64(committed_at_us, "commit timestamp")?
+                session_id,
+                u64_to_i64(ended_at_us, "session progress timestamp")?
             ],
         )
         .map_err(StoreError::storage)?;
@@ -2746,11 +2968,12 @@ mod tests {
     use crate::application::{
         AnswerInput, MAX_OFFLINE_ASSET_BYTES, OfflineConflictReason, OfflineReviewOperation,
         ReconciliationStatus, ReviewAttemptMutation, ReviewAttemptOperation,
-        ReviewAttemptOperationStatus, ReviewOperationAuthority, ReviewSource, ReviewSourceKind,
-        canonical_asset_path, generate_device, prepare_asset, prepare_thema, presentation_content,
-        review_day_at, thema_content,
+        ReviewAttemptOperationStatus, ReviewItemSkipReason, ReviewOperationAuthority, ReviewSource,
+        ReviewSourceKind, SkippedReviewItem, canonical_asset_path, generate_device, prepare_asset,
+        prepare_thema, presentation_content, review_day_at, thema_content,
     };
     use crate::blob::BlobMeta;
+    use crate::domain::MAX_REVIEW_CLOZE_INPUTS;
     use crate::store::StoreError;
 
     fn add_thema_with_tags(
@@ -2973,7 +3196,9 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stored_presentations_do_not_create_attempts() {
+    fn malformed_stored_presentations_complete_without_creating_attempts() {
+        let oversized_answers =
+            serde_json::to_string(&vec!["answer"; MAX_REVIEW_CLOZE_INPUTS + 1]).unwrap();
         for (kind, question, hypotheses, answers) in [
             ("basic", "", r#"[null]"#, r#"["only"]"#),
             ("mcq", "Question", r#"["only"]"#, r#"["only"]"#),
@@ -2983,6 +3208,7 @@ mod tests {
                 r#"[null,null]"#,
                 r#"["first","missing"]"#,
             ),
+            ("cloze", "answer", "[]", oversized_answers.as_str()),
         ] {
             let mut store = SqliteStore::open_in_memory().unwrap();
             add_thema(&mut store, "thema", "Question", None);
@@ -2999,10 +3225,20 @@ mod tests {
                 .create_review_session(&manual_source("thema"), Some(1), None, 2)
                 .unwrap();
 
-            assert!(matches!(
-                store.begin_http_review_attempt(&session.session_id, None, 3),
-                Err(crate::store::StoreError::InvalidReviewState)
-            ));
+            let result = store
+                .begin_http_review_attempt(&session.session_id, None, 3)
+                .unwrap();
+            assert_eq!(result.session.status, "completed");
+            assert_eq!(result.session.current_position, 1);
+            assert_eq!(result.attempt, None);
+            assert_eq!(
+                result.skipped,
+                vec![SkippedReviewItem {
+                    position: 0,
+                    thema_id: "thema".into(),
+                    reason: ReviewItemSkipReason::UnsafePresentation,
+                }]
+            );
             assert_eq!(
                 store
                     .connection
@@ -3011,6 +3247,223 @@ mod tests {
                     .unwrap(),
                 0
             );
+        }
+    }
+
+    #[test]
+    fn unusable_items_are_skipped_before_returning_the_next_attempt() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "unsafe", "Question", None);
+        add_thema(&mut store, "archived", "Archived", None);
+        add_thema(&mut store, "suspended", "Suspended", None);
+        add_thema(&mut store, "ready", "Ready", None);
+        let source = ReviewSource {
+            kind: ReviewSourceKind::Manual,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: vec![
+                "unsafe".into(),
+                "archived".into(),
+                "suspended".into(),
+                "ready".into(),
+            ],
+        };
+        let session = store
+            .create_review_session(&source, Some(4), None, 2)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE thema SET hypothesis_json = '[\"answer\"]'
+                 WHERE thema_id = 'unsafe'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE thema SET archived_at_us = 2 WHERE thema_id = 'archived'",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE review_state SET suspended = 1, state_revision = state_revision + 1
+                 WHERE thema_id = 'suspended'",
+                [],
+            )
+            .unwrap();
+
+        let first = store
+            .begin_http_review_attempt(&session.session_id, None, 3)
+            .unwrap();
+        let attempt = first.attempt.unwrap();
+
+        assert_eq!(attempt.thema_id, "ready");
+        assert_eq!(first.start_position, 0);
+        assert_eq!(first.session.current_position, 3);
+        assert_eq!(
+            first
+                .skipped
+                .iter()
+                .map(|item| item.position)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            first
+                .skipped
+                .iter()
+                .map(|item| item.reason)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewItemSkipReason::UnsafePresentation,
+                ReviewItemSkipReason::Archived,
+                ReviewItemSkipReason::Suspended,
+            ]
+        );
+        let retry = store
+            .begin_http_review_attempt(&session.session_id, None, 4)
+            .unwrap();
+        assert_eq!(retry.start_position, 3);
+        assert_eq!(retry.attempt.unwrap().attempt_id, attempt.attempt_id);
+        assert!(retry.skipped.is_empty());
+        assert_eq!(retry.session.current_position, 3);
+    }
+
+    #[test]
+    fn final_unusable_item_completes_after_earlier_progress() {
+        for materialized in [false, true] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            add_thema(&mut store, "first", "First", None);
+            add_thema(&mut store, "final", "Final", None);
+            let session = store
+                .create_review_session(&manual_source_many(&["first", "final"]), Some(2), None, 2)
+                .unwrap();
+            grade_and_commit(&mut store, &session.session_id, "answer", 3);
+
+            let expected_reason = if materialized {
+                let attempt = store
+                    .begin_http_review_attempt(&session.session_id, None, 6)
+                    .unwrap()
+                    .attempt
+                    .unwrap();
+                assert_eq!(attempt.thema_id, "final");
+                add_thema(&mut store, "final", "Changed", Some(1));
+                ReviewItemSkipReason::ContentChanged
+            } else {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE review_state SET suspended = 1, state_revision = state_revision + 1
+                         WHERE thema_id = 'final'",
+                        [],
+                    )
+                    .unwrap();
+                ReviewItemSkipReason::Suspended
+            };
+
+            let result = store
+                .begin_http_review_attempt(&session.session_id, None, 7)
+                .unwrap();
+            assert_eq!(result.session.status, "completed");
+            assert_eq!(result.session.current_position, 2);
+            assert!(result.attempt.is_none());
+            assert_eq!(result.skipped.len(), 1);
+            assert_eq!(result.skipped[0].position, 1);
+            assert_eq!(result.skipped[0].reason, expected_reason);
+            assert_eq!(
+                store
+                    .connection
+                    .query_row(
+                        "SELECT disposition FROM review_session_item
+                         WHERE session_id = ?1 AND position = 1",
+                        [&session.session_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                "skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_attempts_are_skipped_by_reason_and_session_progresses() {
+        for (mutation, expected) in [
+            ("content", ReviewItemSkipReason::ContentChanged),
+            ("scheduling", ReviewItemSkipReason::SchedulingChanged),
+            ("suspended", ReviewItemSkipReason::Suspended),
+            ("archived", ReviewItemSkipReason::Archived),
+        ] {
+            let mut store = SqliteStore::open_in_memory().unwrap();
+            add_thema(&mut store, "stale", "Stale", None);
+            add_thema(&mut store, "ready", "Ready", None);
+            let source = ReviewSource {
+                kind: ReviewSourceKind::Manual,
+                tags: vec![],
+                exclude_tags: vec![],
+                topic_node_id: None,
+                topic_forward_depth: None,
+                topic_backward_depth: None,
+                manual_ids: vec!["stale".into(), "ready".into()],
+            };
+            let session = store
+                .create_review_session(&source, Some(2), None, 2)
+                .unwrap();
+            let stale = store
+                .begin_http_review_attempt(&session.session_id, None, 3)
+                .unwrap()
+                .attempt
+                .unwrap();
+            match mutation {
+                "content" => add_thema(&mut store, "stale", "Changed", Some(1)),
+                "scheduling" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE review_state SET state_revision = state_revision + 1
+                             WHERE thema_id = 'stale'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "suspended" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE review_state SET suspended = 1,
+                             state_revision = state_revision + 1 WHERE thema_id = 'stale'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "archived" => {
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE thema SET archived_at_us = 4 WHERE thema_id = 'stale'",
+                            [],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let result = store
+                .begin_http_review_attempt(&session.session_id, None, 5)
+                .unwrap();
+
+            assert_eq!(result.skipped[0].reason, expected);
+            assert_eq!(result.attempt.as_ref().unwrap().thema_id, "ready");
+            assert_ne!(
+                result.attempt.as_ref().unwrap().attempt_id,
+                stale.attempt_id
+            );
+            assert_eq!(result.session.current_position, 1);
         }
     }
 
@@ -3029,10 +3482,15 @@ mod tests {
 
         assert_eq!(attempt.presentation.keimenon, "The answer is answer");
         assert_eq!(attempt.presentation.answer, vec!["answer"]);
-        assert!(matches!(
-            store.begin_http_review_attempt(&session.session_id, Some(&device_id), 4),
-            Err(crate::store::StoreError::InvalidReviewState)
-        ));
+        let result = store
+            .begin_http_review_attempt(&session.session_id, Some(&device_id), 4)
+            .unwrap();
+        assert_eq!(result.session.status, "completed");
+        assert_eq!(result.attempt, None);
+        assert_eq!(
+            result.skipped[0].reason,
+            ReviewItemSkipReason::UnsafePresentation
+        );
         assert_eq!(
             store
                 .connection

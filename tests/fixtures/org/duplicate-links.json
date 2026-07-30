@@ -9,7 +9,9 @@
       "title_path": ["Duplicate links"],
       "tags": [],
       "parent_id": null,
-      "level": 0
+      "level": 0,
+      "start_byte": 0,
+      "end_byte": 123
     }
   ],
   "link_occurrences": [

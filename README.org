@@ -175,7 +175,8 @@ The ~/v1~ API provides:
 - device-bound replica state, resumable snapshots, exact revision deltas, and
   immutable blob downloads, with authenticated device identity checked before
   local state changes;
-- optimistic thema create, search, update, archive, and unarchive;
+- optimistic thema create, search, update, archive, unarchive, and direct
+  review-state suspension;
 - revisioned Org documents, renames, tombstones, and historical retrieval;
 - content-addressed managed assets;
 - durable change cursors and cursor-only SSE announcements;
@@ -218,6 +219,17 @@ resource and operation identities; and treats a timeout or invalid mutation
 response as unknown delivery. Clients recover session state through the
 active-session and attempt-state resources.
 
+Management clients page content, archive, and suspension state together through
+~GET /v1/themata/catalog~. General thema and node searches remain
+~GET /v1/themata~ and ~GET /v1/nodes~. Each node result binds its byte range to a document revision
+and SHA-256 digest. To jump to a node, fetch
+~GET /v1/notes/{document_id}/revisions/{document_revision}~, require the
+revision ETag and digest to match, then select the half-open UTF-8 byte range
+~[start_byte, end_byte)~. Heading ranges include the complete heading subtree.
+~HttpClient::node_source~ performs these checks and also works for inactive
+historical nodes while their revision blob is retained. Projections created
+before range support return both offsets as ~null~ instead of guessing.
+
 The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
 direct content resources, online review sessions and attempts, desired-state
 operations, and stable errors are generated from the public Rust DTOs in
@@ -252,7 +264,7 @@ immutable. Normal replica synchronization never creates a review pack.
 
 * Storage
 
-The server's canonical schema v1 stores native themata, tags, node associations,
+The server's canonical schema v3 stores native themata, tags, node associations,
 scheduling state, exact review history, sessions, attempts, devices, settings,
 documents, and the node graph. It also stores replica snapshots and feed
 revisions, review packs, immutable offline operations and results, device
@@ -328,6 +340,13 @@ content from reappearing. Assets are SHA-256 addressed and deduplicated. An
 offline asset blob is uploaded and verified before its sequenced create
 operation, and dependent Org revisions remain behind it in the outbox.
 
+A client may materialize replica blobs as ordinary local working files for its
+editor. The client owns that file layout and watches or saves files according
+to its UI policy. An explicit save queues a revision- and digest-bound document
+operation in the durable outbox; the next sync publishes it or records a typed
+conflict. The daemon does not watch client working trees, and a local autosave
+is not itself a canonical revision.
+
 Check live Org parsing parity read-only:
 
 #+begin_src sh
@@ -349,7 +368,7 @@ gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup verify BACKUP_PATH
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 14
+  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 2
 gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup restore-validate BACKUP_PATH \
   --temporary-directory "$HOME/.local/share/gnosis/restore-check"

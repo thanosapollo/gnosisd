@@ -9,7 +9,9 @@
       "title_path": ["Child"],
       "tags": ["notes", "container", "child"],
       "parent_id": null,
-      "level": 2
+      "level": 2,
+      "start_byte": 102,
+      "end_byte": 184
     }
   ],
   "link_occurrences": [

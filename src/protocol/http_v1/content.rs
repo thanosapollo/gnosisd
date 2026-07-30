@@ -1,11 +1,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{DocumentOperationV1, FsrsConfigV1, ThemaKindV1};
+use super::{DocumentOperationV1, FsrsConfigV1, ReviewStateV1, ThemaKindV1};
 use crate::application::{
     AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
-    DeviceMutationResult, DocumentHead, DocumentRevision, NodeRecord, NodeThemaAssociation,
-    SettingsInput, SettingsRecord, ThemaMutationProjection, ThemaRecord,
+    DeviceMutationResult, DocumentHead, DocumentRevision, NodeCatalogRecord, NodeRecord,
+    NodeThemaAssociation, SettingsInput, SettingsRecord, ThemaCatalogRecord,
+    ThemaMutationProjection, ThemaRecord,
 };
 use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
@@ -42,6 +43,7 @@ pub enum ContentOperationV1 {
     Archive,
     Unarchive,
     Commit,
+    Suspension,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -214,6 +216,10 @@ impl DocumentMutationResultV1 {
 pub enum DesiredStateMutationProjectionV1 {
     Asset(AssetHeadV1),
     Thema(ThemaV1),
+    ReviewState {
+        thema_id: String,
+        state: ReviewStateV1,
+    },
     Settings(SettingsV1),
 }
 
@@ -245,6 +251,8 @@ pub enum DesiredStateMutationResultV1 {
             regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
         )]
         operation_id: String,
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        request_sha256: String,
         rejection: DocumentMutationRejectionV1,
         #[schemars(length(min = 1, max = 512))]
         cursor: String,
@@ -252,7 +260,10 @@ pub enum DesiredStateMutationResultV1 {
 }
 
 impl DesiredStateMutationResultV1 {
-    pub(crate) fn from_application(value: &DeviceMutationResult) -> Result<Self, ContentWireError> {
+    pub(crate) fn from_application(
+        value: &DeviceMutationResult,
+        request_sha256: &str,
+    ) -> Result<Self, ContentWireError> {
         match value {
             DeviceMutationResult::Applied {
                 format_version,
@@ -275,6 +286,7 @@ impl DesiredStateMutationResultV1 {
             } => Ok(Self::Rejected {
                 format_version: *format_version,
                 operation_id: operation_id.clone(),
+                request_sha256: request_sha256.to_owned(),
                 rejection: mutation_rejection(rejection),
                 cursor: mutation_cursor(cursor)?,
             }),
@@ -292,6 +304,12 @@ fn desired_state_projection(
         DeviceMutationProjection::Thema(thema) => Ok(DesiredStateMutationProjectionV1::Thema(
             ThemaV1::from_mutation_projection(thema)?,
         )),
+        DeviceMutationProjection::ReviewState { thema_id, state } => {
+            Ok(DesiredStateMutationProjectionV1::ReviewState {
+                thema_id: thema_id.clone(),
+                state: ReviewStateV1::from(state),
+            })
+        }
         DeviceMutationProjection::Settings(settings) => Ok(
             DesiredStateMutationProjectionV1::Settings(SettingsV1::from_application(settings)),
         ),
@@ -577,6 +595,69 @@ pub struct ThemaPageV1 {
     pub next: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaCatalogItemV1 {
+    pub thema_id: String,
+    pub thema_revision: u64,
+    pub state_revision: u64,
+    pub kind: ThemaKindV1,
+    pub keimenon: String,
+    pub hypothesis: Vec<Option<String>>,
+    pub answer: Vec<String>,
+    pub tags: Vec<String>,
+    pub archived: bool,
+    pub suspended: bool,
+}
+
+impl ThemaCatalogItemV1 {
+    fn from_application(value: &ThemaCatalogRecord) -> Self {
+        Self {
+            thema_id: value.thema_id.clone(),
+            thema_revision: value.thema_revision,
+            state_revision: value.state_revision,
+            kind: thema_kind(value.kind),
+            keimenon: value.keimenon.clone(),
+            hypothesis: value.hypothesis.clone(),
+            answer: value.answer.clone(),
+            tags: value.tags.clone(),
+            archived: value.archived,
+            suspended: value.suspended,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThemaCatalogPageV1 {
+    #[schemars(length(min = 1, max = 512))]
+    pub generation: String,
+    #[schemars(length(max = 500))]
+    pub items: Vec<ThemaCatalogItemV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub next: Option<String>,
+}
+
+impl ThemaCatalogPageV1 {
+    pub(crate) fn from_application(
+        items: &[ThemaCatalogRecord],
+        generation: String,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            generation,
+            items: items
+                .iter()
+                .map(ThemaCatalogItemV1::from_application)
+                .collect(),
+            next: has_more
+                .then(|| items.last().map(|item| item.thema_id.clone()))
+                .flatten(),
+        }
+    }
+}
+
 impl ThemaPageV1 {
     pub(crate) fn from_application(items: &[ThemaRecord]) -> Self {
         Self {
@@ -592,10 +673,21 @@ pub struct NodeV1 {
     pub node_id: String,
     pub document_id: String,
     pub logical_path: String,
+    #[schemars(range(min = 1))]
+    pub document_revision: u64,
+    #[schemars(length(equal = 64))]
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_sha256: String,
     pub title: String,
     pub title_path: Vec<String>,
     pub tags: Vec<String>,
     pub level: u32,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub start_byte: Option<usize>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<usize>", required)]
+    pub end_byte: Option<usize>,
     pub active: bool,
 }
 
@@ -605,11 +697,70 @@ impl NodeV1 {
             node_id: value.node_id.clone(),
             document_id: value.document_id.clone(),
             logical_path: value.logical_path.clone(),
+            document_revision: value.document_revision,
+            content_sha256: value.content_sha256.clone(),
             title: value.title.clone(),
             title_path: value.title_path.clone(),
             tags: value.tags.clone(),
             level: value.level,
+            start_byte: value.start_byte,
+            end_byte: value.end_byte,
             active: value.active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCatalogItemV1 {
+    pub node_id: String,
+    pub document_id: String,
+    pub logical_path: String,
+    pub title_path: Vec<String>,
+    pub active: bool,
+}
+
+impl NodeCatalogItemV1 {
+    fn from_application(value: &NodeCatalogRecord) -> Self {
+        Self {
+            node_id: value.node_id.clone(),
+            document_id: value.document_id.clone(),
+            logical_path: value.logical_path.clone(),
+            title_path: value.title_path.clone(),
+            active: value.active,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeCatalogPageV1 {
+    #[schemars(length(min = 1, max = 512))]
+    pub generation: String,
+    #[schemars(length(max = 5000))]
+    pub items: Vec<NodeCatalogItemV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub next: Option<String>,
+}
+
+impl NodeCatalogPageV1 {
+    pub(crate) fn from_application(
+        items: &[NodeCatalogRecord],
+        generation: String,
+        has_more: bool,
+    ) -> Self {
+        Self {
+            generation,
+            items: items
+                .iter()
+                .map(NodeCatalogItemV1::from_application)
+                .collect(),
+            next: if has_more {
+                items.last().map(|item| item.node_id.clone())
+            } else {
+                None
+            },
         }
     }
 }
@@ -735,6 +886,7 @@ fn content_operation(value: &str) -> Result<ContentOperationV1, ContentWireError
         "archive" => Ok(ContentOperationV1::Archive),
         "unarchive" => Ok(ContentOperationV1::Unarchive),
         "commit" => Ok(ContentOperationV1::Commit),
+        "suspension" => Ok(ContentOperationV1::Suspension),
         _ => Err(ContentWireError),
     }
 }

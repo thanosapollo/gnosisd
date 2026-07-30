@@ -1,6 +1,8 @@
 use super::ids::{NodeId, ThemaId};
 use thiserror::Error;
 
+pub(crate) const MAX_REVIEW_CLOZE_INPUTS: usize = 500;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ThemaKind {
     Basic,
@@ -67,7 +69,10 @@ fn validate_basic(content: &ThemaContent) -> Result<(), ThemaContentError> {
 }
 
 fn validate_cloze(content: &ThemaContent) -> Result<(), ThemaContentError> {
-    if !content.answer.is_empty() && content.hypothesis.len() <= content.answer.len() {
+    if !content.answer.is_empty()
+        && content.answer.len() <= MAX_REVIEW_CLOZE_INPUTS
+        && content.hypothesis.len() <= content.answer.len()
+    {
         Ok(())
     } else {
         Err(ThemaContentError::Shape)
@@ -157,7 +162,9 @@ impl ThemaConceptRelation {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThemaConcept, ThemaConceptRelation};
+    use super::{
+        MAX_REVIEW_CLOZE_INPUTS, ThemaConcept, ThemaConceptRelation, ThemaContent, ThemaKind,
+    };
     use crate::domain::ids::{NodeId, ThemaId};
 
     #[test]
@@ -174,5 +181,21 @@ mod tests {
             ThemaConceptRelation::Primary,
             ThemaConceptRelation::Reference
         );
+    }
+
+    #[test]
+    fn cloze_content_bounds_review_inputs() {
+        let content = |count| ThemaContent {
+            kind: ThemaKind::Cloze,
+            keimenon: "question".into(),
+            hypothesis: vec![],
+            answer: vec!["answer".into(); count],
+            source_guid: None,
+            parathema: None,
+            review_image: None,
+        };
+
+        assert!(content(MAX_REVIEW_CLOZE_INPUTS).validate().is_ok());
+        assert!(content(MAX_REVIEW_CLOZE_INPUTS + 1).validate().is_err());
     }
 }
