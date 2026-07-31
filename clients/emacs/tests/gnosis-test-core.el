@@ -1395,9 +1395,13 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                     (list :attempt_id "attempt" :status "graded"
                           :response (nth 3 arguments)))
                    ("post_review_attempts__id__cloze-check"
-                    `(:matches [t] :all_entered_correct t
+                   `(:matches [t] :all_entered_correct t
                       :complete ,gnosis-core--json-false
-                      :question "one and (...)" :next_input_script "greek"))
+                      :question "one and (...)"
+                      :cloze_spans
+                      [(:start_byte 0 :end_byte 3 :state "correct")
+                       (:start_byte 8 :end_byte 13 :state "concealed")]
+                      :next_input_script "greek"))
                    ("get_review_attempt_state"
                     '(:version 1 :attempt_revision 3
                       :attempt (:attempt_id "attempt")))
@@ -1448,7 +1452,11 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
 (ert-deftest gnosis-core-review-cloze-check-rejects-uncorrelated-response ()
   (let ((valid `(:matches [t] :all_entered_correct t
                  :complete ,gnosis-core--json-false
-                 :question "one and (...)" :next_input_script "greek")))
+                 :question "one and (...)"
+                 :cloze_spans
+                 [(:start_byte 0 :end_byte 3 :state "correct")
+                  (:start_byte 8 :end_byte 13 :state "concealed")]
+                 :next_input_script "greek")))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _) valid)))
       (should (eq valid
@@ -1457,20 +1465,61 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
   (dolist (response
            `((:matches [t] :all_entered_correct ,gnosis-core--json-false
               :complete ,gnosis-core--json-false
-              :question "Question" :next_input_script "greek")
+              :question "Question"
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "correct")]
+              :next_input_script "greek")
              (:matches [t] :all_entered_correct t :complete t
-              :question "Question" :next_input_script "greek")
+              :question "Question"
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "correct")]
+              :next_input_script "greek")
              (:matches [t] :all_entered_correct t
               :complete ,gnosis-core--json-false
-              :question "" :next_input_script "greek")
+              :question ""
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "correct")]
+              :next_input_script "greek")
              (:matches [t] :all_entered_correct t
               :complete ,gnosis-core--json-false
-              :question "Question" :next_input_script "Greek")))
+              :question "Question"
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "correct")]
+              :next_input_script "Greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "Question"
+              :cloze_spans 1
+              :next_input_script "greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "Question"
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "incorrect")]
+              :next_input_script "greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "Question"
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "unanswered")]
+              :next_input_script "greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "Question"
+              :cloze_spans [(:start_byte 0 :end_byte 1 :state "future")]
+              :next_input_script "greek")
+             (:matches [t] :all_entered_correct t
+              :complete ,gnosis-core--json-false
+              :question "Question"
+              :cloze_spans
+              [(:start_byte 1 :end_byte 3 :state "correct")
+               (:start_byte 2 :end_byte 4 :state "concealed")]
+              :next_input_script "greek")))
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest _) response)))
       (should-error
        (gnosis-core-review-attempt-check-cloze "attempt" ["one"])
        :type 'gnosis-core-protocol-error))))
+
+(ert-deftest gnosis-core-review-cloze-spans-reject-mid-codepoint-boundaries ()
+  (dolist (spans '([(:start_byte 0 :end_byte 1 :state "concealed")]
+                    [(:start_byte 1 :end_byte 2 :state "concealed")]))
+    (should-not
+     (gnosis-core--review-cloze-spans-valid-p spans "μx"))))
 
 (ert-deftest gnosis-core-review-session-rejects-invalid-status-position ()
   (let ((invalid '(:session_id "session" :mode "online" :status "active"

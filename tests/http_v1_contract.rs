@@ -8,8 +8,8 @@ use gnosis_core::protocol::http_v1::{
     OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
     ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAttemptOperationResponseV1,
     ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewCommitResponseV1, ReviewPackEnvelopeV2,
-    ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1, ReviewStateV1,
-    ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+    ReviewPresentationV1, ReviewResponsePromptV1, ReviewSessionRequestV1, ReviewSessionV1,
+    ReviewStateV1, ReviewTransitionV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
     SetThemaSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogPageV1,
     ThemaConceptRelationV1, ThemaPageV1, ThemaWriteRequestV1, UpdateSettingsRequestV1,
 };
@@ -289,6 +289,27 @@ fn public_online_review_dtos_preserve_the_existing_v1_shapes() {
         .unwrap()
         .remove("hint");
     assert!(serde_json::from_value::<ReviewAttemptV1>(missing_hint).is_err());
+
+    let cloze = json!({
+        "kind":"cloze",
+        "question":"alpha and (...)",
+        "cloze_spans":[
+            {"start_byte":0,"end_byte":5,"state":"correct"},
+            {"start_byte":10,"end_byte":15,"state":"concealed"}
+        ],
+        "hint":null,
+        "response":{"kind":"texts","input_scripts":[null]},
+        "source_guid":null,
+        "review_image":null,
+        "tags":[]
+    });
+    assert_round_trip::<ReviewPresentationV1>(cloze.clone());
+    let mut unknown_state = cloze.clone();
+    unknown_state["cloze_spans"][0]["state"] = json!("future");
+    assert!(serde_json::from_value::<ReviewPresentationV1>(unknown_state).is_err());
+    let mut missing_spans = cloze;
+    missing_spans.as_object_mut().unwrap().remove("cloze_spans");
+    assert!(serde_json::from_value::<ReviewPresentationV1>(missing_spans).is_err());
 
     assert_round_trip::<ReviewStateV1>(review_state_wire());
     for field in ["stability", "difficulty"] {
@@ -876,6 +897,7 @@ fn review_attempt_result() -> Value {
             "presentation":{
                 "kind":"basic",
                 "question":"Question",
+                "cloze_spans":[],
                 "hint":null,
                 "response":{"kind":"text","input_script":null},
                 "source_guid":null,
@@ -960,4 +982,71 @@ fn review_attempt_status_controls_reveal_and_grading_fields() {
             "pending attempt accepted grading field {field}"
         );
     }
+}
+
+#[test]
+fn review_attempt_rejects_invalid_cloze_span_semantics() {
+    let mut pending = review_attempt_result()["attempt"].clone();
+    pending["status"] = json!("pending");
+    for field in [
+        "revealed_answer",
+        "revealed_parathema",
+        "response",
+        "detected_success",
+        "accepted_success",
+        "proposed_transition",
+    ] {
+        pending[field] = Value::Null;
+    }
+    pending["override_count"] = json!(0);
+    pending["presentation"] = json!({
+        "kind":"cloze",
+        "question":"μ and (...)",
+        "cloze_spans":[
+            {"start_byte":0,"end_byte":2,"state":"concealed"},
+            {"start_byte":7,"end_byte":12,"state":"concealed"}
+        ],
+        "hint":null,
+        "response":{"kind":"texts","input_scripts":[null,null]},
+        "source_guid":null,
+        "review_image":null,
+        "tags":[]
+    });
+    assert!(serde_json::from_value::<ReviewAttemptV1>(pending.clone()).is_ok());
+
+    for (pointer, value) in [
+        ("/presentation/cloze_spans/0/end_byte", json!(1)),
+        ("/presentation/cloze_spans/1/start_byte", json!(1)),
+        ("/presentation/cloze_spans/1/end_byte", json!(99)),
+        ("/presentation/response/input_scripts", json!([null])),
+        ("/presentation/cloze_spans/0/state", json!("incorrect")),
+        ("/presentation/kind", json!("basic")),
+    ] {
+        let mut attempt = pending.clone();
+        *attempt.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            serde_json::from_value::<ReviewAttemptV1>(attempt).is_err(),
+            "accepted invalid cloze field {pointer}"
+        );
+    }
+
+    let mut graded = review_attempt_result()["attempt"].clone();
+    graded["presentation"] = json!({
+        "kind":"cloze",
+        "question":"μ and beta",
+        "cloze_spans":[
+            {"start_byte":0,"end_byte":2,"state":"correct"},
+            {"start_byte":7,"end_byte":11,"state":"unanswered"}
+        ],
+        "hint":null,
+        "response":{"kind":"texts","input_scripts":[null,null]},
+        "source_guid":null,
+        "review_image":null,
+        "tags":[]
+    });
+    graded["revealed_answer"] = json!(["μ", "beta"]);
+    graded["response"] = json!({"kind":"texts","value":["μ","wrong"]});
+    assert!(serde_json::from_value::<ReviewAttemptV1>(graded.clone()).is_ok());
+    graded["presentation"]["cloze_spans"][1]["state"] = json!("concealed");
+    assert!(serde_json::from_value::<ReviewAttemptV1>(graded).is_err());
 }

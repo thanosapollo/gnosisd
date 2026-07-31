@@ -51,9 +51,10 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use crate::application::{
     AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
     FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot, ReviewAttemptBeginResult,
-    ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewItemSkipReason,
-    ReviewResponsePrompt, ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind,
-    SkippedReviewItem, TransitionSnapshot, review_question,
+    ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewClozeSpan,
+    ReviewClozeState, ReviewItemSkipReason, ReviewQuestion, ReviewResponsePrompt,
+    ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, SkippedReviewItem,
+    TransitionSnapshot, review_attempt_question, review_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -969,9 +970,9 @@ impl<'de> Deserialize<'de> for ReviewAttemptV1 {
         D: Deserializer<'de>,
     {
         let attempt = Self::from(ReviewAttemptWireV1::deserialize(deserializer)?);
-        if !attempt.has_valid_status_fields() {
+        if !attempt.has_valid_status_fields() || !attempt.has_valid_presentation_fields() {
             return Err(de::Error::custom(
-                "review attempt fields do not match its status",
+                "review attempt fields do not match its status or presentation",
             ));
         }
         Ok(attempt)
@@ -987,6 +988,8 @@ impl JsonSchema for ReviewAttemptV1 {
         let mut schema = ReviewAttemptWireV1::json_schema(generator);
         let response = generator.subschema_for::<ReviewAnswerV1>().to_value();
         let transition = generator.subschema_for::<ReviewTransitionV1>().to_value();
+        let pending_presentation = review_attempt_presentation_schema(false);
+        let graded_presentation = review_attempt_presentation_schema(true);
         let graded_fields = serde_json::json!({
             "revealed_answer":{"type":"array","items":{"type":"string"}},
             "response":response,
@@ -999,6 +1002,7 @@ impl JsonSchema for ReviewAttemptV1 {
             serde_json::json!([
                 {"properties":{
                     "status":{"const":"pending"},
+                    "presentation":pending_presentation,
                     "revealed_answer":{"type":"null"},
                     "revealed_parathema":{"type":"null"},
                     "response":{"type":"null"},
@@ -1009,6 +1013,7 @@ impl JsonSchema for ReviewAttemptV1 {
                 }},
                 {"properties":{
                     "status":{"const":"graded"},
+                    "presentation":graded_presentation.clone(),
                     "revealed_answer":graded_fields["revealed_answer"].clone(),
                     "response":graded_fields["response"].clone(),
                     "detected_success":graded_fields["detected_success"].clone(),
@@ -1017,6 +1022,7 @@ impl JsonSchema for ReviewAttemptV1 {
                 }},
                 {"properties":{
                     "status":{"const":"committed"},
+                    "presentation":graded_presentation,
                     "revealed_answer":graded_fields["revealed_answer"].clone(),
                     "response":graded_fields["response"].clone(),
                     "detected_success":graded_fields["detected_success"].clone(),
@@ -1027,6 +1033,54 @@ impl JsonSchema for ReviewAttemptV1 {
         );
         schema
     }
+}
+
+fn review_attempt_presentation_schema(graded: bool) -> serde_json::Value {
+    let cloze_states = if graded {
+        serde_json::json!({"enum":["correct","incorrect","unanswered"]})
+    } else {
+        serde_json::json!({"const":"concealed"})
+    };
+    let mc_cloze_states = if graded {
+        serde_json::json!({"enum":["correct","incorrect"]})
+    } else {
+        serde_json::json!({"const":"concealed"})
+    };
+    serde_json::json!({
+        "oneOf":[
+            review_attempt_presentation_case(
+                "basic", "text", serde_json::json!({"maxItems":0})),
+            review_attempt_presentation_case(
+                "cloze", "texts",
+                serde_json::json!({
+                    "minItems":1,
+                    "items":{"properties":{"state":cloze_states}}
+                })),
+            review_attempt_presentation_case(
+                "mcq", "choice", serde_json::json!({"maxItems":0})),
+            review_attempt_presentation_case(
+                "mc-cloze", "choice",
+                serde_json::json!({
+                    "minItems":1,
+                    "maxItems":1,
+                    "items":{"properties":{"state":mc_cloze_states}}
+                }))
+        ]
+    })
+}
+
+fn review_attempt_presentation_case(
+    kind: &str,
+    response_kind: &str,
+    cloze_spans: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "properties":{
+            "kind":{"const":kind},
+            "response":{"properties":{"kind":{"const":response_kind}}},
+            "cloze_spans":cloze_spans
+        }
+    })
 }
 
 impl ReviewAttemptV1 {
@@ -1049,6 +1103,27 @@ impl ReviewAttemptV1 {
                     && self.proposed_transition.is_some()
             }
         }
+    }
+
+    pub(crate) fn has_valid_presentation_fields(&self) -> bool {
+        let response_matches = match (self.presentation.kind, self.response.as_ref()) {
+            (_, None) => self.status == ReviewAttemptStatusV1::Pending,
+            (ThemaKindV1::Basic, Some(ReviewAnswerV1::Text(_)))
+            | (ThemaKindV1::Cloze, Some(ReviewAnswerV1::Texts(_)))
+            | (ThemaKindV1::Mcq | ThemaKindV1::McCloze, Some(ReviewAnswerV1::Choice(_))) => {
+                self.status != ReviewAttemptStatusV1::Pending
+            }
+            _ => false,
+        };
+        response_matches
+            && self.presentation.has_valid_cloze_spans(self.status)
+            && self.revealed_answer.as_ref().is_none_or(|answers| {
+                let expected = match self.presentation.kind {
+                    ThemaKindV1::Cloze => self.presentation.cloze_spans.len(),
+                    _ => 1,
+                };
+                answers.len() == expected
+            })
     }
 
     pub(crate) fn from_application(
@@ -1076,7 +1151,7 @@ impl ReviewAttemptV1 {
             desired_suspended: value.desired_suspended,
             status: ReviewAttemptStatusV1::from_application(&value.status)?,
         };
-        if !attempt.has_valid_status_fields() {
+        if !attempt.has_valid_status_fields() || !attempt.has_valid_presentation_fields() {
             return Err(ReviewAttemptWireError::StatusFields);
         }
         Ok(attempt)
@@ -1108,6 +1183,7 @@ pub struct ReviewPresentationV1 {
     pub kind: ThemaKindV1,
     #[schemars(length(min = 1))]
     pub question: String,
+    pub cloze_spans: Vec<ReviewClozeSpanV1>,
     #[serde(deserialize_with = "deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub hint: Option<String>,
@@ -1123,7 +1199,9 @@ pub struct ReviewPresentationV1 {
 
 impl ReviewPresentationV1 {
     fn from_application(value: &ReviewAttemptView) -> Result<Self, ReviewAttemptWireError> {
-        Self::from_snapshot(&value.presentation)
+        let question =
+            review_attempt_question(value).map_err(|_| ReviewAttemptWireError::Presentation)?;
+        Self::from_question(&value.presentation, question)
     }
 
     pub(crate) fn from_snapshot(
@@ -1131,15 +1209,113 @@ impl ReviewPresentationV1 {
     ) -> Result<Self, ReviewAttemptWireError> {
         let question =
             review_question(presentation).map_err(|_| ReviewAttemptWireError::Presentation)?;
+        Self::from_question(presentation, question)
+    }
+
+    fn from_question(
+        presentation: &PresentationSnapshot,
+        question: ReviewQuestion,
+    ) -> Result<Self, ReviewAttemptWireError> {
         Ok(Self {
             kind: ThemaKindV1::from_application(&presentation.kind)?,
             question: question.text,
+            cloze_spans: question
+                .cloze_spans
+                .iter()
+                .map(ReviewClozeSpanV1::from)
+                .collect(),
             hint: question.hint,
             response: ReviewResponsePromptV1::from_application(question.response),
             source_guid: presentation.source_guid.clone(),
             review_image: presentation.review_image.clone(),
             tags: presentation.tags.clone(),
         })
+    }
+
+    fn has_valid_cloze_spans(&self, status: ReviewAttemptStatusV1) -> bool {
+        !self.question.trim().is_empty()
+            && match (&self.kind, &self.response) {
+                (ThemaKindV1::Basic, ReviewResponsePromptV1::Text { .. })
+                | (ThemaKindV1::Mcq, ReviewResponsePromptV1::Choice { .. }) => {
+                    self.cloze_spans.is_empty()
+                }
+                (ThemaKindV1::Cloze, ReviewResponsePromptV1::Texts { input_scripts }) => {
+                    self.cloze_spans.len() == input_scripts.len()
+                        && valid_cloze_span_ranges(&self.question, &self.cloze_spans, status, false)
+                }
+                (ThemaKindV1::McCloze, ReviewResponsePromptV1::Choice { .. }) => {
+                    self.cloze_spans.len() == 1
+                        && valid_cloze_span_ranges(&self.question, &self.cloze_spans, status, true)
+                }
+                _ => false,
+            }
+    }
+}
+
+fn valid_cloze_span_ranges(
+    question: &str,
+    spans: &[ReviewClozeSpanV1],
+    status: ReviewAttemptStatusV1,
+    multiple_choice: bool,
+) -> bool {
+    let mut previous_end = 0;
+    !question.trim().is_empty()
+        && !spans.is_empty()
+        && spans.iter().all(|span| {
+            let state_is_valid = match status {
+                ReviewAttemptStatusV1::Pending => span.state == ReviewClozeStateV1::Concealed,
+                ReviewAttemptStatusV1::Graded | ReviewAttemptStatusV1::Committed => {
+                    matches!(
+                        span.state,
+                        ReviewClozeStateV1::Correct | ReviewClozeStateV1::Incorrect
+                    ) || (!multiple_choice && span.state == ReviewClozeStateV1::Unanswered)
+                }
+            };
+            let range_is_valid = previous_end <= span.start_byte
+                && span.start_byte < span.end_byte
+                && span.end_byte <= question.len()
+                && question.is_char_boundary(span.start_byte)
+                && question.is_char_boundary(span.end_byte);
+            previous_end = span.end_byte;
+            state_is_valid && range_is_valid
+        })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewClozeSpanV1 {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub state: ReviewClozeStateV1,
+}
+
+impl From<&ReviewClozeSpan> for ReviewClozeSpanV1 {
+    fn from(value: &ReviewClozeSpan) -> Self {
+        Self {
+            start_byte: value.start_byte,
+            end_byte: value.end_byte,
+            state: ReviewClozeStateV1::from(value.state),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewClozeStateV1 {
+    Concealed,
+    Correct,
+    Incorrect,
+    Unanswered,
+}
+
+impl From<ReviewClozeState> for ReviewClozeStateV1 {
+    fn from(value: ReviewClozeState) -> Self {
+        match value {
+            ReviewClozeState::Concealed => Self::Concealed,
+            ReviewClozeState::Correct => Self::Correct,
+            ReviewClozeState::Incorrect => Self::Incorrect,
+            ReviewClozeState::Unanswered => Self::Unanswered,
+        }
     }
 }
 

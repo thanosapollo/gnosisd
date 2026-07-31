@@ -220,24 +220,41 @@
            (attempt-id (plist-get attempt :attempt_id))
            (gnosis-review--attempt attempt)
            (answers '("beta" "alpha"))
-           questions)
+           presentations)
       (cl-letf (((symbol-function 'gnosis-review--read-string)
                  (lambda (&rest _) (pop answers)))
                 ((symbol-function 'gnosis-review--render)
                  (lambda ()
-                   (push (plist-get
-                          (plist-get gnosis-review--attempt :presentation)
-                          :question)
-                         questions))))
+                   (push (copy-tree
+                          (plist-get gnosis-review--attempt :presentation))
+                         presentations))))
         (setq attempt
               (gnosis-core-review-attempt-answer
                attempt-id
                (gnosis-review--read-cloze-answer
                 (plist-get (plist-get attempt :presentation)
                            :response)))))
+      (setq presentations (nreverse presentations))
       (should (equal '("(Greek hint) and beta" "alpha and beta")
-                     (nreverse questions)))
+                     (mapcar (lambda (presentation)
+                               (plist-get presentation :question))
+                             presentations)))
+      (should
+       (equal
+        '(("concealed" "correct") ("correct" "correct"))
+        (mapcar
+         (lambda (presentation)
+           (mapcar (lambda (span) (plist-get span :state))
+                   (append (plist-get presentation :cloze_spans) nil)))
+         presentations)))
       (should (equal "graded" (plist-get attempt :status)))
+      (should
+       (equal '("correct" "correct")
+              (mapcar
+               (lambda (span) (plist-get span :state))
+               (append
+                (plist-get (plist-get attempt :presentation) :cloze_spans)
+                nil))))
       (let ((buffer (get-buffer-create gnosis-review-buffer-name))
             advanced)
         (unwind-protect

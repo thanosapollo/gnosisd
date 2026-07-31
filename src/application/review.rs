@@ -210,6 +210,22 @@ pub(crate) struct ReviewQuestion {
     pub(crate) text: String,
     pub(crate) hint: Option<String>,
     pub(crate) response: ReviewResponsePrompt,
+    pub(crate) cloze_spans: Vec<ReviewClozeSpan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReviewClozeState {
+    Concealed,
+    Correct,
+    Incorrect,
+    Unanswered,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReviewClozeSpan {
+    pub(crate) start_byte: usize,
+    pub(crate) end_byte: usize,
+    pub(crate) state: ReviewClozeState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +234,7 @@ pub(crate) struct ReviewClozeCheck {
     pub(crate) all_entered_correct: bool,
     pub(crate) complete: bool,
     pub(crate) question: String,
+    pub(crate) cloze_spans: Vec<ReviewClozeSpan>,
     pub(crate) next_input_script: Option<String>,
 }
 
@@ -910,17 +927,51 @@ pub(crate) fn review_question(
     let content = presentation_content(presentation)?
         .validate()
         .map_err(|_| ReviewError::Content)?;
-    let text = question_text(&content)?;
+    let materialized = question_text(&content)?;
     let hint = question_hint(&content);
-    ensure_question_is_safe(&content, &text)?;
+    ensure_question_is_safe(&content, &materialized.text)?;
     if let Some(hint) = hint.as_deref() {
         ensure_question_is_safe(&content, hint)?;
     }
     let response = response_prompt(&content);
     Ok(ReviewQuestion {
-        text,
+        text: materialized.text,
         hint,
         response,
+        cloze_spans: materialized.cloze_spans,
+    })
+}
+
+pub(crate) fn review_attempt_question(
+    attempt: &ReviewAttemptView,
+) -> Result<ReviewQuestion, ReviewError> {
+    let question = review_question(&attempt.presentation)?;
+    let Some(response) = attempt.response.as_ref() else {
+        return Ok(question);
+    };
+    let content = presentation_content(&attempt.presentation)?
+        .validate()
+        .map_err(|_| ReviewError::Content)?;
+    let materialized = match (&content.kind, response) {
+        (ThemaKind::Cloze, AnswerInput::Texts(inputs)) => {
+            let check = crate::domain::check_clozes(&content.answer, inputs);
+            let states = graded_cloze_states(&check);
+            materialize_cloze_question(&content, &states, true)?
+        }
+        (ThemaKind::McCloze, AnswerInput::Choice(_)) => {
+            let state = if attempt.detected_success == Some(true) {
+                ReviewClozeState::Correct
+            } else {
+                ReviewClozeState::Incorrect
+            };
+            materialize_cloze_question(&content, &[state], false)?
+        }
+        _ => return Ok(question),
+    };
+    Ok(ReviewQuestion {
+        text: materialized.text,
+        cloze_spans: materialized.cloze_spans,
+        ..question
     })
 }
 
@@ -934,7 +985,7 @@ pub(crate) fn progressive_cloze_check(
     if content.kind != ThemaKind::Cloze || check.revealed.len() != content.answer.len() {
         return Err(ReviewError::Content);
     }
-    let question = progressive_cloze_question(&content, &check.revealed)?;
+    let materialized = progressive_cloze_question(&content, &check.revealed)?;
     let next_input_script = check
         .revealed
         .iter()
@@ -944,17 +995,31 @@ pub(crate) fn progressive_cloze_check(
         matches: check.matches,
         all_entered_correct: check.all_entered_correct,
         complete: check.complete,
-        question,
+        question: materialized.text,
+        cloze_spans: materialized.cloze_spans,
         next_input_script,
     })
 }
 
-fn question_text(content: &ThemaContent) -> Result<String, ReviewError> {
+#[derive(Debug, Eq, PartialEq)]
+struct MaterializedQuestion {
+    text: String,
+    cloze_spans: Vec<ReviewClozeSpan>,
+}
+
+fn question_text(content: &ThemaContent) -> Result<MaterializedQuestion, ReviewError> {
     match content.kind {
-        ThemaKind::Basic => Ok(content.keimenon.clone()),
+        ThemaKind::Basic => Ok(plain_question(&content.keimenon)),
         ThemaKind::Cloze => concealed_question(content, true),
-        ThemaKind::Mcq => Ok(content.keimenon.clone()),
+        ThemaKind::Mcq => Ok(plain_question(&content.keimenon)),
         ThemaKind::McCloze => concealed_question(content, false),
+    }
+}
+
+fn plain_question(text: &str) -> MaterializedQuestion {
+    MaterializedQuestion {
+        text: text.into(),
+        cloze_spans: Vec::new(),
     }
 }
 
@@ -970,25 +1035,83 @@ fn question_hint(content: &ThemaContent) -> Option<String> {
         .cloned()
 }
 
-fn concealed_question(content: &ThemaContent, add_hints: bool) -> Result<String, ReviewError> {
-    materialize_cloze_question(content, None, add_hints)
+fn concealed_question(
+    content: &ThemaContent,
+    add_hints: bool,
+) -> Result<MaterializedQuestion, ReviewError> {
+    let states = vec![ReviewClozeState::Concealed; content.answer.len()];
+    materialize_cloze_question(content, &states, add_hints)
 }
 
 fn progressive_cloze_question(
     content: &ThemaContent,
     revealed: &[bool],
-) -> Result<String, ReviewError> {
-    materialize_cloze_question(content, Some(revealed), true)
+) -> Result<MaterializedQuestion, ReviewError> {
+    let states = revealed
+        .iter()
+        .map(|revealed| {
+            if *revealed {
+                ReviewClozeState::Correct
+            } else {
+                ReviewClozeState::Concealed
+            }
+        })
+        .collect::<Vec<_>>();
+    materialize_cloze_question(content, &states, true)
+}
+
+fn graded_cloze_states(check: &crate::domain::ClozeCheck) -> Vec<ReviewClozeState> {
+    let mut failed_marked = check.all_entered_correct;
+    check
+        .revealed
+        .iter()
+        .map(|revealed| {
+            if *revealed {
+                ReviewClozeState::Correct
+            } else if failed_marked {
+                ReviewClozeState::Unanswered
+            } else {
+                failed_marked = true;
+                ReviewClozeState::Incorrect
+            }
+        })
+        .collect()
 }
 
 fn materialize_cloze_question(
     content: &ThemaContent,
-    revealed: Option<&[bool]>,
+    states: &[ReviewClozeState],
     add_hints: bool,
-) -> Result<String, ReviewError> {
-    if revealed.is_some_and(|values| values.len() != content.answer.len()) {
+) -> Result<MaterializedQuestion, ReviewError> {
+    if states.len() != content.answer.len() {
         return Err(ReviewError::Content);
     }
+    let spans = cloze_source_spans(content)?;
+    let mut question = String::with_capacity(content.keimenon.len());
+    let mut cloze_spans = Vec::with_capacity(spans.len());
+    let mut cursor = 0;
+    for (range, answer_index) in spans {
+        question.push_str(&content.keimenon[cursor..range.start]);
+        cloze_spans.push(push_materialized_cloze(
+            &mut question,
+            content,
+            range.clone(),
+            answer_index,
+            states[answer_index],
+            add_hints,
+        ));
+        cursor = range.end;
+    }
+    question.push_str(&content.keimenon[cursor..]);
+    Ok(MaterializedQuestion {
+        text: question,
+        cloze_spans,
+    })
+}
+
+fn cloze_source_spans(
+    content: &ThemaContent,
+) -> Result<Vec<(std::ops::Range<usize>, usize)>, ReviewError> {
     let mut spans: Vec<(std::ops::Range<usize>, usize)> = Vec::with_capacity(content.answer.len());
     for (answer_index, captured_answer) in content.answer.iter().enumerate() {
         let answer = trim_outer_quotes(captured_answer);
@@ -1007,35 +1130,48 @@ fn materialize_cloze_question(
         spans.push((range, answer_index));
     }
     spans.sort_by_key(|(range, _)| range.start);
+    Ok(spans)
+}
 
-    let mut question = String::with_capacity(content.keimenon.len());
-    let mut cursor = 0;
-    for (range, answer_index) in spans {
-        question.push_str(&content.keimenon[cursor..range.start]);
-        if revealed.is_some_and(|values| values[answer_index]) {
-            question.push_str(&content.keimenon[range.clone()]);
-        } else {
-            let answer = trim_outer_quotes(&content.answer[answer_index]);
-            let hint = add_hints
-                .then(|| {
-                    content
-                        .hypothesis
-                        .get(answer_index)
-                        .and_then(Option::as_deref)
-                })
-                .flatten()
-                .filter(|value| !matches!(*value, "" | "nil" | "\"\""))
-                .unwrap_or("...");
-            question.push_str(leading_whitespace(answer));
+fn push_materialized_cloze(
+    question: &mut String,
+    content: &ThemaContent,
+    range: std::ops::Range<usize>,
+    answer_index: usize,
+    state: ReviewClozeState,
+    add_hints: bool,
+) -> ReviewClozeSpan {
+    let answer = trim_outer_quotes(&content.answer[answer_index]);
+    question.push_str(leading_whitespace(answer));
+    let start_byte = question.len();
+    match state {
+        ReviewClozeState::Concealed => {
             question.push('(');
-            question.push_str(hint);
+            question.push_str(cloze_hint(content, answer_index, add_hints));
             question.push(')');
-            question.push_str(trailing_whitespace(answer));
         }
-        cursor = range.end;
+        _ => question.push_str(content.keimenon[range].trim()),
     }
-    question.push_str(&content.keimenon[cursor..]);
-    Ok(question)
+    let span = ReviewClozeSpan {
+        start_byte,
+        end_byte: question.len(),
+        state,
+    };
+    question.push_str(trailing_whitespace(answer));
+    span
+}
+
+fn cloze_hint(content: &ThemaContent, answer_index: usize, add_hints: bool) -> &str {
+    add_hints
+        .then(|| {
+            content
+                .hypothesis
+                .get(answer_index)
+                .and_then(Option::as_deref)
+        })
+        .flatten()
+        .filter(|value| !matches!(*value, "" | "nil" | "\"\""))
+        .unwrap_or("...")
 }
 
 fn ensure_question_is_safe(content: &ThemaContent, question: &str) -> Result<(), ReviewError> {
@@ -1180,8 +1316,9 @@ mod tests {
     use crate::{application::MAX_REVIEW_PACK_ITEMS, domain::MAX_REVIEW_CLOZE_INPUTS};
 
     use super::{
-        PresentationSnapshot, ReviewAttemptMutation, ReviewAttemptOperation, ReviewResponsePrompt,
-        ReviewSource, ReviewSourceKind, review_day_at, review_question,
+        AnswerInput, PresentationSnapshot, ReviewAttemptMutation, ReviewAttemptOperation,
+        ReviewAttemptView, ReviewClozeSpan, ReviewClozeState, ReviewResponsePrompt, ReviewSource,
+        ReviewSourceKind, review_attempt_question, review_day_at, review_question,
     };
 
     fn presentation(kind: &str, keimenon: &str) -> PresentationSnapshot {
@@ -1210,6 +1347,21 @@ mod tests {
             "Question with (Greek hint) and (Cyrillic hint)"
         );
         assert_eq!(
+            question.cloze_spans,
+            vec![
+                ReviewClozeSpan {
+                    start_byte: 14,
+                    end_byte: 26,
+                    state: ReviewClozeState::Concealed,
+                },
+                ReviewClozeSpan {
+                    start_byte: 31,
+                    end_byte: 46,
+                    state: ReviewClozeState::Concealed,
+                },
+            ]
+        );
+        assert_eq!(
             question.response,
             ReviewResponsePrompt::Texts {
                 input_scripts: vec![Some("greek".into()), Some("cyrillic".into())],
@@ -1230,9 +1382,69 @@ mod tests {
         .unwrap();
 
         assert_eq!(check.question, "Question with (Greek hint) and тайна");
+        assert_eq!(
+            check.cloze_spans,
+            vec![
+                ReviewClozeSpan {
+                    start_byte: 14,
+                    end_byte: 26,
+                    state: ReviewClozeState::Concealed,
+                },
+                ReviewClozeSpan {
+                    start_byte: 31,
+                    end_byte: 41,
+                    state: ReviewClozeState::Correct,
+                },
+            ]
+        );
         assert_eq!(check.next_input_script.as_deref(), Some("greek"));
         assert_eq!(check.matches, vec![true]);
         assert!(!check.complete);
+    }
+
+    #[test]
+    fn graded_cloze_question_preserves_matches_and_reveals_the_rest() {
+        let mut captured = presentation("cloze", "alpha beta gamma");
+        captured.answer = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        captured.hypothesis = vec![None, None, None];
+        let attempt = ReviewAttemptView {
+            attempt_id: "attempt".into(),
+            session_id: "session".into(),
+            thema_id: "thema".into(),
+            presentation: captured,
+            matcher_version: 1,
+            response: Some(AnswerInput::Texts(vec!["beta".into(), "wrong".into()])),
+            detected_success: Some(false),
+            accepted_success: Some(false),
+            override_count: 0,
+            proposed_transition: None,
+            desired_suspended: false,
+            status: "graded".into(),
+        };
+
+        let question = review_attempt_question(&attempt).unwrap();
+
+        assert_eq!(question.text, "alpha beta gamma");
+        assert_eq!(
+            question.cloze_spans,
+            vec![
+                ReviewClozeSpan {
+                    start_byte: 0,
+                    end_byte: 5,
+                    state: ReviewClozeState::Incorrect,
+                },
+                ReviewClozeSpan {
+                    start_byte: 6,
+                    end_byte: 10,
+                    state: ReviewClozeState::Correct,
+                },
+                ReviewClozeSpan {
+                    start_byte: 11,
+                    end_byte: 16,
+                    state: ReviewClozeState::Unanswered,
+                },
+            ]
+        );
     }
 
     #[test]

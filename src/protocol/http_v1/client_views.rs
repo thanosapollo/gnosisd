@@ -2,7 +2,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ReviewSessionV1, ReviewSourceInputV1, ReviewSourceV1, ReviewStateV1, ReviewTransitionV1,
+    ReviewClozeSpanV1, ReviewSessionV1, ReviewSourceInputV1, ReviewSourceV1, ReviewStateV1,
+    ReviewTransitionV1,
 };
 use crate::application::{
     ContentCounts, DashboardSummary, ReviewClozeCheck, ReviewHistoryEvent, ReviewQueueCounts,
@@ -317,6 +318,7 @@ pub struct ReviewClozeCheckV1 {
     pub all_entered_correct: bool,
     pub complete: bool,
     pub question: String,
+    pub cloze_spans: Vec<ReviewClozeSpanV1>,
     #[serde(deserialize_with = "super::deserialize_required_option")]
     #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
     pub next_input_script: Option<String>,
@@ -329,6 +331,11 @@ impl From<ReviewClozeCheck> for ReviewClozeCheckV1 {
             all_entered_correct: value.all_entered_correct,
             complete: value.complete,
             question: value.question,
+            cloze_spans: value
+                .cloze_spans
+                .iter()
+                .map(ReviewClozeSpanV1::from)
+                .collect(),
             next_input_script: value.next_input_script,
         }
     }

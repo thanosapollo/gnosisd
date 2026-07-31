@@ -46,9 +46,19 @@
   "Face reserved for successful review content."
   :group 'gnosis)
 
+(defface gnosis-face-cloze
+  '((t :inherit (highlight italic)))
+  "Face for concealed clozes."
+  :group 'gnosis)
+
 (defface gnosis-face-false
   '((t :inherit error))
   "Face reserved for unsuccessful review content."
+  :group 'gnosis)
+
+(defface gnosis-face-unanswered
+  '((t :inherit (italic underline)))
+  "Face for clozes revealed after an incorrect answer."
   :group 'gnosis)
 
 (defface gnosis-face-hint

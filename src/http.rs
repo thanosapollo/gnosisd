@@ -4357,6 +4357,36 @@ mod tests {
             attempt_cases[2]["properties"]["status"]["const"],
             "committed"
         );
+        let presentation_case = |attempt_index: usize, kind: &str| {
+            attempt_cases[attempt_index]["properties"]["presentation"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["properties"]["kind"]["const"] == kind)
+                .unwrap()
+        };
+        let pending_cloze = presentation_case(0, "cloze");
+        assert_eq!(
+            pending_cloze["properties"]["response"]["properties"]["kind"]["const"],
+            "texts"
+        );
+        assert_eq!(
+            pending_cloze["properties"]["cloze_spans"]["items"]["properties"]["state"]["const"],
+            "concealed"
+        );
+        let graded_cloze = presentation_case(1, "cloze");
+        assert_eq!(
+            graded_cloze["properties"]["cloze_spans"]["items"]["properties"]["state"]["enum"],
+            json!(["correct", "incorrect", "unanswered"])
+        );
+        let pending_basic = presentation_case(0, "basic");
+        assert_eq!(pending_basic["properties"]["cloze_spans"]["maxItems"], 0);
+        let graded_mc_cloze = presentation_case(2, "mc-cloze");
+        assert_eq!(graded_mc_cloze["properties"]["cloze_spans"]["maxItems"], 1);
+        assert_eq!(
+            graded_mc_cloze["properties"]["cloze_spans"]["items"]["properties"]["state"]["enum"],
+            json!(["correct", "incorrect"])
+        );
         assert_eq!(
             schemas["ThemaKindV1"]["enum"],
             json!(["basic", "cloze", "mcq", "mc-cloze"])
@@ -4377,6 +4407,20 @@ mod tests {
         assert_eq!(
             presentation["properties"]["response"]["$ref"],
             "#/components/schemas/ReviewResponsePromptV1"
+        );
+        assert_eq!(
+            presentation["properties"]["cloze_spans"]["items"]["$ref"],
+            "#/components/schemas/ReviewClozeSpanV1"
+        );
+        assert_eq!(
+            schemas["ReviewClozeStateV1"]["enum"],
+            json!(["concealed", "correct", "incorrect", "unanswered"])
+        );
+        assert!(
+            presentation["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("cloze_spans"))
         );
         assert_eq!(
             schemas["ReviewResponsePromptV1"]["oneOf"]
@@ -6789,9 +6833,9 @@ mod tests {
             &service,
             "multi-cloze",
             "cloze",
-            "Literal (...) then cat and cut",
-            vec![None, None],
-            vec!["cat".into(), "cut".into()],
+            "Literal (...) then cat and cut and dog",
+            vec![None, None, None],
+            vec!["cat".into(), "cut".into(), "dog".into()],
             None,
         )
         .await;
@@ -6816,12 +6860,31 @@ mod tests {
         assert_eq!(partial["matches"], json!([true]));
         assert_eq!(partial["all_entered_correct"], true);
         assert_eq!(partial["complete"], false);
-        assert_eq!(partial["question"], "Literal (...) then cat and (...)");
+        assert_eq!(
+            partial["question"],
+            "Literal (...) then cat and (...) and (...)"
+        );
         assert_eq!(partial["next_input_script"], Value::Null);
-        let complete = check_cloze_inputs(&app, &token, attempt_id, &["cot", "bat"]).await;
-        assert_eq!(complete["matches"], json!([true, true]));
+        let wrong_first = check_cloze_inputs(&app, &token, attempt_id, &["wrong", "cut"]).await;
+        assert_eq!(wrong_first["matches"], json!([false, false]));
+        assert_eq!(
+            wrong_first["question"],
+            "Literal (...) then (...) and (...) and (...)"
+        );
+        let wrong_middle =
+            check_cloze_inputs(&app, &token, attempt_id, &["cat", "wrong", "dog"]).await;
+        assert_eq!(wrong_middle["matches"], json!([true, false, false]));
+        assert_eq!(
+            wrong_middle["question"],
+            "Literal (...) then cat and (...) and (...)"
+        );
+        let complete = check_cloze_inputs(&app, &token, attempt_id, &["cot", "bat", "dog"]).await;
+        assert_eq!(complete["matches"], json!([true, true, true]));
         assert_eq!(complete["complete"], true);
-        assert_eq!(complete["question"], "Literal (...) then cat and cut");
+        assert_eq!(
+            complete["question"],
+            "Literal (...) then cat and cut and dog"
+        );
         let state =
             authenticated_json(&app, &token, &format!("/v1/review/attempts/{attempt_id}")).await;
         assert_eq!(state["attempt"]["status"], "pending");

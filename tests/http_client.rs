@@ -4149,7 +4149,7 @@ fn review_operation_json(
             "attempt_id":attempt_id,
             "session_id":"session",
             "thema_id":"thema",
-            "presentation":{"kind":"basic","question":"Question",
+            "presentation":{"kind":"basic","question":"Question","cloze_spans":[],
                 "hint":null,
                 "response":{"kind":"text","input_script":null},
                 "source_guid":null,"review_image":null,"tags":[]},

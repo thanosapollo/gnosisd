@@ -15,7 +15,7 @@
   "Return a minimal attempt with STATUS and response PROMPT."
   (list :attempt_id "attempt" :session_id "session" :thema_id "thema"
         :presentation
-        (list :question "Question?"
+        (list :kind "basic" :question "Question?" :cloze_spans []
               :hint gnosis-core--json-null
               :response (or prompt
                             (list :kind "text"
@@ -464,11 +464,12 @@
 
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
   (let ((gnosis-review--attempt
-         (gnosis-test-review--attempt
+          (gnosis-test-review--attempt
           "pending" (list :kind "texts"
                           :input_scripts
-                          (vector gnosis-core--json-null "cyrillic"))))
-        (answers '("one" "δύο"))
+                          (vector gnosis-core--json-null
+                                  gnosis-core--json-null))))
+        (answers '("beta" "alpha"))
         checks
         scripts
         questions)
@@ -481,10 +482,16 @@
                  (push inputs checks)
                  (if (= (length inputs) 1)
                      '(:matches [t] :all_entered_correct t :complete nil
-                       :question "one and (...)"
-                       :next_input_script "greek")
+                       :question "(...) and beta"
+                       :cloze_spans
+                       [(:start_byte 0 :end_byte 5 :state "concealed")
+                        (:start_byte 10 :end_byte 14 :state "correct")]
+                       :next_input_script nil)
                    `(:matches [t t] :all_entered_correct t :complete t
-                     :question "one and δύο"
+                     :question "alpha and beta"
+                     :cloze_spans
+                     [(:start_byte 0 :end_byte 5 :state "correct")
+                      (:start_byte 10 :end_byte 14 :state "correct")]
                      :next_input_script ,gnosis-core--json-null))))
               ((symbol-function 'gnosis-review--render)
                (lambda (&rest _)
@@ -493,12 +500,12 @@
                         :question)
                        questions))))
       (should
-       (equal '(:kind "texts" :value ["one" "δύο"])
+       (equal '(:kind "texts" :value ["beta" "alpha"])
               (gnosis-review--read-answer)))
-      (should (equal '(["one"] ["one" "δύο"]) (nreverse checks)))
-      (should (equal (list gnosis-core--json-null "greek")
+      (should (equal '(["beta"] ["beta" "alpha"]) (nreverse checks)))
+      (should (equal (list gnosis-core--json-null nil)
                      (nreverse scripts)))
-      (should (equal '("one and (...)" "one and δύο")
+      (should (equal '("(...) and beta" "alpha and beta")
                      (nreverse questions)))))
   (let ((gnosis-review--attempt
          (gnosis-test-review--attempt
@@ -526,6 +533,9 @@
                      :all_entered_correct ,gnosis-core--json-false
                      :complete ,gnosis-core--json-false
                      :question "(...) and (...)"
+                     :cloze_spans
+                     [(:start_byte 0 :end_byte 5 :state "concealed")
+                      (:start_byte 10 :end_byte 15 :state "concealed")]
                      :next_input_script ,gnosis-core--json-null)))
                 ((symbol-function 'gnosis-review--render) #'ignore))
         (should (equal '(:kind "texts" :value ["wrong"])
@@ -576,6 +586,111 @@
           (cl-loop for position from (point-min) below (point-max)
                    count (eq (get-text-property position 'face)
                              'gnosis-face-separator)))))))
+
+(ert-deftest gnosis-review-render-faces-exact-cloze-spans ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-center-content nil)
+    (setf (plist-get
+           (plist-get gnosis-review--attempt :presentation) :question)
+          "μυστικό and (hint) plus (literal)"
+          (plist-get
+           (plist-get gnosis-review--attempt :presentation) :cloze_spans)
+          [(:start_byte 0 :end_byte 14 :state "correct")
+           (:start_byte 19 :end_byte 25 :state "concealed")])
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "μυστικό")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-correct))
+      (search-forward "(hint)")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-cloze))
+      (search-forward "(literal)")
+      (should-not (eq (get-text-property (1- (point)) 'face)
+                      'gnosis-face-cloze)))))
+
+(ert-deftest gnosis-review-rejects-mid-codepoint-cloze-spans ()
+  (dolist (spans '([(:start_byte 0 :end_byte 1 :state "concealed")]
+                    [(:start_byte 1 :end_byte 2 :state "concealed")]))
+    (should-error
+     (gnosis-review--question-text
+      (list :question "μx" :cloze_spans spans))
+     :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-review-render-reveals-failed-cloze-inline ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded")
+          gnosis-center-content nil)
+    (let ((presentation (plist-get gnosis-review--attempt :presentation)))
+      (setf (plist-get presentation :kind) "cloze"
+            (plist-get presentation :question) "alpha beta gamma"
+            (plist-get presentation :cloze_spans)
+            [(:start_byte 0 :end_byte 5 :state "incorrect")
+             (:start_byte 6 :end_byte 10 :state "correct")
+             (:start_byte 11 :end_byte 16 :state "unanswered")]))
+    (setf (plist-get gnosis-review--attempt :accepted_success)
+          gnosis-core--json-false)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (dolist (expected '(("alpha" . gnosis-face-false)
+                          ("beta" . gnosis-face-correct)
+                          ("gamma" . gnosis-face-unanswered)))
+        (goto-char (point-min))
+        (search-forward (car expected))
+        (should (eq (get-text-property (1- (point)) 'face)
+                    (cdr expected))))
+      (should-not (string-match-p "\nAnswer:" (buffer-string)))
+      (should (string-match-p "Your answer: response" (buffer-string))))))
+
+(ert-deftest gnosis-review-render-preserves-cloze-faces-through-org-links ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-center-content nil)
+    (let ((presentation (plist-get gnosis-review--attempt :presentation)))
+      (setf (plist-get presentation :kind) "cloze"
+            (plist-get presentation :question)
+            "[[id:one][alpha]] and (...)"
+            (plist-get presentation :cloze_spans)
+            [(:start_byte 10 :end_byte 15 :state "correct")
+             (:start_byte 22 :end_byte 27 :state "concealed")]))
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "alpha")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-correct))
+      (search-forward "(...)")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-cloze)))))
+
+(ert-deftest gnosis-review-render-keeps-whole-link-face-inside-span ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending")
+          gnosis-center-content nil)
+    (let ((presentation (plist-get gnosis-review--attempt :presentation)))
+      (setf (plist-get presentation :kind) "cloze"
+            (plist-get presentation :question) "[[id:one][alpha]] tail"
+            (plist-get presentation :cloze_spans)
+            [(:start_byte 0 :end_byte 17 :state "correct")]))
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "alpha")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-correct))
+      (search-forward " ")
+      (should-not (eq (get-text-property (1- (point)) 'face)
+                      'gnosis-face-correct)))))
 
 (ert-deftest gnosis-review-render-separates-image-from-question ()
   (with-temp-buffer

@@ -26,6 +26,9 @@
   accepted-result override, suspension, commit, and quit/abort.  Revision
   conflicts refresh authoritative attempt state; delivery-unknown mutations
   are never retried automatically and recover through server reads.
++ Cloze reviews now reveal correct answers inline in any order while keeping
+  remaining clozes concealed with the dedicated cloze face.  A failed answer
+  reveals the remaining canonical text with incorrect and unanswered faces.
 + Added a foundation dashboard for daemon health and OpenAPI visibility.
 + Fetch managed review assets through authenticated HTTP and publish only
   private SHA-256-verified cache entries.

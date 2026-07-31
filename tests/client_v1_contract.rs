@@ -289,6 +289,7 @@ fn question() -> Value {
         "presentation": {
             "kind": "basic",
             "question": "Question",
+            "cloze_spans": [],
             "hint": null,
             "response": {"kind": "text", "input_script": null},
             "source_guid": null,

@@ -1826,12 +1826,39 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
               '("Gnosis review answer response is not correlated")))
     attempt))
 
+(defun gnosis-core--utf8-byte-boundary-p (bytes offset)
+  "Return non-nil when OFFSET is a character boundary in UTF-8 BYTES."
+  (or (= offset 0)
+      (= offset (length bytes))
+      (/= (logand (aref bytes offset) #xc0) #x80)))
+
+(defun gnosis-core--review-cloze-spans-valid-p (spans question)
+  "Return non-nil when SPANS are ordered ranges within QUESTION."
+  (and (vectorp spans)
+       (let* ((bytes (encode-coding-string question 'utf-8 t))
+              (previous 0)
+              (limit (length bytes)))
+         (seq-every-p
+          (lambda (span)
+            (let ((start (plist-get span :start_byte))
+                  (end (plist-get span :end_byte)))
+              (and (gnosis-core--json-object-p span)
+                   (natnump start) (natnump end)
+                   (<= previous start) (< start end) (<= end limit)
+                   (gnosis-core--utf8-byte-boundary-p bytes start)
+                   (gnosis-core--utf8-byte-boundary-p bytes end)
+                   (member (plist-get span :state)
+                           '("concealed" "correct" "incorrect" "unanswered"))
+                   (progn (setq previous end) t))))
+          spans))))
+
 (defun gnosis-core--review-cloze-check-valid-p (check inputs)
   "Return non-nil when CHECK is correlated with cloze INPUTS."
   (let* ((matches (plist-get check :matches))
          (all-entered-correct (plist-get check :all_entered_correct))
          (complete (plist-get check :complete))
          (question (plist-get check :question))
+         (spans (plist-get check :cloze_spans))
          (script (plist-get check :next_input_script))
          (expected-all-correct
           (if (and (vectorp matches)
@@ -1851,6 +1878,13 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
                   (eq script gnosis-core--json-null)))
          (stringp question)
          (not (string-empty-p (string-trim question)))
+         (vectorp spans)
+         (> (length spans) 0)
+         (gnosis-core--review-cloze-spans-valid-p spans question)
+         (seq-every-p
+          (lambda (span)
+            (member (plist-get span :state) '("concealed" "correct")))
+          spans)
          (or (eq script gnosis-core--json-null)
              (and (stringp script)
                   (let ((case-fold-search nil))

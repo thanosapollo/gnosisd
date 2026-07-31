@@ -162,6 +162,61 @@
   (let ((formatted (string-trim-right (gnosis-org-format-string text))))
     (if face (propertize formatted 'face face) formatted)))
 
+(defun gnosis-review--cloze-face (state)
+  "Return the semantic face for cloze STATE."
+  (pcase state
+    ("concealed" 'gnosis-face-cloze)
+    ("correct" 'gnosis-face-correct)
+    ("incorrect" 'gnosis-face-false)
+    ("unanswered" 'gnosis-face-unanswered)
+    (_ (gnosis-core--invalid "Invalid Gnosis cloze state"))))
+
+(defun gnosis-review--cloze-range (text span)
+  "Return character range in TEXT for byte-based cloze SPAN."
+  (let* ((bytes (encode-coding-string text 'utf-8 t))
+         (start (plist-get span :start_byte))
+         (end (plist-get span :end_byte)))
+    (unless (and (natnump start) (natnump end)
+                 (< start end) (<= end (length bytes)))
+      (gnosis-core--invalid "Invalid Gnosis cloze span"))
+    (let ((prefix (decode-coding-string (substring bytes 0 start) 'utf-8 t))
+          (value (decode-coding-string (substring bytes start end) 'utf-8 t)))
+      (unless (and (equal (substring bytes 0 start)
+                          (encode-coding-string prefix 'utf-8 t))
+                   (equal (substring bytes start end)
+                          (encode-coding-string value 'utf-8 t)))
+        (gnosis-core--invalid "Invalid Gnosis cloze span"))
+      (cons (length prefix) (+ (length prefix) (length value))))))
+
+(defun gnosis-review--question-text (presentation)
+  "Return PRESENTATION question with exact cloze faces."
+  (let* ((text (copy-sequence (plist-get presentation :question)))
+         (spans (plist-get presentation :cloze_spans)))
+    (unless (gnosis-core--review-cloze-spans-valid-p spans text)
+      (gnosis-core--invalid "Invalid Gnosis cloze spans"))
+    (seq-doseq (span spans)
+      (pcase-let ((`(,start . ,end)
+                   (gnosis-review--cloze-range text span)))
+        (put-text-property
+         start end 'gnosis-review-cloze-face
+         (gnosis-review--cloze-face (plist-get span :state))
+         text)))
+    (let ((formatted
+           (string-trim-right (gnosis-org-format-string text)))
+          (position 0))
+      (while (< position (length formatted))
+        (let* ((face (get-text-property
+                      position 'gnosis-review-cloze-face formatted))
+               (end (next-single-property-change
+                     position 'gnosis-review-cloze-face formatted
+                     (length formatted))))
+          (when face
+            (add-face-text-property position end face nil formatted))
+          (setq position end)))
+      (remove-text-properties
+       0 (length formatted) '(gnosis-review-cloze-face nil) formatted)
+      formatted)))
+
 (defun gnosis-review--content-text (text &optional face)
   "Return centered display TEXT, optionally with semantic FACE."
   (gnosis--center-text (gnosis-review--styled-text text face)))
@@ -198,22 +253,27 @@
            (let ((value (plist-get presentation :review_image)))
              (unless (eq value gnosis-core--json-null) value)))
       (gnosis-review--insert-separator))
-    (insert (gnosis-review--content-text (plist-get presentation :question)))
+    (insert (gnosis--center-text
+             (gnosis-review--question-text presentation)))
     (let ((hint (plist-get presentation :hint)))
       (unless (eq hint gnosis-core--json-null)
         (gnosis-review--insert-separator)
         (insert (gnosis-review--content-text hint 'gnosis-face-hint))))
     (unless pending
-      (let* ((accepted (plist-get gnosis-review--attempt :accepted_success))
+      (let* ((cloze-p
+              (member (plist-get presentation :kind)
+                      '("cloze" "mc-cloze")))
+             (accepted (plist-get gnosis-review--attempt :accepted_success))
              (response (gnosis-review--response-text
                         (plist-get gnosis-review--attempt :response))))
-        (gnosis-review--insert-separator)
-        (insert
-         (gnosis-review--labeled-text
-          "Answer:"
-          (gnosis-review--answer-text
-           (plist-get gnosis-review--attempt :revealed_answer))
-          'gnosis-face-correct))
+        (unless cloze-p
+          (gnosis-review--insert-separator)
+          (insert
+           (gnosis-review--labeled-text
+            "Answer:"
+            (gnosis-review--answer-text
+             (plist-get gnosis-review--attempt :revealed_answer))
+            'gnosis-face-correct)))
         (unless (eq accepted t)
           (gnosis-review--insert-separator)
           (insert
@@ -302,9 +362,12 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
               continue
               (and (eq t (aref matches (1- (length matches))))
                    (not (eq t (plist-get check :complete)))))
-        (setf (plist-get
-               (plist-get gnosis-review--attempt :presentation) :question)
-              (plist-get check :question))
+        (let ((presentation
+               (plist-get gnosis-review--attempt :presentation)))
+          (setf (plist-get presentation :question)
+                (plist-get check :question)
+                (plist-get presentation :cloze_spans)
+                (plist-get check :cloze_spans)))
         (gnosis-review--render)))
     (list :kind "texts" :value inputs)))
 

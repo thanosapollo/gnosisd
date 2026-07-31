@@ -51,12 +51,12 @@ use crate::{
             NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
             ReviewAnswerV1, ReviewAttemptBeginResponseV1, ReviewAttemptOperationResponseV1,
             ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
-            ReviewClozeCheckV1, ReviewCommitResponseV1, ReviewHistoryPageV1,
-            ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2, ReviewPackStatusV2,
-            ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1, ReviewSessionListRequestV1,
-            ReviewSessionModeV1, ReviewSessionPageV1, ReviewSessionRequestV1,
-            ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1, ReviewSourceV1,
-            ReviewStateV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
+            ReviewClozeCheckV1, ReviewClozeSpanV1, ReviewClozeStateV1, ReviewCommitResponseV1,
+            ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
+            ReviewPackStatusV2, ReviewQueueSummaryRequestV1, ReviewQueueSummaryV1,
+            ReviewSessionListRequestV1, ReviewSessionModeV1, ReviewSessionPageV1,
+            ReviewSessionRequestV1, ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
+            ReviewSourceV1, ReviewStateV1, SetAcceptedSuccessRequestV1, SetSuspensionRequestV1,
             SetThemaSuspensionRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogItemV1,
             ThemaCatalogPageV1, ThemaKindV1, ThemaPageV1, ThemaReviewStateV1, ThemaV1,
             ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
@@ -2064,12 +2064,31 @@ fn checked_cloze_check(
         && result.all_entered_correct == all_entered_correct
         && (!result.complete || (all_entered_correct && result.next_input_script.is_none()))
         && !result.question.trim().is_empty()
+        && valid_progressive_cloze_spans(&result.question, &result.cloze_spans)
         && script_is_valid
     {
         Ok(result)
     } else {
         Err(invalid_response())
     }
+}
+
+fn valid_progressive_cloze_spans(question: &str, spans: &[ReviewClozeSpanV1]) -> bool {
+    let mut previous_end = 0;
+    !spans.is_empty()
+        && spans.iter().all(|span| {
+            let valid = previous_end <= span.start_byte
+                && span.start_byte < span.end_byte
+                && span.end_byte <= question.len()
+                && question.is_char_boundary(span.start_byte)
+                && question.is_char_boundary(span.end_byte)
+                && matches!(
+                    span.state,
+                    ReviewClozeStateV1::Concealed | ReviewClozeStateV1::Correct
+                );
+            previous_end = span.end_byte;
+            valid
+        })
 }
 
 fn checked_begin_result(
@@ -2122,6 +2141,7 @@ fn checked_attempt(
 
 fn valid_attempt(attempt: &ReviewAttemptV1) -> bool {
     attempt.has_valid_status_fields()
+        && attempt.has_valid_presentation_fields()
         && require_review_id(&attempt.attempt_id).is_ok()
         && require_review_id(&attempt.session_id).is_ok()
         && require_review_id(&attempt.thema_id).is_ok()
@@ -3071,6 +3091,11 @@ mod tests {
                 "all_entered_correct": all_entered_correct,
                 "complete": complete,
                 "question": question,
+                "cloze_spans": [{
+                    "start_byte": 0,
+                    "end_byte": 8,
+                    "state": "correct"
+                }],
                 "next_input_script": next_input_script
             })
         };
@@ -3080,12 +3105,18 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let mut invalid_span = response(vec![true], true, false, "Question", Some("greek"));
+        invalid_span["cloze_spans"][0]["end_byte"] = serde_json::json!(9);
+        let mut graded_state = response(vec![true], true, false, "Question", Some("greek"));
+        graded_state["cloze_spans"][0]["state"] = serde_json::json!("incorrect");
         for malformed in [
             response(vec![], true, false, "Question", Some("greek")),
             response(vec![false], true, false, "Question", Some("greek")),
             response(vec![true], true, true, "Question", Some("greek")),
             response(vec![true], true, false, "", Some("greek")),
             response(vec![true], true, false, "Question", Some("Greek")),
+            invalid_span,
+            graded_state,
         ] {
             assert!(matches!(
                 cloze_check_response(malformed).await,

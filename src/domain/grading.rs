@@ -71,20 +71,20 @@ pub(crate) fn check_clozes(answers: &[String], inputs: &[String]) -> ClozeCheck 
         .collect::<Vec<_>>();
     let adjacency = cloze_adjacency(&normalized_answers, &normalized_inputs);
     let mut answer_owners = vec![None; answers.len()];
-    for input_index in 0..inputs.len() {
+    let mut matches = vec![false; inputs.len()];
+    for (input_index, matched) in matches.iter_mut().enumerate() {
         let mut visited = vec![false; answers.len()];
-        assign_cloze(
+        if !assign_cloze(
             input_index,
             &adjacency.edges,
             &mut answer_owners,
             &mut visited,
-        );
+        ) {
+            break;
+        }
+        *matched = true;
     }
     let revealed = answer_owners.iter().map(Option::is_some).collect();
-    let mut matches = vec![false; inputs.len()];
-    for input_index in answer_owners.into_iter().flatten() {
-        matches[input_index] = true;
-    }
     let all_entered_correct = matches.iter().all(|matched| *matched);
     ClozeCheck {
         complete: inputs.len() == answers.len() && all_entered_correct,
@@ -331,6 +331,30 @@ mod tests {
         assert_eq!(
             check_clozes(&answers, &["alpha".into(), "alpha".into()]).matches,
             vec![true, false]
+        );
+    }
+
+    #[test]
+    fn cloze_matching_stops_at_the_first_failure() {
+        let answers = vec!["alpha".into(), "beta".into(), "gamma".into()];
+
+        assert_eq!(
+            check_clozes(&answers, &["wrong".into(), "beta".into()]),
+            super::ClozeCheck {
+                matches: vec![false, false],
+                all_entered_correct: false,
+                complete: false,
+                revealed: vec![false, false, false],
+            }
+        );
+        assert_eq!(
+            check_clozes(&answers, &["alpha".into(), "wrong".into(), "gamma".into()]),
+            super::ClozeCheck {
+                matches: vec![true, false, false],
+                all_entered_correct: false,
+                complete: false,
+                revealed: vec![true, false, false],
+            }
         );
     }
 
