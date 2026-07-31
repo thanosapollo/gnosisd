@@ -335,6 +335,57 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                  200 nil nil t (("If-Match" . "\"3\"")))
                calls)))))
 
+(ert-deftest gnosis-core-mutation-revalidates-response-after-contract-refresh ()
+  (let* ((stale (gnosis-test-core--contract))
+         (fresh (copy-tree stale t))
+         (widget (plist-get
+                  (plist-get (plist-get fresh :components) :schemas)
+                  :Widget))
+         (gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842" :document stale))
+         (requests 0)
+         (refreshes 0))
+    (setf (plist-get (plist-get widget :properties) :extra)
+          '(:type "boolean"))
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf requests)
+                 '(:id "widget" :extra t)))
+              ((symbol-function 'gnosis-core-refresh-contract)
+               (lambda ()
+                 (cl-incf refreshes)
+                 (setf (plist-get gnosis-core--contract-cache :document)
+                       fresh))))
+      (should
+       (equal '(:id "widget" :extra t)
+              (gnosis-core--typed-request
+               "put_widget" '(("id" . "widget")) nil '(:value "text")
+               '(("If-Match" . "\"3\"")))))
+      (should (= requests 1))
+      (should (= refreshes 1)))))
+
+(ert-deftest gnosis-core-mutation-rejects-response-after-contract-refresh ()
+  (let* ((contract (gnosis-test-core--contract))
+         (gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842" :document contract))
+         (requests 0)
+         (refreshes 0))
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf requests)
+                 '(:id "widget" :extra t)))
+              ((symbol-function 'gnosis-core-refresh-contract)
+               (lambda ()
+                 (cl-incf refreshes)
+                 contract)))
+      (should-error
+       (gnosis-core--typed-request
+        "put_widget" '(("id" . "widget")) nil '(:value "text")
+        '(("If-Match" . "\"3\"")))
+       :type 'gnosis-core-mutation-uncertain)
+      (should (= requests 1))
+      (should (= refreshes 1)))))
+
 (ert-deftest gnosis-core-typed-request-rejects-contract-drift ()
   (let ((gnosis-core--contract-cache
          (list :base "http://127.0.0.1:7842"

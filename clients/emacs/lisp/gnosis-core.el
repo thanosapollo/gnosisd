@@ -982,12 +982,31 @@ PATH-VALUES, QUERY, and HEADERS contain the supplied bindings."
       (gnosis-core--invalid "Gnosis operation has ambiguous success responses"))
     (car matches)))
 
+(defun gnosis-core--refreshed-response-valid-p
+    (identity method template success value)
+  "Return non-nil when refreshed IDENTITY accepts response VALUE.
+METHOD, TEMPLATE, and SUCCESS describe the operation that produced VALUE.
+This refreshes the contract without repeating the operation."
+  (condition-case nil
+      (let* ((contract (gnosis-core-refresh-contract))
+             (entry (gnosis-core--operation-entry identity))
+             (operation (plist-get entry :operation))
+             (fresh-success (gnosis-core--operation-success operation)))
+        (and (equal method (plist-get entry :method))
+             (equal template (plist-get entry :path))
+             (= (car success) (car fresh-success))
+             (cdr fresh-success)
+             (gnosis-core--schema-valid-p
+              value (cdr fresh-success) contract)))
+    (error nil)))
+
 (defun gnosis-core--typed-request
     (identity &optional path-values query body headers)
   "Execute live-contract operation IDENTITY.
 PATH-VALUES fill declared path parameters.  QUERY, BODY, and HEADERS supply
 the remaining declared request inputs."
-  (let* ((contract (gnosis-core--contract))
+  (let* ((cached (gnosis-core--contract-cached-p))
+         (contract (gnosis-core--contract))
          (entry (gnosis-core--operation-entry identity))
          (operation (plist-get entry :operation))
          (method (plist-get entry :method))
@@ -1023,8 +1042,13 @@ the remaining declared request inputs."
                   (signal (car condition) (cdr condition))
                 (signal 'gnosis-core-mutation-uncertain
                         '("Gnosis mutation outcome is uncertain")))))))
-      (unless (and (cdr success)
-                   (gnosis-core--schema-valid-p value (cdr success) contract))
+      (unless (or (and (cdr success)
+                       (gnosis-core--schema-valid-p
+                        value (cdr success) contract))
+                  (and cached
+                       (not (equal method "GET"))
+                       (gnosis-core--refreshed-response-valid-p
+                        identity method template success value)))
         (if (equal method "GET")
             (gnosis-core--invalid "Invalid Gnosis operation response")
           (signal 'gnosis-core-mutation-uncertain
