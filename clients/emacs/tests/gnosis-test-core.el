@@ -364,6 +364,41 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (should (= requests 1))
       (should (= refreshes 1)))))
 
+(ert-deftest gnosis-core-mutation-rejects-refreshed-auth-doctrine-drift ()
+  (dolist (key '(:security :x-gnosis-required-scopes))
+    (let* ((stale (gnosis-test-core--contract))
+           (fresh (copy-tree stale t))
+           (widget (plist-get
+                    (plist-get (plist-get fresh :components) :schemas)
+                    :Widget))
+           (operation (plist-get
+                       (plist-get (plist-get fresh :paths)
+                                  :/v1/widgets/{id})
+                       :put))
+           (gnosis-core--contract-cache
+            (list :base "http://127.0.0.1:7842" :document stale))
+           (requests 0)
+           (refreshes 0))
+      (setf (plist-get (plist-get widget :properties) :extra)
+            '(:type "boolean")
+            (plist-get operation key) [])
+      (cl-letf (((symbol-function 'gnosis-core--request)
+                 (lambda (&rest _)
+                   (cl-incf requests)
+                   '(:id "widget" :extra t)))
+                ((symbol-function 'gnosis-core-refresh-contract)
+                 (lambda ()
+                   (cl-incf refreshes)
+                   (setf (plist-get gnosis-core--contract-cache :document)
+                         fresh))))
+        (should-error
+         (gnosis-core--typed-request
+          "put_widget" '(("id" . "widget")) nil '(:value "text")
+          '(("If-Match" . "\"3\"")))
+         :type 'gnosis-core-mutation-uncertain)
+        (should (= requests 1))
+        (should (= refreshes 1))))))
+
 (ert-deftest gnosis-core-mutation-rejects-response-after-contract-refresh ()
   (let* ((contract (gnosis-test-core--contract))
          (gnosis-core--contract-cache

@@ -994,6 +994,8 @@ This refreshes the contract without repeating the operation."
              (fresh-success (gnosis-core--operation-success operation)))
         (and (equal method (plist-get entry :method))
              (equal template (plist-get entry :path))
+             (gnosis-core--operation-bearer-p operation)
+             (gnosis-core--operation-scopes-p operation)
              (= (car success) (car fresh-success))
              (cdr fresh-success)
              (gnosis-core--schema-valid-p
