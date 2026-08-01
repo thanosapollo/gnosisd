@@ -289,7 +289,7 @@
             (gnosis-review--insert-separator)
             (insert
              (gnosis-review--content-text
-              parathema 'gnosis-face-hint))))))
+              parathema 'font-lock-doc-face))))))
     (goto-char (if start-at-top (point-min) (min old-point (point-max))))
     (when old-window-start
       (set-window-start
@@ -329,11 +329,7 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
       ("text"
        (let ((script (plist-get prompt :input_script)))
          (list :kind "text" :value
-               (gnosis-review--read-string
-                (if (eq script gnosis-core--json-null)
-                    "Answer: "
-                  (format "Answer (%s): " script))
-                script))))
+               (gnosis-review--read-string "Answer: " script))))
       ("texts"
        (gnosis-review--read-cloze-answer prompt))
       ("choice"
@@ -350,12 +346,7 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
         continue)
     (setq continue t)
     (while continue
-      (let* ((index (1+ (length inputs)))
-             (input (gnosis-review--read-string
-                     (if (eq script gnosis-core--json-null)
-                         (format "Answer %d: " index)
-                       (format "Answer %d (%s): " index script))
-                     script))
+      (let* ((input (gnosis-review--read-string "Answer: " script))
              (next-inputs (vconcat inputs (vector input)))
              (check (gnosis-core-review-attempt-check-cloze
                      attempt-id next-inputs))

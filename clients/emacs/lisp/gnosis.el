@@ -408,10 +408,21 @@
     (buffer-string)))
 
 (defun gnosis-center-string (string)
-  "Return STRING centered for the selected window width."
-  (let* ((width (max 1 (window-body-width)))
-         (padding (max 0 (/ (- width (string-width string)) 2))))
-    (concat (make-string padding ?\s) string)))
+  "Return STRING filled and centered for the selected window width."
+  (if (string-blank-p string)
+      ""
+    (let* ((width (max 1 (window-body-width)))
+           (wrapped
+            (with-temp-buffer
+              (insert (string-trim string))
+              (let ((fill-column (min fill-column width)))
+                (fill-region (point-min) (point-max)))
+              (buffer-string))))
+      (mapconcat
+       (lambda (line)
+         (let ((padding (max 0 (/ (- width (string-width line)) 2))))
+           (concat (make-string padding ?\s) line)))
+       (split-string wrapped "\n") "\n"))))
 
 (defun gnosis--center-text (text)
   "Return TEXT centered line by line when centering is enabled."

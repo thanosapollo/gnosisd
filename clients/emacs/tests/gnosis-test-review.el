@@ -516,6 +516,17 @@
 
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
   (let ((gnosis-review--attempt
+         (gnosis-test-review--attempt
+          "pending" '(:kind "text" :input_script "Greek")))
+        arguments)
+    (cl-letf (((symbol-function 'gnosis-review--read-string)
+               (lambda (&rest args)
+                 (setq arguments args)
+                 "logos")))
+      (should (equal '(:kind "text" :value "logos")
+                     (gnosis-review--read-answer)))
+      (should (equal '("Answer: " "Greek") arguments))))
+  (let ((gnosis-review--attempt
           (gnosis-test-review--attempt
           "pending" (list :kind "texts"
                           :input_scripts
@@ -523,10 +534,12 @@
                                   gnosis-core--json-null))))
         (answers '("beta" "alpha"))
         checks
+        prompts
         scripts
         questions)
     (cl-letf (((symbol-function 'gnosis-review--read-string)
-               (lambda (_prompt script)
+               (lambda (prompt script)
+                 (push prompt prompts)
                  (push script scripts)
                  (pop answers)))
               ((symbol-function 'gnosis-core-review-attempt-check-cloze)
@@ -555,6 +568,7 @@
        (equal '(:kind "texts" :value ["beta" "alpha"])
               (gnosis-review--read-answer)))
       (should (equal '(["beta"] ["beta" "alpha"]) (nreverse checks)))
+      (should (equal '("Answer: " "Answer: ") (nreverse prompts)))
       (should (equal (list gnosis-core--json-null nil)
                      (nreverse scripts)))
       (should (equal '("(...) and beta" "alpha and beta")
@@ -799,6 +813,22 @@
                  (padding (- (length line) (length text))))
             (should (= padding (/ (- 80 (string-width text)) 2)))))))))
 
+(ert-deftest gnosis-review-render-wraps-long-lines-before-centering ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (let ((fill-column 20))
+      (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 40)))
+        (let ((lines (split-string
+                      (gnosis--center-text
+                       "alpha beta gamma delta epsilon")
+                      "\n")))
+          (should (= 2 (length lines)))
+          (dolist (line lines)
+            (let* ((text (string-trim-left line))
+                   (padding (- (length line) (length text))))
+              (should (<= (string-width text) fill-column))
+              (should (= padding (/ (- 40 (string-width text)) 2))))))))))
+
 (ert-deftest gnosis-review-render-shows-centered-user-answer-on-failure ()
   (with-temp-buffer
     (gnosis-review-mode)
@@ -830,6 +860,20 @@
       (gnosis-review--render)
       (dolist (line (split-string (buffer-string) "\n"))
         (should-not (and (string-blank-p line) (> (length line) 1)))))))
+
+(ert-deftest gnosis-review-render-gives-parathema-doc-face ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-center-content nil
+          gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "graded"))
+    (setf (plist-get gnosis-review--attempt :revealed_parathema) "Context")
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "Context")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'font-lock-doc-face)))))
 
 (ert-deftest gnosis-review-render-omits-operational-result-state ()
   (with-temp-buffer
