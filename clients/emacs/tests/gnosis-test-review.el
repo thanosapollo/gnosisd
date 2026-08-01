@@ -45,6 +45,7 @@
 
 (ert-deftest gnosis-review-map-is-direct-state-aware-and-discoverable ()
   (dolist (case `(("pending" "RET" gnosis-review--answer)
+                  ("pending" "e" gnosis-review--edit)
                   ("graded" "n" gnosis-review--commit-next)
                   ("graded" "o" gnosis-review--override)
                   ("graded" "s" gnosis-review--toggle-suspension)
@@ -77,7 +78,7 @@
 
 (ert-deftest gnosis-review-actions-preserve-popup-only-for-local-state ()
   (let ((rows (keymap-popup--meta gnosis-review-mode-map 'descriptions)))
-    (dolist (key '("RET" "n" "g"))
+    (dolist (key '("RET" "e" "n" "g"))
       (should-not
        (plist-get (keymap-popup--find-entry-by-key rows key) :stay-open)))
     (dolist (key '("o" "s"))
@@ -460,6 +461,57 @@
           (should (equal popups
                          (list gnosis-review-mode-map
                                gnosis-review-mode-map))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gnosis-review-edit-reconciles-changed-thema-through-begin ()
+  (let ((buffer (generate-new-buffer " *gnosis-review-edit-test*"))
+        callback
+        begun-session
+        opened-id
+        presented-buffer
+        returned-buffer
+        (active-session (gnosis-test-review--session))
+        (next-session (gnosis-test-review--session))
+        (next-attempt (gnosis-test-review--attempt "pending")))
+    (setf (plist-get next-session :current_position) 1
+          (plist-get next-attempt :attempt_id) "attempt-2")
+    (unwind-protect
+        (with-current-buffer buffer
+          (gnosis-review-mode)
+          (setq gnosis-review--session active-session
+                gnosis-review--attempt
+                (gnosis-test-review--attempt "pending"))
+          (cl-letf (((symbol-function 'gnosis-edit-thema)
+                     (lambda (thema-id after-save)
+                       (setq opened-id thema-id
+                             callback after-save)))
+                    ((symbol-function 'pop-to-buffer-same-window)
+                     (lambda (target &rest _)
+                       (setq returned-buffer target)))
+                    ((symbol-function 'gnosis-review--refresh)
+                     (lambda () (ert-fail "must re-enter through begin")))
+                    ((symbol-function 'gnosis-review--active-session)
+                     (lambda () active-session))
+                    ((symbol-function 'gnosis-core-review-attempt-begin)
+                     (lambda (session-id)
+                       (setq begun-session session-id)
+                       (gnosis-test-review--begin-result
+                        next-attempt next-session)))
+                    ((symbol-function 'gnosis-review--present)
+                     (lambda (&rest _)
+                       (setq presented-buffer (current-buffer)))))
+            (should (fboundp 'gnosis-review--edit))
+            (funcall 'gnosis-review--edit)
+            (should (equal "thema" opened-id))
+            (should (functionp callback))
+            (funcall callback '(:thema_id "thema" :revision 2))
+            (should (eq buffer returned-buffer))
+            (should (equal "session" begun-session))
+            (should (eq buffer presented-buffer))
+            (should (equal "attempt-2"
+                           (plist-get gnosis-review--attempt :attempt_id)))
+            (should (= 1 (plist-get gnosis-review--session
+                                    :current_position)))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()

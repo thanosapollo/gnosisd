@@ -23,6 +23,8 @@
 (require 'gnosis-completion)
 (require 'subr-x)
 
+(declare-function gnosis-edit-thema "gnosis-edit")
+
 (defvar gnosis-review-buffer-name "*gnosis*"
   "Buffer name reserved for Gnosis review.")
 
@@ -84,6 +86,7 @@
   "n" ("Commit & next" gnosis-review--commit-next
        :inapt-if #'gnosis-review--pending-p)
   :group "State"
+  "e" ("Edit thema" gnosis-review--edit)
   "o" ("Override" gnosis-review--override
        :inapt-if #'gnosis-review--pending-p :stay-open t)
   "s" (#'gnosis-review--suspension-description gnosis-review--toggle-suspension
@@ -708,6 +711,25 @@ When a review is active, prompt to resume it, replace it, or cancel."
             (gnosis-review--render)
             (keymap-popup gnosis-review-mode-map))
         (gnosis-review--present)))))
+
+(defun gnosis-review--edited (buffer _projection)
+  "Return to review BUFFER and reconcile it after a saved edit."
+  (when (buffer-live-p buffer)
+    (pop-to-buffer-same-window buffer)
+    (with-current-buffer buffer
+      (when (derived-mode-p 'gnosis-review-mode)
+        (gnosis-review--next)))))
+
+(defun gnosis-review--edit ()
+  "Edit the current review thema through the shared editor."
+  (interactive)
+  (let ((buffer (current-buffer))
+        (thema-id (plist-get gnosis-review--attempt :thema_id)))
+    (unless (and (stringp thema-id) (not (string-empty-p thema-id)))
+      (user-error "Current review attempt has no thema identity"))
+    (gnosis-edit-thema
+     thema-id (lambda (projection)
+                (gnosis-review--edited buffer projection)))))
 
 (defun gnosis-review--quit ()
   "Close the local review buffer without mutating its durable session."
