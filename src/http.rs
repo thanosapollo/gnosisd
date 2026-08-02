@@ -1520,7 +1520,7 @@ async fn search_nodes(
     }
     let limit = page_limit(query.limit)?;
     let items = if let Some(tag) = query.tag {
-        if !(1..=256).contains(&tag.len()) || tag.trim().is_empty() {
+        if !(1..=256).contains(&tag.chars().count()) || tag.trim().is_empty() {
             return Err(ApiError::bad_request("invalid tag"));
         }
         state
@@ -5911,6 +5911,41 @@ mod tests {
             service.replace_note(prepared, 2, None).await.unwrap();
         }
         let app = router(service.clone());
+        let unicode_256 = "%CE%B1".repeat(256);
+        let unicode_257 = format!("{unicode_256}%CE%B1");
+        for path in [
+            format!("/v1/nodes?tag={unicode_256}"),
+            format!("/v1/nodes/content-search?q={unicode_256}"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized("GET", &path, &token, Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        for path in [
+            format!("/v1/nodes?tag={unicode_257}"),
+            format!("/v1/nodes/content-search?q={unicode_257}"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(authorized("GET", &path, &token, Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let api = openapi_document();
+        for (path, parameter_name) in [("/v1/nodes", "tag"), ("/v1/nodes/content-search", "q")] {
+            let parameter = api["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|parameter| parameter["name"] == parameter_name)
+                .unwrap();
+            assert_eq!(parameter["schema"]["minLength"], 1);
+            assert_eq!(parameter["schema"]["maxLength"], 256);
+        }
         let tags = app
             .clone()
             .oneshot(authorized(

@@ -82,7 +82,7 @@ pub(crate) struct ContentSearchPosition {
 
 pub(crate) fn normalize_content_search_query(value: &str) -> Result<String, ()> {
     let value = value.trim();
-    if (1..=256).contains(&value.len()) {
+    if (1..=256).contains(&value.chars().count()) {
         Ok(value.to_owned())
     } else {
         Err(())
