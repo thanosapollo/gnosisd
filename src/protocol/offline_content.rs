@@ -67,12 +67,17 @@ pub(crate) struct DecodedOfflineContent {
 
 #[derive(Debug, Error)]
 pub(crate) enum OfflineContentWireError {
+    #[error("offline content protocol version is unsupported")]
+    Version,
     #[error("offline content operation is invalid")]
     Operation,
 }
 
 impl OfflineContentOperationEnvelopeV1 {
     pub(crate) fn decode(self) -> Result<DecodedOfflineContent, OfflineContentWireError> {
+        if self.version != OFFLINE_CONTENT_VERSION {
+            return Err(OfflineContentWireError::Version);
+        }
         validate_operation(&self.operation)?;
         let canonical_payload = encode_operation(&self.operation)?;
         Ok(DecodedOfflineContent {
