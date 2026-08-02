@@ -5927,6 +5927,8 @@ mod tests {
         for path in [
             format!("/v1/nodes?tag={unicode_257}"),
             format!("/v1/nodes/content-search?q={unicode_257}"),
+            format!("/v1/nodes/content-search?q=%20{unicode_256}"),
+            format!("/v1/nodes/content-search?q={unicode_256}%20"),
         ] {
             let response = app
                 .clone()
