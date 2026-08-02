@@ -20,7 +20,9 @@ offline-editable Org working tree, customize =gnosis-nodes-dir= and run
 the file and synchronizes it with =gnosisd=.  Saving a new Org file below
 =gnosis-nodes-dir= creates its canonical document.  =M-x gnosis-nodes-sync=
 remains available for explicit synchronization.  Conflicts preserve local
-content and require explicit Ediff resolution and acceptance.
+content and require explicit Ediff resolution and acceptance.  Use
+=M-x gnosis-nodes-insert= to insert an Org ID link; a new completion title
+creates and synchronizes a root node first.
 
 The client resolves operation identities and strict schemas from the daemon's
 live OpenAPI document; it has no handwritten Gnosis DTOs or direct route

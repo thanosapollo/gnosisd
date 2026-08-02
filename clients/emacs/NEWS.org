@@ -12,6 +12,8 @@
   sync, blob, and mutation operations.  Minimal durable state tracks cursors,
   bases, outbox entries, and explicit conflicts without duplicating daemon
   parsing, projections, graph state, revisions, or scheduling.
++ Restored ~gnosis-nodes-insert~ for Org ID links, custom or region descriptions,
+  and explicit root-node creation from a new completion title.
 + Reduced the package to seven focused client modules.  Removed embedded
   persistence, scheduling, grading, import, note, and compatibility backends.
 + Added bounded HTTP transport, bearer credentials resolved through

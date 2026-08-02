@@ -34,6 +34,11 @@ Delivery-unknown mutations are never retried automatically.
 Use =gnosis-nodes-track-file= for offline one-file enrollment and
 =gnosis-nodes-list-conflicts= before selecting a conflict resolution command.
 
+Use =M-x gnosis-nodes-insert= to insert an Org ID link to a selected node.  The
+node title is the default description; a prefix argument prompts for custom
+text, and an active region takes precedence.  Entering a new title creates and
+saves a synchronized root node before inserting its generated ID.
+
 Opening or discovering files never implies create, rename, or deletion.  Saving
 a new Org file below =gnosis-nodes-dir= explicitly enrolls and creates it.  Use
 =M-x gnosis-nodes-rename-file= and =M-x gnosis-nodes-tombstone-file= for rename

@@ -15,6 +15,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'org)
+(require 'org-id)
 (require 'seq)
 (require 'subr-x)
 (require 'gnosis-core)
@@ -26,6 +27,12 @@
 (defcustom gnosis-nodes-dir (expand-file-name "~/Notes/")
   "Root directory containing synchronized Org files."
   :type 'directory
+  :group 'gnosis-nodes)
+
+(defcustom gnosis-nodes-timestring "%Y%m%d%H%M%S"
+  "Time format prepended to filenames created by `gnosis-nodes-insert'.
+When nil, use only the selected node title."
+  :type '(choice string (const :tag "Title only" nil))
   :group 'gnosis-nodes)
 
 (defcustom gnosis-nodes-state-file nil
@@ -658,6 +665,78 @@ When REFRESH is non-nil, always fetch a new catalog."
     (when (derived-mode-p 'org-mode)
       (org-fold-show-context 'org-goto))
     buffer))
+
+(defun gnosis-nodes--new-filename (title)
+  "Return a safe Org filename for new root node TITLE."
+  (let ((name (replace-regexp-in-string
+               "[#/\\\\]" ""
+               (replace-regexp-in-string "[[:space:]]+" "_" title))))
+    (when (string-empty-p name)
+      (user-error "Node title must contain a filename character"))
+    (format "%s.org"
+            (if gnosis-nodes-timestring
+                (format "%s--%s"
+                        (format-time-string gnosis-nodes-timestring) name)
+              name))))
+
+(defun gnosis-nodes--create-root (title)
+  "Create and save a synchronized root node named TITLE.
+Return its Org ID."
+  (make-directory gnosis-nodes-dir t)
+  (let* ((logical-path (gnosis-nodes--new-filename title))
+         (path (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
+         (existing (file-exists-p path))
+         id)
+    (when (and existing
+               (null gnosis-nodes-timestring)
+               (not (y-or-n-p
+                     (format "Node file already exists: %s.  Use it? "
+                             logical-path))))
+      (user-error "Aborted: duplicate filename"))
+    (save-window-excursion
+      (let ((buffer (find-file-noselect path))
+            (org-id-track-globally nil))
+        (switch-to-buffer buffer)
+        (with-current-buffer buffer
+          (unless existing
+            (insert (format "#+title: %s\n#+filetags: \n" title))
+            (org-mode)
+            (goto-char (point-min))
+            (setq id (org-id-get-create))
+            (gnosis-nodes-mode 1)
+            (save-buffer))
+          (setq id (or id (org-entry-get (point-min) "ID")))
+          (unless id
+            (user-error "Existing node file has no root ID")))))
+    id))
+
+;;;###autoload
+(defun gnosis-nodes-insert (arg)
+  "Insert an Org ID link to a selected Gnosis node.
+With prefix ARG, prompt for a custom description.  An active region takes
+precedence and becomes the description.  A new title creates a root node."
+  (interactive "P")
+  (let* ((catalog (gnosis-nodes--catalog))
+         (candidate
+          (completing-read "Select gnosis node: "
+                           (gnosis-nodes--completion-table catalog)))
+         (node-id (gethash candidate (plist-get catalog :by-candidate)))
+         (node (and node-id (gethash node-id (plist-get catalog :by-id))))
+         (title (if node (plist-get node :title) candidate)))
+    (when (string-empty-p title)
+      (user-error "Node title cannot be empty"))
+    (unless (equal (plist-get catalog :authority)
+                   (gnosis-nodes--catalog-authority))
+      (signal 'gnosis-nodes-error
+              '("Gnosis authority changed during node selection")))
+    (let ((id (or node-id (gnosis-nodes--create-root title)))
+          (description
+           (cond ((use-region-p)
+                  (buffer-substring-no-properties
+                   (region-beginning) (region-end)))
+                 (arg (read-string "Description: "))
+                 (t title))))
+      (org-insert-link nil (format "id:%s" id) description))))
 
 ;;;###autoload
 (defun gnosis-nodes-find (&optional refresh)
