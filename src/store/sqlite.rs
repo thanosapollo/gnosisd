@@ -1623,7 +1623,7 @@ impl SqliteStore {
             .case_insensitive(true)
             .build()
             .map_err(StoreError::storage)?;
-        let mut sources = HashMap::<String, Vec<u8>>::new();
+        let mut source_matches = HashMap::<String, bool>::new();
         let mut source_bytes = 0_usize;
         let mut items = Vec::new();
         let mut scanned_after = after.map(str::to_owned);
@@ -1652,7 +1652,9 @@ impl SqliteStore {
             if size > MAX_DOCUMENT_SOURCE_BYTES {
                 return Err(StoreError::InvalidServerState);
             }
-            if !sources.contains_key(&content_digest) {
+            let matches = if let Some(matches) = source_matches.get(&content_digest) {
+                *matches
+            } else {
                 if source_bytes
                     .checked_add(size)
                     .is_none_or(|total| total > CONTENT_SEARCH_SOURCE_BUDGET)
@@ -1665,13 +1667,15 @@ impl SqliteStore {
                     return Err(StoreError::InvalidServerState);
                 }
                 source_bytes += size;
-                sources.insert(content_digest.clone(), source);
-            }
-            let source = std::str::from_utf8(&sources[&content_digest])
-                .map_err(|_| StoreError::InvalidServerState)?;
+                let source =
+                    std::str::from_utf8(&source).map_err(|_| StoreError::InvalidServerState)?;
+                let matches = matcher.is_match(source);
+                source_matches.insert(content_digest.clone(), matches);
+                matches
+            };
             let resume_after = scanned_after.clone();
             scanned_after = Some(document_id.clone());
-            if matcher.is_match(source) {
+            if matches {
                 items.push(ContentSearchItem {
                     hit: ContentSearchHit {
                         document_id,
