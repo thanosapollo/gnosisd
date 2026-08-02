@@ -122,13 +122,6 @@ pub(crate) fn offline_asset_capabilities(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn offline_asset_result_json(
-    result: &crate::application::OfflineAssetResult,
-) -> Result<Value, OfflineAssetWireError> {
-    serde_json::to_value(offline_asset_result_response(result)?).map_err(invalid_operation)
-}
-
 pub(crate) fn offline_asset_result_response(
     result: &crate::application::OfflineAssetResult,
 ) -> Result<OfflineAssetResultEnvelopeV1, OfflineAssetWireError> {

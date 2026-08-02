@@ -1256,8 +1256,7 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        OfflineReviewSubmission, OfflineReviewWireError, ReviewPackEnvelopeV2, offline_result_json,
-        review_pack_json,
+        OfflineReviewSubmission, OfflineReviewWireError, offline_result_json, review_pack_json,
     };
     use crate::application::{OfflineReviewResult, ReviewPackView};
 

@@ -40,32 +40,24 @@ pub use message::{
 };
 #[cfg(test)]
 pub(crate) use offline_asset::canonical_asset_operation;
-#[cfg(test)]
-pub(crate) use offline_asset::offline_asset_result_json;
 pub(crate) use offline_asset::{
     OfflineAssetSubmission, OfflineAssetWireError, offline_asset_capabilities,
     offline_asset_result_response,
 };
 #[cfg(test)]
 pub(crate) use offline_content::canonical_content_operation;
-#[cfg(test)]
-pub(crate) use offline_content::offline_content_result_json;
 pub(crate) use offline_content::{
     MAX_OFFLINE_CONTENT_OPERATION_BYTES, OfflineContentWireError, offline_content_capabilities,
     offline_content_result_response,
 };
+#[cfg(test)]
+pub(crate) use offline_review::canonical_offline_operation;
 pub(crate) use offline_review::{
     MAX_OFFLINE_REVIEW_OPERATION_BYTES, OFFLINE_REVIEW_VERSION, OfflineReviewSubmission,
     OfflineReviewWireError, active_review_pack_response, offline_result_response,
     review_pack_response,
 };
-#[cfg(test)]
-pub(crate) use offline_review::{
-    canonical_offline_operation, offline_result_json, review_pack_json,
-};
 pub(crate) use replica::encode_cursor;
-#[cfg(test)]
-pub(crate) use replica::encode_snapshot_cursor;
 pub(crate) use replica::{
     MAX_REPLICA_CURSOR_BYTES, ReplicaWireError, decode_cursor, decode_snapshot_cursor,
     replica_change_page, replica_snapshot_page, replica_state_response,
