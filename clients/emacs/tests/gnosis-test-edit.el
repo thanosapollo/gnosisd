@@ -40,6 +40,11 @@
     (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
       (kill-buffer buffer))))
 
+(ert-deftest gnosis-edit-mode-uses-js-json-mode ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (should (derived-mode-p 'js-json-mode))))
+
 (ert-deftest gnosis-edit-thema-fetches-before-opening-buffer ()
   (when-let* ((buffer (get-buffer gnosis-edit-buffer-name))) (kill-buffer buffer))
   (cl-letf (((symbol-function 'gnosis-core-thema)

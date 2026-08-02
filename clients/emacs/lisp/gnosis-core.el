@@ -1391,6 +1391,70 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
         (gnosis-core--invalid "Invalid Gnosis node page"))
       page)))
 
+(defun gnosis-core-nodes-by-tag (tag &optional after limit)
+  "Return a server node page matching exact TAG after AFTER at LIMIT."
+  (let* ((parameters
+          (delq nil (list (and after (cons "after" after))
+                          (and limit (cons "limit" limit))
+                          (cons "tag" tag))))
+         (page (gnosis-core--typed-read-request "get_nodes" nil parameters)))
+    (unless (gnosis-core--node-page-p page after (or limit 100))
+      (gnosis-core--invalid "Invalid Gnosis tagged node page"))
+    page))
+
+(defun gnosis-core-node-graph (node-id direction &optional after limit)
+  "Return NODE-ID graph page in DIRECTION after AFTER at LIMIT."
+  (let* ((identity
+          (pcase direction
+            (:inbound "get_nodes__id__inbound")
+            (:outbound "get_nodes__id__outbound")
+            (_ (signal 'gnosis-core-validation-error
+                       '("Invalid Gnosis graph direction")))))
+         (parameters
+          (delq nil (list (and after (cons "after" after))
+                          (and limit (cons "limit" limit)))))
+         (page
+          (if parameters
+              (gnosis-core--typed-read-request
+               identity (list (cons "id" node-id)) parameters)
+            (gnosis-core--typed-read-request
+             identity (list (cons "id" node-id))))))
+    (unless (gnosis-core--node-page-p page after (or limit 100))
+      (gnosis-core--invalid "Invalid Gnosis graph page"))
+    page))
+
+(defun gnosis-core--content-search-hit-p (hit)
+  "Return non-nil when HIT is a valid document content-search result."
+  (let ((file-node-id (plist-get hit :file_node_id)))
+    (and (gnosis-core--opaque-id-p (plist-get hit :document_id))
+         (gnosis-core--document-path-p (plist-get hit :logical_path))
+         (integerp (plist-get hit :revision))
+         (> (plist-get hit :revision) 0)
+         (stringp (plist-get hit :content_digest))
+         (string-match-p "\\`[0-9a-f]\\{64\\}\\'"
+                         (plist-get hit :content_digest))
+         (or (eq file-node-id gnosis-core--json-null)
+             (gnosis-core--opaque-id-p file-node-id)))))
+
+(defun gnosis-core-node-content-search (query &optional cursor limit)
+  "Return document content matches for QUERY after opaque CURSOR at LIMIT."
+  (let* ((parameters
+          (delq nil (list (cons "q" query)
+                          (and cursor (cons "cursor" cursor))
+                          (and limit (cons "limit" limit)))))
+         (page
+          (gnosis-core--typed-read-request
+           "get_nodes_content-search" nil parameters))
+         (items (plist-get page :items))
+         (next (plist-get page :next)))
+    (unless (and (vectorp items)
+                 (<= (length items) (or limit 100))
+                 (cl-every #'gnosis-core--content-search-hit-p items)
+                 (or (eq next gnosis-core--json-null)
+                     (and (stringp next) (not (string-empty-p next)))))
+      (gnosis-core--invalid "Invalid Gnosis content-search page"))
+    page))
+
 (defun gnosis-core--catalog-node-p (node document-id)
   "Return non-nil when NODE is a valid compact catalog item.
 When DOCUMENT-ID is non-nil, require NODE to belong to it."
@@ -1632,6 +1696,44 @@ Do not retry automatically."
     (list (gnosis-core--idempotency-key-header operation-id)
           (gnosis-core--if-match-header revision)))
    operation-id thema-id revision))
+
+(defun gnosis-core-thema-set-archived
+    (thema-id revision archived &optional operation-id)
+  "Set THEMA-ID archived state at REVISION to ARCHIVED.
+Use optional OPERATION-ID and return the authoritative thema projection."
+  (unless (memq archived '(nil t))
+    (signal 'gnosis-core-validation-error
+            '("Invalid Gnosis archive state")))
+  (let* ((operation-id (or operation-id (gnosis-core-operation-id)))
+         (identity (if archived
+                       "post_themata__id__archive"
+                     "post_themata__id__unarchive"))
+         (projection
+          (gnosis-core--thema-mutation-result
+           (gnosis-core--typed-request
+            identity (list (cons "id" thema-id)) nil nil
+            (list (gnosis-core--idempotency-key-header operation-id)
+                  (gnosis-core--if-match-header revision)))
+           operation-id thema-id revision)))
+    (unless (eq archived (eq t (plist-get projection :archived)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis archive projection is invalid")))
+    projection))
+
+(defun gnosis-core-thema-review-state (thema-id)
+  "Return the authoritative review state for THEMA-ID."
+  (let* ((projection
+          (gnosis-core--typed-read-request
+           "get_themata__id__review-state" (list (cons "id" thema-id))))
+         (state (plist-get projection :state)))
+    (unless (and (equal thema-id (plist-get projection :thema_id))
+                 (gnosis-core--json-object-p state)
+                 (natnump (plist-get state :state_revision))
+                 (natnump (plist-get state :review_count))
+                 (memq (plist-get state :suspended)
+                       (list t gnosis-core--json-false)))
+      (gnosis-core--invalid "Invalid Gnosis thema review state"))
+    projection))
 
 (defun gnosis-core--thema-suspension-result
     (result thema-id operation-id state-revision suspended)

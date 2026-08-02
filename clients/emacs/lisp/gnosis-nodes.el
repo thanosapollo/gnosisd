@@ -18,6 +18,8 @@
 (require 'org-id)
 (require 'seq)
 (require 'subr-x)
+(require 'tabulated-list)
+(require 'keymap-popup)
 (require 'gnosis-core)
 
 (defgroup gnosis-nodes nil
@@ -33,6 +35,29 @@
   "Time format prepended to filenames created by `gnosis-nodes-insert'.
 When nil, use only the selected node title."
   :type '(choice string (const :tag "Title only" nil))
+  :group 'gnosis-nodes)
+
+(defcustom gnosis-nodes-templates nil
+  "Named Org templates available to `gnosis-nodes-insert-template'.
+Each value is a string or a function returning a string.  Braced stars such
+as `{*}' and `{**}' expand relative to the current Org heading."
+  :type '(alist :key-type string
+                :value-type (choice string function))
+  :group 'gnosis-nodes)
+
+(defcustom gnosis-journal-directory "journal/"
+  "Relative directory below `gnosis-nodes-dir' containing journal entries."
+  :type 'string
+  :group 'gnosis-nodes)
+
+(defcustom gnosis-journal-date-format "%Y-%m-%d"
+  "Time format used for journal titles and filenames."
+  :type 'string
+  :group 'gnosis-nodes)
+
+(defcustom gnosis-journal-template "{*} Notes\n"
+  "Org body inserted into a new journal entry."
+  :type 'string
   :group 'gnosis-nodes)
 
 (defcustom gnosis-nodes-state-file nil
@@ -93,6 +118,12 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 
 (defvar-local gnosis-nodes--content-sha256 nil)
 (defvar-local gnosis-nodes--document-revision nil)
+
+(defvar-local gnosis-nodes-page--fetch nil)
+(defvar-local gnosis-nodes-page--cursor nil)
+(defvar-local gnosis-nodes-page--next nil)
+(defvar-local gnosis-nodes-page--history nil)
+(defvar-local gnosis-nodes-page--records nil)
 
 (defconst gnosis-nodes--catalog-page-limit 5000)
 (defconst gnosis-nodes--catalog-max-nodes 100000)
@@ -738,6 +769,223 @@ precedence and becomes the description.  A new title creates a root node."
                  (t title))))
       (org-insert-link nil (format "id:%s" id) description))))
 
+(defun gnosis-nodes--expand-template (text &optional base-level)
+  "Expand braced Org heading markers in TEXT from BASE-LEVEL.
+Without BASE-LEVEL, start one level below the current heading."
+  (let ((base-level (or base-level (1+ (or (org-current-level) 0)))))
+    (replace-regexp-in-string
+     "{\\(\\*+\\)}"
+     (lambda (match)
+       (make-string (+ base-level (1- (length (match-string 1 match)))) ?*))
+     text t)))
+
+;;;###autoload
+(defun gnosis-nodes-insert-template ()
+  "Insert a configured Org template at point and save the document."
+  (interactive)
+  (unless gnosis-nodes-templates
+    (user-error "No Gnosis node templates are configured"))
+  (let* ((name (if (= 1 (length gnosis-nodes-templates))
+                   (caar gnosis-nodes-templates)
+                 (completing-read "Template: " gnosis-nodes-templates nil t)))
+         (source (alist-get name gnosis-nodes-templates nil nil #'equal))
+         (text (if (functionp source) (funcall source) source)))
+    (unless (stringp text)
+      (user-error "Gnosis template did not produce text"))
+    (insert (gnosis-nodes--expand-template text))
+    (save-buffer)))
+
+(defun gnosis-nodes--add-tags (tags)
+  "Add TAGS at the current Org heading, or to file tags before headings."
+  (if (org-before-first-heading-p)
+      (save-excursion
+        (goto-char (point-min))
+        (let ((case-fold-search t) existing bounds)
+          (when (re-search-forward
+                 "^#\\+filetags:[[:blank:]]*\\(.*\\)$" nil t)
+            (setq existing (split-string (match-string-no-properties 1) ":" t)
+                  bounds (cons (line-beginning-position) (line-end-position))))
+          (let* ((merged (delete-dups (append existing tags)))
+                 (line (concat "#+filetags: :" (string-join merged ":") ":")))
+            (if bounds
+                (progn (delete-region (car bounds) (cdr bounds)) (insert line))
+              (goto-char (point-min))
+              (insert line "\n"))
+            merged)))
+    (let ((merged (delete-dups (append (org-get-tags nil t) tags))))
+      (org-set-tags merged)
+      merged)))
+
+;;;###autoload
+(defun gnosis-nodes-add-tags (tags)
+  "Add TAGS at the current heading or file level and save the document."
+  (interactive (list (completing-read-multiple "Tags: ")))
+  (gnosis-nodes--add-tags tags)
+  (save-buffer))
+
+(defun gnosis-nodes--journal-logical-path (title)
+  "Return the confined journal logical path for TITLE."
+  (concat (file-name-as-directory gnosis-journal-directory) title ".org"))
+
+(defun gnosis-nodes--journal-matches (query)
+  "Return server journal nodes whose titles match QUERY."
+  (let ((after nil)
+        (prefix (file-name-as-directory gnosis-journal-directory))
+        (seen (make-hash-table :test #'equal))
+        (pages 0)
+        matches done)
+    (while (not done)
+      (let* ((page (gnosis-core-nodes query after 100))
+             (next (plist-get page :next)))
+        (cl-incf pages)
+        (dolist (node (append (plist-get page :items) nil))
+          (when (and (string-prefix-p prefix (plist-get node :logical_path))
+                     (string-match-p (regexp-quote query)
+                                     (plist-get node :title)))
+            (push node matches)))
+        (cond
+         ((eq next gnosis-core--json-null) (setq done t))
+         ((or (gethash next seen) (>= pages 50))
+          (signal 'gnosis-core-protocol-error
+                  '("Invalid Gnosis journal pagination")))
+         (t (puthash next t seen) (setq after next)))))
+    (vconcat (nreverse matches))))
+
+(defun gnosis-nodes--create-journal-entry (title)
+  "Create, save, and visit a journal entry named TITLE."
+  (let* ((logical-path (gnosis-nodes--journal-logical-path title))
+         (path (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
+         (body (gnosis-nodes--expand-template gnosis-journal-template 1))
+         id)
+    (when (file-exists-p path)
+      (user-error "Journal file exists but is not available from gnosisd"))
+    (make-directory (file-name-directory path) t)
+    (find-file path)
+    (insert (format "#+title: %s\n#+filetags: :journal:\n\n%s" title body))
+    (org-mode)
+    (goto-char (point-min))
+    (setq id (org-id-get-create))
+    (gnosis-nodes-mode 1)
+    (save-buffer)
+    id))
+
+;;;###autoload
+(defun gnosis-journal ()
+  "Open today's journal entry, creating and saving it when absent."
+  (interactive)
+  (let* ((title (format-time-string gnosis-journal-date-format))
+         (matches (gnosis-nodes--journal-matches title)))
+    (pcase (length matches)
+      (0 (gnosis-nodes--create-journal-entry title))
+      (1 (gnosis-nodes--visit-node (aref matches 0)))
+      (_ (signal 'gnosis-nodes-error '("Duplicate Gnosis journal entries"))))))
+
+;;;###autoload
+(defun gnosis-journal-find (query)
+  "Find and visit a journal entry matching QUERY."
+  (interactive "sJournal search: ")
+  (let ((matches (gnosis-nodes--journal-matches query)))
+    (unless (> (length matches) 0)
+      (user-error "No matching Gnosis journal entry"))
+    (let* ((table
+            (mapcar (lambda (node)
+                      (cons (plist-get node :title) node))
+                    (append matches nil)))
+           (choice (completing-read "Journal: " table nil t)))
+      (gnosis-nodes--visit-node (alist-get choice table nil nil #'equal)))))
+
+;;;###autoload
+(defun gnosis-journal-insert ()
+  "Insert an Org ID link to a selected journal entry."
+  (interactive)
+  (let* ((query (read-string "Journal search: "))
+         (matches (gnosis-nodes--journal-matches query)))
+    (unless (> (length matches) 0)
+      (user-error "No matching Gnosis journal entry"))
+    (let* ((table
+            (mapcar (lambda (node)
+                      (cons (plist-get node :title) node))
+                    (append matches nil)))
+           (choice (completing-read "Journal: " table nil t))
+           (node (alist-get choice table nil nil #'equal)))
+      (org-insert-link nil (format "id:%s" (plist-get node :node_id)) choice))))
+
+(defun gnosis-nodes--literal-count (string)
+  "Return the number of literal STRING occurrences in the current buffer."
+  (save-excursion
+    (goto-char (point-min))
+    (let ((count 0) (case-fold-search nil))
+      (while (search-forward string nil t) (cl-incf count))
+      count)))
+
+(defun gnosis-nodes--bulk-target-buffer (target)
+  "Return TARGET's confined regular Org buffer."
+  (let* ((path (if (bufferp target)
+                   (buffer-file-name target)
+                 (expand-file-name target)))
+         (root (file-name-as-directory (file-truename gnosis-nodes-dir))))
+    (unless (and path
+                 (string-match-p "\\.org\\'" path)
+                 (not (file-symlink-p path))
+                 (file-regular-p path)
+                 (file-in-directory-p (file-truename path) root))
+      (user-error "Bulk link target is not a confined regular Org file"))
+    (if (bufferp target) target (find-file-noselect path))))
+
+;;;###autoload
+(defun gnosis-bulk-link-string (string node-id targets)
+  "Replace literal STRING with NODE-ID links in explicit finite TARGETS.
+TARGETS contains buffers or filenames.  Preview the occurrence count, require
+confirmation, save each changed document, stop on the first error, and return
+the changed targets."
+  (interactive
+   (let* ((string (read-string "Literal string: "))
+          (node (gnosis-core-node
+                 (completing-read "Node ID: "
+                                  (mapcar (lambda (item)
+                                            (plist-get item :node_id))
+                                          (append (plist-get
+                                                   (gnosis-core-nodes nil nil 100)
+                                                   :items)
+                                                  nil))
+                                  nil t)))
+          (files
+           (completing-read-multiple
+            "Org files: "
+            (directory-files-recursively gnosis-nodes-dir "\\.org\\'")
+            nil t)))
+     (list string (plist-get node :node_id) files)))
+  (when (string-empty-p string)
+    (user-error "Bulk link string cannot be empty"))
+  (let* ((buffers
+          (mapcar #'gnosis-nodes--bulk-target-buffer targets))
+         (count
+          (apply #'+ (mapcar (lambda (buffer)
+                               (with-current-buffer buffer
+                                 (gnosis-nodes--literal-count string)))
+                             buffers))))
+    (cond
+     ((= count 0) (message "No literal matches") nil)
+     ((not (y-or-n-p (format "Replace %d literal occurrence%s? "
+                             count (if (= count 1) "" "s"))))
+      nil)
+     (t
+      (let (changed)
+        (cl-mapc
+         (lambda (target buffer)
+           (with-current-buffer buffer
+             (goto-char (point-min))
+             (let ((case-fold-search nil) found)
+               (while (search-forward string nil t)
+                 (replace-match
+                  (format "[[id:%s][%s]]" node-id string) t t)
+                 (setq found t))
+               (when found
+                 (save-buffer)
+                 (push target changed)))))
+         targets buffers)
+        (nreverse changed))))))
+
 ;;;###autoload
 (defun gnosis-nodes-find (&optional refresh)
   "Select a server node by name and visit its exact document location.
@@ -765,6 +1013,169 @@ With prefix argument REFRESH, rebuild the node catalog first."
           (signal 'gnosis-nodes-error
                   '("Gnosis authority changed during node lookup")))
         (gnosis-nodes--visit-node node)))))
+
+(keymap-popup-define gnosis-nodes-page-mode-map
+  "Keymap for server-backed Gnosis node pages."
+  :parent tabulated-list-mode-map
+  :popup-key "?"
+  :exit-key "C-g"
+  :description "Gnosis Nodes"
+  :group "Open"
+  "RET" ("Visit node" gnosis-nodes-page-visit)
+  :group "Page"
+  "n" ("Next page" gnosis-nodes-page-next)
+  "p" ("Previous page" gnosis-nodes-page-previous)
+  "g" ("Refresh page" gnosis-nodes-page-refresh :stay-open t)
+  "q" ("Quit" quit-window))
+
+(define-derived-mode gnosis-nodes-page-mode tabulated-list-mode "Gnosis Nodes"
+  "Major mode for one page of server-backed node results."
+  (display-line-numbers-mode -1)
+  (setq-local truncate-lines t
+              tabulated-list-padding 2
+              tabulated-list-format
+              [("Title" 36 t) ("Path" 32 t) ("Tags" 24 t)])
+  (tabulated-list-init-header))
+
+(defun gnosis-nodes-page--entry (record)
+  "Return a tabulated entry for node or content-hit RECORD."
+  (let ((identity (or (plist-get record :node_id)
+                      (plist-get record :document_id))))
+    (list identity
+          (vector (or (plist-get record :title) "Document content match")
+                  (or (plist-get record :logical_path) "")
+                  (mapconcat #'identity
+                             (append (or (plist-get record :tags) []) nil)
+                             ", ")))))
+
+(defun gnosis-nodes-page--load (cursor)
+  "Load CURSOR through the current page fetcher."
+  (unless gnosis-nodes-page--fetch
+    (user-error "No Gnosis page source"))
+  (let* ((page (funcall gnosis-nodes-page--fetch cursor))
+         (items (plist-get page :items))
+         (records (make-hash-table :test #'equal)))
+    (cl-loop for record across items
+             do (puthash (or (plist-get record :node_id)
+                             (plist-get record :document_id))
+                         record records))
+    (setq gnosis-nodes-page--cursor cursor
+          gnosis-nodes-page--next (plist-get page :next)
+          gnosis-nodes-page--records records
+          tabulated-list-entries
+          (cl-loop for record across items
+                   collect (gnosis-nodes-page--entry record)))
+    (tabulated-list-print t)
+    (goto-char (point-min))))
+
+(defun gnosis-nodes-page-open (title fetch)
+  "Open a node page named TITLE using single-argument FETCH."
+  (let ((buffer (get-buffer-create (format "*Gnosis Nodes: %s*" title))))
+    (pop-to-buffer-same-window buffer)
+    (gnosis-nodes-page-mode)
+    (setq-local gnosis-nodes-page--fetch fetch
+                gnosis-nodes-page--history nil)
+    (gnosis-nodes-page--load nil)
+    (keymap-popup gnosis-nodes-page-mode-map)))
+
+(defun gnosis-nodes-page-next ()
+  "Open the next server result page."
+  (interactive)
+  (when (eq gnosis-nodes-page--next gnosis-core--json-null)
+    (user-error "No next Gnosis node page"))
+  (push gnosis-nodes-page--cursor gnosis-nodes-page--history)
+  (gnosis-nodes-page--load gnosis-nodes-page--next))
+
+(defun gnosis-nodes-page-previous ()
+  "Return to the previous result page fetched in this buffer."
+  (interactive)
+  (unless gnosis-nodes-page--history
+    (user-error "No previous Gnosis node page"))
+  (gnosis-nodes-page--load (pop gnosis-nodes-page--history)))
+
+(defun gnosis-nodes-page-refresh ()
+  "Refresh the current result page."
+  (interactive)
+  (gnosis-nodes-page--load gnosis-nodes-page--cursor))
+
+(defun gnosis-nodes-page-visit ()
+  "Visit the node or content-hit document at point."
+  (interactive)
+  (let* ((record (gethash (tabulated-list-get-id) gnosis-nodes-page--records))
+         (node-id (or (plist-get record :node_id)
+                      (let ((id (plist-get record :file_node_id)))
+                        (unless (eq id gnosis-core--json-null) id)))))
+    (if node-id
+        (gnosis-nodes--visit-node (gnosis-core-node node-id))
+      (let* ((node (list :document_id (plist-get record :document_id)
+                         :document_revision (plist-get record :revision)
+                         :content_sha256 (plist-get record :content_digest)
+                         :logical_path (plist-get record :logical_path)))
+             (source (gnosis-nodes--document-source node)))
+        (pop-to-buffer-same-window (plist-get source :buffer))
+        (goto-char (point-min))))))
+
+;;;###autoload
+(defun gnosis-nodes-search (query)
+  "Open page-oriented server node-title results for QUERY."
+  (interactive "sNode title: ")
+  (gnosis-nodes-page-open
+   (format "Title %s" query)
+   (lambda (after) (gnosis-core-nodes query after 100))))
+
+;;;###autoload
+(defun gnosis-nodes-search-content (query)
+  "Open page-oriented server document-content results for QUERY."
+  (interactive "sDocument content: ")
+  (gnosis-nodes-page-open
+   (format "Content %s" query)
+   (lambda (cursor) (gnosis-core-node-content-search query cursor 100))))
+
+;;;###autoload
+(defun gnosis-nodes-find-tag (tag)
+  "Open page-oriented server node results for exact TAG."
+  (interactive "sExact tag: ")
+  (gnosis-nodes-page-open
+   (format "Tag %s" tag)
+   (lambda (after) (gnosis-core-nodes-by-tag tag after 100))))
+
+(defun gnosis-nodes--graph (node-id direction)
+  "Open NODE-ID graph page in DIRECTION."
+  (gnosis-nodes-page-open
+   (format "%s %s" (capitalize (substring (symbol-name direction) 1)) node-id)
+   (lambda (after) (gnosis-core-node-graph node-id direction after 100))))
+
+;;;###autoload
+(defun gnosis-nodes-inbound (&optional node-id)
+  "Open inbound links for NODE-ID or the current Org node."
+  (interactive)
+  (gnosis-nodes--graph
+   (or node-id (org-id-get nil) (user-error "No Gnosis node at point"))
+   :inbound))
+
+;;;###autoload
+(defun gnosis-nodes-outbound (&optional node-id)
+  "Open outbound links for NODE-ID or the current Org node."
+  (interactive)
+  (gnosis-nodes--graph
+   (or node-id (org-id-get nil) (user-error "No Gnosis node at point"))
+   :outbound))
+
+;;;###autoload
+(defun gnosis-nodes-goto-id (node-id)
+  "Visit authoritative NODE-ID detail."
+  (interactive
+   (list
+    (or (when-let* ((context (org-element-context))
+                    (type (org-element-type context))
+                    ((eq type 'link))
+                    ((equal "id" (org-element-property :type context))))
+          (org-element-property :path context))
+        (read-string "Gnosis node ID: "))))
+  (gnosis-nodes--visit-node (gnosis-core-node node-id)))
+
+(defalias 'gnosis-nodes-find-by-tag #'gnosis-nodes-find-tag)
+(defalias 'gnosis-nodes-visit-backlinks #'gnosis-nodes-inbound)
 
 (defun gnosis-nodes--nullable (value)
   "Return nil for protocol null VALUE, otherwise VALUE."
@@ -2768,6 +3179,17 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
             ((not gnosis-nodes--pull-complete)
              "Gnosis Org synchronization paused at durable page boundary")
             (t "Gnosis Org synchronization complete"))))
+
+;;;###autoload
+(defun gnosis-nodes-db-sync (&optional full)
+  "Compatibility entry point for interactive `gnosis-nodes-sync'.
+Preserve optional prefix FULL.  A noninteractive call synchronizes all enrolled
+files, matching the legacy whole-database command boundary."
+  (interactive "P")
+  (if (called-interactively-p 'interactive)
+      (let ((current-prefix-arg full))
+        (call-interactively #'gnosis-nodes-sync))
+    (gnosis-nodes-sync :all full)))
 
 ;;;###autoload
 (defun gnosis-nodes-retry-uncertain (operation-id)

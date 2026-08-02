@@ -114,6 +114,15 @@
 (defvar-local gnosis-themata--records nil
   "Catalog records keyed by opaque thema identity.")
 
+(defvar-local gnosis-themata--catalog-records nil)
+(defvar-local gnosis-themata--search-filter nil)
+(defvar-local gnosis-themata--review-filter :all)
+(defvar-local gnosis-themata--tag-filter nil)
+(defvar-local gnosis-themata--query nil)
+(defvar-local gnosis-themata--cursor nil)
+(defvar-local gnosis-themata--next nil)
+(defvar-local gnosis-themata--history nil)
+
 (defun gnosis-dashboard--active-session-p ()
   "Return non-nil when the dashboard has an active review session."
   (and gnosis-dashboard--projection
@@ -167,9 +176,20 @@
   :group "Themata"
   "RET" ("Edit at point" gnosis-themata-edit)
   "e" ("Edit at point" gnosis-themata-edit)
-  "a" ("Add thema" gnosis-themata-add)
+  "a" ("Add thema" gnosis-themata-new)
+  :group "Mutate"
   "s" ("Suspend or unsuspend" gnosis-themata-toggle-suspension)
+  "A" ("Archive or unarchive" gnosis-themata-toggle-archive)
+  "S" ("Suspend visible tag page" gnosis-themata-suspend-tag)
+  "N" ("New / unreviewed" gnosis-themata-show-new)
+  :group "Filter"
+  "t" ("Show tag page" gnosis-themata-find-tag)
+  "/" ("Server search" gnosis-themata-search)
+  "F" ("Filter current page" gnosis-themata-filter-search)
+  "f" ("Review state" gnosis-themata-filter-review-state)
   :group "Navigate"
+  "n" ("Next page" gnosis-themata-next-page)
+  "p" ("Previous page" gnosis-themata-previous-page)
   "g" ("Refresh" gnosis-themata-refresh :stay-open t)
   "q" ("Dashboard" gnosis-dashboard))
 
@@ -273,33 +293,164 @@
   "Install CATALOG in the current buffer and restore SELECTED-ID."
   (let ((items (plist-get catalog :items)))
     (setq gnosis-themata--generation (plist-get catalog :generation)
-          gnosis-themata--records (gnosis-themata--record-table items)
-          tabulated-list-entries
-          (cl-loop for record across items
-                   collect (gnosis-themata--entry record)))
-    (tabulated-list-print t)
-    (when selected-id
-      (gnosis-themata--goto-id selected-id))))
+          gnosis-themata--catalog-records items
+          gnosis-themata--next (if (plist-member catalog :next)
+                                   (plist-get catalog :next)
+                                 gnosis-core--json-null)
+          gnosis-themata--records (gnosis-themata--record-table items))
+    (gnosis-themata--render selected-id)))
+
+(defun gnosis-themata--matches-search-p (record)
+  "Return non-nil when RECORD matches the current text filter."
+  (or (null gnosis-themata--search-filter)
+      (let ((case-fold-search t)
+            (query (regexp-quote gnosis-themata--search-filter)))
+        (seq-some
+         (lambda (value) (and (stringp value) (string-match-p query value)))
+         (append
+          (list (plist-get record :keimenon))
+          (append (plist-get record :hypothesis) nil)
+          (append (plist-get record :answer) nil)
+          (append (plist-get record :tags) nil))))))
+
+(defun gnosis-themata--matches-review-filter-p (record)
+  "Return non-nil when RECORD matches the current review filter."
+  (pcase gnosis-themata--review-filter
+    (:active (and (not (eq t (plist-get record :archived)))
+                  (not (eq t (plist-get record :suspended)))))
+    (:archived (eq t (plist-get record :archived)))
+    (:suspended (eq t (plist-get record :suspended)))
+    (:new (equal 0 (plist-get record :review_count)))
+    (_ t)))
+
+(defun gnosis-themata--matches-tag-filter-p (record)
+  "Return non-nil when RECORD matches the current exact tag filter."
+  (or (null gnosis-themata--tag-filter)
+      (member gnosis-themata--tag-filter
+              (append (plist-get record :tags) nil))))
+
+(defun gnosis-themata--render (&optional selected-id)
+  "Render filtered authoritative records and restore SELECTED-ID."
+  (setq tabulated-list-entries
+        (cl-loop for record across gnosis-themata--catalog-records
+                 when (and (gnosis-themata--matches-search-p record)
+                           (gnosis-themata--matches-review-filter-p record)
+                           (gnosis-themata--matches-tag-filter-p record))
+                 collect (gnosis-themata--entry record)))
+  (tabulated-list-print t)
+  (when selected-id (gnosis-themata--goto-id selected-id)))
+
+(defun gnosis-themata-filter-search (query)
+  "Filter authoritative themata by literal QUERY across visible text fields."
+  (interactive "sThema search (empty clears): ")
+  (let ((selected (tabulated-list-get-id)))
+    (setq gnosis-themata--search-filter (unless (string-empty-p query) query))
+    (gnosis-themata--render selected)))
+
+(defun gnosis-themata-filter-review-state (state)
+  "Filter authoritative themata by review STATE."
+  (interactive
+   (list (intern (concat ":" (completing-read
+                              "State: " '("all" "active" "new" "suspended" "archived")
+                              nil t nil nil "all")))))
+  (unless (memq state '(:all :active :new :suspended :archived))
+    (user-error "Unknown Gnosis thema state filter"))
+  (let ((selected (tabulated-list-get-id)))
+    (setq gnosis-themata--review-filter state)
+    (gnosis-themata--render selected)))
 
 (defun gnosis-themata-refresh ()
-  "Refresh the complete thema management projection."
+  "Refresh the current bounded thema management page."
   (interactive)
   (unless (derived-mode-p 'gnosis-dashboard-themata-mode)
     (user-error "Not in the Gnosis themata dashboard"))
   (let ((selected-id (tabulated-list-get-id))
-        (catalog (gnosis-themata--fetch)))
+        (catalog (gnosis-core-thema-catalog
+                  gnosis-themata--query gnosis-themata--cursor
+                  gnosis-core--thema-catalog-page-limit)))
     (gnosis-themata--install catalog selected-id)))
 
 ;;;###autoload
 (defun gnosis-dashboard-themata ()
-  "Open the complete server-projected thema management list."
+  "Open one bounded server-projected thema management page."
   (interactive)
-  (let ((catalog (gnosis-themata--fetch))
+  (let ((catalog (gnosis-core-thema-catalog
+                  nil nil gnosis-core--thema-catalog-page-limit))
         (buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (gnosis-dashboard-themata-mode)
+    (setq-local gnosis-themata--query nil
+                gnosis-themata--cursor nil
+                gnosis-themata--history nil)
     (gnosis-themata--install catalog)
     (keymap-popup gnosis-dashboard-themata-mode-map)))
+
+(defun gnosis-themata-search (query)
+  "Load the first bounded authoritative thema page matching QUERY."
+  (interactive "sThema server search: ")
+  (let ((catalog (gnosis-core-thema-catalog
+                  query nil gnosis-core--thema-catalog-page-limit)))
+    (setq gnosis-themata--query query
+          gnosis-themata--cursor nil
+          gnosis-themata--history nil
+          gnosis-themata--search-filter nil
+          gnosis-themata--review-filter :all
+          gnosis-themata--tag-filter nil)
+    (gnosis-themata--install catalog)))
+
+(defun gnosis-themata--install-continuation (catalog)
+  "Install continuation CATALOG only when its generation remains stable."
+  (unless (equal gnosis-themata--generation (plist-get catalog :generation))
+    (signal 'gnosis-core-conflict
+            '("Gnosis thema catalog generation changed")))
+  (gnosis-themata--install catalog))
+
+(defun gnosis-themata-next-page ()
+  "Load the next bounded authoritative thema page."
+  (interactive)
+  (when (eq gnosis-themata--next gnosis-core--json-null)
+    (user-error "No next Gnosis thema page"))
+  (let* ((next gnosis-themata--next)
+         (catalog (gnosis-core-thema-catalog
+                   gnosis-themata--query next
+                   gnosis-core--thema-catalog-page-limit)))
+    (gnosis-themata--install-continuation catalog)
+    (push gnosis-themata--cursor gnosis-themata--history)
+    (setq gnosis-themata--cursor next)))
+
+(defun gnosis-themata-previous-page ()
+  "Load the previous thema page visited in this buffer."
+  (interactive)
+  (unless gnosis-themata--history (user-error "No previous Gnosis thema page"))
+  (let* ((previous (car gnosis-themata--history))
+         (catalog (gnosis-core-thema-catalog
+                   gnosis-themata--query previous
+                   gnosis-core--thema-catalog-page-limit)))
+    (gnosis-themata--install-continuation catalog)
+    (pop gnosis-themata--history)
+    (setq gnosis-themata--cursor previous)))
+
+(defun gnosis-themata-show-new ()
+  "Show unreviewed themata from the current bounded server page."
+  (interactive)
+  (setq gnosis-themata--catalog-records
+        (vconcat
+         (mapcar
+          (lambda (record)
+            (let* ((projection
+                    (gnosis-core-thema-review-state
+                     (plist-get record :thema_id)))
+                   (state (plist-get projection :state))
+                   (updated (copy-tree record)))
+              (setq updated
+                    (plist-put updated :review_count
+                               (plist-get state :review_count)))
+              updated))
+          (append gnosis-themata--catalog-records nil))))
+  (setq gnosis-themata--records
+        (gnosis-themata--record-table gnosis-themata--catalog-records)
+        gnosis-themata--review-filter :new)
+  (gnosis-themata--render))
 
 (defun gnosis-themata--record-at-point ()
   "Return the catalog record at point or signal a user error."
@@ -311,14 +462,12 @@
   "Replace visible catalog RECORD after an authoritative mutation."
   (let ((thema-id (plist-get record :thema_id)))
     (puthash thema-id record gnosis-themata--records)
-    (setq tabulated-list-entries
-          (mapcar (lambda (entry)
-                    (if (equal thema-id (car entry))
-                        (gnosis-themata--entry record)
-                      entry))
-                  tabulated-list-entries))
-    (tabulated-list-print t)
-    (gnosis-themata--goto-id thema-id)))
+    (setq gnosis-themata--catalog-records
+          (vconcat
+           (mapcar (lambda (item)
+                     (if (equal thema-id (plist-get item :thema_id)) record item))
+                   (append gnosis-themata--catalog-records nil))))
+    (gnosis-themata--render thema-id)))
 
 (defun gnosis-themata--edited (buffer projection)
   "Update BUFFER from authoritative content PROJECTION."
@@ -359,6 +508,8 @@
            (when (derived-mode-p 'gnosis-dashboard-themata-mode)
              (gnosis-themata-refresh))))))))
 
+(defalias 'gnosis-themata-new #'gnosis-themata-add)
+
 (defun gnosis-themata-toggle-suspension ()
   "Suspend or unsuspend the thema at point."
   (interactive)
@@ -381,6 +532,67 @@
         (gnosis-themata--replace-record updated)
         (message "%s thema %s"
                  (if desired "Suspended" "Unsuspended") thema-id)))))
+
+(defun gnosis-themata-toggle-archive ()
+  "Archive or unarchive the thema at point after confirmation."
+  (interactive)
+  (let* ((record (gnosis-themata--record-at-point))
+         (thema-id (plist-get record :thema_id))
+         (desired (not (eq t (plist-get record :archived))))
+         (action (if desired "Archive" "Unarchive")))
+    (when (y-or-n-p (format "%s thema at point? " action))
+      (let* ((projection
+              (gnosis-core-thema-set-archived
+               thema-id (plist-get record :thema_revision) desired))
+             (updated (copy-tree record)))
+        (dolist (field '(:kind :keimenon :hypothesis :answer :tags :archived))
+          (setq updated (plist-put updated field (plist-get projection field))))
+        (setq updated
+              (plist-put updated :thema_revision (plist-get projection :revision)))
+        (gnosis-themata--replace-record updated)
+        (message "%s thema %s" action thema-id)))))
+
+(defun gnosis-themata-find-tag (tag)
+  "Show the authoritative thema page for exact TAG at point."
+  (interactive
+   (let* ((tags (append (plist-get (gnosis-themata--record-at-point) :tags) nil)))
+     (unless tags (user-error "Thema at point has no tags"))
+     (list (completing-read "Tag: " tags nil t))))
+  (let ((selected (tabulated-list-get-id)))
+    (setq gnosis-themata--tag-filter tag)
+    (gnosis-themata--render selected)))
+
+(defun gnosis-themata-suspend-tag ()
+  "Suspend each unsuspended thema on the visible exact-tag page.
+Stop on the first failed or uncertain mutation; prior accepted mutations remain
+visible as authoritative partial progress."
+  (interactive)
+  (unless gnosis-themata--tag-filter
+    (user-error "Select a Gnosis tag page first"))
+  (let ((records
+         (delq nil
+               (mapcar (lambda (entry)
+                         (let ((record (gethash (car entry) gnosis-themata--records)))
+                           (unless (eq t (plist-get record :suspended)) record)))
+                       tabulated-list-entries))))
+    (if (null records)
+        (message "No unsuspended themata on this tag page")
+      (when (yes-or-no-p
+             (format "Suspend %d thema%s tagged %s? "
+                     (length records) (if (= 1 (length records)) "" "ta")
+                     gnosis-themata--tag-filter))
+        (dolist (record records)
+          (let* ((projection
+                  (gnosis-core-thema-set-suspended
+                   (plist-get record :thema_id)
+                   (plist-get record :state_revision) t))
+                 (state (plist-get projection :state))
+                 (updated (copy-tree record)))
+            (setq updated
+                  (plist-put updated :state_revision
+                             (plist-get state :state_revision)))
+            (setq updated (plist-put updated :suspended (plist-get state :suspended)))
+            (gnosis-themata--replace-record updated)))))))
 
 (defun gnosis--display-link-descriptions (string)
   "Return STRING with bracket links replaced by their descriptions."

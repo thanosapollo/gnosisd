@@ -658,6 +658,93 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
     (should (equal '(("get_dashboard") ("get_nodes") ("get_nodes_catalog"))
                    (nreverse calls)))))
 
+(ert-deftest gnosis-core-node-search-bindings-preserve-strict-query-shapes ()
+  (let ((node (gnosis-test-core--node)) calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 `(:items [,node] :next "node-a"))))
+      (gnosis-core-nodes-by-tag "λογική" nil 25)
+      (gnosis-core-node-graph "opaque/node?id" :inbound "node-0" 25))
+    (should
+     (equal
+      '(("get_nodes" nil (("limit" . 25) ("tag" . "λογική")))
+        ("get_nodes__id__inbound" (("id" . "opaque/node?id"))
+         (("after" . "node-0") ("limit" . 25))))
+      (nreverse calls)))))
+
+(ert-deftest gnosis-core-content-search-validates-hit-and-cursor-shape ()
+  (let ((hit `(:document_id "document-a" :logical_path "notes/a.org"
+               :revision 3
+               :content_digest
+               "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+               :file_node_id "node-a")))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest arguments)
+                 (should
+                  (equal '("get_nodes_content-search" nil
+                           (("q" . "literal") ("cursor" . "opaque")
+                            ("limit" . 25)))
+                         arguments))
+                 `(:items [,hit] :next "next"))))
+      (should (equal "next"
+                     (plist-get
+                      (gnosis-core-node-content-search
+                       "literal" "opaque" 25)
+                      :next))))
+    (dolist (page
+             (list
+              `(:items [,(plist-put (copy-tree hit) :content_digest "bad")]
+                :next ,gnosis-core--json-null)
+              `(:items [,hit] :next 4)
+              `(:items [,hit ,hit] :next ,gnosis-core--json-null)))
+      (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+                 (lambda (&rest _) page)))
+        (should-error
+         (gnosis-core-node-content-search "literal" nil 1)
+         :type 'gnosis-core-protocol-error)))))
+
+(ert-deftest gnosis-core-thema-archive-binding-correlates-authority ()
+  (let (arguments)
+    (cl-letf (((symbol-function 'gnosis-core-operation-id)
+               (lambda () "op:archive"))
+              ((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest value)
+                 (setq arguments value)
+                 '(:status "applied" :format_version 1
+                   :operation_id "op:archive" :changed t :cursor "cursor"
+                   :authoritative
+                   (:kind "thema"
+                    :value (:thema_id "thema-a" :revision 4 :archived t))))))
+      (should (eq t (plist-get (gnosis-core-thema-set-archived
+                                "thema-a" 3 t)
+                               :archived))))
+    (should
+     (equal
+      '("post_themata__id__archive" (("id" . "thema-a")) nil nil
+        (("Idempotency-Key" . "op:archive") ("If-Match" . "\"3\"")))
+      arguments))))
+
+(ert-deftest gnosis-core-thema-review-state-validates-server-projection ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+             (lambda (&rest arguments)
+               (should (equal '("get_themata__id__review-state"
+                                (("id" . "thema-a")))
+                              arguments))
+               `(:thema_id "thema-a"
+                 :state (:state_revision 2 :review_count 0
+                         :suspended ,gnosis-core--json-false)))))
+    (should (equal 0 (plist-get
+                      (plist-get (gnosis-core-thema-review-state "thema-a")
+                                 :state)
+                      :review_count))))
+  (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+             (lambda (&rest _)
+               '(:thema_id "other"
+                 :state (:state_revision 2 :review_count 0 :suspended nil)))))
+    (should-error (gnosis-core-thema-review-state "thema-a")
+                  :type 'gnosis-core-protocol-error)))
+
 (ert-deftest gnosis-core-node-binding-rejects-wrong-response-identity ()
   (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
              (lambda (&rest _)

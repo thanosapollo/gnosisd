@@ -16,6 +16,7 @@
 ;;; Code:
 
 (require 'gnosis-core)
+(require 'js)
 
 (defvar gnosis-edit-new-buffer-name "*Gnosis New*"
   "Buffer name reserved for adding Gnosis content.")
@@ -39,7 +40,7 @@
   "C-c C-c" #'gnosis-edit-save
   "C-c C-k" #'gnosis-edit-cancel)
 
-(define-derived-mode gnosis-edit-mode text-mode "Gnosis-Edit"
+(define-derived-mode gnosis-edit-mode js-json-mode "Gnosis-Edit"
   "Major mode for editing one Gnosis thema request as JSON."
   (setq-local header-line-format
               (substitute-command-keys

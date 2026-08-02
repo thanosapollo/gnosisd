@@ -82,6 +82,21 @@ is not a shipped seventh module and does not bind domain flows.  The integration
 harness starts an isolated daemon, fetches the live document, generates and
 byte-compiles the manifest, then checks health and authenticated transport.
 
+** Authoring and navigation
+
+=gnosis-nodes-insert-template= and =gnosis-nodes-add-tags= edit ordinary Org
+content and save through the synchronization hook.  =gnosis-journal=,
+=gnosis-journal-find=, and =gnosis-journal-insert= provide dated Org entries.
+=gnosis-bulk-link-string= changes only explicitly selected files after preview
+and confirmation.  =gnosis-nodes-db-sync= remains a compatibility entry point.
+
+Server-backed node pages are available through =gnosis-nodes-search=,
+=gnosis-nodes-search-content=, =gnosis-nodes-find-tag=,
+=gnosis-nodes-inbound=, and =gnosis-nodes-outbound=.  The themata dashboard
+supports text/review/tag filters, create/edit, archive, suspension, and confirmed
+tag-page suspension.  The daemon remains authoritative for all projections and
+mutations.
+
 ** Development
 
 #+begin_src sh
