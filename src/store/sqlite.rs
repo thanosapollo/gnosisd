@@ -1547,7 +1547,7 @@ impl SqliteStore {
         expected_generation: Option<&ContentSearchGeneration>,
         after: Option<&str>,
         limit: u16,
-        mut load_source: impl FnMut(&str) -> Result<Vec<u8>, StoreError>,
+        mut load_source: impl FnMut(&str, usize) -> Result<Vec<u8>, StoreError>,
     ) -> Result<ContentSearchPage, StoreError> {
         let transaction = self
             .connection
@@ -1662,7 +1662,7 @@ impl SqliteStore {
                     has_more = true;
                     break;
                 }
-                let source = load_source(&content_digest)?;
+                let source = load_source(&content_digest, size)?;
                 if source.len() != size {
                     return Err(StoreError::InvalidServerState);
                 }
@@ -5954,7 +5954,7 @@ mod tests {
 
         let mut loads = 0;
         let page = store
-            .search_document_content("NEEDLE.+", None, None, 100, |digest| {
+            .search_document_content("NEEDLE.+", None, None, 100, |digest, _size| {
                 loads += 1;
                 sources.get(digest).cloned().ok_or(StoreError::CorruptData {
                     field: "document source",

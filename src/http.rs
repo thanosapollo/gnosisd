@@ -5967,6 +5967,31 @@ mod tests {
             response_json(second).await["items"][0]["document_id"],
             "document-b"
         );
+        let source_b =
+            "#+title: document-b\n* Needle :exact-extra:\n:PROPERTIES:\n:ID: node-b\n:END:\n";
+        let digest_b = format!("{:x}", Sha256::digest(source_b.as_bytes()));
+        let blob_b = directory
+            .path()
+            .join("blobs")
+            .join(&digest_b[..2])
+            .join(&digest_b);
+        std::fs::write(&blob_b, vec![b'x'; source_b.len() + 1]).unwrap();
+        let corrupt = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/content-search?q=needle",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(corrupt.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response_json(corrupt).await["error"]["code"],
+            "invalid_server_state"
+        );
+        std::fs::write(blob_b, source_b).unwrap();
         let mismatch = app
             .clone()
             .oneshot(authorized(

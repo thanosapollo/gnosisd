@@ -2681,9 +2681,9 @@ fn run_store_command(
                 expected_generation.as_ref(),
                 after.as_deref(),
                 limit,
-                |digest| {
+                |digest, size| {
                     blobs
-                        .read(digest)
+                        .read_bounded(digest, size)
                         .map_err(|_| StoreError::InvalidServerState)
                 },
             );

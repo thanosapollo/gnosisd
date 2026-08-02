@@ -95,6 +95,31 @@ impl BlobStore {
         Ok(bytes)
     }
 
+    pub(crate) fn read_bounded(
+        &self,
+        digest: &str,
+        expected_size: usize,
+    ) -> Result<Vec<u8>, BlobError> {
+        let path = self.blob_path(digest)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() != u64::try_from(expected_size).map_err(|_| BlobError::Corrupt)?
+        {
+            return Err(BlobError::Corrupt);
+        }
+        let limit = u64::try_from(expected_size)
+            .map_err(|_| BlobError::Corrupt)?
+            .checked_add(1)
+            .ok_or(BlobError::Corrupt)?;
+        let mut bytes = Vec::with_capacity(expected_size);
+        File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+        if bytes.len() != expected_size {
+            return Err(BlobError::Corrupt);
+        }
+        verify_bytes(&bytes, digest)?;
+        Ok(bytes)
+    }
+
     pub(crate) fn verify(&self, digest: &str, size: u64) -> Result<(), BlobError> {
         verify_file(&self.blob_path(digest)?, digest, size)
     }
@@ -306,6 +331,22 @@ mod tests {
             .join(&first.sha256[..2])
             .join(&first.sha256);
         assert_eq!(std::fs::read(path).unwrap(), b"same");
+    }
+
+    #[test]
+    fn bounded_read_rejects_an_oversized_canonical_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("blobs");
+        let store = BlobStore::open(&root).unwrap();
+        let blob = store.put(b"same", "text/plain").unwrap();
+        assert_eq!(store.read_bounded(&blob.sha256, 4).unwrap(), b"same");
+
+        let path = root.join(&blob.sha256[..2]).join(&blob.sha256);
+        std::fs::write(path, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(matches!(
+            store.read_bounded(&blob.sha256, 4),
+            Err(BlobError::Corrupt)
+        ));
     }
 
     #[test]
