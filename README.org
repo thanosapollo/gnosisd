@@ -1,34 +1,13 @@
-#+title: Gnosis Core
+#+title: gnosisd
 
-Gnosis Core is the source of truth for Gnosis knowledge and learning data.
-Ordinary clients use its authenticated HTTP API. Operators use the local
-administration protocol.
+~gnosisd~ is Gnosis' canonical knowledge and learning server. It owns Org
+documents, parsed nodes and links, themata, review state, FSRS scheduling,
+SQLite persistence, blobs, backups, and synchronization.
 
-* Ownership and trust boundary
-
-~gnosisd~ is the only process that opens the database. Ordinary clients use the
-authenticated HTTP API and never send SQL. The Unix socket is reserved for
-local trust bootstrap, administration, and recovery.
-The daemon is single-user and creates its socket and SQLite database with mode
-~0600~. HTTP binds only to loopback; Tailscale Serve is the remote Tailnet entry
-point.
-
-Every ~/v1~ data endpoint requires a per-device bearer token. Tokens carry
-~read~, ~review~, ~content:write~, ~settings:write~, or ~admin~ scopes. Secrets
-are returned once and SQLite stores only their SHA-256 digests. Device and
-backup administration remains local-socket-only.
-
-One dedicated thread owns the SQLite connection. Reads and writes pass through
-one bounded queue. No transaction, blocking guard, or connection crosses an
-async suspension point. Accepted writes complete even if the client leaves.
-
-The default bounds are:
-
-- 1 MiB frames and HTTP request bodies;
-- 128-byte request IDs;
-- 32 simultaneous Unix connections;
-- eight queued database operations;
-- 64 concurrent HTTP requests with 30-second timeouts.
+Ordinary clients use authenticated typed HTTP ~/v1~. They never open the
+canonical database or calculate scheduling. The Unix socket is reserved for
+local operators: device bootstrap/revocation, backup, recovery, repair, and
+diagnostics.
 
 * Build and run
 
@@ -41,345 +20,99 @@ cargo run --bin gnosisd -- \
   --http-listen 127.0.0.1:7842
 #+end_src
 
-The operator client uses local protocol version 1:
+HTTP binds to loopback. Tailscale Serve may provide Tailnet HTTPS. Do not expose
+the Unix socket or database.
+
+~GET /health~ returns ~{"status":"ready"}~ only after a store round trip.
+Unavailable storage returns HTTP 503. OpenAPI 3.1 is public at
+~GET /v1/openapi.json~.
+
+* Local operator control
+
+~gnosisd-admin~ speaks bounded Unix protocol v1. Success output is JSON. Device
+tokens are returned once; SQLite stores only SHA-256 digests.
 
 #+begin_src sh
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  device-create phone --scope read --scope review
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  device-create emacs --scope read --scope review --scope content:write
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" device-list
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  device-revoke DEVICE_ID
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+  admin repair --batch-size 100
 #+end_src
 
-~GET /health~ is an operational readiness check.  It returns
-~{"status":"ready"}~ only after a round trip through the daemon-owned store
-actor.  A stopped or unavailable store returns HTTP 503 with
-~{"status":"unavailable"}~.
+Ordinary document, thema, review, asset, and synchronization work does not use
+the Unix socket.
 
-All ordinary document, thema, review, and replica commands use authenticated HTTP.
-The URL defaults to ~http://127.0.0.1:7842~. Store the one-time device token in
-a private file without placing it in shell history or argv:
+* HTTP contract
 
-#+begin_src sh
-install -d -m 700 "$HOME/.config/gnosis"
-install -m 600 /dev/null "$HOME/.config/gnosis/client.token"
-# Copy the one-time device token into client.token.
+Every data route requires a device bearer token with exact ~read~, ~review~,
+~content:write~, ~settings:write~, or ~admin~ scopes. CORS is disabled. Request
+bodies, responses, queues, parsing work, and connection counts are bounded.
+Mutations are not automatically retried.
 
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  get-document DOCUMENT_ID
-printf '#+title: Note\n' | \
-  gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  import DOCUMENT_ID --operation-id OPERATION_ID \
-  --content-type 'text/org; charset=utf-8'
-gnosis import-manifest /path/to/manifest.json \
-  --journal /path/to/import.journal --dry-run
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  import-manifest /path/to/manifest.json --journal /path/to/import.journal
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  review-attempt-state ATTEMPT_ID
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  review-attempt-set-accepted ATTEMPT_ID \
-  --operation-id OPERATION_ID --expected-revision REVISION \
-  --accepted-success false
+The API retains:
 
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  sync --replica "$HOME/.local/share/gnosis/client.sqlite"
-#+end_src
+- document create/replace/rename/tombstone, exact revisions, digests, and blobs;
+- node search/catalog, byte spans, title paths, and inbound/outbound links;
+- thema search/catalog, lifecycle, concepts, and direct review suspension;
+- online review sessions, concealed pending questions, grading, desired-state
+  operations, immutable events, and progress;
+- device-bound snapshots, deltas, cursors, SSE wakeups, staged blobs, and
+  sequenced offline content/asset/review reconciliation;
+- explicit offline review-pack acquisition, asset verification, and retained
+  results;
+- revisioned settings, dashboard projections, health, and OpenAPI.
 
-For a Tailnet endpoint, pass ~--http-url https://...~. Mutation delivery is
-never retried automatically. If delivery is unknown, repeat the command only
-with the same operation ID and captured revision. ~sync~ resumes the same local
-replica after restart and prints its snapshot, delta, blob, and outbox counts.
-The durable replica identity comes from the authenticated token and is checked
-again before synchronization changes local state.
+Public IDs are opaque strings. Existing updates use ~If-Match~. Durable
+mutations use device-scoped ~Idempotency-Key~ or typed operation IDs. Exact
+retries return retained results. Stale revisions, conflicts, and unknown
+delivery remain explicit.
 
-~--dry-run~ reads and validates every manifest source without opening the HTTP
-client or creating the journal. Omit it to apply the whole preflighted manifest
-with the normal HTTP token. The mode-0600 journal records only server-confirmed
-results; exact reruns skip completed operation IDs, while changed manifest or
-source bytes fail closed. Transport failures retain the operation identity for
-explicit replay.
+Managed assets use ~assets/<sha256>/<name>~. The server verifies path, digest,
+size, media type, and active state before canonical publication.
 
-#+begin_src json
-{"version":1,"root":"/path/to/export","entries":[{"operation_id":"stable-operation-id","document_id":null,"expected_revision":null,"logical_path":"notes/example.org","content_type":"text/org; charset=utf-8","source_path":"notes/example.org"}]}
-#+end_src
+* Ownership and storage
 
-Offline review packs use typed JSON on standard input and output. Acquire or
-resume a pack while connected:
+One daemon-owned thread holds the canonical SQLite connection. Reads and atomic
+writes pass through bounded queues. Accepted writes finish after client
+disconnect. No transaction or blocking guard crosses an async suspension point.
+SQLite files use mode ~0600~.
 
-#+begin_src sh
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  review-pack acquire --replica "$HOME/.local/share/gnosis/client.sqlite" \
-  < review-pack-request.json
+Server schema v3 stores documents, nodes, links, themata, scheduling, review
+history, sessions, attempts, devices, settings, snapshots, feed revisions,
+offline operations, retained results, and conflicts. Public IDs never expose
+SQLite row IDs.
 
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  review-pack resume --replica "$HOME/.local/share/gnosis/client.sqlite"
-#+end_src
+Documents and assets use immutable SHA-256 blobs outside SQLite. Accepted Org
+revisions parse and index in the same transaction that moves the document head.
+Invalid Org cannot change canonical state. Removed nodes remain queryable as
+inactive historical nodes.
 
-The current question and answer recording work without a token or daemon. The
-question projection never contains the captured answer. Answer input includes
-the immutable attempt ID, pack position, structured response, explicit nullable
-override, desired suspension state, and timestamp so the same operation can be
-replayed after lost output.
+The functional domain contains no SQLite, Tokio, JSON, socket, filesystem,
+orgize, clock, or randomness types.
 
-#+name: offline-answer-v1
-#+begin_src json
-{"version":1,"pack_id":"pack","attempt_id":"attempt","session_position":0,"response":{"kind":"text","value":"Answer"},"accepted_success":null,"desired_suspended":false,"answered_at_us":2}
-#+end_src
-
-#+begin_src sh
-gnosis review-pack current \
-  --replica "$HOME/.local/share/gnosis/client.sqlite"
-
-gnosis review-pack answer \
-  --replica "$HOME/.local/share/gnosis/client.sqlite" \
-  < offline-answer.json
-
-gnosis --token-file "$HOME/.config/gnosis/client.token" \
-  sync --replica "$HOME/.local/share/gnosis/client.sqlite"
-#+end_src
-
-~review-pack answer~ never contacts the network, and ~sync~ remains the only
-outbox drain. Use ~review-pack abandon~ while connected to release an unused
-active pack lease.
-
-Verified pack assets and retained reconciliation outcomes are also available
-without a daemon. Both commands read a closed versioned JSON request from
-standard input. Asset output includes the logical path, digest, media type,
-size, and base64 bytes. Result pages contain only accepted or conflict
-summaries; captured presentations, correct answers, responses, and raw
-operations remain private replica records.
-
-#+begin_src sh
-gnosis review-pack asset \
-  --replica "$HOME/.local/share/gnosis/client.sqlite" \
-  < offline-asset-request.json
-
-gnosis review-pack results \
-  --replica "$HOME/.local/share/gnosis/client.sqlite" \
-  < review-result-page-request.json
-#+end_src
-
-Pass ~--json-errors~ when another program invokes ~gnosis~. Failures are then
-written to standard error as a closed versioned object with a stable category,
-delivery state, optional operation ID, and the typed HTTP error when the server
-rejected the request. Human-readable errors remain the default for terminals.
-
-The Unix message format is a four-byte big-endian length followed by UTF-8
-JSON. It is the privileged local and administrative transport for diagnostics,
-device token administration, and backup commands. Stable errors never expose
-SQL, paths, dependency failures, or backtraces.
-
-* HTTP API
-
-The ~/v1~ API provides:
-
-- device-bound replica state, resumable snapshots, exact revision deltas, and
-  immutable blob downloads, with authenticated device identity checked before
-  local state changes;
-- optimistic thema create, search, update, archive, unarchive, and direct
-  review-state suspension;
-- revisioned Org documents, renames, tombstones, and historical retrieval;
-- content-addressed managed assets;
-- durable change cursors and cursor-only SSE announcements;
-- node search and paged inbound and outbound graph links;
-- revisioned canonical review settings;
-- one active resumable review session with a persisted ordered queue;
-- captured attempts, grading, override, suspension, and idempotent atomic
-  commit;
-- bounded offline review packs and immutable review reconciliation;
-- sequenced offline document, lifecycle, and asset-create operations.
-
-Existing revisioned content and settings updates use ~If-Match~. A stale revision
-returns ~412~ with the current revision and leaves server state unchanged.
-Retry-safe document create, replacement, rename, and tombstone operations use
-~/v1/document-mutations~, a device-scoped ~Idempotency-Key~, and ~If-Match~
-when a current document is required. Exact retries return the retained applied
-or rejected result and cursor. A stale base is a final typed rejection with
-HTTP ~200~; reusing a key for changed content returns ~409~. Rename path
-collisions remain explicit and no-op lifecycle requests do not advance the
-document revision or replica cursor.
-Sequenced offline mutations use immutable operation IDs and contiguous device
-sequence numbers. Review answer and commit retries use retained attempt state.
-Clients recover an attempt and its revision with
-~GET /v1/review/attempts/{id}~. They set correctness or suspension through
-~PUT /v1/review/attempts/{id}/accepted-success~ and
-~PUT /v1/review/attempts/{id}/suspension~ using a durable operation ID and
-expected attempt revision. Exact retries return the retained result.
-
-The first HTTP attempt response hides raw answer-bearing content. Its captured
-presentation contains a server-materialized question and a closed response
-prompt: one text input, an exact list of text inputs with optional script
-hints, or explicit choices. Cloze answers are replaced before serialization.
-Script hints use lowercase Unicode Script names with spaces or underscores
-normalized to hyphens; ~null~ means that no non-Latin input method is suggested.
-Grading returns the detected result, revealed answer, matcher version, and
-proposed transition.
-~client_http::HttpClient~ is the reference native transport. It disables
-redirects, proxies, and automatic retries; bounds every response; validates
-resource and operation identities; and treats a timeout or invalid mutation
-response as unknown delivery. Clients recover session state through the
-active-session and attempt-state resources.
-
-Management clients page content, archive, and suspension state together through
-~GET /v1/themata/catalog~. General thema and node searches remain
-~GET /v1/themata~ and ~GET /v1/nodes~. Each node result binds its byte range to a document revision
-and SHA-256 digest. To jump to a node, fetch
-~GET /v1/notes/{document_id}/revisions/{document_revision}~, require the
-revision ETag and digest to match, then select the half-open UTF-8 byte range
-~[start_byte, end_byte)~. Heading ranges include the complete heading subtree.
-~HttpClient::node_source~ performs these checks and also works for inactive
-historical nodes while their revision blob is retained. Projections created
-before range support return both offsets as ~null~ instead of guessing.
-
-The OpenAPI 3.1 document is available at ~/v1/openapi.json~. Replica bootstrap,
-direct content resources, online review sessions and attempts, desired-state
-operations, and stable errors are generated from the public Rust DTOs in
-~protocol::http_v1~. Content schemas distinguish request defaults from required
-response fields and describe scopes, conditional headers, pagination, raw
-media, and tombstone responses. Review-pack acquisition, pack assets, and
-offline review reconciliation expose closed v1 request and v2 response DTOs,
-exact scopes, statuses, and binary asset responses. Sequenced offline content
-reconciliation has the same closed v1 request and result contract. Sequenced
-offline asset reconciliation is also typed, including staged-blob failures and
-the exact content-addressed size bounds. The offline synchronization portion of
-the schema is generator-ready.
-CORS is disabled. Tailscale provides Tailnet HTTPS while ~gnosisd~ stays on
-~127.0.0.1:7842~.
-
-A complete offline-review replica needs both ~read~ and ~review~ scopes.
-~review~ alone supports the bounded pack flow but cannot bootstrap a full
-~LocalReplica~. ~client_sync::ReplicaSync~ is the reference coordinator. It
-resumes snapshots, pulls durable deltas, downloads required blobs, and drains
-the shared content, asset, and review outbox strictly by device sequence. It
-does not retry unknown mutation delivery. The next explicit synchronization
-replays the same immutable operation and receives its retained result. SSE
-cursor announcements are advisory wakeups, so callers must also synchronize
-periodically because Unix-socket writes do not emit HTTP events.
-
-~client_review::ReviewPackAcquisition~ is the explicit offline-review download
-path. It uses typed pack resources, persists the leased pack before fetching
-assets, verifies asset path, media type, size, and SHA-256, and resumes a
-partial download from ~/v1/review/packs/active~ after restart. Abandonment is
-applied to the replica's mutable progress while the captured pack remains
-immutable. Normal replica synchronization never creates a review pack.
-
-* Storage
-
-The server's canonical schema v3 stores native themata, tags, node associations,
-scheduling state, exact review history, sessions, attempts, devices, settings,
-documents, and the node graph. It also stores replica snapshots and feed
-revisions, review packs, immutable offline operations and results, device
-sequence state, and conflict evidence. Review attempts carry a monotonic
-mutation revision and an immutable journal of accepted or conflicting
-desired-state operations. Direct device mutations retain their canonical
-request and applied or rejected result under a device-scoped operation identity.
-Public IDs are opaque text. Imported numeric thema IDs are retained and new
-resources use UUIDv7.
-
-The replica database retains its distinct canonical schema v1. Server and
-replica databases use distinct SQLite application IDs. Startup creates the
-applicable schema only for an empty database and rejects every other version or
-database identity.
-
-Documents and assets use immutable SHA-256 blobs outside SQLite. SQLite
-tracks logical paths, heads, revisions, renames, tombstones, and the monotonic
-change cursor. Paths are relative and case-unique. Imports carry an explicit
-content type and source; capabilities publish supported types and source and
-projection byte limits. Currently supported documents are Org files. Supported
-files below ~assets/<sha256>/<original-name>~ enter the canonical tree.
-
-Accepted Org revisions are parsed and indexed in the same transaction that
-moves the document head. Invalid Org cannot change the head or node graph.
-Removed nodes remain queryable as inactive historical nodes.
-
-The domain layer contains no SQLite, Tokio, JSON, socket, filesystem, orgize,
-clock, or randomness types. Textual link occurrences, unique semantic graph
-edges, and thema-to-node learning associations remain distinct.
-
-
-* Reviews and settings
-
-Matcher version 1 preserves current case, whitespace, quote, and Levenshtein
-behavior for basic and cloze themata. Multiple-choice variants require one
-exact captured choice. Scheduling uses the FSRS-6 model through implementation
-~fsrs-6.6.1~ with fixed canonical parameters. Desired retention is the only
-scheduler configuration. Canonical settings also start with timezone
-~Europe/Athens~ and day boundary ~0~. Settings are revisioned; existing sessions
-keep their captured settings when canonical settings change.
-
-* Offline replicas
-
-An offline-capable client owns a real local SQLite replica. It contains
-downloaded projections and blobs, a durable server-bound cursor, installed
-review packs, and immutable review, content, and asset outboxes. A snapshot is
-staged page by page and becomes active only when its terminal page is complete.
-If a cursor expires or names a different server history, the client installs a
-new snapshot without deleting pending work or conflict evidence. SSE only
-wakes the client; correctness comes from pulling the durable delta feed.
-
-Review packs materialize one ordered session and capture every presentation,
-thema digest, scheduling revision, scheduler and matcher version, timezone, day
-boundary, resolved parameters, and required managed asset. One exclusive
-server lease prevents another device or online session from advancing that
-materialized session. A disconnected or abandoned client leaves the lease
-visible until it is explicitly recovered or abandoned; the daemon never
-chooses a winner by timestamp.
-
-Each offline answer is committed locally with its attempt ID and the next
-device sequence before the UI advances. Reconciliation verifies the captured
-content and base scheduling revision, recomputes the transition from the
-recorded versioned inputs, and atomically commits the event, scheduling state,
-session progress, suspension, and totals. Exact retries return the retained
-result. Stale attempts remain explicit conflicts and cannot change canonical
-scheduling state.
-
-Review, document, and asset operations share one contiguous per-device
-sequence. Document mutations retain submitted Org or captured lifecycle bases;
-invalid and stale revisions remain queryable without replacing the active head
-or node index. Tombstones flow through the replica feed and prevent deleted
-content from reappearing. Assets are SHA-256 addressed and deduplicated. An
-offline asset blob is uploaded and verified before its sequenced create
-operation, and dependent Org revisions remain behind it in the outbox.
-
-A client may materialize replica blobs as ordinary local working files for its
-editor. The client owns that file layout and watches or saves files according
-to its UI policy. An explicit save queues a revision- and digest-bound document
-operation in the durable outbox; the next sync publishes it or records a typed
-conflict. The daemon does not watch client working trees, and a local autosave
-is not itself a canonical revision.
-
-Check live Org parsing parity read-only:
-
-#+begin_src sh
-tools/check-org-parity.sh tests/fixtures/org/basic.org
-tools/check-org-parity.sh tests/fixtures/org/no-file-id.org
-tools/check-org-parity.sh tests/fixtures/org/duplicate-links.org
-tools/check-org-parity.sh tests/fixtures/org/unicode.org
-tools/check-org-parity.sh tests/fixtures/org/compatibility.org
-#+end_src
-
-* Backups
+* Backups and recovery
 
 Online backup runs through the database owner and includes a consistent SQLite
-snapshot, every referenced blob, and a SHA-256 manifest:
+snapshot, every referenced blob, and a SHA-256 manifest.
 
 #+begin_src sh
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup create --directory "$HOME/.local/share/gnosis/backups"
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup verify BACKUP_PATH
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 2
-gnosis --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
+gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup restore-validate BACKUP_PATH \
   --temporary-directory "$HOME/.local/share/gnosis/restore-check"
 #+end_src
 
-Restore validation materializes and checks a temporary instance without
-replacing the live server.
-
-Cold restore requires the daemon to be stopped. It validates and stages the
-complete backup before replacing either target, then preserves the prior
-database and blob tree in a mode-0700 ~.DATABASE.restore-rollback~ directory:
+Restore validation materializes a temporary instance without replacing live
+state. Cold restore requires stopped daemon:
 
 #+begin_src sh
 systemctl --user stop gnosisd
@@ -391,21 +124,15 @@ gnosisd --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 systemctl --user start gnosisd
 #+end_src
 
-Restore refuses a running daemon, occupied socket path, invalid backup, or
-existing rollback directory. Verify service state and restored data before
-removing the reported rollback directory. Rollback also preserves any prior
-SQLite ~-journal~, ~-wal~, and ~-shm~ sidecars; move them with the database when
-rolling back.
+Cold restore validates and stages the complete backup before replacement. It
+refuses running-daemon/startup-lock races and preserves prior targets plus
+SQLite sidecars under the reported mode-0700 rollback directory.
 
-* Scope
+* Deployment
 
-This remains a single-user canonical server. Remote non-Tailnet transport,
-multi-server synchronization, Markdown, embeddings, and client filesystem
-watching remain out of scope. Client protocol alignment and mobile UI work are
-separate milestones.
-
-Raspberry Pi installation and cutover are in
-[[file:docs/raspberry-pi.org][docs/raspberry-pi.org]].
+Systemd user units and Pi runbook live under ~deployment/~ and
+~docs/raspberry-pi.org~. The service keeps HTTP on loopback and grants writes
+only to Gnosis state/runtime paths.
 
 * Validation
 
@@ -418,11 +145,14 @@ cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo tree --depth 1
 nix build
-for fixture in basic no-file-id duplicate-links unicode compatibility; do
-  tools/check-org-parity.sh "tests/fixtures/org/$fixture.org"
-done
-nix run nixpkgs#cargo-audit -- audit
 tools/check-packaged-smoke.sh
 #+end_src
 
-The project is licensed under GPL-3.0-or-later. See [[file:LICENSE][LICENSE]].
+Emacs client checks:
+
+#+begin_src sh
+make -C clients/emacs test
+make -C clients/emacs integration
+#+end_src
+
+Project licensed GPL-3.0-or-later. See [[file:LICENSE][LICENSE]].

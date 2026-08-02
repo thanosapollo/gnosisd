@@ -1,7 +1,7 @@
 //! Public JSON contracts for authenticated HTTP `/v1` clients.
 //!
-//! These DTOs preserve their exact versioned JSON shapes. `LocalReplica`
-//! performs cursor, identity, projection, and ordering validation before
+//! These DTOs preserve their exact versioned JSON shapes. Offline-capable
+//! clients validate cursor, identity, projection, and ordering before local
 //! persistence.
 
 mod client_views;
@@ -57,7 +57,7 @@ use crate::application::{
     ReviewAttemptBeginResult, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
     ReviewClozeSpan, ReviewClozeState, ReviewItemSkipReason, ReviewQuestion, ReviewResponsePrompt,
     ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, SkippedReviewItem,
-    TransitionSnapshot, review_attempt_question, review_question,
+    TransitionSnapshot, review_attempt_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
@@ -1279,14 +1279,6 @@ impl ReviewPresentationV1 {
         let question =
             review_attempt_question(value).map_err(|_| ReviewAttemptWireError::Presentation)?;
         Self::from_question(&value.presentation, question)
-    }
-
-    pub(crate) fn from_snapshot(
-        presentation: &PresentationSnapshot,
-    ) -> Result<Self, ReviewAttemptWireError> {
-        let question =
-            review_question(presentation).map_err(|_| ReviewAttemptWireError::Presentation)?;
-        Self::from_question(presentation, question)
     }
 
     fn from_question(

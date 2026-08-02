@@ -1,9 +1,12 @@
 [package]
-name = "gnosis-core"
+name = "gnosisd"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
-description = "Local daemon core for Gnosis knowledge and learning clients"
+description = "Gnosis knowledge and learning daemon"
+
+[lib]
+name = "gnosis_core"
 
 [dependencies]
 axum = "0.8"
@@ -15,10 +18,8 @@ fsrs = { version = "=6.6.1", default-features = false }
 getrandom = "0.3"
 orgize = "0.9"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rusqlite = { version = "0.37", features = ["backup", "bundled", "hooks"] }
 rustix = { version = "1", features = ["fs"] }
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

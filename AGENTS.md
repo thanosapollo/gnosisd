@@ -29,8 +29,8 @@ data, content, and review operations use HTTP only.
 - `src/protocol/http_v1.rs` is the client HTTP contract kernel. Runtime DTOs and
   OpenAPI schemas must remain identical; do not maintain parallel JSON models.
 - `src/bin/gnosisd.rs` is the only shipped canonical database owner.
-- `src/bin/gnosis.rs` uses `HttpClient` for ordinary online operations. Offline
-  commands may use the concrete client replica, never the canonical database.
+- `src/bin/gnosisd-admin.rs` is the minimal privileged Unix operator client.
+  Ordinary data, content, and review operations remain HTTP client concerns.
 
 ## Data and review invariants
 

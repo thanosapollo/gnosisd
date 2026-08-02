@@ -4,28 +4,31 @@ set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 core_dir=${GNOSIS_CORE_DIR:-$project_dir/../..}
 gnosisd=${GNOSISD:-}
-gnosis_cli=${GNOSIS_CLI:-}
+gnosisd_admin=${GNOSISD_ADMIN:-}
 emacs_bin=$(command -v "${EMACS:-emacs}")
 make_bin=${MAKE:-make}
 
-if [ -n "$gnosisd" ] || [ -n "$gnosis_cli" ]; then
-    if [ -z "$gnosisd" ] || [ -z "$gnosis_cli" ]; then
-        echo "GNOSISD and GNOSIS_CLI must be set together" >&2
+if [ -n "$gnosisd" ] || [ -n "$gnosisd_admin" ]; then
+    if [ -z "$gnosisd" ] || [ -z "$gnosisd_admin" ]; then
+        echo "GNOSISD and GNOSISD_ADMIN must be set together" >&2
         exit 1
     fi
 else
     [ -f "$core_dir/Cargo.toml" ] || {
-        echo "Set GNOSIS_CORE_DIR or GNOSISD and GNOSIS_CLI" >&2
+        echo "Set GNOSIS_CORE_DIR or GNOSISD and GNOSISD_ADMIN" >&2
         exit 1
     }
     nix develop "$core_dir" --command \
         cargo build --manifest-path "$core_dir/Cargo.toml" --bins
     gnosisd=$core_dir/target/debug/gnosisd
-    gnosis_cli=$core_dir/target/debug/gnosis
+    gnosisd_admin=$core_dir/target/debug/gnosisd-admin
 fi
 
 [ -x "$gnosisd" ] || { echo "gnosisd is not executable: $gnosisd" >&2; exit 1; }
-[ -x "$gnosis_cli" ] || { echo "gnosis is not executable: $gnosis_cli" >&2; exit 1; }
+[ -x "$gnosisd_admin" ] || {
+    echo "gnosisd-admin is not executable: $gnosisd_admin" >&2
+    exit 1
+}
 
 suite_state=$(mktemp -d "${TMPDIR:-/tmp}/gnosis-emacs-contract.XXXXXX")
 chmod 700 "$suite_state"
@@ -81,13 +84,13 @@ for test_name in $tests; do
     done
 
     device=$(
-        "$gnosis_cli" --socket "$state/gnosis.sock" \
+        "$gnosisd_admin" --socket "$state/gnosis.sock" \
             device-create emacs-contract --scope read --scope review \
             --scope content:write
     )
     token=$(printf '%s\n' "$device" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
     device_2=$(
-        "$gnosis_cli" --socket "$state/gnosis.sock" \
+        "$gnosisd_admin" --socket "$state/gnosis.sock" \
             device-create emacs-contract-2 --scope read --scope review \
             --scope content:write
     )

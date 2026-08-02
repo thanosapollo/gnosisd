@@ -18,7 +18,7 @@ use crate::protocol::replica::encode_cursor;
 pub(crate) const OFFLINE_REVIEW_VERSION: u32 = 1;
 pub(crate) const MAX_OFFLINE_REVIEW_OPERATION_BYTES: usize =
     MAX_REVIEW_PACK_BYTES + 2 * MAX_OFFLINE_ASSET_BYTES as usize;
-pub(crate) const MAX_OFFLINE_REVIEW_RESULT_BYTES: usize = MAX_REVIEW_PACK_BYTES + 64 * 1024;
+
 const OFFLINE_REVIEW_RESPONSE_VERSION: u32 = 2;
 const MAX_REVIEW_PACK_CURSOR_CHARS: usize = 512;
 
@@ -93,6 +93,7 @@ pub(crate) enum OfflineReviewWireError {
     Operation,
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_offline_operation(
     version: u32,
     operation: &OfflineReviewOperation,
@@ -150,48 +151,6 @@ pub(crate) fn offline_result_response(
         version: OFFLINE_REVIEW_RESPONSE_VERSION,
         result: OfflineReviewResultV2::try_from(result)?,
     })
-}
-
-pub(crate) fn decode_review_pack(
-    envelope: ReviewPackEnvelopeV2,
-) -> Result<ReviewPackView, OfflineReviewWireError> {
-    if envelope.version != OFFLINE_REVIEW_RESPONSE_VERSION {
-        return Err(OfflineReviewWireError::Version);
-    }
-    let value = serde_json::to_value(&envelope).map_err(|_| OfflineReviewWireError::Operation)?;
-    require_response_size(&value)?;
-    ReviewPackView::try_from(envelope.pack)
-}
-
-pub(crate) fn decode_offline_result(
-    value: Value,
-) -> Result<OfflineReviewResult, OfflineReviewWireError> {
-    require_response_size(&value)?;
-    require_response_version(&value)?;
-    let envelope: OfflineReviewResultEnvelopeV2 =
-        serde_json::from_value(value).map_err(|_| OfflineReviewWireError::Operation)?;
-    OfflineReviewResult::try_from(envelope.result)
-}
-
-fn require_response_version(value: &Value) -> Result<(), OfflineReviewWireError> {
-    let version = value
-        .get("version")
-        .and_then(Value::as_u64)
-        .ok_or(OfflineReviewWireError::Operation)?;
-    if version == u64::from(OFFLINE_REVIEW_RESPONSE_VERSION) {
-        Ok(())
-    } else {
-        Err(OfflineReviewWireError::Version)
-    }
-}
-
-fn require_response_size(value: &Value) -> Result<(), OfflineReviewWireError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| OfflineReviewWireError::Operation)?;
-    if bytes.len() <= MAX_OFFLINE_REVIEW_RESULT_BYTES {
-        Ok(())
-    } else {
-        Err(OfflineReviewWireError::Operation)
-    }
 }
 
 #[derive(Serialize)]
@@ -1297,14 +1256,10 @@ mod tests {
     use sha2::{Digest as _, Sha256};
 
     use super::{
-        MAX_OFFLINE_ASSET_BYTES, MAX_REVIEW_PACK_CURSOR_CHARS, OfflineReviewSubmission,
-        OfflineReviewWireError, ReviewPackEnvelopeV2, decode_offline_result, decode_review_pack,
-        offline_result_json, review_pack_json,
+        OfflineReviewSubmission, OfflineReviewWireError, ReviewPackEnvelopeV2, offline_result_json,
+        review_pack_json,
     };
-    use crate::application::{
-        MAX_REVIEW_PACK_ID_CHARS, MAX_REVIEW_PACK_ITEMS, MAX_REVIEW_PACK_MEDIA_TYPE_CHARS,
-        OfflineReviewResult, ReviewPackView,
-    };
+    use crate::application::{OfflineReviewResult, ReviewPackView};
 
     #[test]
     fn rejects_unknown_versions_before_decoding_the_operation() {
@@ -1330,128 +1285,6 @@ mod tests {
             }))
             .is_err()
         );
-    }
-
-    #[test]
-    fn response_decoders_classify_unknown_versions() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/protocol/offline-review-v1.json"
-        ))
-        .unwrap();
-        let mut pack = fixture["pack"].clone();
-        pack["version"] = json!(1);
-        assert!(serde_json::from_value::<ReviewPackEnvelopeV2>(pack).is_err());
-        let mut result = fixture["result"].clone();
-        result["version"] = json!(1);
-        assert!(matches!(
-            decode_offline_result(result),
-            Err(OfflineReviewWireError::Version)
-        ));
-    }
-
-    #[test]
-    fn review_pack_rejects_oversized_asset_metadata() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/protocol/offline-review-v1.json"
-        ))
-        .unwrap();
-        let mut pack = fixture["pack"].clone();
-        let digest = "a".repeat(64);
-        pack["pack"]["assets"] = json!([{
-            "logical_path": format!("assets/{digest}/image.png"),
-            "content_sha256": digest,
-            "size_bytes": MAX_OFFLINE_ASSET_BYTES + 1,
-            "media_type": "image/png"
-        }]);
-        let response = serde_json::from_value(pack).unwrap();
-        assert!(matches!(
-            decode_review_pack(response),
-            Err(OfflineReviewWireError::Operation)
-        ));
-    }
-
-    #[test]
-    fn review_pack_runtime_bounds_match_the_public_schema() {
-        let fixture = pack_fixture();
-        for field in ["pack_id", "session_id", "device_id", "lease_id"] {
-            let mut oversized = fixture.clone();
-            oversized["pack"][field] = json!("x".repeat(MAX_REVIEW_PACK_ID_CHARS + 1));
-            assert_invalid_pack(oversized);
-        }
-        let mut thema = fixture.clone();
-        thema["pack"]["items"][0]["thema_id"] = json!("x".repeat(MAX_REVIEW_PACK_ID_CHARS + 1));
-        assert_invalid_pack(thema);
-        let mut cursor = fixture.clone();
-        cursor["pack"]["cursor"] = json!("x".repeat(MAX_REVIEW_PACK_CURSOR_CHARS + 1));
-        assert_invalid_pack(cursor);
-
-        let mut media = fixture.clone();
-        media["pack"]["assets"] =
-            json!([pack_asset("x".repeat(MAX_REVIEW_PACK_MEDIA_TYPE_CHARS + 1))]);
-        assert_invalid_pack(media);
-
-        let mut items = fixture;
-        let repeated = repeated_items(&items, MAX_REVIEW_PACK_ITEMS + 1);
-        items["pack"]["items"] = repeated;
-        assert_invalid_pack(items);
-    }
-
-    #[test]
-    fn review_pack_accepts_exact_public_boundaries() {
-        let mut fixture = pack_fixture();
-        for field in ["pack_id", "session_id", "device_id", "lease_id"] {
-            fixture["pack"][field] = json!("x".repeat(MAX_REVIEW_PACK_ID_CHARS));
-        }
-        fixture["pack"]["items"][0]["thema_id"] = json!("x".repeat(MAX_REVIEW_PACK_ID_CHARS));
-        fixture["pack"]["assets"] =
-            json!([pack_asset("x".repeat(MAX_REVIEW_PACK_MEDIA_TYPE_CHARS))]);
-        fixture["pack"]["assets"][0]["size_bytes"] = json!(MAX_OFFLINE_ASSET_BYTES);
-        let response = serde_json::from_value(fixture).unwrap();
-        assert!(decode_review_pack(response).is_ok());
-
-        let mut fixture = pack_fixture();
-        let repeated = repeated_items(&fixture, MAX_REVIEW_PACK_ITEMS);
-        fixture["pack"]["items"] = repeated;
-        let response = serde_json::from_value(fixture).unwrap();
-        assert!(decode_review_pack(response).is_ok());
-    }
-
-    fn pack_fixture() -> serde_json::Value {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/protocol/offline-review-v1.json"
-        ))
-        .unwrap();
-        fixture["pack"].clone()
-    }
-
-    fn assert_invalid_pack(value: serde_json::Value) {
-        let response = serde_json::from_value(value).unwrap();
-        assert!(matches!(
-            decode_review_pack(response),
-            Err(OfflineReviewWireError::Operation)
-        ));
-    }
-
-    fn pack_asset(media_type: String) -> serde_json::Value {
-        let digest = "a".repeat(64);
-        json!({
-            "logical_path": format!("assets/{digest}/image.png"),
-            "content_sha256": digest,
-            "size_bytes": 1,
-            "media_type": media_type
-        })
-    }
-
-    fn repeated_items(fixture: &serde_json::Value, count: usize) -> serde_json::Value {
-        let item = fixture["pack"]["items"][0].clone();
-        (0..count)
-            .map(|position| {
-                let mut item = item.clone();
-                item["position"] = json!(position);
-                item
-            })
-            .collect::<Vec<_>>()
-            .into()
     }
 
     #[test]

@@ -3,25 +3,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::application::{
-    DocumentProjectionSnapshot, FsrsAlgorithmSnapshot, FsrsConfigSnapshot,
-    FsrsImplementationSnapshot, FsrsModelSnapshot, MAX_DOCUMENT_SOURCE_BYTES, ProjectionEdge,
-    ProjectionLinkOccurrence, ProjectionNode, ReplicaChange, ReplicaProjection, ReplicaState,
-    ReviewStateSnapshot, SettingsInput, SnapshotPage, SnapshotPosition, prepare_thema,
-    thema_content, validate_asset_path,
-};
-use crate::{
-    domain::SourceSpan,
-    is_canonical_sha256,
-    parser::{supported_content_type, validate_document_path},
+    DocumentProjectionSnapshot, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,
+    ReplicaChange, ReplicaProjection, ReplicaState, ReviewStateSnapshot, SnapshotPage,
+    SnapshotPosition,
 };
 
 use super::http_v1::{
     AssetOperationV1, AssetRevisionV1, DocumentOperationV1, DocumentProjectionV1,
-    DocumentRevisionV1, FsrsAlgorithmV1, FsrsConfigV1, FsrsImplementationV1, FsrsModelV1,
-    ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1, ReplicaChangePageV1, ReplicaChangeV1,
-    ReplicaProjectionV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewStateRevisionV1,
-    ReviewStateV1, SettingsOperationV1, SettingsRevisionV1, ThemaConceptV1, ThemaKindV1,
-    ThemaOperationV1, ThemaRevisionV1,
+    DocumentRevisionV1, FsrsConfigV1, ProjectionEdgeV1, ProjectionLinkV1, ProjectionNodeV1,
+    ReplicaChangePageV1, ReplicaChangeV1, ReplicaProjectionV1, ReplicaSnapshotPageV1,
+    ReplicaStateV1, ReviewStateRevisionV1, ReviewStateV1, SettingsOperationV1, SettingsRevisionV1,
+    ThemaConceptV1, ThemaKindV1, ThemaOperationV1, ThemaRevisionV1,
 };
 
 pub(crate) const REPLICA_VERSION: u32 = 1;
@@ -40,44 +32,6 @@ pub(crate) enum ReplicaWireError {
     PageTooLarge,
     #[error("replica response is invalid")]
     Response,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedReplicaState {
-    pub(crate) server_id: String,
-    pub(crate) cursor: String,
-    pub(crate) next_device_sequence: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedReplicaItem {
-    pub(crate) entity_kind: String,
-    pub(crate) entity_id: String,
-    pub(crate) revision: u64,
-    pub(crate) tombstone: bool,
-    pub(crate) blob_digests: Vec<String>,
-    pub(crate) payload_json: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedChangePage {
-    pub(crate) server_id: String,
-    pub(crate) from: String,
-    pub(crate) next: String,
-    pub(crate) has_more: bool,
-    pub(crate) items: Vec<DecodedReplicaItem>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedSnapshotPage {
-    pub(crate) snapshot_id: String,
-    pub(crate) server_id: String,
-    pub(crate) cut_cursor: u64,
-    pub(crate) cut_token: String,
-    pub(crate) cursor: Option<String>,
-    pub(crate) next: Option<String>,
-    pub(crate) next_after: Option<u64>,
-    pub(crate) items: Vec<DecodedReplicaItem>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,134 +152,6 @@ pub(crate) fn replica_snapshot_page(
         .map(ReplicaProjectionV1::try_from)
         .collect::<Result<Vec<_>, _>>()?;
     encode_snapshot_page(page, &items)
-}
-
-pub(crate) fn decode_replica_state(
-    state: ReplicaStateV1,
-) -> Result<DecodedReplicaState, ReplicaWireError> {
-    require_response_size(&state)?;
-    if state.version != REPLICA_VERSION || !state.snapshot_required {
-        return Err(ReplicaWireError::Response);
-    }
-    let (server_id, _, _) = decode_cursor(&state.cursor)?;
-    if server_id != state.server_id || state.server_id.is_empty() {
-        return Err(ReplicaWireError::Response);
-    }
-    Ok(DecodedReplicaState {
-        server_id: state.server_id,
-        cursor: state.cursor,
-        next_device_sequence: state.next_device_sequence,
-    })
-}
-
-pub(crate) fn decode_change_page(
-    page: ReplicaChangePageV1,
-) -> Result<DecodedChangePage, ReplicaWireError> {
-    require_response_size(&page)?;
-    if page.version != REPLICA_VERSION {
-        return Err(ReplicaWireError::Response);
-    }
-    let (server_id, from, _) = decode_cursor(&page.from)?;
-    let (next_server, next, _) = decode_cursor(&page.next)?;
-    let terminal_matches = page
-        .items
-        .last()
-        .map_or(page.from == page.next, |item| item.cursor == page.next);
-    if server_id != next_server
-        || next < from
-        || !terminal_matches
-        || (page.has_more && page.items.is_empty())
-    {
-        return Err(ReplicaWireError::Response);
-    }
-    let items = decode_changes(&page.items, &server_id, from, next)?;
-    Ok(DecodedChangePage {
-        server_id,
-        from: page.from,
-        next: page.next,
-        has_more: page.has_more,
-        items,
-    })
-}
-
-pub(crate) fn decode_snapshot_page(
-    page: ReplicaSnapshotPageV1,
-) -> Result<DecodedSnapshotPage, ReplicaWireError> {
-    require_response_size(&page)?;
-    if page.version != REPLICA_VERSION || page.snapshot_id.is_empty() {
-        return Err(ReplicaWireError::Response);
-    }
-    let identity = snapshot_identity(&page)?;
-    let items = page
-        .items
-        .iter()
-        .map(DecodedReplicaItem::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(DecodedSnapshotPage {
-        snapshot_id: page.snapshot_id,
-        server_id: identity.0,
-        cut_cursor: identity.1,
-        cut_token: identity.2,
-        cursor: page.cursor,
-        next: page.next,
-        next_after: identity.3,
-        items,
-    })
-}
-
-fn decode_changes(
-    changes: &[ReplicaChangeV1],
-    server_id: &str,
-    from: u64,
-    next: u64,
-) -> Result<Vec<DecodedReplicaItem>, ReplicaWireError> {
-    let mut previous = from;
-    let mut decoded = Vec::with_capacity(changes.len());
-    for change in changes {
-        let (change_server, position, _) = decode_cursor(&change.cursor)?;
-        if change_server != server_id || position <= previous || position > next {
-            return Err(ReplicaWireError::Response);
-        }
-        previous = position;
-        decoded.push(DecodedReplicaItem::try_from(&change.projection)?);
-    }
-    if previous != next {
-        return Err(ReplicaWireError::Response);
-    }
-    Ok(decoded)
-}
-
-fn snapshot_identity(
-    page: &ReplicaSnapshotPageV1,
-) -> Result<(String, u64, String, Option<u64>), ReplicaWireError> {
-    match (&page.cursor, &page.next) {
-        (Some(cursor), None) => {
-            let (server_id, cut, token) = decode_cursor(cursor)?;
-            Ok((server_id, cut, token, None))
-        }
-        (None, Some(next)) => {
-            let position = decode_snapshot_cursor(next)?;
-            if position.snapshot_id != page.snapshot_id || position.after == 0 {
-                return Err(ReplicaWireError::Response);
-            }
-            Ok((
-                position.server_id,
-                position.cut_cursor,
-                position.cut_token,
-                Some(position.after),
-            ))
-        }
-        _ => Err(ReplicaWireError::Response),
-    }
-}
-
-fn require_response_size(value: &impl Serialize) -> Result<(), ReplicaWireError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| ReplicaWireError::Response)?;
-    if bytes.len() <= MAX_REPLICA_PAGE_BYTES {
-        Ok(())
-    } else {
-        Err(ReplicaWireError::Response)
-    }
 }
 
 fn encode_change_page(
@@ -462,266 +288,6 @@ impl TryFrom<&ReplicaProjection> for ReplicaProjectionV1 {
                 created_at_us: value.created_at_us,
             }),
         })
-    }
-}
-
-impl TryFrom<&ReplicaProjectionV1> for DecodedReplicaItem {
-    type Error = ReplicaWireError;
-
-    fn try_from(value: &ReplicaProjectionV1) -> Result<Self, Self::Error> {
-        let (kind, id, revision, tombstone, blobs) = projection_identity(value)?;
-        let payload_json = serde_json::to_string(value).map_err(|_| ReplicaWireError::Response)?;
-        Ok(Self {
-            entity_kind: kind.into(),
-            entity_id: id,
-            revision,
-            tombstone,
-            blob_digests: blobs,
-            payload_json,
-        })
-    }
-}
-
-type ProjectionIdentity = (&'static str, String, u64, bool, Vec<String>);
-
-fn projection_identity(
-    value: &ReplicaProjectionV1,
-) -> Result<ProjectionIdentity, ReplicaWireError> {
-    match value {
-        ReplicaProjectionV1::Document(value) => document_identity(value),
-        ReplicaProjectionV1::Asset(value) => asset_identity(value),
-        ReplicaProjectionV1::Thema(value) => thema_identity(value),
-        ReplicaProjectionV1::Settings(value) => settings_identity(value),
-        ReplicaProjectionV1::ReviewState(value) => review_identity(value),
-    }
-}
-
-fn document_identity(value: &DocumentRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
-    require_identity(&value.document_id)?;
-    if !supported_content_type(&value.content_type) {
-        return Err(ReplicaWireError::Response);
-    }
-    validate_document_path(&value.content_type, &value.logical_path)
-        .map_err(|_| ReplicaWireError::Response)?;
-    validate_blob_reference(value.content_sha256.as_deref(), value.blob_url.as_deref())?;
-    let tombstone = value.operation == DocumentOperationV1::Tombstone;
-    let invalid_tombstone =
-        tombstone && (value.projection.is_some() || value.content_sha256.is_some());
-    let invalid_active = !tombstone
-        && (value.projection.is_none()
-            || (value.operation == DocumentOperationV1::Snapshot)
-                != value.content_sha256.is_none());
-    if invalid_tombstone || invalid_active {
-        return Err(ReplicaWireError::Response);
-    }
-    if let Some(projection) = &value.projection {
-        validate_document_projection(projection)?;
-        if value
-            .content_sha256
-            .as_ref()
-            .is_some_and(|digest| digest != &projection.content_sha256)
-        {
-            return Err(ReplicaWireError::Response);
-        }
-    }
-    Ok((
-        "document",
-        value.document_id.clone(),
-        value.revision,
-        tombstone,
-        value.content_sha256.iter().cloned().collect(),
-    ))
-}
-
-fn validate_document_projection(projection: &DocumentProjectionV1) -> Result<(), ReplicaWireError> {
-    require_digest(&projection.content_sha256)?;
-    for node in &projection.nodes {
-        match (node.start_byte, node.end_byte) {
-            (Some(start), Some(end))
-                if end <= MAX_DOCUMENT_SOURCE_BYTES
-                    && SourceSpan::from_offsets(start, end).is_ok() => {}
-            (None, None) => {}
-            _ => return Err(ReplicaWireError::Response),
-        }
-    }
-    Ok(())
-}
-
-fn asset_identity(value: &AssetRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
-    validate_asset_path(&value.logical_path).map_err(|_| ReplicaWireError::Response)?;
-    validate_blob_reference(value.content_sha256.as_deref(), value.blob_url.as_deref())?;
-    let tombstone = value.operation == AssetOperationV1::Tombstone;
-    let has_content = value.content_sha256.is_some()
-        && value.size_bytes.is_some()
-        && value
-            .media_type
-            .as_ref()
-            .is_some_and(|value| !value.is_empty());
-    if tombstone == has_content {
-        return Err(ReplicaWireError::Response);
-    }
-    if value
-        .content_sha256
-        .as_ref()
-        .is_some_and(|digest| value.logical_path.split('/').nth(1) != Some(digest.as_str()))
-    {
-        return Err(ReplicaWireError::Response);
-    }
-    Ok((
-        "asset",
-        value.logical_path.clone(),
-        value.revision,
-        tombstone,
-        value.content_sha256.iter().cloned().collect(),
-    ))
-}
-
-fn thema_identity(value: &ThemaRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
-    require_identity(&value.thema_id)?;
-    require_digest(&value.content_sha256)?;
-    let content = thema_content(
-        value.kind.as_str(),
-        value.keimenon.clone(),
-        value.hypothesis.clone(),
-        value.answer.clone(),
-        value.source_guid.clone(),
-        value.parathema.clone(),
-        value.review_image.clone(),
-    )
-    .map_err(|_| ReplicaWireError::Response)?;
-    let prepared = prepare_thema(
-        Some(value.thema_id.clone()),
-        content,
-        value.tags.clone(),
-        value
-            .concepts
-            .iter()
-            .map(|concept| (concept.node_id.clone(), concept.relation.into()))
-            .collect(),
-        value.asset_paths.clone(),
-        None,
-    )
-    .map_err(|_| ReplicaWireError::Response)?;
-    if prepared.content_sha256 != value.content_sha256
-        || prepared.tags != value.tags
-        || prepared.concepts.len() != value.concepts.len()
-        || !prepared
-            .concepts
-            .iter()
-            .zip(&value.concepts)
-            .all(|(prepared, wire)| {
-                prepared.concept_id().as_str() == wire.node_id
-                    && prepared.relation() == wire.relation.into()
-            })
-        || prepared.asset_paths != value.asset_paths
-    {
-        return Err(ReplicaWireError::Response);
-    }
-    Ok((
-        "thema",
-        value.thema_id.clone(),
-        value.revision,
-        false,
-        Vec::new(),
-    ))
-}
-
-fn fsrs_config_snapshot(value: &FsrsConfigV1) -> FsrsConfigSnapshot {
-    FsrsConfigSnapshot {
-        algorithm: match value.algorithm {
-            FsrsAlgorithmV1::Fsrs => FsrsAlgorithmSnapshot::Fsrs,
-        },
-        model: match value.model {
-            FsrsModelV1::Fsrs6 => FsrsModelSnapshot::Six,
-        },
-        implementation: match value.implementation {
-            FsrsImplementationV1::FsrsRs1_1 => FsrsImplementationSnapshot::Crate6Dot6Dot1,
-        },
-        desired_retention: value.desired_retention,
-        parameters: value.parameters,
-    }
-}
-
-fn settings_identity(value: &SettingsRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
-    if value.timezone.is_empty() || value.day_boundary_hour > 23 {
-        return Err(ReplicaWireError::Response);
-    }
-    let config = fsrs_config_snapshot(&value.scheduler);
-    if !config.valid() {
-        return Err(ReplicaWireError::Response);
-    }
-    let settings = SettingsInput {
-        timezone: value.timezone.clone(),
-        day_boundary_hour: value.day_boundary_hour,
-        desired_retention: value.scheduler.desired_retention,
-    };
-    settings
-        .validate()
-        .map_err(|_| ReplicaWireError::Response)?;
-    Ok((
-        "settings",
-        "settings".into(),
-        value.revision,
-        false,
-        Vec::new(),
-    ))
-}
-
-fn review_identity(value: &ReviewStateRevisionV1) -> Result<ProjectionIdentity, ReplicaWireError> {
-    require_identity(&value.thema_id)?;
-    if (value.state.state_revision == 0) != value.event_id.is_none()
-        || value.event_id.as_ref().is_some_and(String::is_empty)
-        || value.created_at_us == 0
-    {
-        return Err(ReplicaWireError::Response);
-    }
-    let state = ReviewStateSnapshot {
-        state_revision: value.state.state_revision,
-        review_count: value.state.review_count,
-        last_reviewed_at_us: value.state.last_reviewed_at_us,
-        last_review_day: value.state.last_review_day,
-        next_review_day: value.state.next_review_day,
-        interval_days: value.state.interval_days,
-        total_successes: value.state.total_successes,
-        total_failures: value.state.total_failures,
-        suspended: value.state.suspended,
-        stability: value.state.stability,
-        difficulty: value.state.difficulty,
-    };
-    crate::domain::validate_state(&state.into()).map_err(|_| ReplicaWireError::Response)?;
-    Ok((
-        "review",
-        value.thema_id.clone(),
-        value.state.state_revision,
-        false,
-        Vec::new(),
-    ))
-}
-
-fn require_identity(value: &str) -> Result<(), ReplicaWireError> {
-    if value.is_empty() || value.len() > 4096 {
-        Err(ReplicaWireError::Response)
-    } else {
-        Ok(())
-    }
-}
-
-fn require_digest(value: &str) -> Result<(), ReplicaWireError> {
-    if is_canonical_sha256(value) {
-        Ok(())
-    } else {
-        Err(ReplicaWireError::Response)
-    }
-}
-
-fn validate_blob_reference(
-    digest: Option<&str>,
-    url: Option<&str>,
-) -> Result<(), ReplicaWireError> {
-    match (digest, url) {
-        (Some(digest), Some(url)) if url == blob_url(digest) => require_digest(digest),
-        (None, None) => Ok(()),
-        _ => Err(ReplicaWireError::Response),
     }
 }
 
@@ -907,8 +473,8 @@ mod tests {
 
     use super::{
         CursorV1, MAX_REPLICA_CURSOR_BYTES, ReplicaWireError, decode_cursor,
-        decode_snapshot_cursor, decode_snapshot_page, encode_cursor, encode_snapshot_cursor,
-        encode_token, replica_change_page, replica_snapshot_page, replica_state_response,
+        decode_snapshot_cursor, encode_cursor, encode_snapshot_cursor, encode_token,
+        replica_change_page, replica_snapshot_page, replica_state_response,
     };
     use crate::application::{
         AssetRevision, DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision,
@@ -1033,31 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn replica_node_source_spans_must_be_paired_and_bounded() {
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/protocol/replica-sync-v1.json"
-        ))
-        .unwrap();
-        let page = fixture["snapshot_partial"].clone();
-        assert!(decode_snapshot_page(serde_json::from_value(page.clone()).unwrap()).is_ok());
-
-        let mut unpaired = page.clone();
-        unpaired["items"][0]["projection"]["projection"]["nodes"][0]["end_byte"] = Value::Null;
-        assert!(matches!(
-            decode_snapshot_page(serde_json::from_value(unpaired).unwrap()),
-            Err(ReplicaWireError::Response)
-        ));
-
-        let mut oversized = page;
-        oversized["items"][0]["projection"]["projection"]["nodes"][0]["end_byte"] =
-            json!(crate::application::MAX_DOCUMENT_SOURCE_BYTES + 1);
-        assert!(matches!(
-            decode_snapshot_page(serde_json::from_value(oversized).unwrap()),
-            Err(ReplicaWireError::Response)
-        ));
-    }
-
-    #[test]
     fn one_projection_cannot_exceed_the_response_budget() {
         let mut projection = document_projection();
         let ReplicaProjection::Document(document) = &mut projection else {
@@ -1083,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn mc_cloze_projection_round_trips_through_v1() {
+    fn mc_cloze_projection_encodes_through_v1() {
         let content = thema_content(
             "mc-cloze",
             "Question".into(),
@@ -1135,7 +676,6 @@ mod tests {
             serde_json::to_value(&wire).unwrap()["items"][0]["projection"]["kind"],
             "mc-cloze"
         );
-        assert_eq!(super::decode_snapshot_page(wire).unwrap().items.len(), 1);
     }
 
     fn document_projection() -> ReplicaProjection {

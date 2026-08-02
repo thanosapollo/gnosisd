@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 
-;; Emit the current Elisp projection fields shared with gnosis-core.
+;; Emit the current Elisp projection fields shared with gnosisd.
 
 ;;; Code:
 

@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
+#[cfg(test)]
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -64,24 +65,8 @@ pub(crate) struct DecodedOfflineContent {
     pub(crate) canonical_payload: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedOfflineContentResult {
-    pub(crate) operation_id: String,
-    pub(crate) status: ContentReconciliationStatus,
-    pub(crate) conflict_reason: Option<OfflineContentConflictReason>,
-    pub(crate) authoritative: Option<AuthoritativeDocument>,
-    pub(crate) cursor: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedOfflineContentCapabilities {
-    pub(crate) server_id: String,
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum OfflineContentWireError {
-    #[error("offline content protocol version is unsupported")]
-    Version,
     #[error("offline content operation is invalid")]
     Operation,
 }
@@ -98,6 +83,7 @@ impl OfflineContentOperationEnvelopeV1 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_content_operation(
     operation: &OfflineContentOperation,
 ) -> Result<String, OfflineContentWireError> {
@@ -119,27 +105,6 @@ pub(crate) fn offline_content_capabilities(
         supported_content_types: supported_content_types().map(str::to_owned).collect(),
         max_source_bytes: MAX_DOCUMENT_SOURCE_BYTES as u64,
         max_projection_bytes: MAX_DOCUMENT_PROJECTION_BYTES as u64,
-    })
-}
-
-pub(crate) fn decode_offline_content_capabilities(
-    capabilities: ContentCapabilitiesV1,
-) -> Result<DecodedOfflineContentCapabilities, OfflineContentWireError> {
-    if capabilities.version != OFFLINE_CONTENT_CAPABILITIES_VERSION
-        || capabilities.document_lifecycle != 1
-        || !capabilities
-            .supported_content_types
-            .iter()
-            .map(String::as_str)
-            .eq(supported_content_types())
-        || capabilities.max_source_bytes != MAX_DOCUMENT_SOURCE_BYTES as u64
-        || capabilities.max_projection_bytes != MAX_DOCUMENT_PROJECTION_BYTES as u64
-        || !is_hex_identity(&capabilities.server_id)
-    {
-        return Err(OfflineContentWireError::Operation);
-    }
-    Ok(DecodedOfflineContentCapabilities {
-        server_id: capabilities.server_id,
     })
 }
 
@@ -215,24 +180,6 @@ fn offline_content_document(
         content_sha256: value.content_sha256.clone(),
         active: value.active,
     })
-}
-
-pub(crate) fn decode_offline_content_result(
-    value: Value,
-) -> Result<DecodedOfflineContentResult, OfflineContentWireError> {
-    require_size(&value, MAX_OFFLINE_CONTENT_RESULT_BYTES)?;
-    require_response_version(&value)?;
-    let envelope: OfflineContentResultEnvelopeV1 =
-        serde_json::from_value(value).map_err(invalid_operation)?;
-    decode_result(envelope.result)
-}
-
-fn require_response_version(value: &Value) -> Result<(), OfflineContentWireError> {
-    match value.get("version").and_then(Value::as_u64) {
-        Some(version) if version == u64::from(OFFLINE_CONTENT_VERSION) => Ok(()),
-        Some(_) => Err(OfflineContentWireError::Version),
-        None => Err(OfflineContentWireError::Operation),
-    }
 }
 
 fn encode_operation(
@@ -383,81 +330,10 @@ fn valid_content_base(base: &OfflineContentBaseV1) -> bool {
     }
 }
 
-fn decode_result(
-    value: OfflineContentResultV1,
-) -> Result<DecodedOfflineContentResult, OfflineContentWireError> {
-    let (operation_id, status, conflict_reason, authoritative, cursor) = match value {
-        OfflineContentResultV1::Accepted {
-            operation_id,
-            authoritative,
-            cursor,
-            ..
-        } => (
-            operation_id,
-            ContentReconciliationStatus::Accepted,
-            None,
-            Some(authoritative.into()),
-            cursor,
-        ),
-        OfflineContentResultV1::Conflict {
-            operation_id,
-            conflict_reason,
-            authoritative,
-            cursor,
-        } => (
-            operation_id,
-            ContentReconciliationStatus::Conflict,
-            Some(conflict_reason.into()),
-            authoritative.map(AuthoritativeDocument::from),
-            cursor,
-        ),
-    };
-    require_identity(&operation_id)?;
-    validate_cursor(&cursor)?;
-    if let Some(document) = &authoritative {
-        validate_authoritative(document)?;
-    }
-    Ok(DecodedOfflineContentResult {
-        operation_id,
-        status,
-        conflict_reason,
-        authoritative,
-        cursor,
-    })
-}
-
-fn validate_authoritative(document: &AuthoritativeDocument) -> Result<(), OfflineContentWireError> {
-    DocumentId::new(document.document_id.clone()).map_err(invalid_operation)?;
-    validate_logical_path(&document.logical_path).map_err(invalid_operation)?;
-    if document.revision == 0
-        || document.revision > i64::MAX as u64
-        || document.active != document.content_sha256.is_some()
-    {
-        return Err(OfflineContentWireError::Operation);
-    }
-    if let Some(digest) = &document.content_sha256 {
-        require_digest(digest)?;
-    }
-    let Some(content_type) = document.content_type.as_deref() else {
-        return Err(OfflineContentWireError::Operation);
-    };
-    validate_document_path(content_type, &document.logical_path).map_err(invalid_operation)?;
-    Ok(())
-}
-
 fn require_serialized_size(
     value: &impl Serialize,
     maximum: usize,
 ) -> Result<(), OfflineContentWireError> {
-    let bytes = serde_json::to_vec(value).map_err(invalid_operation)?;
-    if bytes.len() > maximum {
-        Err(OfflineContentWireError::Operation)
-    } else {
-        Ok(())
-    }
-}
-
-fn require_size(value: &Value, maximum: usize) -> Result<(), OfflineContentWireError> {
     let bytes = serde_json::to_vec(value).map_err(invalid_operation)?;
     if bytes.len() > maximum {
         Err(OfflineContentWireError::Operation)
@@ -819,8 +695,8 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        OfflineContentSubmission, OfflineContentWireError, decode_offline_content_capabilities,
-        decode_offline_content_result, offline_content_capabilities, offline_content_result_json,
+        OfflineContentSubmission, OfflineContentWireError, offline_content_capabilities,
+        offline_content_result_json,
     };
     use crate::application::{
         AuthoritativeDocument, ContentReconciliationStatus, OfflineContentConflictReason,
@@ -897,42 +773,6 @@ mod tests {
             }
             _ => panic!("expected put operation"),
         }
-    }
-
-    #[test]
-    fn result_decoder_classifies_unknown_versions() {
-        let value = json!({"version":2,"result":{}});
-        assert!(matches!(
-            decode_offline_content_result(value),
-            Err(OfflineContentWireError::Version)
-        ));
-    }
-
-    #[test]
-    fn accepted_tombstones_require_a_stable_content_type() {
-        let cursor = super::encode_cursor(&"a".repeat(32), 1, &"b".repeat(32)).unwrap();
-        let value = json!({
-            "version": 1,
-            "result": {
-                "status": "accepted",
-                "operation_id": "operation",
-                "conflict_reason": null,
-                "authoritative": {
-                    "document_id": "document",
-                    "logical_path": "note.org",
-                    "content_type": null,
-                    "revision": 2,
-                    "content_sha256": null,
-                    "active": false
-                },
-                "cursor": cursor
-            }
-        });
-
-        assert!(matches!(
-            decode_offline_content_result(value),
-            Err(OfflineContentWireError::Operation)
-        ));
     }
 
     #[test]
@@ -1185,23 +1025,7 @@ mod tests {
     fn lifecycle_capability_is_explicit_and_server_bound() {
         let server_id = "a".repeat(32);
         let value = offline_content_capabilities(&server_id).unwrap();
-        assert_eq!(
-            decode_offline_content_capabilities(value)
-                .unwrap()
-                .server_id,
-            server_id
-        );
-        for invalid in [
-            json!({"version":1,"server_id":"bad","document_lifecycle":1,
-                   "supported_content_types":["text/org; charset=utf-8"],
-                   "max_source_bytes":1_048_576,"max_projection_bytes":1_048_576}),
-            json!({"version":1,"server_id":"a".repeat(32),"document_lifecycle":0,
-                   "supported_content_types":["text/org; charset=utf-8"],
-                   "max_source_bytes":1_048_576,"max_projection_bytes":1_048_576}),
-        ] {
-            let invalid = serde_json::from_value(invalid).unwrap();
-            assert!(decode_offline_content_capabilities(invalid).is_err());
-        }
+        assert_eq!(value.server_id, server_id);
         assert!(
             serde_json::from_value::<crate::protocol::http_v1::ContentCapabilitiesV1>(json!({
                 "version":1,

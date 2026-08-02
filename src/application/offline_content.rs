@@ -79,28 +79,11 @@ impl OfflineContentOperation {
         }
     }
 
-    pub(crate) fn logical_path(&self) -> Option<&str> {
-        match &self.mutation {
-            OfflineContentMutation::Put { logical_path, .. }
-            | OfflineContentMutation::Rename { logical_path, .. } => Some(logical_path),
-            OfflineContentMutation::Tombstone { .. } => None,
-        }
-    }
-
     pub(crate) fn content_type(&self) -> &str {
         match &self.mutation {
             OfflineContentMutation::Put { content_type, .. }
             | OfflineContentMutation::Rename { content_type, .. }
             | OfflineContentMutation::Tombstone { content_type, .. } => content_type,
-        }
-    }
-}
-
-impl ContentBase {
-    pub(crate) fn content_sha256(&self) -> Option<&str> {
-        match self {
-            Self::Absent => None,
-            Self::Revision { content_sha256, .. } => content_sha256.as_deref(),
         }
     }
 }

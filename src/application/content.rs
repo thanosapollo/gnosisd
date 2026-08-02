@@ -698,6 +698,7 @@ pub(crate) fn path_key(value: &str) -> String {
     value.to_lowercase()
 }
 
+#[cfg(test)]
 pub(crate) fn asset_paths_in_org(org: &str) -> Result<Vec<String>, ContentError> {
     parse_document(crate::parser::ORG_CONTENT_TYPE, org)
         .map(|parsed| parsed.asset_paths().to_vec())

@@ -74,21 +74,6 @@ pub(crate) struct DecodedOfflineAsset {
     pub(crate) canonical_payload: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedOfflineAssetCapabilities {
-    pub(crate) server_id: String,
-    pub(crate) max_blob_bytes: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedOfflineAssetResult {
-    pub(crate) operation_id: String,
-    pub(crate) status: AssetReconciliationStatus,
-    pub(crate) conflict_reason: Option<OfflineAssetConflictReason>,
-    pub(crate) authoritative: Option<AuthoritativeAsset>,
-    pub(crate) cursor: String,
-}
-
 #[derive(Debug, Error)]
 pub(crate) enum OfflineAssetWireError {
     #[error("offline asset protocol version is unsupported")]
@@ -114,6 +99,7 @@ impl OfflineAssetSubmission {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_asset_operation(
     operation: &OfflineAssetOperation,
 ) -> Result<String, OfflineAssetWireError> {
@@ -133,22 +119,6 @@ pub(crate) fn offline_asset_capabilities(
         server_id: server_id.to_owned(),
         put_asset: 1,
         max_blob_bytes: MAX_OFFLINE_ASSET_BYTES,
-    })
-}
-
-pub(crate) fn decode_offline_asset_capabilities(
-    value: AssetCapabilitiesV1,
-) -> Result<DecodedOfflineAssetCapabilities, OfflineAssetWireError> {
-    if value.version != OFFLINE_ASSET_VERSION
-        || value.put_asset != 1
-        || value.max_blob_bytes != MAX_OFFLINE_ASSET_BYTES
-        || !is_hex_identity(&value.server_id)
-    {
-        return Err(OfflineAssetWireError::Operation);
-    }
-    Ok(DecodedOfflineAssetCapabilities {
-        server_id: value.server_id,
-        max_blob_bytes: value.max_blob_bytes,
     })
 }
 
@@ -220,24 +190,6 @@ fn asset_projection(
     Ok(projection)
 }
 
-pub(crate) fn decode_offline_asset_result(
-    value: Value,
-) -> Result<DecodedOfflineAssetResult, OfflineAssetWireError> {
-    require_size(&value, MAX_OFFLINE_ASSET_RESULT_BYTES)?;
-    require_response_version(&value)?;
-    let envelope: OfflineAssetResultEnvelopeV1 =
-        serde_json::from_value(value).map_err(invalid_operation)?;
-    decode_result(envelope.result)
-}
-
-fn require_response_version(value: &Value) -> Result<(), OfflineAssetWireError> {
-    match value.get("version").and_then(Value::as_u64) {
-        Some(version) if version == u64::from(OFFLINE_ASSET_VERSION) => Ok(()),
-        Some(_) => Err(OfflineAssetWireError::Version),
-        None => Err(OfflineAssetWireError::Operation),
-    }
-}
-
 fn validate_operation(value: &OfflineAssetOperationV1) -> Result<(), OfflineAssetWireError> {
     require_identity(&value.operation_id)?;
     require_identity(&value.device_id)?;
@@ -267,49 +219,6 @@ fn validate_operation(value: &OfflineAssetOperationV1) -> Result<(), OfflineAsse
         return Err(OfflineAssetWireError::Operation);
     }
     Ok(())
-}
-
-fn decode_result(
-    value: OfflineAssetResultV1,
-) -> Result<DecodedOfflineAssetResult, OfflineAssetWireError> {
-    let (operation_id, status, conflict_reason, authoritative, cursor) = match value {
-        OfflineAssetResultV1::Accepted {
-            operation_id,
-            authoritative,
-            cursor,
-            ..
-        } => (
-            operation_id,
-            AssetReconciliationStatus::Accepted,
-            None,
-            Some(authoritative),
-            cursor,
-        ),
-        OfflineAssetResultV1::Conflict {
-            operation_id,
-            conflict_reason,
-            authoritative,
-            cursor,
-        } => (
-            operation_id,
-            AssetReconciliationStatus::Conflict,
-            Some(conflict_reason.into()),
-            authoritative,
-            cursor,
-        ),
-    };
-    require_identity(&operation_id)?;
-    validate_cursor(&cursor)?;
-    if let Some(asset) = &authoritative {
-        validate_authoritative(asset)?;
-    }
-    Ok(DecodedOfflineAssetResult {
-        operation_id,
-        status,
-        conflict_reason,
-        authoritative: authoritative.map(AuthoritativeAsset::from),
-        cursor,
-    })
 }
 
 fn validate_authoritative(value: &OfflineAssetProjectionV1) -> Result<(), OfflineAssetWireError> {
@@ -420,15 +329,6 @@ fn require_absent<T>(value: Option<T>) -> Result<(), OfflineAssetWireError> {
         .is_none()
         .then_some(())
         .ok_or(OfflineAssetWireError::Operation)
-}
-
-fn require_size(value: &Value, maximum: usize) -> Result<(), OfflineAssetWireError> {
-    let bytes = serde_json::to_vec(value).map_err(invalid_operation)?;
-    if bytes.len() > maximum {
-        Err(OfflineAssetWireError::Operation)
-    } else {
-        Ok(())
-    }
 }
 
 fn invalid_operation<T>(_error: T) -> OfflineAssetWireError {
@@ -636,8 +536,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        OfflineAssetSubmission, decode_offline_asset_capabilities, decode_offline_asset_result,
-        offline_asset_capabilities, offline_asset_result_response,
+        OfflineAssetSubmission, offline_asset_capabilities, offline_asset_result_response,
     };
     use crate::application::{AssetReconciliationStatus, AuthoritativeAsset, OfflineAssetResult};
 
@@ -645,9 +544,8 @@ mod tests {
     fn capability_is_strict_and_server_bound() {
         let server = "a".repeat(32);
         let value = offline_asset_capabilities(&server).unwrap();
-        let decoded = decode_offline_asset_capabilities(value).unwrap();
-        assert_eq!(decoded.server_id, server);
-        assert_eq!(decoded.max_blob_bytes, super::MAX_OFFLINE_ASSET_BYTES);
+        assert_eq!(value.server_id, server);
+        assert_eq!(value.max_blob_bytes, super::MAX_OFFLINE_ASSET_BYTES);
         assert!(
             serde_json::from_value::<crate::protocol::http_v1::AssetCapabilitiesV1>(json!({
                 "version": 1,
@@ -723,38 +621,6 @@ mod tests {
         }))
         .unwrap();
         assert!(submission.decode().is_ok());
-    }
-
-    #[test]
-    fn result_authority_rejects_unknown_fields() {
-        let result = json!({
-            "version": 1,
-            "result": {
-                "operation_id": "operation",
-                "status": "accepted",
-                "conflict_reason": null,
-                "authoritative": {
-                    "logical_path": format!("assets/{}/image.png", "a".repeat(64)),
-                    "revision": 1,
-                    "content_sha256": "a".repeat(64),
-                    "size_bytes": 4,
-                    "media_type": "image/png",
-                    "active": true,
-                    "future": true
-                },
-                "cursor": "eyJ2ZXJzaW9uIjoxLCJzZXJ2ZXJfaWQiOiIwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZiIsInBvc2l0aW9uIjowLCJ0b2tlbiI6IjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExIn0"
-            }
-        });
-        assert!(decode_offline_asset_result(result).is_err());
-    }
-
-    #[test]
-    fn result_decoder_classifies_unknown_versions() {
-        let value = json!({"version":2,"result":{}});
-        assert!(matches!(
-            decode_offline_asset_result(value),
-            Err(super::OfflineAssetWireError::Version)
-        ));
     }
 
     #[test]

@@ -6,8 +6,8 @@ Requires=gnosisd.service
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=%h/.nix-profile/bin/gnosis --socket %t/gnosis/gnosis.sock admin backup create --directory %h/.local/share/gnosis/backups
-ExecStartPost=%h/.nix-profile/bin/gnosis --socket %t/gnosis/gnosis.sock admin backup prune --directory %h/.local/share/gnosis/backups --keep 2
+ExecStart=%h/.nix-profile/bin/gnosisd-admin --socket %t/gnosis/gnosis.sock admin backup create --directory %h/.local/share/gnosis/backups
+ExecStartPost=%h/.nix-profile/bin/gnosisd-admin --socket %t/gnosis/gnosis.sock admin backup prune --directory %h/.local/share/gnosis/backups --keep 2
 TimeoutStartSec=30m
 NoNewPrivileges=true
 PrivateTmp=true
