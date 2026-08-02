@@ -34,10 +34,11 @@ pub use client_views::{
 };
 pub use content::{
     AssetHeadV1, ContentChangePageV1, ContentChangeV1, ContentEntityKindV1, ContentOperationV1,
-    DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DocumentHeadV1,
-    DocumentImportRequestV1, DocumentMutationRejectionV1, DocumentMutationResultV1,
-    DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodeCatalogItemV1, NodeCatalogPageV1,
-    NodePageV1, NodeThemaAssociationPageV1, NodeThemaAssociationV1, NodeV1, NoteRenameRequestV1,
+    ContentSearchHitV1, ContentSearchPageV1, DesiredStateMutationProjectionV1,
+    DesiredStateMutationResultV1, DocumentHeadV1, DocumentImportRequestV1,
+    DocumentMutationRejectionV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+    DocumentRevisionSummaryV1, NodeCatalogItemV1, NodeCatalogPageV1, NodePageV1,
+    NodeThemaAssociationPageV1, NodeThemaAssociationV1, NodeV1, NoteRenameRequestV1,
     NoteWriteRequestV1, SettingsV1, StagedBlobV1, ThemaCatalogItemV1, ThemaCatalogPageV1,
     ThemaConceptRelationV1, ThemaConceptV1, ThemaPageV1, ThemaV1, ThemaWriteRequestV1,
     UpdateSettingsRequestV1,
@@ -45,20 +46,96 @@ pub use content::{
 
 use std::borrow::Cow;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize, de};
+use sha2::{Digest, Sha256};
 
 use crate::application::{
-    AnswerInput, FsrsAlgorithmSnapshot, FsrsConfigSnapshot, FsrsImplementationSnapshot,
-    FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot, ReviewAttemptBeginResult,
-    ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView, ReviewClozeSpan,
-    ReviewClozeState, ReviewItemSkipReason, ReviewQuestion, ReviewResponsePrompt,
+    AnswerInput, ContentSearchGeneration, FsrsAlgorithmSnapshot, FsrsConfigSnapshot,
+    FsrsImplementationSnapshot, FsrsModelSnapshot, PresentationSnapshot, RecallOutcomeSnapshot,
+    ReviewAttemptBeginResult, ReviewAttemptOperationResult, ReviewAttemptState, ReviewAttemptView,
+    ReviewClozeSpan, ReviewClozeState, ReviewItemSkipReason, ReviewQuestion, ReviewResponsePrompt,
     ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, SkippedReviewItem,
     TransitionSnapshot, review_attempt_question, review_question,
 };
 
 const MIN_BEARER_TOKEN_BYTES: usize = 40;
 const MAX_BEARER_TOKEN_BYTES: usize = 128;
+pub(crate) const MAX_CONTENT_SEARCH_CURSOR_BYTES: usize = 2 * 1024;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContentSearchCursorV1 {
+    version: u32,
+    server_id: String,
+    generation_cursor: u64,
+    generation_token: String,
+    query_digest: String,
+    next_document_id: String,
+}
+
+pub(crate) struct ContentSearchPosition {
+    pub(crate) generation: ContentSearchGeneration,
+    pub(crate) after: String,
+}
+
+pub(crate) fn normalize_content_search_query(value: &str) -> Result<String, ()> {
+    let value = value.trim();
+    if (1..=256).contains(&value.len()) {
+        Ok(value.to_owned())
+    } else {
+        Err(())
+    }
+}
+
+pub(crate) fn encode_content_search_cursor(
+    generation: &ContentSearchGeneration,
+    query: &str,
+    next_document_id: &str,
+) -> Result<String, ()> {
+    let cursor = ContentSearchCursorV1 {
+        version: 1,
+        server_id: generation.server_id.clone(),
+        generation_cursor: generation.cursor,
+        generation_token: generation.cursor_token.clone(),
+        query_digest: format!("{:x}", Sha256::digest(query.as_bytes())),
+        next_document_id: next_document_id.to_owned(),
+    };
+    let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).map_err(|_| ())?);
+    if encoded.len() <= MAX_CONTENT_SEARCH_CURSOR_BYTES {
+        Ok(encoded)
+    } else {
+        Err(())
+    }
+}
+
+pub(crate) fn decode_content_search_cursor(
+    value: &str,
+    query: &str,
+) -> Result<ContentSearchPosition, ()> {
+    if value.len() > MAX_CONTENT_SEARCH_CURSOR_BYTES {
+        return Err(());
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| ())?;
+    let cursor: ContentSearchCursorV1 = serde_json::from_slice(&bytes).map_err(|_| ())?;
+    if cursor.version != 1
+        || cursor.query_digest != format!("{:x}", Sha256::digest(query.as_bytes()))
+        || cursor.server_id.is_empty()
+        || cursor.generation_token.is_empty()
+        || cursor.next_document_id.is_empty()
+    {
+        return Err(());
+    }
+    Ok(ContentSearchPosition {
+        generation: ContentSearchGeneration {
+            server_id: cursor.server_id,
+            cursor: cursor.generation_cursor,
+            cursor_token: cursor.generation_token,
+        },
+        after: cursor.next_document_id,
+    })
+}
 
 pub(crate) fn valid_bearer_token(value: &str) -> bool {
     (MIN_BEARER_TOKEN_BYTES..=MAX_BEARER_TOKEN_BYTES).contains(&value.len())
@@ -1456,6 +1533,8 @@ pub enum ApiErrorCodeV1 {
     RequestTooLarge,
     InvalidBody,
     RequestTimeout,
+    CatalogChanged,
+    InvalidServerState,
     UnsupportedOfflineReviewVersion,
     InvalidOfflineReviewOperation,
     UnsupportedOfflineContentVersion,
@@ -1490,6 +1569,8 @@ impl ApiErrorCodeV1 {
             Self::RequestTooLarge => "request_too_large",
             Self::InvalidBody => "invalid_body",
             Self::RequestTimeout => "request_timeout",
+            Self::CatalogChanged => "catalog_changed",
+            Self::InvalidServerState => "invalid_server_state",
             Self::UnsupportedOfflineReviewVersion => "unsupported_offline_review_version",
             Self::InvalidOfflineReviewOperation => "invalid_offline_review_operation",
             Self::UnsupportedOfflineContentVersion => "unsupported_offline_content_version",

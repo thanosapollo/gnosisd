@@ -50,11 +50,12 @@ use crate::{
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
-            ContentCapabilitiesV1, ContentChangePageV1, DashboardV1, DesiredStateMutationResultV1,
-            DeviceIdentityV1, DocumentHeadV1, DocumentImportRequestV1, DocumentMutationResultV1,
-            DocumentRevisionPageV1, DocumentRevisionSummaryV1, NodeCatalogPageV1, NodePageV1,
-            NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
-            OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
+            ContentCapabilitiesV1, ContentChangePageV1, ContentSearchPageV1, DashboardV1,
+            DesiredStateMutationResultV1, DeviceIdentityV1, DocumentHeadV1,
+            DocumentImportRequestV1, DocumentMutationResultV1, DocumentRevisionPageV1,
+            DocumentRevisionSummaryV1, MAX_CONTENT_SEARCH_CURSOR_BYTES, NodeCatalogPageV1,
+            NodePageV1, NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1,
+            NoteWriteRequestV1, OfflineAssetOperationEnvelopeV1, OfflineAssetResultEnvelopeV1,
             OfflineContentOperationEnvelopeV1, OfflineContentResultEnvelopeV1,
             OfflineReviewOperationEnvelopeV1, OfflineReviewResultEnvelopeV2, ReplicaChangePageV1,
             ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1, ReviewAttemptBeginResponseV1,
@@ -65,7 +66,8 @@ use crate::{
             ReviewSessionStatusV1, ReviewSessionSummaryV1, ReviewSessionV1,
             SetAcceptedSuccessRequestV1, SetSuspensionRequestV1, SetThemaSuspensionRequestV1,
             SettingsV1, StagedBlobV1, ThemaCatalogPageV1, ThemaPageV1, ThemaReviewStateV1, ThemaV1,
-            ThemaWriteRequestV1, UpdateSettingsRequestV1, valid_bearer_token,
+            ThemaWriteRequestV1, UpdateSettingsRequestV1, decode_content_search_cursor,
+            encode_content_search_cursor, normalize_content_search_query, valid_bearer_token,
         },
         offline_asset_capabilities, offline_asset_result_response, offline_content_capabilities,
         offline_content_result_response, offline_result_response, replica_change_page,
@@ -245,6 +247,7 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/themata/{id}/unarchive", post(unarchive_thema))
         .route("/v1/nodes", get(search_nodes))
         .route("/v1/nodes/catalog", get(node_catalog))
+        .route("/v1/nodes/content-search", get(search_document_content))
         .route("/v1/nodes/{id}", get(get_node))
         .route("/v1/nodes/{id}/themata", get(node_themata))
         .route("/v1/nodes/{id}/inbound", get(inbound_nodes))
@@ -342,6 +345,7 @@ struct PageQuery {
     after: Option<String>,
     limit: Option<u16>,
     q: Option<String>,
+    tag: Option<String>,
 }
 
 fn page_limit(value: Option<u16>) -> Result<u16, ApiError> {
@@ -1511,20 +1515,92 @@ async fn search_nodes(
     Query(query): Query<PageQuery>,
 ) -> Result<Json<NodePageV1>, ApiError> {
     require(&principal, DeviceScope::Read)?;
-    let items = state
-        .service
-        .search_nodes(
-            query.q.unwrap_or_default(),
-            page_limit(query.limit)?,
-            query.after,
-        )
-        .await
-        .map_err(ApiError::service)?;
+    if query.q.is_some() && query.tag.is_some() {
+        return Err(ApiError::bad_request("q and tag cannot be combined"));
+    }
+    let limit = page_limit(query.limit)?;
+    let items = if let Some(tag) = query.tag {
+        if !(1..=256).contains(&tag.len()) || tag.trim().is_empty() {
+            return Err(ApiError::bad_request("invalid tag"));
+        }
+        state
+            .service
+            .search_nodes_by_tag(tag, limit, query.after)
+            .await
+    } else {
+        state
+            .service
+            .search_nodes(query.q.unwrap_or_default(), limit, query.after)
+            .await
+    }
+    .map_err(ApiError::service)?;
     run_blocking(move || {
         bounded_projection_page(
             &items,
             |page| Ok(NodePageV1::from_application(page)),
             "node exceeds the response limit",
+        )
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+struct ContentSearchHttpQuery {
+    q: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+async fn search_document_content(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Query(query): Query<ContentSearchHttpQuery>,
+) -> Result<Json<ContentSearchPageV1>, ApiError> {
+    require(&principal, DeviceScope::Read)?;
+    let normalized = normalize_content_search_query(query.q.as_deref().unwrap_or_default())
+        .map_err(|_| ApiError::bad_request("invalid content search query"))?;
+    let position = query
+        .cursor
+        .as_deref()
+        .map(|cursor| decode_content_search_cursor(cursor, &normalized))
+        .transpose()
+        .map_err(|_| ApiError::bad_request("invalid content search cursor"))?;
+    if let Some(position) = &position {
+        DocumentId::new(position.after.clone())
+            .map_err(|_| ApiError::bad_request("invalid content search cursor"))?;
+    }
+    let page = state
+        .service
+        .search_document_content(
+            normalized.clone(),
+            position
+                .as_ref()
+                .map(|position| position.generation.clone()),
+            position.map(|position| position.after),
+            page_limit(query.limit)?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    let item_count = page.items.len();
+    run_blocking(move || {
+        bounded_projection_page(
+            &page.items,
+            |items| {
+                let next_position = if items.len() < item_count {
+                    page.items[items.len()].resume_after.as_deref()
+                } else {
+                    page.next_position.as_deref()
+                };
+                let next = next_position
+                    .map(|position| {
+                        encode_content_search_cursor(&page.generation, &normalized, position)
+                    })
+                    .transpose()
+                    .map_err(|_| ApiError::internal())?;
+                Ok(ContentSearchPageV1::from_application(items, next))
+            },
+            "content search item exceeds the response limit",
         )
     })
     .await
@@ -2505,6 +2581,11 @@ impl ApiError {
             StoreError::ReplicaCursor | StoreError::ReplicaServer => Self::snapshot_required(),
             StoreError::InvalidCursor => Self::bad_request("invalid cursor"),
             StoreError::NodePageProjectionLimit => Self::internal(),
+            StoreError::CatalogChanged => Self::new(
+                StatusCode::CONFLICT,
+                ApiErrorCodeV1::CatalogChanged,
+                "content catalog changed; restart search",
+            ),
             StoreError::BlobRequired { digest } => Self {
                 status: StatusCode::CONFLICT,
                 code: ApiErrorCodeV1::BlobRequired,
@@ -2526,12 +2607,17 @@ impl ApiError {
             ),
             StoreError::PathConflict => Self::invalid_content("stored projection"),
             StoreError::InvalidProjection { .. } => Self::invalid_content("stored projection"),
-            StoreError::CorruptData { .. }
-            | StoreError::BackupDeadlineExceeded
+            StoreError::InvalidServerState => Self::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ApiErrorCodeV1::InvalidServerState,
+                "canonical document content is unavailable or corrupt",
+            ),
+            StoreError::BackupDeadlineExceeded
             | StoreError::BackupCancelled
             | StoreError::UnsupportedSchemaVersion { .. }
             | StoreError::UnsupportedSchemaLayout
             | StoreError::UnsupportedApplicationId { .. }
+            | StoreError::CorruptData { .. }
             | StoreError::Storage(_) => Self::internal(),
         }
     }
@@ -2963,6 +3049,13 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             "NodePageV1",
             &["400", "401", "403", "408", "500", "503"],
         )),
+        ("/v1/nodes/content-search", "get") => Some(json_contract(
+            "read",
+            None,
+            "200",
+            "ContentSearchPageV1",
+            &["400", "401", "403", "408", "409", "422", "500", "503"],
+        )),
         ("/v1/nodes/catalog", "get") => Some(json_contract(
             "read",
             None,
@@ -3149,6 +3242,13 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
             json!({"name":"document_id","in":"query","required":false,"schema":{"type":"string"}}),
         ];
     }
+    if path == "/v1/nodes/content-search" {
+        return vec![
+            json!({"name":"q","in":"query","required":true,"schema":{"type":"string","minLength":1,"maxLength":256}}),
+            json!({"name":"cursor","in":"query","required":false,"schema":{"type":"string","minLength":1,"maxLength":MAX_CONTENT_SEARCH_CURSOR_BYTES}}),
+            json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
+        ];
+    }
     let paged = matches!(
         path,
         "/v1/changes"
@@ -3171,6 +3271,9 @@ fn content_query_parameters(path: &str) -> Vec<Value> {
     if matches!(path, "/v1/themata" | "/v1/themata/catalog" | "/v1/nodes") {
         parameters
             .push(json!({"name":"q","in":"query","required":false,"schema":{"type":"string"}}));
+    }
+    if path == "/v1/nodes" {
+        parameters.push(json!({"name":"tag","in":"query","required":false,"schema":{"type":"string","minLength":1,"maxLength":256}}));
     }
     parameters
 }
@@ -3519,6 +3622,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ThemaV1>();
     generator.subschema_for::<NodeCatalogPageV1>();
     generator.subschema_for::<NodePageV1>();
+    generator.subschema_for::<ContentSearchPageV1>();
     generator.subschema_for::<NodeV1>();
     generator.subschema_for::<NodeThemaAssociationPageV1>();
     generator.subschema_for::<SettingsV1>();
@@ -3671,6 +3775,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/themata/{id}/unarchive", "post"),
     ("/v1/nodes", "get"),
     ("/v1/nodes/catalog", "get"),
+    ("/v1/nodes/content-search", "get"),
     ("/v1/nodes/{id}", "get"),
     ("/v1/nodes/{id}/themata", "get"),
     ("/v1/nodes/{id}/inbound", "get"),
@@ -5769,6 +5874,135 @@ mod tests {
             .unwrap();
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
 
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tag_and_content_search_routes_are_exact_and_generation_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("search".into(), vec!["read".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        for (document, node, tag) in [
+            ("document-a", "node-a", "exact"),
+            ("document-b", "node-b", "exact-extra"),
+            ("document-c", "node-c", "exact"),
+        ] {
+            let prepared = prepare_document(
+                Some(document.into()),
+                format!("notes/{document}.org"),
+                "text/org; charset=utf-8".into(),
+                format!(
+                    "#+title: {document}\n* Needle :{tag}:\n:PROPERTIES:\n:ID: {node}\n:END:\n"
+                ),
+                None,
+            )
+            .unwrap();
+            service.replace_note(prepared, 2, None).await.unwrap();
+        }
+        let app = router(service.clone());
+        let tags = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes?tag=exact",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tags.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(tags).await["items"].as_array().unwrap().len(),
+            2
+        );
+        let ambiguous = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes?q=needle&tag=exact",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ambiguous.status(), StatusCode::BAD_REQUEST);
+
+        let first = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                "/v1/nodes/content-search?q=needle&limit=1",
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        assert_eq!(first["items"][0]["document_id"], "document-a");
+        let cursor = first["next"].as_str().unwrap();
+        let second = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/nodes/content-search?q=needle&limit=1&cursor={cursor}"),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(second).await["items"][0]["document_id"],
+            "document-b"
+        );
+        let mismatch = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/nodes/content-search?q=other&cursor={cursor}"),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+        let replacement = prepare_document(
+            Some("document-c".into()),
+            "notes/document-c.org".into(),
+            "text/org; charset=utf-8".into(),
+            "#+title: document-c\n* Changed\n".into(),
+            None,
+        )
+        .unwrap();
+        service.replace_note(replacement, 3, None).await.unwrap();
+        let changed = app
+            .clone()
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/nodes/content-search?q=needle&cursor={cursor}"),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(changed.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(changed).await["error"]["code"],
+            "catalog_changed"
+        );
         drop(app);
         drop(service);
         runtime.finish().await.unwrap();

@@ -27,7 +27,8 @@ pub(crate) use client_views::{
     ThemaReviewState,
 };
 pub(crate) use content::{
-    AssetHead, AssetRevision, ContentChange, DocumentHead, DocumentProjectionSnapshot,
+    AssetHead, AssetRevision, ContentChange, ContentSearchGeneration, ContentSearchHit,
+    ContentSearchItem, ContentSearchPage, DocumentHead, DocumentProjectionSnapshot,
     DocumentReplicaRevision, DocumentRevision, MAX_DOCUMENT_PROJECTION_BYTES,
     MAX_DOCUMENT_SOURCE_BYTES, NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset,
     PreparedNote, PreparedThema, ProjectionEdge, ProjectionLinkOccurrence, ProjectionNode,

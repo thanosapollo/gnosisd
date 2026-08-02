@@ -36,11 +36,11 @@ use crate::application::{ImportSummary, PreparedServerImport};
 
 use crate::{
     application::{
-        AnswerInput, ApplicationError, AssetHead, ContentChange,
-        DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary, DeviceDesiredStateMutation,
-        DeviceMutationResult, DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
-        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeCatalogPage, NodeRecord,
-        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
+        AnswerInput, ApplicationError, AssetHead, ContentChange, ContentSearchGeneration,
+        ContentSearchPage, DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary,
+        DeviceDesiredStateMutation, DeviceMutationResult, DevicePrincipal, DeviceRecord,
+        DocumentHead, DocumentRevision, MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeCatalogPage,
+        NodeRecord, NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
         OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
         OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
         PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
@@ -692,6 +692,42 @@ impl ServiceHandle {
             limit,
             after,
             response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn search_nodes_by_tag(
+        &self,
+        tag: String,
+        limit: u16,
+        after: Option<String>,
+    ) -> Result<Vec<NodeRecord>, ServiceError> {
+        request(&self.sender, |response| StoreCommand::SearchNodesByTag {
+            tag,
+            limit,
+            after,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn search_document_content(
+        &self,
+        query: String,
+        expected_generation: Option<ContentSearchGeneration>,
+        after: Option<String>,
+        limit: u16,
+    ) -> Result<ContentSearchPage, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::SearchDocumentContent {
+                query,
+                expected_generation,
+                after,
+                limit,
+                response,
+            }
         })
         .await?
         .map_err(ServiceError::Store)
@@ -1673,6 +1709,19 @@ enum StoreCommand {
         after: Option<String>,
         response: oneshot::Sender<StoreResult<Vec<NodeRecord>>>,
     },
+    SearchNodesByTag {
+        tag: String,
+        limit: u16,
+        after: Option<String>,
+        response: oneshot::Sender<StoreResult<Vec<NodeRecord>>>,
+    },
+    SearchDocumentContent {
+        query: String,
+        expected_generation: Option<ContentSearchGeneration>,
+        after: Option<String>,
+        limit: u16,
+        response: oneshot::Sender<StoreResult<ContentSearchPage>>,
+    },
     NodeCatalog {
         device_id: String,
         document_id: Option<String>,
@@ -2611,6 +2660,35 @@ fn run_store_command(
             response,
             store.search_nodes(&query, limit, after.as_deref()),
         ),
+        StoreCommand::SearchNodesByTag {
+            tag,
+            limit,
+            after,
+            response,
+        } => send(
+            response,
+            store.search_nodes_by_tag(&tag, limit, after.as_deref()),
+        ),
+        StoreCommand::SearchDocumentContent {
+            query,
+            expected_generation,
+            after,
+            limit,
+            response,
+        } => {
+            let result = store.search_document_content(
+                &query,
+                expected_generation.as_ref(),
+                after.as_deref(),
+                limit,
+                |digest| {
+                    blobs
+                        .read(digest)
+                        .map_err(|_| StoreError::InvalidServerState)
+                },
+            );
+            send(response, result);
+        }
         StoreCommand::NodeCatalog {
             device_id,
             document_id,

@@ -294,6 +294,35 @@ pub(crate) struct NodeCatalogRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContentSearchGeneration {
+    pub(crate) server_id: String,
+    pub(crate) cursor: u64,
+    pub(crate) cursor_token: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContentSearchHit {
+    pub(crate) document_id: String,
+    pub(crate) logical_path: String,
+    pub(crate) revision: u64,
+    pub(crate) content_digest: String,
+    pub(crate) file_node_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContentSearchItem {
+    pub(crate) hit: ContentSearchHit,
+    pub(crate) resume_after: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContentSearchPage {
+    pub(crate) generation: ContentSearchGeneration,
+    pub(crate) items: Vec<ContentSearchItem>,
+    pub(crate) next_position: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NodeThemaAssociation {
     pub(crate) thema_id: String,
     pub(crate) relation: ThemaConceptRelation,

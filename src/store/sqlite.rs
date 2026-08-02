@@ -27,7 +27,8 @@ use crate::domain::{
 };
 use crate::{
     application::{
-        AssetHead, AssetRevision, ContentChange, DevicePrincipal, DeviceRecord, DocumentHead,
+        AssetHead, AssetRevision, ContentChange, ContentSearchGeneration, ContentSearchHit,
+        ContentSearchItem, ContentSearchPage, DevicePrincipal, DeviceRecord, DocumentHead,
         DocumentProjectionSnapshot, DocumentReplicaRevision, DocumentRevision,
         MAX_DOCUMENT_PROJECTION_BYTES, MAX_DOCUMENT_SOURCE_BYTES, NewDevice, NodeCatalogPage,
         NodeCatalogRecord, NodeRecord, NodeThemaAssociation, PreparedAsset, PreparedNote,
@@ -51,6 +52,8 @@ const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
 const SCHEMA_VERSION: u32 = 3;
 const THEMA_CATALOG_MATERIALIZED_BYTES: usize = 1024 * 1024;
+const CONTENT_SEARCH_DOCUMENT_BUDGET: usize = 1_000;
+const CONTENT_SEARCH_SOURCE_BUDGET: usize = 8 * 1024 * 1024;
 const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -88,6 +91,8 @@ pub(crate) enum StoreError {
     InvalidCursor,
     #[error("node page projection budget was reached")]
     NodePageProjectionLimit,
+    #[error("content catalog changed; restart search")]
+    CatalogChanged,
     #[error("replica snapshot belongs to another server")]
     ReplicaServer,
     #[error("operation requires a staged blob")]
@@ -102,6 +107,8 @@ pub(crate) enum StoreError {
     InvalidProjection { reason: &'static str },
     #[error("stored document contains invalid {field}")]
     CorruptData { field: &'static str },
+    #[error("canonical document content is unavailable or corrupt")]
+    InvalidServerState,
     #[error("database schema version {found} is unsupported; expected version {supported}")]
     UnsupportedSchemaVersion { found: u32, supported: u32 },
     #[error("database schema layout is unsupported")]
@@ -1501,6 +1508,200 @@ impl SqliteStore {
             .collect::<Result<Vec<String>, _>>()
             .map_err(StoreError::storage)?;
         load_node_records(&self.connection, ids)
+    }
+
+    pub(crate) fn search_nodes_by_tag(
+        &self,
+        tag: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<Vec<NodeRecord>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT node_id FROM (
+                     SELECT DISTINCT node.node_id FROM node
+                     JOIN node_tag ON node_tag.document_id = node.document_id
+                                      AND node_tag.node_id = node.node_id
+                     WHERE node_tag.tag = ?1
+                     UNION
+                     SELECT retired.node_id FROM retired_node AS retired
+                     JOIN json_each(retired.tags_json) AS tag
+                     WHERE tag.value = ?1
+                       AND NOT EXISTS(SELECT 1 FROM node WHERE node_id = retired.node_id)
+                 ) WHERE node_id > coalesce(?2, '')
+                 ORDER BY node_id LIMIT ?3",
+            )
+            .map_err(StoreError::storage)?;
+        let ids = statement
+            .query_map(params![tag, after, i64::from(limit)], |row| row.get(0))
+            .map_err(StoreError::storage)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(StoreError::storage)?;
+        load_node_records(&self.connection, ids)
+    }
+
+    pub(crate) fn search_document_content(
+        &mut self,
+        query: &str,
+        expected_generation: Option<&ContentSearchGeneration>,
+        after: Option<&str>,
+        limit: u16,
+        mut load_source: impl FnMut(&str) -> Result<Vec<u8>, StoreError>,
+    ) -> Result<ContentSearchPage, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::storage)?;
+        let cursor = current_content_cursor(&transaction)?;
+        let generation = ContentSearchGeneration {
+            server_id: server_id(&transaction)?,
+            cursor,
+            cursor_token: replica_cursor_token(&transaction, cursor)?,
+        };
+        if let Some(expected) = expected_generation {
+            if expected.server_id == generation.server_id {
+                match replica_cursor_token(&transaction, expected.cursor) {
+                    Ok(token) if token != expected.cursor_token => {
+                        return Err(StoreError::InvalidCursor);
+                    }
+                    Err(StoreError::ReplicaCursor) => return Err(StoreError::CatalogChanged),
+                    Err(error) => return Err(error),
+                    Ok(_) => {}
+                }
+            }
+            if expected != &generation {
+                return Err(StoreError::CatalogChanged);
+            }
+        }
+        if let Some(after) = after {
+            let valid: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM document WHERE document_id = ?1 AND active = 1)",
+                    [after],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::storage)?;
+            if !valid {
+                return Err(StoreError::InvalidCursor);
+            }
+        }
+        let rows = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT document.document_id, document.logical_path, document.revision,
+                            document.content_sha256, document.head_blob_sha256,
+                            document.file_node_id, blob.size_bytes
+                     FROM document
+                     LEFT JOIN blob ON blob.content_sha256 = document.head_blob_sha256
+                     WHERE document.active = 1
+                       AND document.document_id > coalesce(?1, '')
+                     ORDER BY document.document_id
+                     LIMIT ?2",
+                )
+                .map_err(StoreError::storage)?;
+            statement
+                .query_map(
+                    params![after, CONTENT_SEARCH_DOCUMENT_BUDGET as i64 + 1],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                        ))
+                    },
+                )
+                .map_err(StoreError::storage)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::storage)?
+        };
+        let matcher = regex::RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(true)
+            .build()
+            .map_err(StoreError::storage)?;
+        let mut sources = HashMap::<String, Vec<u8>>::new();
+        let mut source_bytes = 0_usize;
+        let mut items = Vec::new();
+        let mut scanned_after = after.map(str::to_owned);
+        let mut has_more = rows.len() > CONTENT_SEARCH_DOCUMENT_BUDGET;
+        for row in rows.into_iter().take(CONTENT_SEARCH_DOCUMENT_BUDGET) {
+            if items.len() == usize::from(limit) {
+                has_more = true;
+                break;
+            }
+            let (
+                document_id,
+                logical_path,
+                revision,
+                content_digest,
+                head_digest,
+                file_node_id,
+                size,
+            ) = row;
+            let logical_path = logical_path.ok_or(StoreError::InvalidServerState)?;
+            let head_digest = head_digest.ok_or(StoreError::InvalidServerState)?;
+            if head_digest != content_digest {
+                return Err(StoreError::InvalidServerState);
+            }
+            let size = usize::try_from(size.ok_or(StoreError::InvalidServerState)?)
+                .map_err(|_| StoreError::InvalidServerState)?;
+            if size > MAX_DOCUMENT_SOURCE_BYTES {
+                return Err(StoreError::InvalidServerState);
+            }
+            if !sources.contains_key(&content_digest) {
+                if source_bytes
+                    .checked_add(size)
+                    .is_none_or(|total| total > CONTENT_SEARCH_SOURCE_BUDGET)
+                {
+                    has_more = true;
+                    break;
+                }
+                let source = load_source(&content_digest)?;
+                if source.len() != size {
+                    return Err(StoreError::InvalidServerState);
+                }
+                source_bytes += size;
+                sources.insert(content_digest.clone(), source);
+            }
+            let source = std::str::from_utf8(&sources[&content_digest])
+                .map_err(|_| StoreError::InvalidServerState)?;
+            let resume_after = scanned_after.clone();
+            scanned_after = Some(document_id.clone());
+            if matcher.is_match(source) {
+                items.push(ContentSearchItem {
+                    hit: ContentSearchHit {
+                        document_id,
+                        logical_path,
+                        revision: u64::try_from(revision)
+                            .ok()
+                            .filter(|revision| *revision > 0)
+                            .ok_or(StoreError::InvalidServerState)?,
+                        content_digest,
+                        file_node_id,
+                    },
+                    resume_after,
+                });
+            }
+        }
+        let ending_cursor = current_content_cursor(&transaction)?;
+        let ending_generation = ContentSearchGeneration {
+            server_id: server_id(&transaction)?,
+            cursor: ending_cursor,
+            cursor_token: replica_cursor_token(&transaction, ending_cursor)?,
+        };
+        if ending_generation != generation {
+            return Err(StoreError::CatalogChanged);
+        }
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(ContentSearchPage {
+            generation,
+            items,
+            next_position: has_more.then_some(scanned_after).flatten(),
+        })
     }
 
     pub(crate) fn node_catalog(
@@ -5665,6 +5866,112 @@ mod tests {
         assert_eq!(records[0].document_revision, 1);
         assert_eq!(records[0].content_sha256, prepared.blob_sha256);
         assert_eq!((records[0].start_byte, records[0].end_byte), (None, None));
+    }
+
+    #[test]
+    fn exact_tag_search_matches_current_and_retired_unicode_tags() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Note\n\n* Current :Δ:\n:PROPERTIES:\n:ID: current\n:END:\n\n* Retired :δ:\n:PROPERTIES:\n:ID: retired\n:END:\n".into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&first, &first_blob, 1, None).unwrap();
+        let replacement = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Note\n\n* Current :Δ:\n:PROPERTIES:\n:ID: current\n:END:\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let replacement_blob = BlobMeta {
+            sha256: replacement.blob_sha256.clone(),
+            size_bytes: replacement.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&replacement, &replacement_blob, 2, None)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .search_nodes_by_tag("Δ", 10, None)
+                .unwrap()
+                .into_iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>(),
+            ["current"]
+        );
+        assert_eq!(
+            store
+                .search_nodes_by_tag("δ", 10, None)
+                .unwrap()
+                .into_iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>(),
+            ["retired"]
+        );
+    }
+
+    #[test]
+    fn content_search_reads_authoritative_bodies_in_document_order() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let mut sources = std::collections::HashMap::new();
+        for (document_id, source) in [
+            ("document-b", "#+title: B\nbody-only Needle.+\n"),
+            ("document-a", "#+title: needle.+ title\nno match marker\n"),
+            ("document-c", "#+title: B\nbody-only Needle.+\n"),
+        ] {
+            let prepared = prepare_note(
+                Some(document_id.into()),
+                format!("{document_id}.org"),
+                source.into(),
+                None,
+            )
+            .unwrap();
+            let blob = BlobMeta {
+                sha256: prepared.blob_sha256.clone(),
+                size_bytes: prepared.source.len() as u64,
+                media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+            };
+            sources.insert(
+                prepared.blob_sha256.clone(),
+                prepared.source.clone().into_bytes(),
+            );
+            store.replace_note(&prepared, &blob, 1, None).unwrap();
+        }
+
+        let mut loads = 0;
+        let page = store
+            .search_document_content("NEEDLE.+", None, None, 100, |digest| {
+                loads += 1;
+                sources.get(digest).cloned().ok_or(StoreError::CorruptData {
+                    field: "document source",
+                })
+            })
+            .unwrap();
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.hit.document_id.as_str())
+                .collect::<Vec<_>>(),
+            ["document-a", "document-b", "document-c"]
+        );
+        assert_eq!(loads, 2, "equal source digests must be loaded once");
+        assert!(
+            page.items
+                .iter()
+                .all(|item| item.hit.file_node_id.is_none())
+        );
+        assert!(page.next_position.is_none());
     }
 
     #[test]

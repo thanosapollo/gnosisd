@@ -44,12 +44,13 @@ use crate::{
         decode_review_pack,
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorCodeV1, ApiErrorResponseV1,
-            AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, DashboardV1,
-            DesiredStateMutationProjectionV1, DesiredStateMutationResultV1, DeviceIdentityV1,
-            DocumentImportRequestV1, DocumentMutationRejectionV1, DocumentMutationResultV1,
-            FsrsConfigV1, NodePageV1, NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1,
-            NoteWriteRequestV1, ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1,
-            ReviewAnswerV1, ReviewAttemptBeginResponseV1, ReviewAttemptOperationResponseV1,
+            AssetCapabilitiesV1, AssetHeadV1, ContentCapabilitiesV1, ContentSearchPageV1,
+            DashboardV1, DesiredStateMutationProjectionV1, DesiredStateMutationResultV1,
+            DeviceIdentityV1, DocumentImportRequestV1, DocumentMutationRejectionV1,
+            DocumentMutationResultV1, FsrsConfigV1, MAX_CONTENT_SEARCH_CURSOR_BYTES, NodePageV1,
+            NodeThemaAssociationPageV1, NodeV1, NoteRenameRequestV1, NoteWriteRequestV1,
+            ReplicaChangePageV1, ReplicaSnapshotPageV1, ReplicaStateV1, ReviewAnswerV1,
+            ReviewAttemptBeginResponseV1, ReviewAttemptOperationResponseV1,
             ReviewAttemptStateResponseV1, ReviewAttemptV1, ReviewClozeCheckRequestV1,
             ReviewClozeCheckV1, ReviewClozeSpanV1, ReviewClozeStateV1, ReviewCommitResponseV1,
             ReviewHistoryPageV1, ReviewHistoryRequestV1, ReviewPackAssetV2, ReviewPackEnvelopeV2,
@@ -802,6 +803,60 @@ impl HttpClient {
         drop(pairs);
         let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
         checked_node_page(page, limit, after.as_ref())
+    }
+
+    pub async fn nodes_by_tag(
+        &self,
+        tag: &str,
+        limit: u16,
+        after: Option<&str>,
+    ) -> Result<NodePageV1, HttpClientError> {
+        if !(1..=500).contains(&limit) || !(1..=256).contains(&tag.len()) || tag.trim().is_empty() {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let after = after
+            .map(|value| NodeId::new(value.to_owned()))
+            .transpose()
+            .map_err(|_| HttpClientError::InvalidCursor)?;
+        let mut url = self.endpoint("v1/nodes")?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("tag", tag);
+            query.append_pair("limit", &limit.to_string());
+            if let Some(after) = &after {
+                query.append_pair("after", after.as_str());
+            }
+        }
+        let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        checked_node_page(page, limit, after.as_ref())
+    }
+
+    pub async fn search_document_content(
+        &self,
+        query: &str,
+        limit: u16,
+        cursor: Option<&str>,
+    ) -> Result<ContentSearchPageV1, HttpClientError> {
+        let query = query.trim();
+        if !(1..=256).contains(&query.len())
+            || !(1..=500).contains(&limit)
+            || cursor.is_some_and(|value| {
+                value.is_empty() || value.len() > MAX_CONTENT_SEARCH_CURSOR_BYTES
+            })
+        {
+            return Err(HttpClientError::InvalidMutation);
+        }
+        let mut url = self.endpoint("v1/nodes/content-search")?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("q", query);
+            pairs.append_pair("limit", &limit.to_string());
+            if let Some(cursor) = cursor {
+                pairs.append_pair("cursor", cursor);
+            }
+        }
+        let page = execute_json_exact(self.client.get(url), MAX_FRAME_SIZE, StatusCode::OK).await?;
+        checked_content_search_page(page, limit)
     }
 
     pub async fn themata(
@@ -1558,6 +1613,34 @@ fn checked_node_page(
         items,
         next: page.next,
     })
+}
+
+fn checked_content_search_page(
+    page: ContentSearchPageV1,
+    limit: u16,
+) -> Result<ContentSearchPageV1, HttpClientError> {
+    if page.items.len() > usize::from(limit)
+        || page
+            .items
+            .windows(2)
+            .any(|items| items[0].document_id >= items[1].document_id)
+        || page.next.as_deref().is_some_and(|cursor| {
+            cursor.is_empty() || cursor.len() > MAX_CONTENT_SEARCH_CURSOR_BYTES
+        })
+        || page.items.iter().any(|item| {
+            DocumentId::new(item.document_id.clone()).is_err()
+                || validate_document_path("text/org; charset=utf-8", &item.logical_path).is_err()
+                || item.revision == 0
+                || !is_canonical_sha256(&item.content_digest)
+                || item
+                    .file_node_id
+                    .as_ref()
+                    .is_some_and(|id| NodeId::new(id.clone()).is_err())
+        })
+    {
+        return Err(invalid_response());
+    }
+    Ok(page)
 }
 
 fn checked_thema_page(
@@ -2877,9 +2960,9 @@ fn error_status_matches(status: StatusCode, code: ApiErrorCodeV1) -> bool {
         | ApiErrorCodeV1::UnsupportedOfflineContentVersion
         | ApiErrorCodeV1::UnsupportedOfflineAssetVersion => StatusCode::BAD_REQUEST,
         ApiErrorCodeV1::PreconditionRequired => StatusCode::PRECONDITION_REQUIRED,
-        ApiErrorCodeV1::Internal | ApiErrorCodeV1::ReplicaProjectionTooLarge => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        ApiErrorCodeV1::Internal
+        | ApiErrorCodeV1::InvalidServerState
+        | ApiErrorCodeV1::ReplicaProjectionTooLarge => StatusCode::INTERNAL_SERVER_ERROR,
         ApiErrorCodeV1::InvalidContent
         | ApiErrorCodeV1::InvalidBody
         | ApiErrorCodeV1::InvalidOfflineReviewOperation
@@ -2889,7 +2972,8 @@ fn error_status_matches(status: StatusCode, code: ApiErrorCodeV1) -> bool {
         | ApiErrorCodeV1::InvalidBlobMetadata => StatusCode::UNPROCESSABLE_ENTITY,
         ApiErrorCodeV1::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         ApiErrorCodeV1::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
-        ApiErrorCodeV1::SnapshotRequired
+        ApiErrorCodeV1::CatalogChanged
+        | ApiErrorCodeV1::SnapshotRequired
         | ApiErrorCodeV1::ActiveSession
         | ApiErrorCodeV1::ReviewStateConflict
         | ApiErrorCodeV1::IdempotencyConflict
@@ -3248,6 +3332,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn content_search_validator_rejects_unbounded_or_invalid_hits() {
+        let page: ContentSearchPageV1 = serde_json::from_value(serde_json::json!({
+            "items": [{
+                "document_id": "document",
+                "logical_path": "notes/document.org",
+                "revision": 1,
+                "content_digest": "a".repeat(64),
+                "file_node_id": "node"
+            }],
+            "next": "cursor"
+        }))
+        .unwrap();
+        assert!(checked_content_search_page(page.clone(), 1).is_ok());
+        assert!(checked_content_search_page(page.clone(), 0).is_err());
+
+        let mut invalid = page.clone();
+        invalid.items[0].content_digest = "A".repeat(64);
+        assert!(checked_content_search_page(invalid, 1).is_err());
+        let mut invalid = page;
+        invalid.next = Some("x".repeat(MAX_CONTENT_SEARCH_CURSOR_BYTES + 1));
+        assert!(checked_content_search_page(invalid, 1).is_err());
     }
 
     #[tokio::test]

@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{DocumentOperationV1, FsrsConfigV1, ReviewStateV1, ThemaKindV1};
 use crate::application::{
-    AssetHead, ContentChange, DeviceMutationProjection, DeviceMutationRejection,
-    DeviceMutationResult, DocumentHead, DocumentRevision, NodeCatalogRecord, NodeRecord,
-    NodeThemaAssociation, SettingsInput, SettingsRecord, ThemaCatalogRecord,
-    ThemaMutationProjection, ThemaRecord,
+    AssetHead, ContentChange, ContentSearchHit, ContentSearchItem, DeviceMutationProjection,
+    DeviceMutationRejection, DeviceMutationResult, DocumentHead, DocumentRevision,
+    NodeCatalogRecord, NodeRecord, NodeThemaAssociation, SettingsInput, SettingsRecord,
+    ThemaCatalogRecord, ThemaMutationProjection, ThemaRecord,
 };
 use crate::domain::{ThemaConcept, ThemaConceptRelation, ThemaKind};
 
@@ -818,6 +818,55 @@ impl NodePageV1 {
         Self {
             items: items.iter().map(NodeV1::from_application).collect(),
             next: items.last().map(|item| item.node_id.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSearchHitV1 {
+    pub document_id: String,
+    pub logical_path: String,
+    #[schemars(range(min = 1))]
+    pub revision: u64,
+    #[schemars(length(equal = 64))]
+    #[schemars(regex(pattern = "^[0-9a-f]{64}$"))]
+    pub content_digest: String,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub file_node_id: Option<String>,
+}
+
+impl ContentSearchHitV1 {
+    fn from_application(value: &ContentSearchHit) -> Self {
+        Self {
+            document_id: value.document_id.clone(),
+            logical_path: value.logical_path.clone(),
+            revision: value.revision,
+            content_digest: value.content_digest.clone(),
+            file_node_id: value.file_node_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentSearchPageV1 {
+    #[schemars(length(max = 500))]
+    pub items: Vec<ContentSearchHitV1>,
+    #[serde(deserialize_with = "super::deserialize_required_option")]
+    #[schemars(with = "crate::protocol::RequiredNullable<String>", required)]
+    pub next: Option<String>,
+}
+
+impl ContentSearchPageV1 {
+    pub(crate) fn from_application(items: &[ContentSearchItem], next: Option<String>) -> Self {
+        Self {
+            items: items
+                .iter()
+                .map(|item| ContentSearchHitV1::from_application(&item.hit))
+                .collect(),
+            next,
         }
     }
 }
