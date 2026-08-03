@@ -5936,8 +5936,16 @@ mod tests {
             .replace_note(&replacement, &replacement_blob, 3, None)
             .unwrap();
 
-        assert_eq!(store.get_thema("thema").unwrap(), Some(stored_thema));
-        let error = store
+        assert_eq!(
+            store.get_thema("thema").unwrap().as_ref(),
+            Some(&stored_thema)
+        );
+        let content_changes = store.latest_content_cursor().unwrap();
+        let history: u64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM thema_revision", [], |row| row.get(0))
+            .unwrap();
+        let retired_error = store
             .put_thema(
                 &prepare_thema(
                     Some("thema".into()),
@@ -5953,7 +5961,41 @@ mod tests {
                 None,
             )
             .unwrap_err();
-        assert_eq!(error.to_string(), "thema references an inactive node");
+        assert!(matches!(
+            retired_error,
+            StoreError::InactiveReference { kind: "node" }
+        ));
+        let missing_error = store
+            .put_thema(
+                &prepare_thema(
+                    Some("thema".into()),
+                    associated.content.clone(),
+                    vec![],
+                    vec![("missing".into(), ThemaConceptRelation::Primary)],
+                    vec![],
+                    Some(1),
+                )
+                .unwrap(),
+                20260715,
+                5,
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(missing_error, StoreError::NotFound));
+        assert_eq!(
+            store.get_thema("thema").unwrap().as_ref(),
+            Some(&stored_thema)
+        );
+        assert_eq!(store.latest_content_cursor().unwrap(), content_changes);
+        assert_eq!(
+            store
+                .connection
+                .query_row::<u64, _, _>("SELECT COUNT(*) FROM thema_revision", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            history
+        );
 
         store
             .put_thema(
@@ -5967,7 +6009,7 @@ mod tests {
                 )
                 .unwrap(),
                 20260715,
-                5,
+                6,
                 None,
             )
             .unwrap();
