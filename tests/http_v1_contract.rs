@@ -151,10 +151,31 @@ fn public_error_code_names_match_their_wire_values() {
         BlobRequired,
         BlobMetadataConflict,
         RenameRequired,
+        PathConflict,
+        NodeIdConflict,
         InvalidBlobMetadata,
     ];
     for code in codes {
         assert_eq!(serde_json::to_value(code).unwrap(), json!(code.as_str()));
+    }
+}
+
+#[test]
+fn public_store_conflicts_preserve_path_and_absent_revision_semantics() {
+    for wire in [
+        json!({"error":{
+            "code":"path_conflict",
+            "message":"logical path belongs to another active resource",
+            "meta":null
+        }}),
+        json!({"error":{
+            "code":"revision_conflict",
+            "message":"resource revision changed",
+            "meta":{"expected_revision":null,"current_revision":7}
+        }}),
+    ] {
+        let response: ApiErrorResponseV1 = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
     }
 }
 
@@ -193,8 +214,15 @@ fn public_document_mutation_results_are_exclusive_and_strict() {
         "rejection":{"reason":"path_conflict"},
         "cursor":"cursor"
     });
+    let node_id_conflict = json!({
+        "status":"rejected",
+        "format_version":1,
+        "operation_id":"import",
+        "rejection":{"reason":"node_id_conflict","node_id":"shared"},
+        "cursor":"cursor"
+    });
 
-    for wire in [applied, rejected, path_conflict] {
+    for wire in [applied, rejected, path_conflict, node_id_conflict] {
         let result: DocumentMutationResultV1 = serde_json::from_value(wire.clone()).unwrap();
         assert_eq!(serde_json::to_value(result).unwrap(), wire);
     }

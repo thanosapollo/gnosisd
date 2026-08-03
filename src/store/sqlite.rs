@@ -103,6 +103,10 @@ pub(crate) enum StoreError {
     PathChange,
     #[error("logical path belongs to another active resource")]
     PathConflict,
+    #[error("node ID {node_id} belongs to another document")]
+    NodeIdConflict { node_id: String },
+    #[error("thema references an inactive {kind}")]
+    InactiveReference { kind: &'static str },
     #[error("document projection is invalid: {reason}")]
     InvalidProjection { reason: &'static str },
     #[error("stored document contains invalid {field}")]
@@ -3281,12 +3285,44 @@ fn validate_thema_associations(
     prepared: &PreparedThema,
 ) -> Result<(), StoreError> {
     for concept in &prepared.concepts {
-        require_active(connection, "node", "node_id", concept.concept_id().as_str())?;
+        require_active_node(connection, concept.concept_id().as_str())?;
     }
     for asset_path in &prepared.asset_paths {
-        require_active(connection, "managed_asset", "asset_path", asset_path)?;
+        require_active_association(
+            connection,
+            "managed_asset",
+            "asset_path",
+            asset_path,
+            "asset",
+        )?;
     }
     Ok(())
+}
+
+fn require_active_node(connection: &Connection, node_id: &str) -> Result<(), StoreError> {
+    let active = connection
+        .query_row(
+            "SELECT active FROM node WHERE node_id = ?1",
+            [node_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(StoreError::storage)?;
+    if active == Some(true) {
+        return Ok(());
+    }
+    let retired = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM retired_node WHERE node_id = ?1)",
+            [node_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StoreError::storage)?;
+    if active == Some(false) || retired {
+        Err(StoreError::InactiveReference { kind: "node" })
+    } else {
+        Err(StoreError::NotFound)
+    }
 }
 
 fn validate_note_assets(
@@ -3294,7 +3330,13 @@ fn validate_note_assets(
     prepared: &PreparedNote,
 ) -> Result<(), StoreError> {
     for asset_path in &prepared.asset_paths {
-        require_active(connection, "managed_asset", "asset_path", asset_path)?;
+        require_active_association(
+            connection,
+            "managed_asset",
+            "asset_path",
+            asset_path,
+            "asset",
+        )?;
     }
     Ok(())
 }
@@ -3313,9 +3355,7 @@ fn require_thema_assets_active(connection: &Connection, thema_id: &str) -> Resul
         )
         .map_err(StoreError::storage)?;
     if unavailable {
-        Err(StoreError::InvalidProjection {
-            reason: "thema references an inactive asset",
-        })
+        Err(StoreError::InactiveReference { kind: "asset" })
     } else {
         Ok(())
     }
@@ -3363,20 +3403,22 @@ fn insert_document_revision_assets(
     Ok(())
 }
 
-fn require_active(
+fn require_active_association(
     connection: &Connection,
     table: &str,
     column: &str,
     value: &str,
+    kind: &'static str,
 ) -> Result<(), StoreError> {
-    let query = format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1 AND active = 1)");
-    let exists: bool = connection
-        .query_row(&query, [value], |row| row.get(0))
+    let query = format!("SELECT active FROM {table} WHERE {column} = ?1");
+    let active = connection
+        .query_row(&query, [value], |row| row.get::<_, bool>(0))
+        .optional()
         .map_err(StoreError::storage)?;
-    if exists {
-        Ok(())
-    } else {
-        Err(StoreError::NotFound)
+    match active {
+        Some(true) => Ok(()),
+        Some(false) => Err(StoreError::InactiveReference { kind }),
+        None => Err(StoreError::NotFound),
     }
 }
 
@@ -4608,6 +4650,7 @@ pub(super) fn note_write_decision(
     let current_path = document_path(connection, &prepared.document_id)?;
     require_unchanged_path(prepared, current_path.as_deref())?;
     check_path_available(connection, prepared)?;
+    check_node_ids_available(connection, prepared)?;
     if allow_noop && note_is_unchanged(connection, prepared, current.as_ref(), &current_path)? {
         return current
             .map(NoteWriteDecision::Unchanged)
@@ -4625,6 +4668,34 @@ fn require_unchanged_path(
     } else {
         Ok(())
     }
+}
+
+fn check_node_ids_available(
+    connection: &Connection,
+    prepared: &PreparedNote,
+) -> Result<(), StoreError> {
+    let mut conflict = connection
+        .prepare_cached(
+            "SELECT EXISTS(
+               SELECT 1 FROM node WHERE node_id = ?1 AND document_id <> ?2
+               UNION ALL
+               SELECT 1 FROM retired_node WHERE node_id = ?1 AND document_id <> ?2
+             )",
+        )
+        .map_err(StoreError::storage)?;
+    for node in prepared.projection.nodes() {
+        let unavailable = conflict
+            .query_row([node.id().as_str(), prepared.document_id.as_str()], |row| {
+                row.get::<_, bool>(0)
+            })
+            .map_err(StoreError::storage)?;
+        if unavailable {
+            return Err(StoreError::NodeIdConflict {
+                node_id: node.id().as_str().to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn note_is_unchanged(
@@ -5722,6 +5793,225 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM thema_concept", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cross_document_node_id_collision_is_actionable_and_rolls_back() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let original = prepare_note(
+            Some("original".into()),
+            "original.org".into(),
+            ":PROPERTIES:\n:ID: shared\n:END:\n#+title: Original\n".into(),
+            None,
+        )
+        .unwrap();
+        let original_blob = BlobMeta {
+            sha256: original.blob_sha256.clone(),
+            size_bytes: original.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&original, &original_blob, 1, None)
+            .unwrap();
+        let retired = prepare_note(
+            Some("original".into()),
+            "original.org".into(),
+            "#+title: Original\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let retired_blob = BlobMeta {
+            sha256: retired.blob_sha256.clone(),
+            size_bytes: retired.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&retired, &retired_blob, 2, None)
+            .unwrap();
+        let conflicting = prepare_note(
+            Some("conflicting".into()),
+            "conflicting.org".into(),
+            ":PROPERTIES:\n:ID: shared\n:END:\n#+title: Conflicting\n".into(),
+            None,
+        )
+        .unwrap();
+        let conflicting_blob = BlobMeta {
+            sha256: conflicting.blob_sha256.clone(),
+            size_bytes: conflicting.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+
+        let error = store
+            .replace_note(&conflicting, &conflicting_blob, 3, None)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("node ID shared belongs to another document")
+        );
+        assert_eq!(
+            store
+                .get_document(&DocumentId::new("original").unwrap())
+                .unwrap()
+                .unwrap()
+                .revision(),
+            2
+        );
+        assert!(
+            store
+                .get_document(&DocumentId::new("conflicting").unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retired_thema_concept_is_distinct_from_missing_thema() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let original = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            concat!(
+                ":PROPERTIES:\n:ID: root\n:END:\n#+title: Note\n",
+                "* Child\n:PROPERTIES:\n:ID: child\n:END:\n"
+            )
+            .into(),
+            None,
+        )
+        .unwrap();
+        let original_blob = BlobMeta {
+            sha256: original.blob_sha256.clone(),
+            size_bytes: original.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&original, &original_blob, 1, None)
+            .unwrap();
+        let associated = prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                "Question".into(),
+                vec![],
+                vec!["Answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            vec![],
+            vec![("child".into(), ThemaConceptRelation::Primary)],
+            vec![],
+            None,
+        )
+        .unwrap();
+        let stored_thema = store.put_thema(&associated, 20260715, 2, None).unwrap();
+        let replacement = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            ":PROPERTIES:\n:ID: root\n:END:\n#+title: Note\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let replacement_blob = BlobMeta {
+            sha256: replacement.blob_sha256.clone(),
+            size_bytes: replacement.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&replacement, &replacement_blob, 3, None)
+            .unwrap();
+
+        assert_eq!(store.get_thema("thema").unwrap(), Some(stored_thema));
+        let error = store
+            .put_thema(
+                &prepare_thema(
+                    Some("thema".into()),
+                    associated.content.clone(),
+                    vec![],
+                    vec![("child".into(), ThemaConceptRelation::Primary)],
+                    vec![],
+                    Some(1),
+                )
+                .unwrap(),
+                20260715,
+                4,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "thema references an inactive node");
+
+        store
+            .put_thema(
+                &prepare_thema(
+                    Some("thema".into()),
+                    associated.content,
+                    vec![],
+                    vec![("root".into(), ThemaConceptRelation::Primary)],
+                    vec![],
+                    Some(1),
+                )
+                .unwrap(),
+                20260715,
+                5,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn inactive_thema_asset_has_one_error_for_put_and_unarchive() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let asset_digest = register_asset(&mut store, b"inactive association");
+        let asset_path = format!("assets/{asset_digest}/asset.png");
+        let prepared = prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                "Question".into(),
+                vec![],
+                vec!["Answer".into()],
+                None,
+                None,
+                Some(asset_path.clone()),
+            )
+            .unwrap(),
+            vec![],
+            vec![],
+            vec![asset_path.clone()],
+            None,
+        )
+        .unwrap();
+        store.put_thema(&prepared, 20260715, 2, None).unwrap();
+        store.set_thema_archived("thema", 1, true, 3, None).unwrap();
+        store.tombstone_asset(&asset_path, 1, 4, None).unwrap();
+
+        let put_error = store
+            .put_thema(
+                &prepare_thema(
+                    Some("thema".into()),
+                    prepared.content,
+                    vec![],
+                    vec![],
+                    vec![asset_path],
+                    Some(2),
+                )
+                .unwrap(),
+                20260715,
+                5,
+                None,
+            )
+            .unwrap_err();
+        let unarchive_error = store
+            .set_thema_archived("thema", 2, false, 6, None)
+            .unwrap_err();
+
+        assert_eq!(put_error.to_string(), "thema references an inactive asset");
+        assert_eq!(put_error.to_string(), unarchive_error.to_string());
+        let thema = store.get_thema("thema").unwrap().unwrap();
+        assert_eq!(thema.revision, 2);
+        assert!(thema.archived);
     }
 
     #[test]

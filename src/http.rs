@@ -2028,7 +2028,7 @@ fn attempt_operation_response(
                 .map_err(|_| ApiError::internal())?,
         )),
         ReviewAttemptOperationStatus::RevisionConflict => Err(ApiError::conflict(
-            result.expected_attempt_revision,
+            Some(result.expected_attempt_revision),
             Some(result.attempt_revision),
         )),
         ReviewAttemptOperationStatus::StaleAttempt => Err(ApiError::new(
@@ -2505,7 +2505,7 @@ impl ApiError {
             }),
         }
     }
-    fn conflict(expected: u64, actual: Option<u64>) -> Self {
+    fn conflict(expected: Option<u64>, actual: Option<u64>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
             code: ApiErrorCodeV1::RevisionConflict,
@@ -2548,8 +2548,8 @@ impl ApiError {
     fn store(error: StoreError) -> Self {
         match error {
             StoreError::NotFound => Self::not_found(),
-            StoreError::Conflict { expected, actual } => Self::conflict(expected, actual),
-            StoreError::ExpectedAbsent { .. } => Self::internal(),
+            StoreError::Conflict { expected, actual } => Self::conflict(Some(expected), actual),
+            StoreError::ExpectedAbsent { actual } => Self::conflict(None, Some(actual)),
             StoreError::ActiveReviewSession => Self::new(
                 StatusCode::CONFLICT,
                 ApiErrorCodeV1::ActiveSession,
@@ -2605,7 +2605,17 @@ impl ApiError {
                 ApiErrorCodeV1::RenameRequired,
                 "document path changes require the rename endpoint",
             ),
-            StoreError::PathConflict => Self::invalid_content("stored projection"),
+            StoreError::PathConflict => Self::new(
+                StatusCode::CONFLICT,
+                ApiErrorCodeV1::PathConflict,
+                "logical path belongs to another active resource",
+            ),
+            StoreError::NodeIdConflict { .. } => Self::new(
+                StatusCode::CONFLICT,
+                ApiErrorCodeV1::NodeIdConflict,
+                "node ID belongs to another document",
+            ),
+            StoreError::InactiveReference { .. } => Self::invalid_content("inactive reference"),
             StoreError::InvalidProjection { .. } => Self::invalid_content("stored projection"),
             StoreError::InvalidServerState => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2627,7 +2637,9 @@ impl ApiError {
             ApplicationError::InvalidDocumentId(error) => Self::invalid_content(error),
             ApplicationError::InvalidOrg(error) => Self::invalid_content(error),
             ApplicationError::InvalidContent(error) => Self::invalid_content(error),
-            ApplicationError::Conflict { expected, actual } => Self::conflict(expected, actual),
+            ApplicationError::Conflict { expected, actual } => {
+                Self::conflict(Some(expected), actual)
+            }
             ApplicationError::Storage => Self::internal(),
         }
     }
@@ -3883,9 +3895,42 @@ mod tests {
             ApiErrorCodeV1::RevisionConflict,
             "resource revision changed",
             Some(ApiErrorMetaV1::Revision {
-                expected_revision: 7,
+                expected_revision: Some(7),
                 current_revision: Some(9),
             }),
+        );
+        assert_api_error(
+            ServiceError::Store(StoreError::ExpectedAbsent { actual: 7 }),
+            StatusCode::PRECONDITION_FAILED,
+            ApiErrorCodeV1::RevisionConflict,
+            "resource revision changed",
+            Some(ApiErrorMetaV1::Revision {
+                expected_revision: None,
+                current_revision: Some(7),
+            }),
+        );
+        assert_api_error(
+            ServiceError::Store(StoreError::PathConflict),
+            StatusCode::CONFLICT,
+            ApiErrorCodeV1::PathConflict,
+            "logical path belongs to another active resource",
+            None,
+        );
+        assert_api_error(
+            ServiceError::Store(StoreError::NodeIdConflict {
+                node_id: "shared".into(),
+            }),
+            StatusCode::CONFLICT,
+            ApiErrorCodeV1::NodeIdConflict,
+            "node ID belongs to another document",
+            None,
+        );
+        assert_api_error(
+            ServiceError::Store(StoreError::InactiveReference { kind: "node" }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ApiErrorCodeV1::InvalidContent,
+            "content validation failed",
+            None,
         );
     }
 
@@ -4281,6 +4326,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("current_revision"))
+        );
+        assert!(
+            schemas["RevisionErrorMetaSchemaV1"]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("expected_revision"))
         );
         assert_eq!(
             schemas["ReplicaSnapshotPageV1"]["oneOf"]
@@ -7583,6 +7634,82 @@ mod tests {
         );
         assert_eq!(service.latest_content_cursor().await.unwrap(), 0);
         assert!(!blob_root.join(&digest[..2]).join(digest).exists());
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_node_ids_are_typed_conflicts_and_preserve_the_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device =
+            generate_device("writer".into(), vec!["read".into(), "content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+        let body = |path: &str, title: &str| {
+            serde_json::to_vec(&json!({
+                "logical_path": path,
+                "content_type": "text/org; charset=utf-8",
+                "source": format!(
+                    ":PROPERTIES:\n:ID: shared\n:END:\n#+title: {title}\n"
+                )
+            }))
+            .unwrap()
+        };
+
+        let first = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                "first",
+                None,
+                Body::from(body("first.org", "First")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        assert_eq!(first["status"], "applied");
+        let first_id = first["authoritative"]["document_id"].as_str().unwrap();
+
+        let conflicting = app
+            .clone()
+            .oneshot(authorized_mutation(
+                "POST",
+                "/v1/document-mutations",
+                &token,
+                "conflicting",
+                None,
+                Body::from(body("conflicting.org", "Conflicting")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(conflicting.status(), StatusCode::OK);
+        let conflicting = response_json(conflicting).await;
+        assert_eq!(conflicting["status"], "rejected");
+        assert_eq!(conflicting["rejection"]["reason"], "node_id_conflict");
+        assert_eq!(conflicting["rejection"]["node_id"], "shared");
+
+        let owner = app
+            .oneshot(authorized(
+                "GET",
+                &format!("/v1/notes/{first_id}"),
+                &token,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(owner.status(), StatusCode::OK);
         drop(service);
         runtime.finish().await.unwrap();
     }

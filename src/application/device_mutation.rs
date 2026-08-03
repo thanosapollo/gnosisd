@@ -320,6 +320,9 @@ pub(crate) enum DeviceMutationRejection {
     },
     NotFound,
     InvalidContent,
+    NodeIdConflict {
+        node_id: String,
+    },
     PathConflict,
     RenameRequired,
 }

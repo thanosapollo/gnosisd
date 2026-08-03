@@ -145,6 +145,9 @@ pub enum DocumentMutationRejectionV1 {
     },
     NotFound,
     InvalidContent,
+    NodeIdConflict {
+        node_id: String,
+    },
     PathConflict,
     RenameRequired,
 }
@@ -334,6 +337,11 @@ fn mutation_rejection(value: &DeviceMutationRejection) -> DocumentMutationReject
         }
         DeviceMutationRejection::NotFound => DocumentMutationRejectionV1::NotFound,
         DeviceMutationRejection::InvalidContent => DocumentMutationRejectionV1::InvalidContent,
+        DeviceMutationRejection::NodeIdConflict { node_id } => {
+            DocumentMutationRejectionV1::NodeIdConflict {
+                node_id: node_id.clone(),
+            }
+        }
         DeviceMutationRejection::PathConflict => DocumentMutationRejectionV1::PathConflict,
         DeviceMutationRejection::RenameRequired => DocumentMutationRejectionV1::RenameRequired,
     }

@@ -1548,6 +1548,8 @@ pub enum ApiErrorCodeV1 {
     BlobRequired,
     BlobMetadataConflict,
     RenameRequired,
+    PathConflict,
+    NodeIdConflict,
     InvalidBlobMetadata,
 }
 
@@ -1584,6 +1586,8 @@ impl ApiErrorCodeV1 {
             Self::BlobRequired => "blob_required",
             Self::BlobMetadataConflict => "blob_metadata_conflict",
             Self::RenameRequired => "rename_required",
+            Self::PathConflict => "path_conflict",
+            Self::NodeIdConflict => "node_id_conflict",
             Self::InvalidBlobMetadata => "invalid_blob_metadata",
         }
     }
@@ -1603,7 +1607,9 @@ pub enum ApiErrorMetaV1 {
         snapshot_url: String,
     },
     Revision {
-        expected_revision: u64,
+        #[serde(deserialize_with = "deserialize_required_option")]
+        #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
+        expected_revision: Option<u64>,
         #[serde(deserialize_with = "deserialize_required_option")]
         #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
         current_revision: Option<u64>,
@@ -1787,7 +1793,8 @@ mod error_schema {
     #[derive(JsonSchema)]
     #[serde(deny_unknown_fields)]
     struct RevisionErrorMetaSchemaV1 {
-        expected_revision: u64,
+        #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
+        expected_revision: Option<u64>,
         #[schemars(with = "crate::protocol::RequiredNullable<u64>", required)]
         current_revision: Option<u64>,
     }

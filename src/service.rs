@@ -4529,7 +4529,9 @@ mod tests {
             service
                 .archive_thema("thema".into(), archived.revision, false, 6, None)
                 .await,
-            Err(ServiceError::Store(StoreError::InvalidProjection { .. }))
+            Err(ServiceError::Store(StoreError::InactiveReference {
+                kind: "asset"
+            }))
         ));
         assert_eq!(service.latest_content_cursor().await.unwrap(), cursor);
         assert!(

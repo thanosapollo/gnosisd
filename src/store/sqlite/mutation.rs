@@ -299,9 +299,9 @@ fn desired_state_rejection(error: &StoreError) -> Option<DeviceMutationRejection
         }),
         StoreError::NotFound => Some(DeviceMutationRejection::NotFound),
         StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
-        StoreError::BlobMetadata | StoreError::InvalidProjection { .. } => {
-            Some(DeviceMutationRejection::InvalidContent)
-        }
+        StoreError::BlobMetadata
+        | StoreError::InactiveReference { .. }
+        | StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
         _ => None,
     }
 }
@@ -518,7 +518,12 @@ fn document_rejection(error: &StoreError) -> Option<DeviceMutationRejection> {
             })
         }
         StoreError::NotFound => Some(DeviceMutationRejection::InvalidContent),
-        StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
+        StoreError::InactiveReference { .. } | StoreError::InvalidProjection { .. } => {
+            Some(DeviceMutationRejection::InvalidContent)
+        }
+        StoreError::NodeIdConflict { node_id } => Some(DeviceMutationRejection::NodeIdConflict {
+            node_id: node_id.clone(),
+        }),
         StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
         StoreError::PathChange => Some(DeviceMutationRejection::RenameRequired),
         _ => None,
@@ -667,7 +672,9 @@ fn lifecycle_rejection(error: &StoreError) -> Option<DeviceMutationRejection> {
         }
         StoreError::NotFound => Some(DeviceMutationRejection::NotFound),
         StoreError::PathConflict => Some(DeviceMutationRejection::PathConflict),
-        StoreError::InvalidProjection { .. } => Some(DeviceMutationRejection::InvalidContent),
+        StoreError::InactiveReference { .. } | StoreError::InvalidProjection { .. } => {
+            Some(DeviceMutationRejection::InvalidContent)
+        }
         _ => None,
     }
 }
@@ -739,6 +746,35 @@ mod tests {
         blob::BlobMeta,
         domain::DocumentId,
     };
+
+    #[test]
+    fn expected_store_failures_keep_typed_mutation_rejections() {
+        assert!(matches!(
+            super::document_rejection(&StoreError::NodeIdConflict {
+                node_id: "shared".into()
+            }),
+            Some(DeviceMutationRejection::NodeIdConflict { node_id }) if node_id == "shared"
+        ));
+        assert!(matches!(
+            super::desired_state_rejection(&StoreError::ExpectedAbsent { actual: 7 }),
+            Some(DeviceMutationRejection::RevisionConflict {
+                expected: None,
+                actual: Some(7)
+            })
+        ));
+        assert!(matches!(
+            super::desired_state_rejection(&StoreError::PathConflict),
+            Some(DeviceMutationRejection::PathConflict)
+        ));
+        assert!(matches!(
+            super::desired_state_rejection(&StoreError::InactiveReference { kind: "asset" }),
+            Some(DeviceMutationRejection::InvalidContent)
+        ));
+        assert!(matches!(
+            super::lifecycle_rejection(&StoreError::InactiveReference { kind: "asset" }),
+            Some(DeviceMutationRejection::InvalidContent)
+        ));
+    }
 
     #[test]
     fn desired_state_mutations_replay_assets_themata_and_settings() {

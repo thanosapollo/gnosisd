@@ -550,6 +550,8 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::BlobMetadata
         | StoreError::PathChange
         | StoreError::PathConflict
+        | StoreError::NodeIdConflict { .. }
+        | StoreError::InactiveReference { .. }
         | StoreError::InvalidProjection { .. }
         | StoreError::CorruptData { .. }
         | StoreError::BackupDeadlineExceeded
