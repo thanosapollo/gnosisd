@@ -2126,6 +2126,19 @@
         (should-error (gnosis-bulk-link-string "alpha" invalid)
                       :type 'user-error)))))
 
+(ert-deftest gnosis-bulk-link-commands-reject-over-limit-before-effects ()
+  (let ((gnosis-nodes-max-bulk-link-string-length 3)
+        touched)
+    (cl-letf (((symbol-function 'gnosis-nodes--thema-catalog)
+               (lambda () (setq touched t)))
+              ((symbol-function 'gnosis-nodes--bulk-target-buffer)
+               (lambda (_) (setq touched t))))
+      (should-error (gnosis-bulk-link-string "four" "node-a")
+                    :type 'user-error)
+      (should-error (gnosis-bulk-link-org-files "four" "node-a" '(ignored))
+                    :type 'user-error))
+    (should-not touched)))
+
 (ert-deftest gnosis-bulk-link-org-files-cancellation-leaves-targets-unchanged ()
   (with-temp-buffer
     (org-mode)
@@ -2353,7 +2366,9 @@
                  (lambda (id) (list :node_id id)))
                 ((symbol-function 'gnosis-nodes--visit-node)
                  (lambda (node) (setq visited node))))
-        (call-interactively #'gnosis-nodes-goto-id)))
+        (call-interactively #'gnosis-nodes-goto-id)
+        (setq visited nil)
+        (gnosis-nodes-goto-id)))
     (should (equal "opaque-node" (plist-get visited :node_id)))))
 
 (ert-deftest gnosis-nodes-create-root-writes-an-org-file-with-id ()

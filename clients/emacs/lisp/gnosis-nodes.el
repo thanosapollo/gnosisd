@@ -1009,6 +1009,14 @@ Use the active region as description; with ARG, prompt for a custom one."
       (user-error "Bulk link target is not a confined regular Org file"))
     (if (bufferp target) target (find-file-noselect path))))
 
+(defun gnosis-nodes--validate-bulk-link-string (string)
+  "Validate bounded non-empty bulk-link STRING or signal a user error."
+  (unless (and (stringp string) (not (string-empty-p string)))
+    (user-error "Bulk link string must be non-empty"))
+  (when (> (length string) gnosis-nodes-max-bulk-link-string-length)
+    (user-error "Bulk link string exceeds %d characters"
+                gnosis-nodes-max-bulk-link-string-length)))
+
 ;;;###autoload
 (defun gnosis-bulk-link-org-files (string node-id targets)
   "Replace literal STRING with NODE-ID links in explicit finite TARGETS.
@@ -1024,11 +1032,7 @@ the changed targets."
             (directory-files-recursively gnosis-nodes-dir "\\.org\\'")
             nil t)))
      (list string node-id files)))
-  (unless (and (stringp string) (not (string-empty-p string)))
-    (user-error "Bulk link string must be non-empty"))
-  (when (> (length string) gnosis-nodes-max-bulk-link-string-length)
-    (user-error "Bulk link string exceeds %d characters"
-                gnosis-nodes-max-bulk-link-string-length))
+  (gnosis-nodes--validate-bulk-link-string string)
   (let* ((buffers
           (mapcar #'gnosis-nodes--bulk-target-buffer targets))
          (count
@@ -1111,8 +1115,7 @@ count, then apply revision-checked mutations in order and stop on first error."
   (interactive
    (list (read-string "Literal string: ")
          (gnosis-nodes--read-catalog-node-id "Node: ")))
-  (unless (and (stringp string) (not (string-empty-p string)))
-    (user-error "Bulk link string must be non-empty"))
+  (gnosis-nodes--validate-bulk-link-string string)
   (unless (gnosis-core--opaque-id-p node-id)
     (user-error "Bulk link node identity is invalid"))
   (let* ((records
@@ -1329,16 +1332,17 @@ With prefix argument REFRESH, rebuild the node catalog first."
    :outbound))
 
 ;;;###autoload
-(defun gnosis-nodes-goto-id (node-id)
+(defun gnosis-nodes-goto-id (&optional node-id)
   "Visit authoritative NODE-ID detail."
-  (interactive
-   (list
-    (or (when-let* ((context (org-element-context))
-                    (type (org-element-type context))
-                    ((eq type 'link))
-                    ((equal "id" (org-element-property :type context))))
-          (org-element-property :path context))
-        (read-string "Gnosis node ID: "))))
+  (interactive)
+  (setq node-id
+        (or node-id
+            (when-let* ((context (org-element-context))
+                        (type (org-element-type context))
+                        ((eq type 'link))
+                        ((equal "id" (org-element-property :type context))))
+              (org-element-property :path context))
+            (read-string "Gnosis node ID: ")))
   (gnosis-nodes--visit-node (gnosis-core-node node-id)))
 
 ;;;###autoload
