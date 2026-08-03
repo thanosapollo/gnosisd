@@ -744,7 +744,7 @@ mod tests {
             prepare_thema, thema_content,
         },
         blob::BlobMeta,
-        domain::DocumentId,
+        domain::{DocumentId, ThemaConceptRelation, ThemaId},
     };
 
     #[test]
@@ -1030,6 +1030,103 @@ mod tests {
             assert_eq!(replay.result, retained.result);
         }
         assert_eq!(store.get_thema("thema").unwrap().unwrap(), before);
+        assert_eq!(row_count(&store, "content_change"), content_changes);
+        assert_eq!(row_count(&store, "thema_revision"), history);
+    }
+
+    #[test]
+    fn unarchive_with_retired_concept_retains_invalid_content() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "thema-unarchive");
+        let original = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            concat!(
+                ":PROPERTIES:\n:ID: root\n:END:\n#+title: Note\n",
+                "* Child\n:PROPERTIES:\n:ID: child\n:END:\n"
+            )
+            .into(),
+            None,
+        )
+        .unwrap();
+        let original_blob = BlobMeta {
+            sha256: original.blob_sha256.clone(),
+            size_bytes: original.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&original, &original_blob, 1, None)
+            .unwrap();
+        let thema = prepare_thema(
+            Some("thema".into()),
+            thema_content(
+                "basic",
+                "Question".into(),
+                vec![],
+                vec!["Answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            vec![],
+            vec![("child".into(), ThemaConceptRelation::Primary)],
+            vec![],
+            None,
+        )
+        .unwrap();
+        store.put_thema(&thema, 20260719, 2, None).unwrap();
+        store.set_thema_archived("thema", 1, true, 3, None).unwrap();
+        let replacement = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            ":PROPERTIES:\n:ID: root\n:END:\n#+title: Note\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let replacement_blob = BlobMeta {
+            sha256: replacement.blob_sha256.clone(),
+            size_bytes: replacement.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&replacement, &replacement_blob, 4, None)
+            .unwrap();
+        let operation = prepare_device_desired_state_mutation(
+            1,
+            "unarchive".into(),
+            device,
+            DeviceDesiredStateMutation::SetThemaArchived {
+                thema_id: ThemaId::new("thema").unwrap(),
+                expected_revision: 2,
+                archived: false,
+            },
+        )
+        .unwrap();
+        let before = store.get_thema("thema").unwrap().unwrap();
+        let content_changes = row_count(&store, "content_change");
+        let history = row_count(&store, "thema_revision");
+
+        let first = store
+            .apply_device_desired_state_mutation(&operation, 5)
+            .unwrap();
+        let replay = store
+            .apply_device_desired_state_mutation(&operation, 6)
+            .unwrap();
+
+        assert!(!first.replayed);
+        assert!(matches!(
+            first.result,
+            DeviceMutationResult::Rejected {
+                rejection: DeviceMutationRejection::InvalidContent,
+                ..
+            }
+        ));
+        assert!(replay.replayed);
+        assert_eq!(replay.result, first.result);
+        assert_eq!(store.get_thema("thema").unwrap().unwrap(), before);
+        assert_eq!(before.revision, 2);
+        assert!(before.archived);
         assert_eq!(row_count(&store, "content_change"), content_changes);
         assert_eq!(row_count(&store, "thema_revision"), history);
     }

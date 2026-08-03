@@ -527,7 +527,7 @@ pub(super) fn set_thema_archived_in(
     let current = thema_revision(transaction, thema_id)?.ok_or(StoreError::NotFound)?;
     check_expected_number(Some(expected_revision), Some(current))?;
     if !archived {
-        require_thema_assets_active(transaction, thema_id)?;
+        require_thema_associations_active(transaction, thema_id)?;
     }
     let revision = next_number(Some(current))?;
     transaction
@@ -3341,7 +3341,20 @@ fn validate_note_assets(
     Ok(())
 }
 
-fn require_thema_assets_active(connection: &Connection, thema_id: &str) -> Result<(), StoreError> {
+fn require_thema_associations_active(
+    connection: &Connection,
+    thema_id: &str,
+) -> Result<(), StoreError> {
+    let concepts = connection
+        .prepare_cached("SELECT concept_id FROM thema_concept WHERE thema_id = ?1")
+        .map_err(StoreError::storage)?
+        .query_map([thema_id], |row| row.get::<_, String>(0))
+        .map_err(StoreError::storage)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::storage)?;
+    for concept_id in concepts {
+        require_active_node(connection, &concept_id)?;
+    }
     let unavailable: bool = connection
         .query_row(
             "SELECT EXISTS(
