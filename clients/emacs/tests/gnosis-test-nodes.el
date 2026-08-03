@@ -1913,6 +1913,23 @@
     (gnosis-nodes--add-tags '("heading" "new"))
     (should (equal '("heading" "new") (org-get-tags nil t)))))
 
+(ert-deftest gnosis-nodes-tag-editing-rejects-invalid-tags-before-save ()
+  (dolist (tag '("" "two words" "x:y" "line\nbreak"))
+    (with-temp-buffer
+      (org-mode)
+      (insert "#+title: Note\n")
+      (let ((before (buffer-string)))
+        (cl-letf (((symbol-function 'save-buffer)
+                   (lambda (&rest _) (ert-fail "Invalid tags must not save"))))
+          (should-error (gnosis-nodes-add-tags (list tag)) :type 'user-error))
+        (should (equal before (buffer-string))))))
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+filetags: :two words:\n#+title: Note\n")
+    (let ((before (buffer-string)))
+      (should-error (gnosis-nodes--add-tags '(valid)) :type 'user-error)
+      (should (equal before (buffer-string))))))
+
 (ert-deftest gnosis-nodes-insert-template-saves-through-sync-hook ()
   (let ((gnosis-nodes-templates '(("Only" . (lambda () "{*} Child"))))
         (saves 0))
@@ -1944,6 +1961,25 @@
       (should (equal title created))
       (gnosis-journal)
       (should (equal "journal-id" (plist-get visited :node_id))))))
+
+(ert-deftest gnosis-journal-reopens-unindexed-local-entry ()
+  (let* ((root (make-temp-file "gnosis-journal-local-" t))
+         (gnosis-nodes-dir root)
+         (gnosis-journal-directory "journal")
+         (path (expand-file-name "journal/2026-08-03.org" root)))
+    (unwind-protect
+        (progn
+          (make-directory (file-name-directory path) t)
+          (write-region "#+title: 2026-08-03\n" nil path nil 'silent)
+          (cl-letf (((symbol-function 'format-time-string)
+                     (lambda (&rest _) "2026-08-03"))
+                    ((symbol-function 'gnosis-nodes--journal-matches)
+                     (lambda (&rest _) [])))
+            (gnosis-journal)
+            (should (equal (file-truename path)
+                           (file-truename buffer-file-name)))))
+      (when-let* ((buffer (find-buffer-visiting path))) (kill-buffer buffer))
+      (delete-directory root t))))
 
 (ert-deftest gnosis-journal-find-and-insert-use-server-node-identity ()
   (let ((node '(:node_id "journal-id" :title "2026-08-03")) visited)
@@ -2003,7 +2039,30 @@
         (gnosis-journal-insert)
         (should (equal "[[id:second][Same]]" (buffer-string)))))))
 
-(ert-deftest gnosis-bulk-link-string-is-finite-confirmed-and-saves-each-match ()
+(ert-deftest gnosis-journal-insert-preserves-region-and-prefix-descriptions ()
+  (let ((node '(:node_id "journal-id" :title "Journal"
+                :logical_path "journal/a.org")))
+    (cl-letf (((symbol-function 'gnosis-nodes--journal-matches)
+               (lambda (&rest _) (vector node)))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt table &rest _) (caar table))))
+      (with-temp-buffer
+        (org-mode)
+        (insert "region text")
+        (set-mark (point-min))
+        (activate-mark)
+        (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "query")))
+          (gnosis-journal-insert '(4)))
+        (should (equal "[[id:journal-id][region text]]" (buffer-string))))
+      (with-temp-buffer
+        (org-mode)
+        (let ((answers '("query" "custom")))
+          (cl-letf (((symbol-function 'read-string)
+                     (lambda (&rest _) (pop answers))))
+            (gnosis-journal-insert '(4))))
+        (should (equal "[[id:journal-id][custom]]" (buffer-string)))))))
+
+(ert-deftest gnosis-bulk-link-org-files-is-finite-confirmed-and-saves-each-match ()
   (let ((first (generate-new-buffer " *gnosis-bulk-first*"))
         (second (generate-new-buffer " *gnosis-bulk-second*"))
         saves)
@@ -2017,7 +2076,7 @@
                     ((symbol-function 'save-buffer)
                      (lambda (&rest _) (push (current-buffer) saves))))
             (should (equal (list first)
-                           (gnosis-bulk-link-string
+                           (gnosis-bulk-link-org-files
                             "alpha" "node-a" (list first second)))))
           (should (equal (list first) saves))
           (should (equal "[[id:node-a][alpha]] [[id:node-a][alpha]]"
@@ -2026,7 +2085,40 @@
       (kill-buffer first)
       (kill-buffer second))))
 
-(ert-deftest gnosis-bulk-link-string-cancellation-leaves-targets-unchanged ()
+(ert-deftest gnosis-bulk-link-string-mutates-authoritative-themata-only ()
+  (let ((record '(:thema_id "thema-a" :question "alpha question"))
+        updates)
+    (with-temp-buffer
+      (insert "alpha local file")
+      (cl-letf (((symbol-function 'gnosis-nodes--thema-catalog)
+                 (lambda () (list record)))
+                ((symbol-function 'gnosis-core-thema)
+                 (lambda (_) '(:thema_id "thema-a" :revision 2
+                               :question "alpha question" :answer "answer")))
+                ((symbol-function 'gnosis-core-thema-write-view)
+                 (lambda (projection)
+                   (list :question (plist-get projection :question)
+                         :answer (plist-get projection :answer))))
+                ((symbol-function 'gnosis-core-operation-id) (lambda () "op-a"))
+                ((symbol-function 'gnosis-core-thema-update)
+                 (lambda (&rest args) (push args updates) '(:thema_id "thema-a")))
+                ((symbol-function 'y-or-n-p) (lambda (&rest _) t)))
+        (should (equal '("thema-a") (gnosis-bulk-link-string "alpha" "node-a")))
+        (should (equal "alpha local file" (buffer-string))))
+      (should
+       (equal '("thema-a" "op-a" 2
+                (:question "[[id:node-a][alpha]] question" :answer "answer"))
+              (car updates)))
+      (setq updates nil)
+      (cl-letf (((symbol-function 'gnosis-nodes--thema-catalog)
+                 (lambda () (list record)))
+                ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
+                ((symbol-function 'gnosis-core-thema-update)
+                 (lambda (&rest _) (ert-fail "Cancellation must not mutate"))))
+        (should-not (gnosis-bulk-link-string "alpha" "node-a"))
+        (should-not updates)))))
+
+(ert-deftest gnosis-bulk-link-org-files-cancellation-leaves-targets-unchanged ()
   (with-temp-buffer
     (org-mode)
     (insert "alpha")
@@ -2035,11 +2127,11 @@
               ((symbol-function 'y-or-n-p) (lambda (&rest _) nil))
               ((symbol-function 'save-buffer)
                (lambda (&rest _) (ert-fail "Cancellation must not save"))))
-      (should-not (gnosis-bulk-link-string "alpha" "node-a"
+      (should-not (gnosis-bulk-link-org-files "alpha" "node-a"
                                            (list (current-buffer)))))
     (should (equal "alpha" (buffer-string)))))
 
-(ert-deftest gnosis-bulk-link-string-skips-existing-org-links ()
+(ert-deftest gnosis-bulk-link-org-files-skips-existing-org-links ()
   (with-temp-buffer
     (org-mode)
     (insert "alpha [[id:old][alpha]]\n"
@@ -2049,7 +2141,7 @@
                (lambda (target) target))
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
               ((symbol-function 'save-buffer) #'ignore))
-      (gnosis-bulk-link-string "alpha" "new" (list (current-buffer))))
+      (gnosis-bulk-link-org-files "alpha" "new" (list (current-buffer))))
     (should
      (equal (concat "[[id:new][alpha]] [[id:old][alpha]]\n"
                     "* [[id:new][alpha]] :alpha:\n"
@@ -2060,7 +2152,7 @@
         (lambda (link) (push (org-element-property :path link) links)))
       (should (equal '("new" "old" "new") (nreverse links))))))
 
-(ert-deftest gnosis-bulk-link-string-skips-matches-crossing-org-markup ()
+(ert-deftest gnosis-bulk-link-org-files-skips-matches-crossing-org-markup ()
   (with-temp-buffer
     (org-mode)
     (insert "alpha [[id:old][beta]] tail")
@@ -2069,7 +2161,7 @@
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
               ((symbol-function 'save-buffer) #'ignore))
       (should-not
-       (gnosis-bulk-link-string "alpha [[id:old][beta" "new"
+       (gnosis-bulk-link-org-files "alpha [[id:old][beta" "new"
                                 (list (current-buffer)))))
     (should (equal "alpha [[id:old][beta]] tail" (buffer-string)))))
 
@@ -2103,7 +2195,7 @@
                  (lambda (target) target))
                 ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                 ((symbol-function 'save-buffer) #'ignore))
-        (call-interactively #'gnosis-bulk-link-string))
+        (call-interactively #'gnosis-bulk-link-org-files))
       (should (equal "[[id:node-100][alpha]]" (buffer-string))))))
 
 (ert-deftest gnosis-bulk-link-targets-stay-inside-org-root ()
@@ -2128,15 +2220,13 @@
       (delete-file outside))))
 
 (ert-deftest gnosis-nodes-db-sync-forwards-interactive-prefix ()
-  (let (prefix called)
+  (let (calls)
     (cl-letf (((symbol-function 'gnosis-nodes-sync)
-               (lambda (&rest _)
-                 (interactive)
-                 (setq prefix current-prefix-arg called t))))
+               (lambda (&rest args) (push args calls))))
+      (call-interactively #'gnosis-nodes-db-sync)
       (let ((current-prefix-arg '(4)))
         (call-interactively #'gnosis-nodes-db-sync)))
-    (should called)
-    (should (equal '(4) prefix))))
+    (should (equal '((:all nil) (:all (4))) (nreverse calls)))))
 
 (ert-deftest gnosis-node-page-next-preserves-server-cursor-and-selection ()
   (let ((first (gnosis-test-nodes--catalog-node "node-a" :title "Alpha"))

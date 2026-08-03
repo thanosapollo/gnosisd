@@ -814,8 +814,15 @@ Without BASE-LEVEL, start one level below the current heading."
     (insert (gnosis-nodes--expand-template text))
     (save-buffer)))
 
+(defun gnosis-nodes--valid-tag-p (tag)
+  "Return non-nil when TAG follows Org's tag token grammar."
+  (and (stringp tag) (string-match-p "\\`[^[:space:]:]+\\'" tag)))
+
 (defun gnosis-nodes--add-tags (tags)
   "Add TAGS at the current Org heading, or to file tags before headings."
+  (unless (and (listp tags)
+               (cl-every #'gnosis-nodes--valid-tag-p tags))
+    (user-error "Tags must contain no whitespace or colon"))
   (if (org-before-first-heading-p)
       (save-excursion
         (goto-char (point-min))
@@ -824,6 +831,8 @@ Without BASE-LEVEL, start one level below the current heading."
                  "^#\\+filetags:[[:blank:]]*\\(.*\\)$" nil t)
             (setq existing (split-string (match-string-no-properties 1) ":" t)
                   bounds (cons (line-beginning-position) (line-end-position))))
+          (unless (cl-every #'gnosis-nodes--valid-tag-p existing)
+            (user-error "Existing file tags are invalid"))
           (let* ((merged (delete-dups (append existing tags)))
                  (line (concat "#+filetags: :" (string-join merged ":") ":")))
             (if bounds
@@ -877,17 +886,23 @@ Without BASE-LEVEL, start one level below the current heading."
          (path (gnosis-nodes--safe-path gnosis-nodes-dir logical-path))
          (body (gnosis-nodes--expand-template gnosis-journal-template 1))
          id)
-    (when (file-exists-p path)
-      (user-error "Journal file exists but is not available from gnosisd"))
-    (make-directory (file-name-directory path) t)
-    (find-file path)
-    (insert (format "#+title: %s\n#+filetags: :journal:\n\n%s" title body))
-    (org-mode)
-    (goto-char (point-min))
-    (setq id (org-id-get-create))
-    (gnosis-nodes-mode 1)
-    (save-buffer)
-    id))
+    (if (file-exists-p path)
+        (progn
+          (when (or (file-symlink-p path) (not (file-regular-p path)))
+            (user-error "Journal path is not a regular confined file"))
+          (find-file path)
+          (org-mode)
+          (gnosis-nodes-mode 1)
+          (org-id-get nil))
+      (make-directory (file-name-directory path) t)
+      (find-file path)
+      (insert (format "#+title: %s\n#+filetags: :journal:\n\n%s" title body))
+      (org-mode)
+      (goto-char (point-min))
+      (setq id (org-id-get-create))
+      (gnosis-nodes-mode 1)
+      (save-buffer)
+      id)))
 
 ;;;###autoload
 (defun gnosis-journal ()
@@ -907,9 +922,10 @@ Without BASE-LEVEL, start one level below the current heading."
       (_ (signal 'gnosis-nodes-error '("Duplicate Gnosis journal entries"))))))
 
 ;;;###autoload
-(defun gnosis-journal-find (query)
+(defun gnosis-journal-find (&optional query)
   "Find and visit a journal entry matching QUERY."
-  (interactive "sJournal search: ")
+  (interactive)
+  (setq query (or query (read-string "Journal search: ")))
   (let ((matches (gnosis-nodes--journal-matches query)))
     (unless (> (length matches) 0)
       (user-error "No matching Gnosis journal entry"))
@@ -929,18 +945,25 @@ Without BASE-LEVEL, start one level below the current heading."
    (append matches nil)))
 
 ;;;###autoload
-(defun gnosis-journal-insert ()
-  "Insert an Org ID link to a selected journal entry."
-  (interactive)
+(defun gnosis-journal-insert (&optional arg)
+  "Insert an Org ID link to a selected journal entry.
+Use the active region as description; with ARG, prompt for a custom one."
+  (interactive "P")
   (let* ((query (read-string "Journal search: "))
          (matches (gnosis-nodes--journal-matches query)))
     (unless (> (length matches) 0)
       (user-error "No matching Gnosis journal entry"))
     (let* ((table (gnosis-nodes--journal-completion-table matches))
            (choice (completing-read "Journal: " table nil t))
-           (node (alist-get choice table nil nil #'equal)))
+           (node (alist-get choice table nil nil #'equal))
+           (description
+            (cond
+             ((use-region-p)
+              (buffer-substring-no-properties (region-beginning) (region-end)))
+             (arg (read-string "Description: "))
+             (t (plist-get node :title)))))
       (org-insert-link nil (format "id:%s" (plist-get node :node_id))
-                       (plist-get node :title)))))
+                       description))))
 
 (defun gnosis-nodes--literal-count (string)
   "Return the number of literal STRING occurrences in the current buffer."
@@ -986,7 +1009,7 @@ Without BASE-LEVEL, start one level below the current heading."
     (if (bufferp target) target (find-file-noselect path))))
 
 ;;;###autoload
-(defun gnosis-bulk-link-string (string node-id targets)
+(defun gnosis-bulk-link-org-files (string node-id targets)
   "Replace literal STRING with NODE-ID links in explicit finite TARGETS.
 TARGETS contains buffers or filenames.  Preview the occurrence count, require
 confirmation, save each changed document, stop on the first error, and return
@@ -1036,6 +1059,72 @@ the changed targets."
                  (push target changed)))))
          targets buffers)
         (nreverse changed))))))
+
+(defun gnosis-nodes--thema-catalog ()
+  "Return one generation-bound bounded thema catalog."
+  (let ((cursor nil) generation records seen (pages 0) done)
+    (while (not done)
+      (when (>= pages 50)
+        (signal 'gnosis-nodes-error '("Gnosis thema catalog exceeds bulk bound")))
+      (let* ((page (gnosis-core-thema-catalog
+                    nil cursor gnosis-core--thema-catalog-page-limit))
+             (page-generation (plist-get page :generation))
+             (next (plist-get page :next)))
+        (unless (or (null generation) (equal generation page-generation))
+          (signal 'gnosis-nodes-error '("Gnosis thema catalog generation changed")))
+        (setq generation page-generation
+              records (nconc records (append (plist-get page :items) nil))
+              pages (1+ pages))
+        (if (eq next gnosis-core--json-null)
+            (setq done t)
+          (when (member next seen)
+            (signal 'gnosis-nodes-error '("Gnosis thema catalog cursor replayed")))
+          (push next seen)
+          (setq cursor next))))
+    records))
+
+(defun gnosis-nodes--replace-literal (string replacement value)
+  "Replace literal STRING with REPLACEMENT in VALUE."
+  (replace-regexp-in-string (regexp-quote string) replacement value t t))
+
+;;;###autoload
+(defun gnosis-bulk-link-string (string node-id)
+  "Replace STRING in authoritative thema questions with NODE-ID Org links.
+Fetch a bounded generation-consistent catalog, confirm the exact mutation
+count, then apply revision-checked mutations in order and stop on first error."
+  (interactive
+   (list (read-string "Literal string: ")
+         (gnosis-nodes--read-catalog-node-id "Node: ")))
+  (unless (and (stringp string) (not (string-empty-p string)))
+    (user-error "Bulk link string must be non-empty"))
+  (let* ((replacement (format "[[id:%s][%s]]" node-id string))
+         (records
+          (seq-filter
+           (lambda (record)
+             (let ((question (plist-get record :question)))
+               (and (stringp question) (string-match-p (regexp-quote string) question))))
+           (gnosis-nodes--thema-catalog))))
+    (when (and records
+               (y-or-n-p (format "Update %d authoritative thema%s? "
+                                 (length records)
+                                 (if (= (length records) 1) "" "ta"))))
+      (let (updated)
+        (dolist (record records (nreverse updated))
+          (let* ((thema-id (plist-get record :thema_id))
+                 (projection (gnosis-core-thema thema-id))
+                 (revision (plist-get projection :revision))
+                 (request (gnosis-core-thema-write-view projection))
+                 (question (plist-get request :question)))
+            (unless (and (stringp question)
+                         (string-match-p (regexp-quote string) question))
+              (signal 'gnosis-core-conflict '("Gnosis thema changed during bulk link")))
+            (setq request
+                  (plist-put request :question
+                             (gnosis-nodes--replace-literal
+                              string replacement question)))
+            (gnosis-core-thema-update
+             thema-id (gnosis-core-operation-id) revision request)
+            (push thema-id updated)))))))
 
 ;;;###autoload
 (defun gnosis-nodes-find (&optional refresh)
@@ -3256,10 +3345,7 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
 Preserve optional prefix FULL.  A noninteractive call synchronizes all enrolled
 files, matching the legacy whole-database command boundary."
   (interactive "P")
-  (if (called-interactively-p 'interactive)
-      (let ((current-prefix-arg full))
-        (call-interactively #'gnosis-nodes-sync))
-    (gnosis-nodes-sync :all full)))
+  (gnosis-nodes-sync :all full))
 
 ;;;###autoload
 (defun gnosis-nodes-retry-uncertain (operation-id)
