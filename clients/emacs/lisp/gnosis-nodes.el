@@ -1083,9 +1083,24 @@ the changed targets."
           (setq cursor next))))
     records))
 
-(defun gnosis-nodes--replace-literal (string replacement value)
-  "Replace literal STRING with REPLACEMENT in VALUE."
-  (replace-regexp-in-string (regexp-quote string) replacement value t t))
+(defun gnosis-nodes--link-keimenon (string node-id value)
+  "Return VALUE with plain-text STRING matches linked to NODE-ID, or nil.
+Matching is case-insensitive, existing Org links remain byte-identical, and
+each replacement keeps its original spelling as the description."
+  (with-temp-buffer
+    (org-mode)
+    (insert value)
+    (goto-char (point-min))
+    (let ((case-fold-search t) changed)
+      (while (search-forward string nil t)
+        (let ((begin (match-beginning 0))
+              (end (match-end 0))
+              (description (match-string-no-properties 0)))
+          (when (gnosis-nodes--plain-text-range-p begin end)
+            (delete-region begin end)
+            (org-insert-link nil (format "id:%s" node-id) description)
+            (setq changed t))))
+      (and changed (buffer-substring-no-properties (point-min) (point-max))))))
 
 ;;;###autoload
 (defun gnosis-bulk-link-string (string node-id)
@@ -1097,12 +1112,14 @@ count, then apply revision-checked mutations in order and stop on first error."
          (gnosis-nodes--read-catalog-node-id "Node: ")))
   (unless (and (stringp string) (not (string-empty-p string)))
     (user-error "Bulk link string must be non-empty"))
-  (let* ((replacement (format "[[id:%s][%s]]" node-id string))
-         (records
+  (unless (gnosis-core--opaque-id-p node-id)
+    (user-error "Bulk link node identity is invalid"))
+  (let* ((records
           (seq-filter
            (lambda (record)
-             (let ((question (plist-get record :keimenon)))
-               (and (stringp question) (string-match-p (regexp-quote string) question))))
+             (let ((keimenon (plist-get record :keimenon)))
+               (and (stringp keimenon)
+                    (gnosis-nodes--link-keimenon string node-id keimenon))))
            (gnosis-nodes--thema-catalog))))
     (when (and records
                (y-or-n-p (format "Update %d authoritative thema%s? "
@@ -1114,14 +1131,13 @@ count, then apply revision-checked mutations in order and stop on first error."
                  (projection (gnosis-core-thema thema-id))
                  (revision (plist-get projection :revision))
                  (request (gnosis-core-thema-write-view projection))
-                 (question (plist-get request :keimenon)))
-            (unless (and (stringp question)
-                         (string-match-p (regexp-quote string) question))
+                 (keimenon (plist-get request :keimenon))
+                 (linked (and (stringp keimenon)
+                              (gnosis-nodes--link-keimenon
+                               string node-id keimenon))))
+            (unless linked
               (signal 'gnosis-core-conflict '("Gnosis thema changed during bulk link")))
-            (setq request
-                  (plist-put request :keimenon
-                             (gnosis-nodes--replace-literal
-                              string replacement question)))
+            (setq request (plist-put request :keimenon linked))
             (gnosis-core-thema-update
              thema-id (gnosis-core-operation-id) revision request)
             (push thema-id updated)))))))

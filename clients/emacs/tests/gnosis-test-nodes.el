@@ -2086,7 +2086,8 @@
       (kill-buffer second))))
 
 (ert-deftest gnosis-bulk-link-string-mutates-authoritative-themata-only ()
-  (let ((record '(:thema_id "thema-a" :keimenon "alpha question"))
+  (let ((record '(:thema_id "thema-a"
+                  :keimenon "alpha and [[id:old][Alpha]] plus [[id:bare]] then ALPHA"))
         updates)
     (with-temp-buffer
       (insert "alpha local file")
@@ -2094,7 +2095,8 @@
                  (lambda () (list record)))
                 ((symbol-function 'gnosis-core-thema)
                  (lambda (_) '(:thema_id "thema-a" :revision 2
-                               :keimenon "alpha question" :answer "answer")))
+                               :keimenon "alpha and [[id:old][Alpha]] plus [[id:bare]] then ALPHA"
+                               :answer "answer")))
                 ((symbol-function 'gnosis-core-thema-write-view)
                  (lambda (projection)
                    (list :keimenon (plist-get projection :keimenon)
@@ -2107,7 +2109,8 @@
         (should (equal "alpha local file" (buffer-string))))
       (should
        (equal '("thema-a" "op-a" 2
-                (:keimenon "[[id:node-a][alpha]] question" :answer "answer"))
+                (:keimenon "[[id:node-a][alpha]] and [[id:old][Alpha]] plus [[id:bare]] then [[id:node-a][ALPHA]]"
+                 :answer "answer"))
               (car updates)))
       (setq updates nil)
       (cl-letf (((symbol-function 'gnosis-nodes--thema-catalog)
@@ -2116,7 +2119,12 @@
                 ((symbol-function 'gnosis-core-thema-update)
                  (lambda (&rest _) (ert-fail "Cancellation must not mutate"))))
         (should-not (gnosis-bulk-link-string "alpha" "node-a"))
-        (should-not updates)))))
+        (should-not updates)))
+    (cl-letf (((symbol-function 'gnosis-nodes--thema-catalog)
+               (lambda () (ert-fail "Invalid identity must fail before fetch"))))
+      (dolist (invalid '(nil ""))
+        (should-error (gnosis-bulk-link-string "alpha" invalid)
+                      :type 'user-error)))))
 
 (ert-deftest gnosis-bulk-link-org-files-cancellation-leaves-targets-unchanged ()
   (with-temp-buffer
