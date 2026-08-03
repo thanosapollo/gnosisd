@@ -2040,6 +2040,52 @@
         (lambda (link) (push (org-element-property :path link) links)))
       (should (equal '("new" "old" "new") (nreverse links))))))
 
+(ert-deftest gnosis-bulk-link-string-skips-matches-crossing-org-markup ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "alpha [[id:old][beta]] tail")
+    (cl-letf (((symbol-function 'gnosis-nodes--bulk-target-buffer)
+               (lambda (target) target))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'save-buffer) #'ignore))
+      (should-not
+       (gnosis-bulk-link-string "alpha [[id:old][beta" "new"
+                                (list (current-buffer)))))
+    (should (equal "alpha [[id:old][beta]] tail" (buffer-string)))))
+
+(ert-deftest gnosis-bulk-link-interactive-uses-complete-disambiguated-catalog ()
+  (let* ((nodes
+          (vconcat
+           (cl-loop for index below 101
+                    collect
+                    (gnosis-test-nodes--catalog-node
+                     (format "node-%d" index)
+                     :title (if (memq index '(0 100)) "Same" (format "N%d" index))
+                     :title_path
+                     (vector (if (memq index '(0 100))
+                                 "Same" (format "N%d" index)))))))
+         (catalog (gnosis-nodes--build-catalog nodes '(authority) "feed"))
+         selected)
+    (maphash (lambda (candidate node-id)
+               (when (equal node-id "node-100") (setq selected candidate)))
+             (plist-get catalog :by-candidate))
+    (with-temp-buffer
+      (org-mode)
+      (insert "alpha")
+      (cl-letf (((symbol-function 'gnosis-nodes--catalog) (lambda (&rest _) catalog))
+                ((symbol-function 'gnosis-nodes--catalog-authority)
+                 (lambda () '(authority)))
+                ((symbol-function 'read-string) (lambda (&rest _) "alpha"))
+                ((symbol-function 'completing-read) (lambda (&rest _) selected))
+                ((symbol-function 'completing-read-multiple)
+                 (lambda (&rest _) (list (current-buffer))))
+                ((symbol-function 'gnosis-nodes--bulk-target-buffer)
+                 (lambda (target) target))
+                ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                ((symbol-function 'save-buffer) #'ignore))
+        (call-interactively #'gnosis-bulk-link-string))
+      (should (equal "[[id:node-100][alpha]]" (buffer-string))))))
+
 (ert-deftest gnosis-bulk-link-targets-stay-inside-org-root ()
   (let* ((root (make-temp-file "gnosis-bulk-root-" t))
          (outside (make-temp-file "gnosis-bulk-outside-" nil ".org"))

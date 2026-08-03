@@ -45,6 +45,11 @@ as `{*}' and `{**}' expand relative to the current Org heading."
                 :value-type (choice string function))
   :group 'gnosis-nodes)
 
+(defcustom gnosis-nodes-max-bulk-link-string-length 512
+  "Maximum literal character count accepted by bulk link conversion."
+  :type 'integer
+  :group 'gnosis-nodes)
+
 (defcustom gnosis-journal-directory "journal/"
   "Relative directory below `gnosis-nodes-dir' containing journal entries."
   :type 'string
@@ -470,6 +475,20 @@ When REFRESH is non-nil, always fetch a new catalog."
        (eql gnosis-nodes--catalog-version
             (plist-get catalog :version))
        (equal authority (plist-get catalog :authority))))
+
+(defun gnosis-nodes--read-catalog-node-id (prompt)
+  "Read a disambiguated node using PROMPT and return its opaque ID."
+  (let* ((catalog (gnosis-nodes--catalog))
+         (candidate
+          (completing-read prompt (gnosis-nodes--completion-table catalog)
+                           nil t))
+         (node-id (gethash candidate (plist-get catalog :by-candidate))))
+    (unless (and node-id
+                 (equal (plist-get catalog :authority)
+                        (gnosis-nodes--catalog-authority)))
+      (signal 'gnosis-nodes-error
+              '("Gnosis authority changed during node selection")))
+    node-id))
 
 (defun gnosis-nodes--changed-document-list ()
   "Return sorted document IDs recorded during the current synchronization."
@@ -923,7 +942,8 @@ Without BASE-LEVEL, start one level below the current heading."
     (goto-char (point-min))
     (let ((count 0) (case-fold-search nil))
       (while (search-forward string nil t)
-        (when (gnosis-nodes--plain-text-at-p (match-beginning 0))
+        (when (gnosis-nodes--plain-text-range-p
+               (match-beginning 0) (match-end 0))
           (cl-incf count)))
       count)))
 
@@ -939,6 +959,11 @@ Without BASE-LEVEL, start one level below the current heading."
             (match-beginning 4)
             (<= (match-beginning 4) position)
             (< position (match-end 4)))))))
+
+(defun gnosis-nodes--plain-text-range-p (begin end)
+  "Return non-nil when every character from BEGIN to END is plain Org text."
+  (cl-loop for position from begin below end
+           always (gnosis-nodes--plain-text-at-p position)))
 
 (defun gnosis-nodes--bulk-target-buffer (target)
   "Return TARGET's confined regular Org buffer."
@@ -962,23 +987,18 @@ confirmation, save each changed document, stop on the first error, and return
 the changed targets."
   (interactive
    (let* ((string (read-string "Literal string: "))
-          (node (gnosis-core-node
-                 (completing-read "Node ID: "
-                                  (mapcar (lambda (item)
-                                            (plist-get item :node_id))
-                                          (append (plist-get
-                                                   (gnosis-core-nodes nil nil 100)
-                                                   :items)
-                                                  nil))
-                                  nil t)))
+          (node-id (gnosis-nodes--read-catalog-node-id "Node: "))
           (files
            (completing-read-multiple
             "Org files: "
             (directory-files-recursively gnosis-nodes-dir "\\.org\\'")
             nil t)))
-     (list string (plist-get node :node_id) files)))
-  (when (string-empty-p string)
-    (user-error "Bulk link string cannot be empty"))
+     (list string node-id files)))
+  (unless (and (stringp string) (not (string-empty-p string)))
+    (user-error "Bulk link string must be non-empty"))
+  (when (> (length string) gnosis-nodes-max-bulk-link-string-length)
+    (user-error "Bulk link string exceeds %d characters"
+                gnosis-nodes-max-bulk-link-string-length))
   (let* ((buffers
           (mapcar #'gnosis-nodes--bulk-target-buffer targets))
          (count
@@ -1001,7 +1021,7 @@ the changed targets."
                (while (search-forward string nil t)
                  (let ((begin (match-beginning 0))
                        (end (match-end 0)))
-                   (when (gnosis-nodes--plain-text-at-p begin)
+                   (when (gnosis-nodes--plain-text-range-p begin end)
                      (delete-region begin end)
                      (org-insert-link nil (format "id:%s" node-id) string)
                      (setq found t))))
