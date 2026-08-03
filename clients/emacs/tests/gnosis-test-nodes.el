@@ -2086,7 +2086,7 @@
       (kill-buffer second))))
 
 (ert-deftest gnosis-bulk-link-string-mutates-authoritative-themata-only ()
-  (let ((record '(:thema_id "thema-a" :question "alpha question"))
+  (let ((record '(:thema_id "thema-a" :keimenon "alpha question"))
         updates)
     (with-temp-buffer
       (insert "alpha local file")
@@ -2094,10 +2094,10 @@
                  (lambda () (list record)))
                 ((symbol-function 'gnosis-core-thema)
                  (lambda (_) '(:thema_id "thema-a" :revision 2
-                               :question "alpha question" :answer "answer")))
+                               :keimenon "alpha question" :answer "answer")))
                 ((symbol-function 'gnosis-core-thema-write-view)
                  (lambda (projection)
-                   (list :question (plist-get projection :question)
+                   (list :keimenon (plist-get projection :keimenon)
                          :answer (plist-get projection :answer))))
                 ((symbol-function 'gnosis-core-operation-id) (lambda () "op-a"))
                 ((symbol-function 'gnosis-core-thema-update)
@@ -2107,7 +2107,7 @@
         (should (equal "alpha local file" (buffer-string))))
       (should
        (equal '("thema-a" "op-a" 2
-                (:question "[[id:node-a][alpha]] question" :answer "answer"))
+                (:keimenon "[[id:node-a][alpha]] question" :answer "answer"))
               (car updates)))
       (setq updates nil)
       (cl-letf (((symbol-function 'gnosis-nodes--thema-catalog)

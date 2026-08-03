@@ -356,8 +356,10 @@
   (unless (memq state '(:all :active :new :suspended :archived))
     (user-error "Unknown Gnosis thema state filter"))
   (let ((selected (tabulated-list-get-id)))
-    (setq gnosis-themata--review-filter state)
-    (gnosis-themata--render selected)))
+    (if (eq state :new)
+        (gnosis-themata-show-new selected)
+      (setq gnosis-themata--review-filter state)
+      (gnosis-themata--render selected))))
 
 (defun gnosis-themata-refresh ()
   "Refresh the current bounded thema management page."
@@ -430,8 +432,9 @@
     (pop gnosis-themata--history)
     (setq gnosis-themata--cursor previous)))
 
-(defun gnosis-themata-show-new ()
-  "Show unreviewed themata from the current bounded server page."
+(defun gnosis-themata-show-new (&optional selected-id)
+  "Show unreviewed themata from the current bounded server page.
+Restore optional SELECTED-ID when it remains visible."
   (interactive)
   (setq gnosis-themata--catalog-records
         (vconcat
@@ -450,7 +453,7 @@
   (setq gnosis-themata--records
         (gnosis-themata--record-table gnosis-themata--catalog-records)
         gnosis-themata--review-filter :new)
-  (gnosis-themata--render))
+  (gnosis-themata--render selected-id))
 
 (defun gnosis-themata--record-at-point ()
   "Return the catalog record at point or signal a user error."

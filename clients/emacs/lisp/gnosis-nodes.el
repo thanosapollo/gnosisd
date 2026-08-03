@@ -1101,7 +1101,7 @@ count, then apply revision-checked mutations in order and stop on first error."
          (records
           (seq-filter
            (lambda (record)
-             (let ((question (plist-get record :question)))
+             (let ((question (plist-get record :keimenon)))
                (and (stringp question) (string-match-p (regexp-quote string) question))))
            (gnosis-nodes--thema-catalog))))
     (when (and records
@@ -1114,12 +1114,12 @@ count, then apply revision-checked mutations in order and stop on first error."
                  (projection (gnosis-core-thema thema-id))
                  (revision (plist-get projection :revision))
                  (request (gnosis-core-thema-write-view projection))
-                 (question (plist-get request :question)))
+                 (question (plist-get request :keimenon)))
             (unless (and (stringp question)
                          (string-match-p (regexp-quote string) question))
               (signal 'gnosis-core-conflict '("Gnosis thema changed during bulk link")))
             (setq request
-                  (plist-put request :question
+                  (plist-put request :keimenon
                              (gnosis-nodes--replace-literal
                               string replacement question)))
             (gnosis-core-thema-update

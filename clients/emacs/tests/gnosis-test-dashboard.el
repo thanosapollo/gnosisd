@@ -486,7 +486,7 @@
                      :state (:state_revision 1 :review_count
                              ,(if (equal id "first") 0 2)
                              :suspended ,gnosis-core--json-false)))))
-        (gnosis-themata-show-new))
+        (gnosis-themata-filter-review-state :new))
       (should (= 1 (length tabulated-list-entries)))
       (should (equal "first" (caar tabulated-list-entries))))))
 
