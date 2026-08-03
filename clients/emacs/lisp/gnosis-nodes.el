@@ -913,12 +913,20 @@ Without BASE-LEVEL, start one level below the current heading."
   (let ((matches (gnosis-nodes--journal-matches query)))
     (unless (> (length matches) 0)
       (user-error "No matching Gnosis journal entry"))
-    (let* ((table
-            (mapcar (lambda (node)
-                      (cons (plist-get node :title) node))
-                    (append matches nil)))
+    (let* ((table (gnosis-nodes--journal-completion-table matches))
            (choice (completing-read "Journal: " table nil t)))
       (gnosis-nodes--visit-node (alist-get choice table nil nil #'equal)))))
+
+(defun gnosis-nodes--journal-completion-table (matches)
+  "Return one-to-one completion labels for journal MATCHES."
+  (mapcar
+   (lambda (node)
+     (cons (format "%s — %s [%s]"
+                   (gnosis-nodes--display-text (plist-get node :title))
+                   (plist-get node :logical_path)
+                   (plist-get node :node_id))
+           node))
+   (append matches nil)))
 
 ;;;###autoload
 (defun gnosis-journal-insert ()
@@ -928,13 +936,11 @@ Without BASE-LEVEL, start one level below the current heading."
          (matches (gnosis-nodes--journal-matches query)))
     (unless (> (length matches) 0)
       (user-error "No matching Gnosis journal entry"))
-    (let* ((table
-            (mapcar (lambda (node)
-                      (cons (plist-get node :title) node))
-                    (append matches nil)))
+    (let* ((table (gnosis-nodes--journal-completion-table matches))
            (choice (completing-read "Journal: " table nil t))
            (node (alist-get choice table nil nil #'equal)))
-      (org-insert-link nil (format "id:%s" (plist-get node :node_id)) choice))))
+      (org-insert-link nil (format "id:%s" (plist-get node :node_id))
+                       (plist-get node :title)))))
 
 (defun gnosis-nodes--literal-count (string)
   "Return the number of literal STRING occurrences in the current buffer."
@@ -1229,8 +1235,17 @@ With prefix argument REFRESH, rebuild the node catalog first."
         (read-string "Gnosis node ID: "))))
   (gnosis-nodes--visit-node (gnosis-core-node node-id)))
 
-(defalias 'gnosis-nodes-find-by-tag #'gnosis-nodes-find-tag)
-(defalias 'gnosis-nodes-visit-backlinks #'gnosis-nodes-inbound)
+;;;###autoload
+(defun gnosis-nodes-find-by-tag (&optional tag)
+  "Open server-backed node results for TAG, prompting when omitted."
+  (interactive)
+  (gnosis-nodes-find-tag (or tag (read-string "Tag: "))))
+
+;;;###autoload
+(defun gnosis-nodes-visit-backlinks (&optional node-id)
+  "Open inbound links for NODE-ID, using the node at point when omitted."
+  (interactive)
+  (gnosis-nodes-inbound node-id))
 
 (defun gnosis-nodes--nullable (value)
   "Return nil for protocol null VALUE, otherwise VALUE."
