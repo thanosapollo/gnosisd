@@ -1451,7 +1451,10 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
                  (<= (length items) (or limit 100))
                  (cl-every #'gnosis-core--content-search-hit-p items)
                  (or (eq next gnosis-core--json-null)
-                     (and (stringp next) (not (string-empty-p next)))))
+                     (and (> (length items) 0)
+                          (stringp next)
+                          (not (string-empty-p next))
+                          (not (equal next cursor)))))
       (gnosis-core--invalid "Invalid Gnosis content-search page"))
     page))
 

@@ -697,12 +697,17 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
               `(:items [,(plist-put (copy-tree hit) :content_digest "bad")]
                 :next ,gnosis-core--json-null)
               `(:items [,hit] :next 4)
+              `(:items [] :next "next")
               `(:items [,hit ,hit] :next ,gnosis-core--json-null)))
       (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
                  (lambda (&rest _) page)))
         (should-error
          (gnosis-core-node-content-search "literal" nil 1)
-         :type 'gnosis-core-protocol-error)))))
+         :type 'gnosis-core-protocol-error)))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest _) `(:items [,hit] :next "opaque"))))
+      (should-error (gnosis-core-node-content-search "literal" "opaque" 1)
+                    :type 'gnosis-core-protocol-error))))
 
 (ert-deftest gnosis-core-thema-archive-binding-correlates-authority ()
   (let (arguments)

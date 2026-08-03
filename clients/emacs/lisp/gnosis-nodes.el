@@ -840,6 +840,7 @@ Without BASE-LEVEL, start one level below the current heading."
         (cl-incf pages)
         (dolist (node (append (plist-get page :items) nil))
           (when (and (string-prefix-p prefix (plist-get node :logical_path))
+                     (zerop (plist-get node :level))
                      (string-match-p (regexp-quote query)
                                      (plist-get node :title)))
             (push node matches)))
@@ -874,7 +875,13 @@ Without BASE-LEVEL, start one level below the current heading."
   "Open today's journal entry, creating and saving it when absent."
   (interactive)
   (let* ((title (format-time-string gnosis-journal-date-format))
-         (matches (gnosis-nodes--journal-matches title)))
+         (logical-path (gnosis-nodes--journal-logical-path title))
+         (matches
+          (vconcat
+           (seq-filter
+            (lambda (node)
+              (equal logical-path (plist-get node :logical_path)))
+            (append (gnosis-nodes--journal-matches title) nil)))))
     (pcase (length matches)
       (0 (gnosis-nodes--create-journal-entry title))
       (1 (gnosis-nodes--visit-node (aref matches 0)))
@@ -915,8 +922,17 @@ Without BASE-LEVEL, start one level below the current heading."
   (save-excursion
     (goto-char (point-min))
     (let ((count 0) (case-fold-search nil))
-      (while (search-forward string nil t) (cl-incf count))
+      (while (search-forward string nil t)
+        (when (gnosis-nodes--plain-text-at-p (match-beginning 0))
+          (cl-incf count)))
       count)))
+
+(defun gnosis-nodes--plain-text-at-p (position)
+  "Return non-nil when POSITION is replaceable plain Org text."
+  (save-excursion
+    (goto-char position)
+    (memq (org-element-type (org-element-context))
+          '(headline paragraph table-cell))))
 
 (defun gnosis-nodes--bulk-target-buffer (target)
   "Return TARGET's confined regular Org buffer."
@@ -977,9 +993,12 @@ the changed targets."
              (goto-char (point-min))
              (let ((case-fold-search nil) found)
                (while (search-forward string nil t)
-                 (replace-match
-                  (format "[[id:%s][%s]]" node-id string) t t)
-                 (setq found t))
+                 (let ((begin (match-beginning 0))
+                       (end (match-end 0)))
+                   (when (gnosis-nodes--plain-text-at-p begin)
+                     (delete-region begin end)
+                     (org-insert-link nil (format "id:%s" node-id) string)
+                     (setq found t))))
                (when found
                  (save-buffer)
                  (push target changed)))))
@@ -1048,12 +1067,9 @@ With prefix argument REFRESH, rebuild the node catalog first."
                              (append (or (plist-get record :tags) []) nil)
                              ", ")))))
 
-(defun gnosis-nodes-page--load (cursor)
-  "Load CURSOR through the current page fetcher."
-  (unless gnosis-nodes-page--fetch
-    (user-error "No Gnosis page source"))
-  (let* ((page (funcall gnosis-nodes-page--fetch cursor))
-         (items (plist-get page :items))
+(defun gnosis-nodes-page--install (page cursor)
+  "Install fetched PAGE for CURSOR in the current result buffer."
+  (let* ((items (plist-get page :items))
          (records (make-hash-table :test #'equal)))
     (cl-loop for record across items
              do (puthash (or (plist-get record :node_id)
@@ -1067,6 +1083,13 @@ With prefix argument REFRESH, rebuild the node catalog first."
                    collect (gnosis-nodes-page--entry record)))
     (tabulated-list-print t)
     (goto-char (point-min))))
+
+(defun gnosis-nodes-page--load (cursor)
+  "Load CURSOR through the current page fetcher."
+  (unless gnosis-nodes-page--fetch
+    (user-error "No Gnosis page source"))
+  (gnosis-nodes-page--install
+   (funcall gnosis-nodes-page--fetch cursor) cursor))
 
 (defun gnosis-nodes-page-open (title fetch)
   "Open a node page named TITLE using single-argument FETCH."
@@ -1083,15 +1106,21 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (interactive)
   (when (eq gnosis-nodes-page--next gnosis-core--json-null)
     (user-error "No next Gnosis node page"))
-  (push gnosis-nodes-page--cursor gnosis-nodes-page--history)
-  (gnosis-nodes-page--load gnosis-nodes-page--next))
+  (let* ((cursor gnosis-nodes-page--next)
+         (page (funcall gnosis-nodes-page--fetch cursor))
+         (previous gnosis-nodes-page--cursor))
+    (gnosis-nodes-page--install page cursor)
+    (push previous gnosis-nodes-page--history)))
 
 (defun gnosis-nodes-page-previous ()
   "Return to the previous result page fetched in this buffer."
   (interactive)
   (unless gnosis-nodes-page--history
     (user-error "No previous Gnosis node page"))
-  (gnosis-nodes-page--load (pop gnosis-nodes-page--history)))
+  (let* ((cursor (car gnosis-nodes-page--history))
+         (page (funcall gnosis-nodes-page--fetch cursor)))
+    (gnosis-nodes-page--install page cursor)
+    (pop gnosis-nodes-page--history)))
 
 (defun gnosis-nodes-page-refresh ()
   "Refresh the current result page."

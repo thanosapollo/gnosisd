@@ -4,6 +4,7 @@
 
 (require 'ert)
 (require 'gnosis-nodes)
+(require 'org-element)
 
 (defun gnosis-test-nodes--cursor (server-id position &optional snapshot-id)
   "Return protocol cursor for SERVER-ID, POSITION, and optional SNAPSHOT-ID."
@@ -1931,7 +1932,10 @@
               ((symbol-function 'gnosis-nodes--journal-matches)
                (lambda (query)
                  (should (equal title query))
-                 (if created (vector '(:node_id "journal-id")) [])))
+                 (if created
+                     (vector '(:node_id "journal-id"
+                               :logical_path "journal/2026-08-03.org"))
+                   [])))
               ((symbol-function 'gnosis-nodes--create-journal-entry)
                (lambda (value) (setq created value)))
               ((symbol-function 'gnosis-nodes--visit-node)
@@ -1956,6 +1960,28 @@
         (org-mode)
         (gnosis-journal-insert)
         (should (equal "[[id:journal-id][2026-08-03]]" (buffer-string)))))))
+
+(ert-deftest gnosis-journal-matches-only-file-nodes-and-today-exact-path ()
+  (let* ((root '(:node_id "root" :title "2026-08-03" :level 0
+                 :logical_path "journal/2026-08-03.org"))
+         (child '(:node_id "child" :title "2026-08-03 notes" :level 1
+                  :logical_path "journal/2026-08-03.org"))
+         (other '(:node_id "other" :title "2026-08-03" :level 0
+                  :logical_path "journal/other.org"))
+         visited)
+    (cl-letf (((symbol-function 'gnosis-core-nodes)
+               (lambda (&rest _)
+                 `(:items [,root ,child ,other] :next ,gnosis-core--json-null)))
+              ((symbol-function 'format-time-string)
+               (lambda (&rest _) "2026-08-03"))
+              ((symbol-function 'gnosis-nodes--visit-node)
+               (lambda (node) (setq visited node))))
+      (should (equal '("root" "other")
+                     (mapcar (lambda (node) (plist-get node :node_id))
+                             (append (gnosis-nodes--journal-matches
+                                      "2026-08-03") nil))))
+      (gnosis-journal)
+      (should (equal "root" (plist-get visited :node_id))))))
 
 (ert-deftest gnosis-bulk-link-string-is-finite-confirmed-and-saves-each-match ()
   (let ((first (generate-new-buffer " *gnosis-bulk-first*"))
@@ -1992,6 +2018,21 @@
       (should-not (gnosis-bulk-link-string "alpha" "node-a"
                                            (list (current-buffer)))))
     (should (equal "alpha" (buffer-string)))))
+
+(ert-deftest gnosis-bulk-link-string-skips-existing-org-links ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "alpha [[id:old][alpha]]")
+    (cl-letf (((symbol-function 'gnosis-nodes--bulk-target-buffer)
+               (lambda (target) target))
+              ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+              ((symbol-function 'save-buffer) #'ignore))
+      (gnosis-bulk-link-string "alpha" "new" (list (current-buffer))))
+    (should (equal "[[id:new][alpha]] [[id:old][alpha]]" (buffer-string)))
+    (let ((tree (org-element-parse-buffer)) links)
+      (org-element-map tree 'link
+        (lambda (link) (push (org-element-property :path link) links)))
+      (should (equal '("new" "old") (nreverse links))))))
 
 (ert-deftest gnosis-bulk-link-targets-stay-inside-org-root ()
   (let* ((root (make-temp-file "gnosis-bulk-root-" t))
@@ -2041,6 +2082,33 @@
       (gnosis-nodes-page-next)
       (should (equal '(nil "node-a") (nreverse calls)))
       (should (equal "node-b" (tabulated-list-get-id))))))
+
+(ert-deftest gnosis-node-page-fetch-failures-preserve-all-page-state ()
+  (let ((node (gnosis-test-nodes--catalog-node "node-a" :title "Alpha")))
+    (with-temp-buffer
+      (gnosis-nodes-page-mode)
+      (setq-local gnosis-nodes-page--fetch
+                  (lambda (cursor)
+                    (if (equal cursor "bad")
+                        (signal 'gnosis-core-transport-error '("failed"))
+                      `(:items [,node] :next "bad"))))
+      (gnosis-nodes-page--load nil)
+      (let ((cursor gnosis-nodes-page--cursor)
+            (next gnosis-nodes-page--next)
+            (history gnosis-nodes-page--history)
+            (records gnosis-nodes-page--records)
+            (entries tabulated-list-entries)
+            (selected (tabulated-list-get-id)))
+        (should-error (gnosis-nodes-page-next) :type 'gnosis-core-transport-error)
+        (should (equal cursor gnosis-nodes-page--cursor))
+        (should (equal next gnosis-nodes-page--next))
+        (should (equal history gnosis-nodes-page--history))
+        (should (eq records gnosis-nodes-page--records))
+        (should (equal entries tabulated-list-entries))
+        (should (equal selected (tabulated-list-get-id))))
+      (setq-local gnosis-nodes-page--history '("bad"))
+      (should-error (gnosis-nodes-page-previous) :type 'gnosis-core-transport-error)
+      (should (equal '("bad") gnosis-nodes-page--history)))))
 
 (ert-deftest gnosis-node-search-uses-title-tag-content-and-graph-bindings ()
   (let (calls)
