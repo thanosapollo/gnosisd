@@ -931,8 +931,14 @@ Without BASE-LEVEL, start one level below the current heading."
   "Return non-nil when POSITION is replaceable plain Org text."
   (save-excursion
     (goto-char position)
-    (memq (org-element-type (org-element-context))
-          '(headline paragraph table-cell))))
+    (pcase (org-element-type (org-element-context))
+      ((or 'paragraph 'table-cell) t)
+      ('headline
+       (beginning-of-line)
+       (and (looking-at org-complex-heading-regexp)
+            (match-beginning 4)
+            (<= (match-beginning 4) position)
+            (< position (match-end 4)))))))
 
 (defun gnosis-nodes--bulk-target-buffer (target)
   "Return TARGET's confined regular Org buffer."

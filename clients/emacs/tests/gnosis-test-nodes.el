@@ -2022,17 +2022,23 @@
 (ert-deftest gnosis-bulk-link-string-skips-existing-org-links ()
   (with-temp-buffer
     (org-mode)
-    (insert "alpha [[id:old][alpha]]")
+    (insert "alpha [[id:old][alpha]]\n"
+            "* alpha :alpha:\n"
+            ":PROPERTIES:\n:alpha: alpha\n:END:\n")
     (cl-letf (((symbol-function 'gnosis-nodes--bulk-target-buffer)
                (lambda (target) target))
               ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
               ((symbol-function 'save-buffer) #'ignore))
       (gnosis-bulk-link-string "alpha" "new" (list (current-buffer))))
-    (should (equal "[[id:new][alpha]] [[id:old][alpha]]" (buffer-string)))
+    (should
+     (equal (concat "[[id:new][alpha]] [[id:old][alpha]]\n"
+                    "* [[id:new][alpha]] :alpha:\n"
+                    ":PROPERTIES:\n:alpha: alpha\n:END:\n")
+            (buffer-string)))
     (let ((tree (org-element-parse-buffer)) links)
       (org-element-map tree 'link
         (lambda (link) (push (org-element-property :path link) links)))
-      (should (equal '("new" "old") (nreverse links))))))
+      (should (equal '("new" "old" "new") (nreverse links))))))
 
 (ert-deftest gnosis-bulk-link-targets-stay-inside-org-root ()
   (let* ((root (make-temp-file "gnosis-bulk-root-" t))
