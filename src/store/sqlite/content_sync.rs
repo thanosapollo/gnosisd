@@ -347,13 +347,9 @@ fn mutation_conflict_reason(
             let prepared = prepared.ok_or(StoreError::CorruptData {
                 field: "content preparation",
             })?;
-            match super::validate_note_assets(transaction, prepared) {
-                Ok(()) => super::check_path_available(transaction, prepared),
-                Err(StoreError::NotFound) => {
-                    return Ok(Some(OfflineContentConflictReason::InvalidContent));
-                }
-                Err(error) => return Err(error),
-            }
+            super::validate_note_assets(transaction, prepared)
+                .and_then(|()| super::check_path_available(transaction, prepared))
+                .and_then(|()| super::check_node_ids_available(transaction, prepared))
         }
         OfflineContentMutation::Rename { logical_path, .. } => {
             if head.is_none_or(|head| head.blob_sha256.is_none()) {
@@ -365,6 +361,11 @@ fn mutation_conflict_reason(
     };
     match available {
         Ok(()) => Ok(None),
+        Err(
+            StoreError::NotFound
+            | StoreError::InactiveReference { .. }
+            | StoreError::NodeIdConflict { .. },
+        ) => Ok(Some(OfflineContentConflictReason::InvalidContent)),
         Err(StoreError::PathConflict) => Ok(Some(OfflineContentConflictReason::PathConflict)),
         Err(error) => Err(error),
     }
@@ -1202,6 +1203,70 @@ mod tests {
             Some(OfflineContentConflictReason::InvalidContent)
         );
         assert!(result.authoritative.is_none());
+        assert_eq!(store.latest_content_cursor().unwrap(), before);
+        assert_eq!(
+            store
+                .replica_state(&device_id)
+                .unwrap()
+                .next_device_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn inactive_asset_conflicts_are_retained_and_exactly_replayed() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device_id = add_device(&mut store);
+        let bytes = b"inactive asset";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let path = format!("assets/{digest}/asset.png");
+        let prepared_asset =
+            crate::application::prepare_asset(path.clone(), "asset.png".into(), None).unwrap();
+        store
+            .put_asset(
+                &prepared_asset,
+                &BlobMeta {
+                    sha256: digest,
+                    size_bytes: bytes.len() as u64,
+                    media_type: "image/png".into(),
+                },
+                1,
+                None,
+            )
+            .unwrap();
+        store.tombstone_asset(&path, 1, 2, None).unwrap();
+        let operation = operation(
+            &store,
+            &device_id,
+            "operation-inactive-asset",
+            1,
+            ContentBase::Absent,
+            &format!("#+title: Offline\n[[file:{path}]]\n"),
+        );
+        let prepared = prepare_offline_document(&operation).unwrap();
+        let before = store.latest_content_cursor().unwrap();
+
+        let apply = |store: &mut SqliteStore| {
+            store
+                .reconcile_content_operation(
+                    1,
+                    &operation,
+                    "inactive-asset-operation",
+                    Some(&device_id),
+                    100,
+                    Ok((prepared.as_ref(), Some(&blob(&operation)))),
+                )
+                .unwrap()
+        };
+        let first = apply(&mut store);
+        let replay = apply(&mut store);
+
+        assert_eq!(first, replay);
+        assert_eq!(first.status, ContentReconciliationStatus::Conflict);
+        assert_eq!(
+            first.conflict_reason,
+            Some(OfflineContentConflictReason::InvalidContent)
+        );
         assert_eq!(store.latest_content_cursor().unwrap(), before);
         assert_eq!(
             store

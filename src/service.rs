@@ -3176,14 +3176,16 @@ mod tests {
         stage_blob_command, store_actor,
     };
     use crate::application::{
-        AssetReconciliationStatus, ContentBase, DeviceDesiredStateMutation, DeviceMutationResult,
-        ImportDocument, MAX_DOCUMENT_SOURCE_BYTES, OfflineAssetConflictReason,
-        OfflineAssetOperation, OfflineContentMutation, OfflineContentOperation, ReplicaProjection,
-        SettingsInput, canonical_asset_path, generate_device, prepare_asset,
+        AssetReconciliationStatus, ContentBase, ContentReconciliationStatus,
+        DeviceDesiredStateMutation, DeviceMutationResult, ImportDocument,
+        MAX_DOCUMENT_SOURCE_BYTES, OfflineAssetConflictReason, OfflineAssetOperation,
+        OfflineContentMutation, OfflineContentOperation, ReplicaProjection, SettingsInput,
+        canonical_asset_path, generate_device, prepare_asset,
         prepare_device_desired_state_mutation, prepare_device_document_mutation, prepare_note,
         prepare_thema, thema_content,
     };
     use crate::blob::{BlobMeta, BlobStore};
+    use crate::domain::DocumentId;
     use crate::protocol::canonical_asset_operation;
     use crate::store::{SqliteStore, StoreError};
 
@@ -3220,6 +3222,82 @@ mod tests {
                 base: ContentBase::Absent,
             },
         }
+    }
+
+    async fn offline_put_at_replica_state(
+        service: &ServiceHandle,
+        device_id: String,
+        operation_id: &str,
+        source: String,
+    ) -> OfflineContentOperation {
+        let state = service.replica_state(device_id.clone()).await.unwrap();
+        let content_sha256 = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        OfflineContentOperation {
+            operation_id: operation_id.into(),
+            device_id,
+            device_sequence: 1,
+            cursor_server_id: state.server_id,
+            cursor: state.cursor,
+            cursor_token: state.cursor_token,
+            authored_at_us: 1,
+            mutation: OfflineContentMutation::Put {
+                document_id: "offline-document".into(),
+                logical_path: "offline.org".into(),
+                content_sha256,
+                content_type: "text/org; charset=utf-8".into(),
+                source,
+                base: ContentBase::Absent,
+            },
+        }
+    }
+
+    async fn assert_offline_node_conflict(
+        service: &ServiceHandle,
+        blob_root: &std::path::Path,
+        label: &str,
+        created_at_us: u64,
+    ) {
+        let device = generate_device(label.into(), vec!["content:write".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        service
+            .create_device(device, created_at_us as i64)
+            .await
+            .unwrap();
+        let source = format!(":PROPERTIES:\n:ID: shared\n:END:\n#+title: {label} conflict\n");
+        let digest = format!("{:x}", sha2::Sha256::digest(source.as_bytes()));
+        let operation = offline_put_at_replica_state(
+            service,
+            device_id.clone(),
+            &format!("{label}-conflict"),
+            source,
+        )
+        .await;
+        let payload = format!("{label}-conflict-payload");
+        let before = service.latest_content_cursor().await.unwrap();
+        let first = service
+            .reconcile_content_operation(
+                1,
+                operation.clone(),
+                payload.clone(),
+                Some(device_id.clone()),
+                created_at_us + 1,
+            )
+            .await
+            .unwrap();
+        let replay = service
+            .reconcile_content_operation(1, operation, payload, Some(device_id), created_at_us + 2)
+            .await
+            .unwrap();
+
+        assert_eq!(first, replay);
+        assert_eq!(first.status, ContentReconciliationStatus::Conflict);
+        assert_eq!(
+            first.conflict_reason.map(|reason| reason.as_str()),
+            Some("invalid_content")
+        );
+        assert!(first.authoritative.is_none());
+        assert_eq!(service.latest_content_cursor().await.unwrap(), before);
+        assert!(!blob_root.join(&digest[..2]).join(digest).exists());
     }
 
     #[tokio::test]
@@ -3355,6 +3433,53 @@ mod tests {
             (0, 0, 0)
         );
         assert!(!blob_path.join(&digest[..2]).join(digest).exists());
+    }
+
+    #[tokio::test]
+    async fn offline_node_id_conflicts_do_not_publish_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob_root = directory.path().join("blobs");
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let owner = prepare_note(
+            Some("owner".into()),
+            "owner.org".into(),
+            ":PROPERTIES:\n:ID: shared\n:END:\n#+title: Owner\n".into(),
+            None,
+        )
+        .unwrap();
+        service.replace_note(owner, 1, None).await.unwrap();
+        assert_offline_node_conflict(&service, &blob_root, "active", 2).await;
+
+        let retired_owner = prepare_note(
+            Some("owner".into()),
+            "owner.org".into(),
+            "#+title: Owner\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        service.replace_note(retired_owner, 5, None).await.unwrap();
+        assert_offline_node_conflict(&service, &blob_root, "retired", 6).await;
+        assert!(
+            service
+                .note(DocumentId::new("offline-document").unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            service
+                .note(DocumentId::new("owner").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .revision,
+            2
+        );
+
+        drop(service);
+        runtime.finish().await.unwrap();
     }
 
     #[tokio::test]
