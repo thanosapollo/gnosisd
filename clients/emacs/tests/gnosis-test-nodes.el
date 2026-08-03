@@ -1914,7 +1914,7 @@
     (should (equal '("heading" "new") (org-get-tags nil t)))))
 
 (ert-deftest gnosis-nodes-tag-editing-rejects-invalid-tags-before-save ()
-  (dolist (tag '("" "two words" "x:y" "line\nbreak"))
+  (dolist (tag '("" "two words" "x:y" "line\nbreak" "a/b" "a,b" "a{b"))
     (with-temp-buffer
       (org-mode)
       (insert "#+title: Note\n")

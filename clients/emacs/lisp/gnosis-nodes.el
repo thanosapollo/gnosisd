@@ -816,7 +816,8 @@ Without BASE-LEVEL, start one level below the current heading."
 
 (defun gnosis-nodes--valid-tag-p (tag)
   "Return non-nil when TAG follows Org's tag token grammar."
-  (and (stringp tag) (string-match-p "\\`[^[:space:]:]+\\'" tag)))
+  (and (stringp tag)
+       (string-match-p (format "\\`%s\\'" org-tag-re) tag)))
 
 (defun gnosis-nodes--add-tags (tags)
   "Add TAGS at the current Org heading, or to file tags before headings."
