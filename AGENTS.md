@@ -87,9 +87,6 @@ nix develop
 
 Focused checks:
 
-`tools/check-org-parity.sh` uses `clients/emacs` by default; set
-`GNOSIS_ELISP_DIR` to check another Emacs client tree.
-
 ```sh
 cargo test --lib domain::
 cargo test --lib parser::org_tests
@@ -99,7 +96,19 @@ cargo test --lib protocol::
 cargo test --test daemon_protocol
 ```
 
+Optional Org parity (external Elisp oracle only): monorepo
+`clients/emacs` does not ship `lisp/gnosis-org.el`. Point
+`GNOSIS_ELISP_DIR` at a tree that provides it, then:
+
+```sh
+tools/check-org-parity.sh tests/fixtures/org/basic.org
+```
+
 Required handoff gates:
+
+`nix flake check` builds the default package only. It does not run
+`cargo test`, `clippy`, or `fmt`. Treat the cargo gates below as the
+real validation set.
 
 ```sh
 nix flake check

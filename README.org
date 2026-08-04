@@ -11,8 +11,13 @@ diagnostics.
 
 * Build and run
 
+Create socket, database, and blob parents before the first start. The
+daemon does not create missing parent directories for those paths.
+
 #+begin_src sh
 nix develop
+install -d -m 0700 "$XDG_RUNTIME_DIR/gnosis"
+install -d -m 0700 "$HOME/.local/share/gnosis" "$HOME/.local/share/gnosis/blobs"
 cargo run --bin gnosisd -- \
   --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   --database "$HOME/.local/share/gnosis/gnosis.sqlite" \
@@ -135,6 +140,10 @@ Systemd user units and Pi runbook live under ~deployment/~ and
 only to Gnosis state/runtime paths.
 
 * Validation
+
+~nix flake check~ builds the default package only. It does not run
+~cargo test~, ~clippy~, or ~fmt~. Use the cargo gates below for real
+validation.
 
 #+begin_src sh
 nix flake check
