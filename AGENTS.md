@@ -96,13 +96,9 @@ cargo test --lib protocol::
 cargo test --test daemon_protocol
 ```
 
-Optional Org parity (external Elisp oracle only): monorepo
-`clients/emacs` does not ship `lisp/gnosis-org.el`. Point
-`GNOSIS_ELISP_DIR` at a tree that provides it, then:
-
-```sh
-tools/check-org-parity.sh tests/fixtures/org/basic.org
-```
+Optional Org parity: monorepo `clients/emacs` does not ship
+`lisp/gnosis-org.el`. `tools/check-org-parity.sh` needs an external
+tree via `GNOSIS_ELISP_DIR` and is not a monorepo handoff gate.
 
 Required handoff gates:
 
