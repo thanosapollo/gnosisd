@@ -141,9 +141,9 @@ only to Gnosis state/runtime paths.
 
 * Validation
 
-~nix flake check~ builds the default package only. It does not run
-~cargo test~, ~clippy~, or ~fmt~. Use the cargo gates below for real
-validation.
+~nix flake check~ builds the default package. That package checkPhase
+runs ~cargo test~ via cargoCheckHook. It does not run ~cargo fmt~,
+~clippy~, or ~cargo doc~. Keep the cargo gates below for those.
 
 #+begin_src sh
 nix flake check

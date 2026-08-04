@@ -106,9 +106,9 @@ tools/check-org-parity.sh tests/fixtures/org/basic.org
 
 Required handoff gates:
 
-`nix flake check` builds the default package only. It does not run
-`cargo test`, `clippy`, or `fmt`. Treat the cargo gates below as the
-real validation set.
+`nix flake check` builds the default package. That package's checkPhase
+runs `cargo test` via cargoCheckHook. It does not run `cargo fmt`,
+`clippy`, or `cargo doc`. Keep the cargo gates below for those.
 
 ```sh
 nix flake check
