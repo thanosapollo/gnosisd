@@ -34,13 +34,15 @@ Unavailable storage returns HTTP 503. OpenAPI 3.1 is public at
 
 * Local operator control
 
-~gnosisd-admin~ speaks bounded Unix protocol v1. Success output is JSON. Device
-tokens are returned once; SQLite stores only SHA-256 digests.
+~gnosisd-admin~ speaks bounded Unix protocol v2. Success output is JSON. Device
+tokens stay in caller-selected mode-0600 credential files; SQLite stores only
+SHA-256 digests. Reusing same file safely replays interrupted provisioning.
 
 #+begin_src sh
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" system-info
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  device-create emacs --scope read --scope review --scope content:write
+  device-create emacs --scope read --scope review --scope content:write \
+  --credential-file "$XDG_CONFIG_HOME/gnosis/emacs-device.json"
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" device-list
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   device-revoke DEVICE_ID

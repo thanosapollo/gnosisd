@@ -17,9 +17,15 @@ pub(crate) const MAX_REVIEW_PACK_MEDIA_TYPE_CHARS: usize = 255;
 pub(crate) const DEFAULT_ONLINE_REVIEW_TARGET_COUNT: u32 = 100;
 pub(crate) const MAX_ONLINE_REVIEW_TARGET_COUNT: u32 = 500;
 
+#[cfg(test)]
+pub(crate) use auth::generate_device;
+pub use auth::{
+    AuthError, ProvisioningCredential, generate_provisioning_credential,
+    validate_provisioning_credential,
+};
 pub(crate) use auth::{
-    DevicePrincipal, DeviceRecord, DeviceScope, NewDevice, generate_device, parse_stored_scopes,
-    stored_scopes, token_digest,
+    DevicePrincipal, DeviceRecord, DeviceScope, NewDevice, parse_stored_scopes,
+    prepare_provisioned_device, stored_scopes, token_digest,
 };
 pub(crate) use client_views::{
     ContentCounts, DashboardSummary, ReviewHistoryEvent, ReviewHistoryQuery, ReviewQueueCounts,

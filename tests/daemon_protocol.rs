@@ -46,19 +46,39 @@ async fn unix_socket_serves_operator_commands_and_secures_files() {
         ResponseOutcome::Failure { error } => panic!("system.info failed: {error:?}"),
     }
 
-    let created = request(
+    let provisioning = Request::DeviceCreate {
+        device_id: "0198-operator-test".into(),
+        name: "operator-test".into(),
+        token: "gnosis_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        scopes: vec!["read".into()],
+    };
+    let created = request(&socket, "device-create", provisioning.clone()).await;
+    assert!(matches!(
+        &created.outcome,
+        ResponseOutcome::Success { result }
+            if matches!(**result, ResponseResult::DeviceCreated(_))
+    ));
+    assert!(!serde_json::to_string(&created).unwrap().contains("gnosis_"));
+    let replayed = request(&socket, "device-create-replay", provisioning).await;
+    assert!(matches!(
+        replayed.outcome,
+        ResponseOutcome::Success { result }
+            if matches!(*result, ResponseResult::DeviceCreated(_))
+    ));
+    let mismatch = request(
         &socket,
-        "device-create",
+        "device-create-mismatch",
         Request::DeviceCreate {
-            name: "operator-test".into(),
+            device_id: "0198-operator-test".into(),
+            name: "other".into(),
+            token: "gnosis_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             scopes: vec!["read".into()],
         },
     )
     .await;
     assert!(matches!(
-        created.outcome,
-        ResponseOutcome::Success { result }
-            if matches!(*result, ResponseResult::DeviceCreated(_))
+        mismatch.outcome,
+        ResponseOutcome::Failure { error } if error.code == ErrorCode::Conflict
     ));
     let listed = request(&socket, "device-list", Request::DeviceList {}).await;
     assert!(matches!(

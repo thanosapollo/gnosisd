@@ -9,6 +9,10 @@ pub mod protocol;
 mod service;
 mod store;
 
+pub use application::{
+    AuthError, ProvisioningCredential, generate_provisioning_credential,
+    validate_provisioning_credential,
+};
 pub use domain::{ThemaConcept, ThemaConceptRelation};
 
 pub(crate) fn is_canonical_sha256(value: &str) -> bool {

@@ -2624,6 +2624,7 @@ impl ApiError {
             ),
             StoreError::BackupDeadlineExceeded
             | StoreError::BackupCancelled
+            | StoreError::DeviceProvisioningConflict
             | StoreError::UnsupportedSchemaVersion { .. }
             | StoreError::UnsupportedSchemaLayout
             | StoreError::UnsupportedApplicationId { .. }

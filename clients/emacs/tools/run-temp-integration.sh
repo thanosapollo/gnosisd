@@ -83,18 +83,16 @@ for test_name in $tests; do
         sleep 0.05
     done
 
-    device=$(
-        "$gnosisd_admin" --socket "$state/gnosis.sock" \
-            device-create emacs-contract --scope read --scope review \
-            --scope content:write
-    )
-    token=$(printf '%s\n' "$device" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-    device_2=$(
-        "$gnosisd_admin" --socket "$state/gnosis.sock" \
-            device-create emacs-contract-2 --scope read --scope review \
-            --scope content:write
-    )
-    token_2=$(printf '%s\n' "$device_2" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+    credential=$state/device.json
+    credential_2=$state/device-2.json
+    "$gnosisd_admin" --socket "$state/gnosis.sock" \
+        device-create emacs-contract --scope read --scope review \
+        --scope content:write --credential-file "$credential" >/dev/null
+    token=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' "$credential")
+    "$gnosisd_admin" --socket "$state/gnosis.sock" \
+        device-create emacs-contract-2 --scope read --scope review \
+        --scope content:write --credential-file "$credential_2" >/dev/null
+    token_2=$(sed -n 's/.*"token":"\([^"]*\)".*/\1/p' "$credential_2")
     [ -n "$token" ] && [ -n "$token_2" ] || {
         echo "Temporary device tokens missing" >&2
         exit 1

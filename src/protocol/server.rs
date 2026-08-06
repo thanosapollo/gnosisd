@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    application::{ApplicationError, generate_device},
+    application::{ApplicationError, prepare_provisioned_device},
     protocol::{
         BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, ErrorCode,
         MessageValidationError, PROTOCOL_VERSION, ProtocolError, RepairView, Request,
@@ -287,7 +287,12 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
             protocol_version: PROTOCOL_VERSION,
         })),
 
-        Request::DeviceCreate { name, scopes } => create_device(state, name, scopes).await,
+        Request::DeviceCreate {
+            device_id,
+            name,
+            token,
+            scopes,
+        } => create_device(state, device_id, name, token, scopes).await,
         Request::DeviceList {} => list_devices(state).await,
         Request::DeviceRevoke { device_id } => revoke_device(state, device_id).await,
         Request::BackupCreate { destination } => create_backup(state, destination).await,
@@ -318,11 +323,13 @@ fn bounded_success(id: String, result: ResponseResult) -> ResponseEnvelope {
 
 async fn create_device(
     state: ServerState,
+    device_id: String,
     name: String,
+    token: String,
     scopes: Vec<String>,
 ) -> Result<ResponseResult, ProtocolError> {
-    let device = generate_device(name, scopes).map_err(|_| malformed_admin())?;
-    let token = device.token.clone();
+    let device = prepare_provisioned_device(device_id, name, token, scopes)
+        .map_err(|_| malformed_admin())?;
     let record = state
         .store
         .create_device(device, now_us()?)
@@ -330,7 +337,6 @@ async fn create_device(
         .map_err(actor_error)?;
     Ok(ResponseResult::DeviceCreated(DeviceCreatedView {
         device: DeviceView::from(record),
-        token,
     }))
 }
 
@@ -536,6 +542,9 @@ fn actor_store_error(error: StoreError) -> ProtocolError {
         | StoreError::ReviewOwnership
         | StoreError::IdempotencyConflict => {
             ProtocolError::new(ErrorCode::Conflict, "review state conflict")
+        }
+        StoreError::DeviceProvisioningConflict => {
+            ProtocolError::new(ErrorCode::Conflict, "device provisioning identity conflict")
         }
         StoreError::Conflict { .. }
         | StoreError::ExpectedAbsent { .. }

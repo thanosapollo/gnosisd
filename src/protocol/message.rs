@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_REQUEST_ID_LEN: usize = 128;
 pub const MAX_REPAIR_BATCH_SIZE: u16 = 1_000;
@@ -34,7 +34,12 @@ pub enum Request {
     SystemInfo {},
 
     #[serde(rename = "admin.device_create")]
-    DeviceCreate { name: String, scopes: Vec<String> },
+    DeviceCreate {
+        device_id: String,
+        name: String,
+        token: String,
+        scopes: Vec<String>,
+    },
     #[serde(rename = "admin.device_list")]
     DeviceList {},
     #[serde(rename = "admin.device_revoke")]
@@ -137,7 +142,6 @@ pub struct BackupView {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeviceCreatedView {
     pub device: DeviceView,
-    pub token: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -215,12 +219,14 @@ pub enum MessageValidationError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_ID_LEN, MessageValidationError, Request, RequestEnvelope};
+    use super::{
+        MAX_REQUEST_ID_LEN, MessageValidationError, PROTOCOL_VERSION, Request, RequestEnvelope,
+    };
 
     #[test]
     fn operator_request_round_trips() {
         let request = RequestEnvelope {
-            version: 1,
+            version: PROTOCOL_VERSION,
             id: "request-1".into(),
             request: Request::SystemInfo {},
         };
@@ -243,7 +249,7 @@ mod tests {
             "asset.chunk",
         ] {
             let json =
-                format!(r#"{{"version":1,"id":"request","method":"{method}","params":{{}}}}"#);
+                format!(r#"{{"version":2,"id":"request","method":"{method}","params":{{}}}}"#);
             assert!(
                 serde_json::from_str::<RequestEnvelope>(&json).is_err(),
                 "accepted {method}"
@@ -254,15 +260,15 @@ mod tests {
     #[test]
     fn rejects_unknown_version_and_unbounded_request_id() {
         let mut request = RequestEnvelope {
-            version: 2,
+            version: 1,
             id: "request-1".into(),
             request: Request::SystemInfo {},
         };
         assert_eq!(
             request.validate(),
-            Err(MessageValidationError::UnsupportedVersion(2))
+            Err(MessageValidationError::UnsupportedVersion(1))
         );
-        request.version = 1;
+        request.version = PROTOCOL_VERSION;
         request.id = "x".repeat(MAX_REQUEST_ID_LEN + 1);
         assert_eq!(
             request.validate(),

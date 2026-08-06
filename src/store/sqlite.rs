@@ -83,6 +83,8 @@ pub(crate) enum StoreError {
     ReviewOwnership,
     #[error("operation identity was reused with a different payload")]
     IdempotencyConflict,
+    #[error("device ID was reused with different provisioning data")]
+    DeviceProvisioningConflict,
     #[error("device operation sequence has a gap: expected {expected}")]
     DeviceSequence { expected: u64 },
     #[error("replica cursor is outside the retained server feed")]
@@ -1822,6 +1824,28 @@ impl SqliteStore {
     ) -> Result<DeviceRecord, StoreError> {
         let scopes = stored_scopes(&device.scopes).map_err(StoreError::storage)?;
         let transaction = self.write_transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT name, token_digest, scopes_json FROM device WHERE device_id = ?1",
+                [&device.device_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::storage)?;
+        if let Some((name, token_digest, stored_scopes)) = existing {
+            transaction.commit().map_err(StoreError::storage)?;
+            if name != device.name || token_digest != device.token_digest || stored_scopes != scopes
+            {
+                return Err(StoreError::DeviceProvisioningConflict);
+            }
+            return self.device(&device.device_id)?.ok_or(StoreError::NotFound);
+        }
         transaction
             .execute(
                 "INSERT INTO device(
@@ -5444,13 +5468,56 @@ mod tests {
         DeviceDesiredStateMutation, DeviceMutationProjection, DeviceMutationResult,
         MAX_DOCUMENT_PROJECTION_BYTES, NodeThemaAssociation, PreparedNote, ReplicaProjection,
         ReviewSource, ReviewSourceKind, SettingsInput, generate_device, prepare_asset,
-        prepare_device_desired_state_mutation, prepare_note, prepare_thema, thema_content,
+        prepare_device_desired_state_mutation, prepare_note, prepare_provisioned_device,
+        prepare_thema, thema_content,
     };
     use crate::blob::BlobMeta;
     use crate::domain::{
         DocumentId, DocumentProjection, DocumentProjectionInput, LinkOccurrence, Node, NodeId,
         SourceSpan, ThemaConceptRelation, ThemaId, TitlePath,
     };
+
+    #[test]
+    fn device_provisioning_exact_retry_reuses_record_and_mismatch_conflicts() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("phone".into(), vec!["read".into()]).unwrap();
+        let other = generate_device("other".into(), vec!["read".into()]).unwrap();
+        let first = store.create_device(&device, 1).unwrap();
+        let replay = store.create_device(&device, 2).unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(
+            store.devices().unwrap().as_slice(),
+            std::slice::from_ref(&first)
+        );
+        assert!(
+            store
+                .authenticate(&device.token_digest, 2)
+                .unwrap()
+                .is_some()
+        );
+        let after_authentication = store.devices().unwrap();
+
+        for (name, token, scopes) in [
+            ("other", device.token.clone(), vec!["read".into()]),
+            ("phone", other.token.clone(), vec!["read".into()]),
+            ("phone", device.token.clone(), vec!["review".into()]),
+        ] {
+            let mismatch =
+                prepare_provisioned_device(device.device_id.clone(), name.into(), token, scopes)
+                    .unwrap();
+            assert!(matches!(
+                store.create_device(&mismatch, 3),
+                Err(StoreError::DeviceProvisioningConflict)
+            ));
+        }
+        assert_eq!(store.devices().unwrap(), after_authentication);
+        assert!(
+            store
+                .authenticate(&other.token_digest, 3)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn backup_retries_while_source_writer_holds_lock() {
