@@ -33,18 +33,32 @@
 (defvar-local gnosis-edit--after-save nil
   "Function called with the validated server projection after save.")
 
-(defvar-local gnosis-edit--write-uncertain nil
-  "Non-nil after a mutation whose server outcome cannot be determined.")
+(defvar-local gnosis-edit--recovery nil
+  "Immutable operation and request retained after unknown delivery.")
+
+(put 'gnosis-edit--recovery 'permanent-local t)
 
 (defvar-keymap gnosis-edit-mode-map
   "C-c C-c" #'gnosis-edit-save
+  "C-c C-r" #'gnosis-edit-retry-uncertain
   "C-c C-k" #'gnosis-edit-cancel)
+
+(defun gnosis-edit--allow-kill ()
+  "Return non-nil unless this editor retains uncertain recovery."
+  (if gnosis-edit--recovery
+      (progn
+        (message "Gnosis mutation recovery retained; retry or explicitly discard it")
+        nil)
+    t))
+
+(put 'gnosis-edit--allow-kill 'permanent-local-hook t)
 
 (define-derived-mode gnosis-edit-mode js-json-mode "Gnosis-Edit"
   "Major mode for editing one Gnosis thema request as JSON."
+  (add-hook 'kill-buffer-query-functions #'gnosis-edit--allow-kill nil t)
   (setq-local header-line-format
               (substitute-command-keys
-               " Save with \\[gnosis-edit-save], cancel with \\[gnosis-edit-cancel]")))
+               " Save \\[gnosis-edit-save], retry \\[gnosis-edit-retry-uncertain], cancel \\[gnosis-edit-cancel]")))
 
 (defun gnosis-edit--new-request ()
   "Return a complete initial thema request document."
@@ -88,10 +102,12 @@
     (set-buffer-modified-p nil)))
 
 (defun gnosis-edit--ensure-buffer-available (name)
-  "Reject replacing a modified editor buffer named NAME."
-  (when-let* ((buffer (get-buffer name))
-              ((buffer-modified-p buffer)))
-    (user-error "Gnosis editor has unsaved changes")))
+  "Reject replacing an occupied editor buffer named NAME."
+  (when-let ((buffer (get-buffer name)))
+    (when (buffer-local-value 'gnosis-edit--recovery buffer)
+      (user-error "Gnosis editor has an uncertain mutation to recover"))
+    (when (buffer-modified-p buffer)
+      (user-error "Gnosis editor has unsaved changes"))))
 
 (defun gnosis-edit--open (name request thema-id revision after-save)
   "Open NAME with REQUEST, THEMA-ID, REVISION, and AFTER-SAVE callback."
@@ -104,7 +120,7 @@
     (setq-local gnosis-edit--thema-id thema-id)
     (setq-local gnosis-edit--revision revision)
     (setq-local gnosis-edit--after-save after-save)
-    (setq-local gnosis-edit--write-uncertain nil)
+    (setq-local gnosis-edit--recovery nil)
     (gnosis-edit--replace-request request)
     buffer))
 
@@ -127,44 +143,79 @@
     (gnosis-edit--open gnosis-edit-buffer-name request thema-id
                        (plist-get projection :revision) after-save)))
 
-(defun gnosis-edit--send (operation-id request)
-  "Send REQUEST once under OPERATION-ID, recording an uncertain outcome."
+(defun gnosis-edit--send (operation-id request thema-id revision)
+  "Send REQUEST once under OPERATION-ID for THEMA-ID at REVISION.
+Record the complete immutable request context after unknown delivery."
   (condition-case condition
-      (if gnosis-edit--thema-id
+      (if thema-id
           (gnosis-core-thema-update
-           gnosis-edit--thema-id operation-id gnosis-edit--revision request)
+           thema-id operation-id revision request)
         (gnosis-core-thema-create operation-id request))
     (gnosis-core-mutation-uncertain
-     (setq gnosis-edit--write-uncertain t)
+     (setq gnosis-edit--recovery
+           (list :operation-id operation-id
+                 :thema-id thema-id
+                 :revision revision
+                 :request (copy-tree request t)))
      (signal (car condition) (cdr condition)))))
 
-(defun gnosis-edit-save ()
-  "Save the current thema through the server contract."
-  (interactive)
-  (unless (derived-mode-p 'gnosis-edit-mode)
-    (user-error "Not in a Gnosis editing buffer"))
-  (when gnosis-edit--write-uncertain
-    (user-error "Mutation outcome is uncertain; cancel and reload before saving"))
-  (let* ((request (gnosis-edit--parse))
-         (operation-id (gnosis-core-operation-id))
-         (projection (gnosis-edit--send operation-id request))
-         (saved-request (gnosis-core-thema-write-view projection))
-         (thema-id (plist-get projection :thema_id))
-         (revision (plist-get projection :revision)))
-    (setq gnosis-edit--thema-id thema-id)
-    (setq gnosis-edit--revision revision)
-    (setq gnosis-edit--write-uncertain nil)
+(defun gnosis-edit--accept (projection)
+  "Accept authoritative PROJECTION and return it."
+  (let ((saved-request (gnosis-core-thema-write-view projection))
+        (thema-id (plist-get projection :thema_id))
+        (revision (plist-get projection :revision)))
+    (setq gnosis-edit--thema-id thema-id
+          gnosis-edit--revision revision
+          gnosis-edit--recovery nil)
     (gnosis-edit--replace-request saved-request)
     (when gnosis-edit--after-save
       (funcall gnosis-edit--after-save projection))
     (message "Saved thema %s at revision %s" thema-id revision)
     projection))
 
+(defun gnosis-edit-save ()
+  "Save the current thema through the server contract."
+  (interactive)
+  (unless (derived-mode-p 'gnosis-edit-mode)
+    (user-error "Not in a Gnosis editing buffer"))
+  (when gnosis-edit--recovery
+    (user-error "Mutation outcome is uncertain; retry or explicitly discard it"))
+  (let* ((request (gnosis-edit--parse))
+         (operation-id (gnosis-core-operation-id))
+         (projection
+          (gnosis-edit--send operation-id request
+                             gnosis-edit--thema-id gnosis-edit--revision)))
+    (gnosis-edit--accept projection)))
+
+(defun gnosis-edit-retry-uncertain ()
+  "Replay the retained uncertain mutation with exact identity and request."
+  (interactive)
+  (unless gnosis-edit--recovery
+    (user-error "No uncertain Gnosis mutation to retry"))
+  (let ((operation-id (plist-get gnosis-edit--recovery :operation-id))
+        (thema-id (plist-get gnosis-edit--recovery :thema-id))
+        (revision (plist-get gnosis-edit--recovery :revision))
+        (request (plist-get gnosis-edit--recovery :request)))
+    (gnosis-edit--accept
+     (gnosis-edit--send operation-id request thema-id revision))))
+
 (defun gnosis-edit-cancel ()
   "Close the current Gnosis editing shell without mutation."
   (interactive)
   (unless (derived-mode-p 'gnosis-edit-mode)
     (user-error "Not in a Gnosis editing buffer"))
+  (when gnosis-edit--recovery
+    (user-error "Mutation outcome is uncertain; retry or explicitly discard it"))
+  (quit-window t))
+
+(defun gnosis-edit-discard-uncertain ()
+  "Explicitly discard retained uncertain mutation recovery and close editor."
+  (interactive)
+  (unless gnosis-edit--recovery
+    (user-error "No uncertain Gnosis mutation to discard"))
+  (unless (yes-or-no-p "Discard uncertain Gnosis mutation recovery? ")
+    (user-error "Gnosis recovery preserved"))
+  (setq gnosis-edit--recovery nil)
   (quit-window t))
 
 (provide 'gnosis-edit)

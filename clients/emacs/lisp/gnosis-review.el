@@ -417,6 +417,20 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
          nil
        (signal (car condition) (cdr condition))))))
 
+(defun gnosis-review--abort-session (session-id)
+  "Abort SESSION-ID, requiring authoritative absence after unknown delivery."
+  (condition-case condition
+      (gnosis-core-review-session-abort session-id)
+    (gnosis-core-mutation-uncertain
+     (condition-case nil
+         (let ((session (gnosis-review--active-session)))
+           (if (or (null session)
+                   (not (equal session-id (plist-get session :session_id))))
+               nil
+             (signal (car condition) (cdr condition))))
+       (gnosis-core-error
+        (signal (car condition) (cdr condition)))))))
+
 (defun gnosis-review--complete ()
   "Clear the current review and close its buffer."
   (setq gnosis-review--session nil
@@ -539,7 +553,7 @@ When a review is active, prompt to resume it, replace it, or cancel."
         (?r (gnosis-review--open
              (gnosis-review--resume-session
               (plist-get session :session_id))))
-        (?a (gnosis-core-review-session-abort
+        (?a (gnosis-review--abort-session
              (plist-get session :session_id))
             (message "Gnosis review aborted"))
         (?c (message "Gnosis review unchanged")))

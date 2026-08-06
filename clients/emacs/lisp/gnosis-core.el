@@ -88,6 +88,8 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 (define-error 'gnosis-core-not-found "Gnosis resource not found" 'gnosis-core-error)
 (define-error 'gnosis-core-conflict "Gnosis state conflict" 'gnosis-core-error)
 (define-error 'gnosis-core-validation-error "Gnosis request rejected" 'gnosis-core-error)
+(define-error 'gnosis-core-http-rejection "Gnosis HTTP request rejected"
+  'gnosis-core-validation-error)
 (define-error 'gnosis-core-unavailable "Gnosis service unavailable" 'gnosis-core-transport-error)
 (define-error 'gnosis-core-protocol-error "Invalid Gnosis response" 'gnosis-core-error)
 (define-error 'gnosis-core-mutation-uncertain
@@ -292,7 +294,7 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
                       ((= status 403) 'gnosis-core-authorization-error)
                       ((= status 404) 'gnosis-core-not-found)
                       ((memq status '(409 412 428)) 'gnosis-core-conflict)
-                      ((memq status '(400 413 422)) 'gnosis-core-validation-error)
+                      ((memq status '(400 413 422)) 'gnosis-core-http-rejection)
                       ((or (= status 408) (= status 504)) 'gnosis-core-timeout)
                       ((>= status 500) 'gnosis-core-unavailable)
                       (t 'gnosis-core-protocol-error))))

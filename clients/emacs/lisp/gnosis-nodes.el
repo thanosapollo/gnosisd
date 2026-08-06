@@ -3127,7 +3127,7 @@ Return match, next cursor, remaining count, and visits."
               (setq gnosis-nodes--mutation-sent t)
               (aset outbox index (gnosis-nodes--outbox-mark entry :sending))
               (gnosis-nodes--write-state state)
-              (condition-case nil
+              (condition-case condition
                   (let* ((result (gnosis-nodes--send-entry entry payload))
                          (authoritative
                           (copy-tree (plist-get result :authoritative))))
@@ -3150,6 +3150,23 @@ Return match, next cursor, remaining count, and visits."
                     (gnosis-nodes--write-state state)
                     (when (equal "rejected" (plist-get result :status))
                       (throw 'gnosis-nodes--stop-outbox nil)))
+                (gnosis-core-http-rejection
+                 (setq entry
+                       (plist-put
+                        entry :result
+                        (list :status "rejected"
+                              :rejection
+                              (list :reason (nth 2 condition)
+                                    :message (nth 1 condition)))))
+                 (aset outbox index
+                       (gnosis-nodes--outbox-mark entry :rejected))
+                 (gnosis-nodes--write-state state)
+                 (throw 'gnosis-nodes--stop-outbox nil))
+                (gnosis-core-validation-error
+                 (aset outbox index
+                       (gnosis-nodes--outbox-mark entry :pending))
+                 (gnosis-nodes--write-state state)
+                 (signal (car condition) (cdr condition)))
                 (gnosis-core-mutation-uncertain
                  (aset outbox index
                        (gnosis-nodes--outbox-mark entry :uncertain))

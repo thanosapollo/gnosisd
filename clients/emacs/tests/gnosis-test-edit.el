@@ -78,6 +78,125 @@
           (should (equal "unsaved" (buffer-string))))
       (kill-buffer buffer))))
 
+(ert-deftest gnosis-edit-open-commands-preserve-uncertain-recovery ()
+  (dolist (case `((,gnosis-edit-new-buffer-name gnosis-add-thema)
+                  (,gnosis-edit-buffer-name gnosis-edit-thema "other")))
+    (let* ((name (car case))
+           (buffer (get-buffer-create name))
+           (recovery (list :operation-id "op:uncertain"
+                           :thema-id "original" :revision 7
+                           :request (copy-tree gnosis-test-edit--request t)))
+           (fetches 0))
+      (unwind-protect
+          (with-current-buffer buffer
+            (gnosis-edit-mode)
+            (setq-local gnosis-edit--recovery recovery)
+            (set-buffer-modified-p nil)
+            (cl-letf (((symbol-function 'gnosis-core-thema)
+                       (lambda (&rest _) (cl-incf fetches))))
+              (should-error (apply (cadr case) (cddr case)) :type 'user-error))
+            (should (equal recovery gnosis-edit--recovery))
+            (should (= fetches 0)))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer (setq gnosis-edit--recovery nil))
+          (kill-buffer buffer))))))
+
+(ert-deftest gnosis-edit-renamed-buffers-refuse-kill-with-recovery ()
+  (dolist (name (list gnosis-edit-new-buffer-name gnosis-edit-buffer-name))
+    (when-let ((existing (get-buffer name)))
+      (with-current-buffer existing (setq gnosis-edit--recovery nil))
+      (kill-buffer existing))
+    (let* ((buffer (get-buffer-create name))
+           (recovery (list :operation-id "op:uncertain"
+                           :thema-id "original" :revision 7
+                           :request (copy-tree gnosis-test-edit--request t))))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (gnosis-edit-mode)
+              (setq-local gnosis-edit--recovery recovery)
+              (rename-buffer (generate-new-buffer-name "*Renamed Gnosis*"))
+              (set-buffer-modified-p nil))
+            (should-not (kill-buffer buffer))
+            (should (buffer-live-p buffer))
+            (should (equal recovery
+                           (buffer-local-value 'gnosis-edit--recovery buffer)))
+            (with-current-buffer buffer (setq gnosis-edit--recovery nil)))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer (setq gnosis-edit--recovery nil))
+          (kill-buffer buffer))))))
+
+(ert-deftest gnosis-edit-renamed-buffer-reinit-preserves-recovery-guard ()
+  (dolist (mode '(gnosis-edit-mode fundamental-mode))
+    (let* ((buffer (generate-new-buffer "*Gnosis Edit*"))
+           (recovery (list :operation-id "op:uncertain"
+                           :thema-id "original" :revision 7
+                           :request (copy-tree gnosis-test-edit--request t))))
+      (unwind-protect
+          (progn
+            (with-current-buffer buffer
+              (gnosis-edit-mode)
+              (setq-local gnosis-edit--recovery recovery)
+              (rename-buffer (generate-new-buffer-name "*Renamed Gnosis*"))
+              (funcall mode)
+              (set-buffer-modified-p nil)
+              (should (equal recovery gnosis-edit--recovery))
+              (should (memq #'gnosis-edit--allow-kill
+                            kill-buffer-query-functions)))
+            (should-not (kill-buffer buffer))
+            (should (equal recovery
+                           (buffer-local-value 'gnosis-edit--recovery buffer))))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer (setq gnosis-edit--recovery nil))
+          (kill-buffer buffer))))))
+
+(ert-deftest gnosis-edit-renamed-buffer-confirmed-discard-clears-before-close ()
+  (let ((buffer (generate-new-buffer "*Gnosis New*"))
+        (recovery (list :operation-id "op:uncertain"
+                        :request (copy-tree gnosis-test-edit--request t))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (gnosis-edit-mode)
+          (setq-local gnosis-edit--recovery recovery)
+          (rename-buffer (generate-new-buffer-name "*Renamed Gnosis*"))
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                    ((symbol-function 'quit-window)
+                     (lambda (&rest _)
+                       (should-not gnosis-edit--recovery)
+                       (kill-buffer (current-buffer)))))
+            (gnosis-edit-discard-uncertain))
+          (should-not (buffer-live-p buffer)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (setq gnosis-edit--recovery nil))
+        (kill-buffer buffer)))))
+
+(ert-deftest gnosis-edit-renamed-buffer-declined-discard-preserves-recovery ()
+  (let ((buffer (generate-new-buffer "*Gnosis Edit*"))
+        (recovery (list :operation-id "op:uncertain"
+                        :request (copy-tree gnosis-test-edit--request t))))
+    (unwind-protect
+        (with-current-buffer buffer
+          (gnosis-edit-mode)
+          (setq-local gnosis-edit--recovery recovery)
+          (rename-buffer (generate-new-buffer-name "*Renamed Gnosis*"))
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) nil))
+                    ((symbol-function 'quit-window)
+                     (lambda (&rest _) (ert-fail "quit-window called"))))
+            (should-error (gnosis-edit-discard-uncertain) :type 'user-error))
+          (should (buffer-live-p buffer))
+          (should (equal recovery gnosis-edit--recovery)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer (setq gnosis-edit--recovery nil))
+        (kill-buffer buffer)))))
+
+(ert-deftest gnosis-edit-renamed-buffer-without-recovery-kills-normally ()
+  (let ((buffer (generate-new-buffer "*Gnosis Edit*")))
+    (with-current-buffer buffer
+      (gnosis-edit-mode)
+      (rename-buffer (generate-new-buffer-name "*Renamed Gnosis*")))
+    (should (kill-buffer buffer))
+    (should-not (buffer-live-p buffer))))
+
 (ert-deftest gnosis-edit-save-promotes-create-after-valid-response ()
   (let (calls callback (operation-calls 0))
     (with-temp-buffer
@@ -156,9 +275,77 @@
         (should-error (gnosis-edit-save)
                       :type 'gnosis-core-mutation-uncertain)
         (should-error (gnosis-edit-save) :type 'user-error))
-      (should gnosis-edit--write-uncertain)
+      (should
+       (equal (list :operation-id "op:uncertain"
+                    :thema-id nil :revision nil
+                    :request gnosis-test-edit--request)
+              gnosis-edit--recovery))
       (should (equal '("op:uncertain") operation-ids))
       (should (= calls 1)))))
+
+(ert-deftest gnosis-edit-uncertain-retry-uses-retained-identity-and-request ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (setq-local gnosis-edit--thema-id "changed-target")
+    (setq-local gnosis-edit--revision 99)
+    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (let ((retained (copy-tree gnosis-test-edit--request t))
+          arguments)
+      (setq-local gnosis-edit--recovery
+                  (list :operation-id "op:uncertain"
+                        :thema-id "original-target" :revision 7
+                        :request retained))
+      (erase-buffer)
+      (insert "{\"kind\":\"changed\"}")
+      (cl-letf (((symbol-function 'gnosis-core-thema-update)
+                 (lambda (thema-id operation-id revision request)
+                   (setq arguments
+                         (list thema-id operation-id revision request))
+                   (append '(:thema_id "original-target" :revision 8) request)))
+                ((symbol-function 'gnosis-core-thema-write-view)
+                 (lambda (projection)
+                   (cl-loop for (key value) on projection by #'cddr
+                            unless (memq key '(:thema_id :revision))
+                            append (list key value))))
+                ((symbol-function 'message) #'ignore))
+        (gnosis-edit-retry-uncertain))
+      (should (equal (list "original-target" "op:uncertain" 7 retained)
+                     arguments))
+      (should-not gnosis-edit--recovery)
+      (should (equal retained (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-uncertain-retry-errors-preserve-complete-recovery ()
+  (dolist (error '((gnosis-core-validation-error "local preflight")
+                   (gnosis-core-protocol-error "malformed response")
+                   (gnosis-core-authentication-error "unauthorized")))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (let ((recovery
+             (list :operation-id "op:uncertain"
+                   :thema-id "original-target" :revision 7
+                   :request (copy-tree gnosis-test-edit--request t))))
+        (setq-local gnosis-edit--recovery recovery)
+        (cl-letf (((symbol-function 'gnosis-core-thema-update)
+                   (lambda (&rest _) (signal (car error) (cdr error)))))
+          (should-error (gnosis-edit-retry-uncertain) :type (car error)))
+        (should (equal recovery gnosis-edit--recovery))))))
+
+(ert-deftest gnosis-edit-cancel-preserves-uncertain-recovery-until-discard ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (setq-local gnosis-edit--recovery
+                (list :operation-id "op:uncertain"
+                      :request (copy-tree gnosis-test-edit--request t)))
+    (let (closed)
+      (cl-letf (((symbol-function 'quit-window)
+                 (lambda (&rest _) (setq closed t))))
+        (should-error (gnosis-edit-cancel) :type 'user-error)
+        (should gnosis-edit--recovery)
+        (should-not closed)
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t)))
+          (gnosis-edit-discard-uncertain))
+        (should-not gnosis-edit--recovery)
+        (should closed)))))
 
 (provide 'gnosis-test-edit)
 ;;; gnosis-test-edit.el ends here

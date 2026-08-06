@@ -1135,18 +1135,20 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                   :type 'gnosis-core-protocol-error)))
 
 (ert-deftest gnosis-core-maps-generic-error-envelope-by-status ()
-  (cl-letf (((symbol-function 'gnosis-core--token)
-             (lambda () (make-string 40 ?x)))
-            ((symbol-function 'gnosis-core--retrieve-bounded)
-             (lambda (&rest _)
-               (gnosis-test-core--http-buffer
-                422
-                "{\"error\":{\"code\":\"future_error\",\"message\":\"bad request\",\"meta\":{\"new\":true}}}"))))
-    (let ((condition
-           (should-error
-            (gnosis-core--perform-request "GET" "/v1/test" nil 200 nil t)
-            :type 'gnosis-core-validation-error)))
-      (should (equal '("bad request" "future_error") (cdr condition))))))
+  (dolist (status '(400 413 422))
+    (cl-letf (((symbol-function 'gnosis-core--token)
+               (lambda () (make-string 40 ?x)))
+              ((symbol-function 'gnosis-core--retrieve-bounded)
+               (lambda (&rest _)
+                 (gnosis-test-core--http-buffer
+                  status
+                  "{\"error\":{\"code\":\"future_error\",\"message\":\"bad request\",\"meta\":{\"new\":true}}}"))))
+      (let ((condition
+             (should-error
+              (gnosis-core--perform-request "GET" "/v1/test" nil 200 nil t)
+              :type 'gnosis-core-validation-error)))
+        (should (eq 'gnosis-core-http-rejection (car condition)))
+        (should (equal '("bad request" "future_error") (cdr condition)))))))
 
 (ert-deftest gnosis-core-rejects-unbounded-or-malformed-error-envelope ()
   (dolist (body

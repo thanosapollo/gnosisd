@@ -493,6 +493,27 @@
                                         :current_revision)))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-http-rejection-persists-bounded-server-evidence ()
+  (let* ((entry (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" (gnosis-nodes--digest "body")
+                 nil "body"))
+         (state (list :bases [] :outbox (vector entry) :conflicts []))
+         stored)
+    (cl-letf (((symbol-function 'gnosis-nodes--write-state)
+               (lambda (value) (setq stored (copy-tree value t))))
+              ((symbol-function 'gnosis-core-document-create)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-http-rejection
+                         '("Invalid content" "invalid_content")))))
+      (gnosis-nodes--send-outbox state))
+    (let ((saved (aref (plist-get stored :outbox) 0)))
+      (should (eq :rejected (plist-get saved :status)))
+      (should
+       (equal '(:status "rejected"
+                :rejection (:reason "invalid_content"
+                            :message "Invalid content"))
+              (plist-get saved :result))))))
+
 (ert-deftest gnosis-nodes-rejects-equal-revision-projection-collision ()
   (let* ((directory (make-temp-file "gnosis-nodes-revision" t))
          (gnosis-nodes-dir directory)
@@ -1122,6 +1143,22 @@
     (should-not called)
     (should-not writes)
     (should (eq :pending (plist-get entry :status)))))
+
+(ert-deftest gnosis-nodes-local-request-validation-restores-pending ()
+  (let* ((entry (gnosis-nodes--outbox-entry
+                 :create nil nil "note.org" (gnosis-nodes--digest "body")
+                 nil "body"))
+         (state (list :bases [] :outbox (vector entry) :conflicts []))
+         stored)
+    (cl-letf (((symbol-function 'gnosis-nodes--write-state)
+               (lambda (value) (setq stored (copy-tree value t))))
+              ((symbol-function 'gnosis-core-document-create)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-validation-error '("Local preflight")))))
+      (should-error (gnosis-nodes--send-outbox state)
+                    :type 'gnosis-core-validation-error))
+    (should (eq :pending
+                (plist-get (aref (plist-get stored :outbox) 0) :status)))))
 
 (ert-deftest gnosis-nodes-outbox-rejects-payload-digest-mismatch-before-transport ()
   (let* ((entry (gnosis-nodes--outbox-entry
