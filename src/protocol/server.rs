@@ -4,13 +4,18 @@ use std::{
     net::SocketAddr,
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use axum::serve::Listener;
 use thiserror::Error;
 use tokio::{
-    net::{TcpListener, UnixListener, UnixStream},
-    sync::{Semaphore, watch},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpListener, TcpStream, UnixListener, UnixStream},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -146,12 +151,13 @@ impl DaemonServer {
         let state = ServerState {
             store: service.handle(),
         };
-        let semaphore = std::sync::Arc::new(Semaphore::new(max_connections));
+        let unix_semaphore = Arc::new(Semaphore::new(max_connections));
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let http_task = http_listener.map(|listener| {
             tokio::spawn(serve_http(
                 listener,
                 state.store.clone(),
+                max_connections,
                 shutdown_receiver.clone(),
             ))
         });
@@ -159,7 +165,7 @@ impl DaemonServer {
         let accept_error = accept_until_shutdown(
             &listener,
             state.clone(),
-            semaphore,
+            unix_semaphore,
             shutdown_receiver,
             &mut handlers,
             shutdown,
@@ -206,10 +212,12 @@ fn shutdown_remaining(started: Instant) -> Duration {
 async fn serve_http(
     listener: TcpListener,
     service: ServiceHandle,
+    max_connections: usize,
     shutdown: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let app = crate::http::router_with_shutdown(service, shutdown.clone());
     let drain_shutdown = shutdown.clone();
+    let listener = LimitedTcpListener::new(listener, max_connections);
     let server = std::future::IntoFuture::into_future(
         axum::serve(listener, app).with_graceful_shutdown(shutdown_requested(shutdown)),
     );
@@ -229,10 +237,105 @@ async fn shutdown_requested(mut shutdown: watch::Receiver<bool>) {
     while !*shutdown.borrow_and_update() && shutdown.changed().await.is_ok() {}
 }
 
+/// HTTP-only admission: wait for a permit, then accept. The permit lives with the stream.
+struct LimitedTcpListener {
+    listener: TcpListener,
+    semaphore: Arc<Semaphore>,
+}
+
+struct PermitTcpStream {
+    stream: TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LimitedTcpListener {
+    fn new(listener: TcpListener, max_connections: usize) -> Self {
+        Self {
+            listener,
+            semaphore: Arc::new(Semaphore::new(max_connections)),
+        }
+    }
+}
+
+impl Listener for LimitedTcpListener {
+    type Io = PermitTcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let permit = match self.semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => std::future::pending().await,
+            };
+            match self.listener.accept().await {
+                Ok((stream, addr)) => {
+                    return (
+                        PermitTcpStream {
+                            stream,
+                            _permit: permit,
+                        },
+                        addr,
+                    );
+                }
+                Err(error) => {
+                    drop(permit);
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        continue;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+impl AsyncRead for PermitTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PermitTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 async fn accept_until_shutdown(
     listener: &UnixListener,
     state: ServerState,
-    semaphore: std::sync::Arc<Semaphore>,
+    semaphore: Arc<Semaphore>,
     shutdown_receiver: watch::Receiver<bool>,
     handlers: &mut JoinSet<()>,
     shutdown: impl Future<Output = ()>,
@@ -1178,5 +1281,139 @@ mod tests {
             })
             .unwrap();
         assert_eq!(revisions, 1);
+    }
+
+    async fn hold_incomplete_http(address: std::net::SocketAddr) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    async fn http_connection_cap_backlogs_until_a_permit_frees() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("gnosis.sock");
+        let mut config = DaemonConfig::new(&socket, directory.path().join("gnosis.sqlite"));
+        config.http_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.max_connections = 3;
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        let address = server.http_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = stopped.await;
+        }));
+
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            holders.push(hold_incomplete_http(address).await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut waiting = tokio::net::TcpStream::connect(address).await.unwrap();
+        waiting
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), waiting.read(&mut buf))
+                .await
+                .is_err(),
+            "HTTP admit must keep the N+1 connection kernel-backlogged while N permits are held"
+        );
+
+        drop(holders.pop());
+        let n = tokio::time::timeout(Duration::from_secs(2), waiting.read(&mut buf))
+            .await
+            .expect("HTTP response after a permit frees")
+            .unwrap();
+        assert!(n > 0);
+        assert!(
+            buf[..n].starts_with(b"HTTP/1.1 200"),
+            "unexpected response after admit free: {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        drop(holders);
+        drop(waiting);
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_connection_cap_leaves_unix_admin_available() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("gnosis.sock");
+        let mut config = DaemonConfig::new(&socket, directory.path().join("gnosis.sqlite"));
+        config.http_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.max_connections = 3;
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        let address = server.http_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = stopped.await;
+        }));
+
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            holders.push(hold_incomplete_http(address).await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let request = crate::protocol::RequestEnvelope {
+            version: crate::protocol::PROTOCOL_VERSION,
+            id: "unix-while-http-full".into(),
+            request: crate::protocol::Request::SystemInfo {},
+        };
+        let response = crate::protocol::request(&socket, &request)
+            .await
+            .expect("unix admin must stay available while HTTP admission is saturated");
+        match response.outcome {
+            crate::protocol::ResponseOutcome::Success { result } => match result.as_ref() {
+                crate::protocol::ResponseResult::SystemInfo(info) => {
+                    assert_eq!(info.protocol_version, crate::protocol::PROTOCOL_VERSION)
+                }
+                other => panic!("unexpected unix success while HTTP full: {other:?}"),
+            },
+            other => panic!("unexpected unix response while HTTP full: {other:?}"),
+        }
+
+        drop(holders);
+        shutdown.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_admit_wait_cancels_on_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("gnosis.sock");
+        let mut config = DaemonConfig::new(&socket, directory.path().join("gnosis.sqlite"));
+        config.http_addr = Some("127.0.0.1:0".parse().unwrap());
+        config.max_connections = 3;
+        let server = super::DaemonServer::bind(config).await.unwrap();
+        let address = server.http_addr().unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(server.run(async move {
+            let _ = stopped.await;
+        }));
+
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            holders.push(hold_incomplete_http(address).await);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waiting = tokio::net::TcpStream::connect(address).await.unwrap();
+
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must cancel HTTP admit wait")
+            .unwrap()
+            .unwrap();
+        drop(holders);
+        drop(waiting);
     }
 }

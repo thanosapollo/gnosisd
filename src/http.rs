@@ -2430,7 +2430,7 @@ impl ApiError {
             Self::new(
                 status,
                 ApiErrorCodeV1::RequestTooLarge,
-                "request body exceeds the 1 MiB limit",
+                "request body exceeds the server limit",
             )
         } else {
             Self::new(
@@ -8364,9 +8364,13 @@ mod tests {
             "image/png",
             Body::from(vec![0; super::MAX_BODY + 1]),
         );
+        let oversized = app.clone().oneshot(oversized).await.unwrap();
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let oversized_body = response_json(oversized).await;
+        assert_eq!(oversized_body["error"]["code"], "request_too_large");
         assert_eq!(
-            app.clone().oneshot(oversized).await.unwrap().status(),
-            StatusCode::PAYLOAD_TOO_LARGE
+            oversized_body["error"]["message"],
+            "request body exceeds the server limit"
         );
 
         let accepted = app
@@ -9161,6 +9165,70 @@ mod tests {
         let encoded = serde_json::to_string(&pending).unwrap();
         assert!(!encoded.contains("μυστικό"));
         assert!(!encoded.contains("тайна"));
+    }
+
+    #[tokio::test]
+    async fn request_too_large_is_limit_neutral_across_route_caps() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device("limits".into(), vec!["content:write".into()]).unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        let app = router(service.clone());
+
+        let digest = "a".repeat(64);
+        let default_oversized = app
+            .clone()
+            .oneshot(authorized_with_type(
+                "PUT",
+                &format!("/v1/sync/blobs/{digest}"),
+                &token,
+                "application/octet-stream",
+                Body::from(vec![0; super::MAX_BODY + 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(default_oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let default_body = response_json(default_oversized).await;
+        assert_eq!(default_body["error"]["code"], "request_too_large");
+        assert_eq!(
+            default_body["error"]["message"],
+            "request body exceeds the server limit"
+        );
+
+        let larger_limit = super::MAX_OFFLINE_CONTENT_OPERATION_BYTES;
+        assert!(
+            larger_limit > super::MAX_BODY,
+            "content offline route must use a larger body cap than the default"
+        );
+        let larger_oversized = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/content/offline-operations",
+                &token,
+                Body::from(vec![b'x'; larger_limit + 1]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(larger_oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let larger_body = response_json(larger_oversized).await;
+        assert_eq!(larger_body["error"]["code"], "request_too_large");
+        assert_eq!(
+            larger_body["error"]["message"],
+            "request body exceeds the server limit"
+        );
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
     }
 
     fn authorized(method: &str, uri: &str, token: &str, body: Body) -> Request<Body> {
