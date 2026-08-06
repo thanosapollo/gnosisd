@@ -1,91 +1,80 @@
 # Agents.md
 
-Keep this file current and concise.
+`gnosisd` owns canonical documents, roam-like nodes/links, themata, review
+state, grading, FSRS, persistence, blobs, sync. Clients: typed authenticated
+HTTP `/v1` only. Never open canonical DB or compute scheduling client-side.
 
-Gnosis Core is a standalone daemon/server. `gnosisd` owns canonical documents,
-parsed roam-like nodes and links, themata linked to nodes, review state, grading,
-FSRS scheduling, persistence, blobs, and synchronization. Clients consume typed
-authenticated HTTP `/v1`; they never open the canonical database or calculate
-scheduling.
-
-The Unix socket is a privileged local operator boundary for system information,
-device bootstrap and revocation, backup, recovery, and diagnostics. Ordinary
-data, content, and review operations use HTTP only.
+Unix socket = privileged local operator boundary (system info, device
+bootstrap/revocation, backup, recovery, diagnostics). Ordinary data/content/
+review stay HTTP.
 
 ## Architecture
 
-- `src/domain` is the functional core. It contains no SQLite, Tokio, Serde JSON,
-  sockets, filesystem, or orgize types.
-- `src/application` validates typed commands and builds projections before a
-  write enters the persistence queue.
-- `src/parser` is the concrete Org adapter. Add no parser trait until a second
-  implementation creates a real substitution boundary.
-- `src/store` is the only SQLite adapter. SQLite files are mode `0600`.
-- `src/service` owns imports, backups, blobs, and persistence coordination. One
-  daemon-owned thread holds the canonical connection and handles reads and
-  atomic writes through bounded queues.
-- `src/protocol` owns versioned wire DTOs, HTTP routes, OpenAPI, and privileged
-  Unix framing. Public IDs are opaque strings, never SQLite row IDs.
-- `src/protocol/http_v1.rs` is the client HTTP contract kernel. Runtime DTOs and
-  OpenAPI schemas must remain identical; do not maintain parallel JSON models.
-- `src/bin/gnosisd.rs` is the only shipped canonical database owner.
-- `src/bin/gnosisd-admin.rs` is the minimal privileged Unix operator client.
-  Ordinary data, content, and review operations remain HTTP client concerns.
+- `src/domain`: functional core. No SQLite, Tokio, Serde JSON, sockets, FS,
+  orgize types.
+- `src/application`: validate typed commands; build projections before
+  persistence queue.
+- `src/parser`: concrete Org adapter. No parser trait until second impl needs
+  substitution boundary.
+- `src/store`: sole SQLite adapter. DB files mode `0600`.
+- `src/service`: imports, backups, blobs, persistence. One daemon thread holds
+  canonical connection; reads/atomic writes via bounded queues.
+- `src/protocol`: versioned wire DTOs, HTTP routes, OpenAPI, privileged Unix
+  framing. Public IDs opaque strings, never SQLite row IDs.
+- `src/protocol/http_v1.rs`: client HTTP contract kernel. Runtime DTOs and
+  OpenAPI schemas identical; no parallel JSON models.
+- `src/bin/gnosisd.rs`: only shipped canonical DB owner.
+- `src/bin/gnosisd-admin.rs`: minimal privileged Unix operator client.
 
 ## Data and review invariants
 
-- Keep textual link occurrences, unique semantic node edges, and
-  `ThemaConcept` learning associations separate.
-- Node titles are local values. Title paths contain indexed ancestors only.
-  Source spans are zero-based, half-open UTF-8 byte ranges covering complete
-  Org links.
-- The daemon owns grading, FSRS transitions, session progress, suspension,
-  daily totals, revisions, conflicts, and immutable review events.
-- Pending HTTP attempts expose only server-materialized questions and typed
-  response prompts. Keep answers server-side until grading.
-- Desired-state mutations use durable device-scoped operation IDs and expected
-  revisions. Exact retries return retained results; stale or competing
-  revisions remain explicit.
-- Review and content operations share one contiguous per-device sequence.
-  Accepted and conflict results are immutable; invalid operations change no
-  canonical state.
-- Document revisions bind to captured content digests. Numeric revision alone
-  never authorizes an offline write.
+- Keep textual link occurrences, unique semantic node edges, `ThemaConcept`
+  learning associations separate.
+- Node titles local. Title paths = indexed ancestors only. Source spans
+  zero-based half-open UTF-8 byte ranges over complete Org links.
+- Daemon owns grading, FSRS transitions, session progress, suspension, daily
+  totals, revisions, conflicts, immutable review events.
+- Pending HTTP attempts: server-materialized questions + typed response prompts
+  only. Answers server-side until grading.
+- Desired-state mutations: durable device-scoped op IDs + expected revisions.
+  Exact retries return retained results; stale/competing revisions stay
+  explicit.
+- Review + content ops share one contiguous per-device sequence. Accepted and
+  conflict results immutable; invalid ops change no canonical state.
+- Document revisions bind content digests. Numeric revision alone never
+  authorizes offline write.
 - Canonical Org writes reference active content-addressed assets only. Verify
-  asset path, digest, size, and state before publication or use.
-- Replica bootstrap installs complete snapshots atomically before advancing its
-  durable cursor. Reconciliation cursors never fast-forward the replica feed.
-- Unknown mutation delivery stops synchronization with operation identity
-  intact. Next explicit sync replays that exact immutable operation.
-- Review pack acquisition is explicit. Persist typed packs before downloading
-  and verifying assets. Periodic replica sync never creates a pack.
+  path, digest, size, state before publication/use.
+- Replica bootstrap: atomic complete snapshot install before durable cursor
+  advance. Reconciliation cursors never fast-forward replica feed.
+- Unknown mutation delivery stops sync with op identity intact. Next explicit
+  sync replays that exact immutable operation.
+- Review pack acquisition explicit. Persist typed packs before download/asset
+  verify. Periodic replica sync never creates pack.
 
 ## Safety
 
-- Keep transactions, clocks, randomness, socket I/O, filesystem access, and
-  async types out of `src/domain`.
-- Do not use `Arc<Mutex<Connection>>`.
-- Accepted writes finish after client disconnect. No blocking guard or
-  transaction crosses `.await`.
-- Bound request bodies, responses, queues, and parsing work. CPU-heavy parsing
-  and projection preparation must not run on Tokio runtime workers.
-- HTTP mutations require exact scopes and statuses. Do not follow redirects,
-  trust proxies implicitly, retry mutations automatically, or hide delivery
-  uncertainty.
-- Socket startup uses atomic `.startup-lock` directory ownership for stale
-  cleanup and bind. SIGINT and SIGTERM enter graceful shutdown.
+- No transactions, clocks, randomness, socket I/O, FS, or async types in
+  `src/domain`.
+- No `Arc<Mutex<Connection>>`.
+- Accepted writes finish after client disconnect. No blocking guard/transaction
+  crosses `.await`.
+- Bound bodies, responses, queues, parsing. CPU-heavy parsing/projection prep
+  off Tokio runtime workers.
+- HTTP mutations: exact scopes + statuses. No redirects, implicit proxy trust,
+  automatic mutation retries, or hidden delivery uncertainty.
+- Socket startup: atomic `.startup-lock` dir ownership for stale cleanup/bind.
+  SIGINT/SIGTERM graceful shutdown.
 - Never expose secrets, tokens, private topology, operator paths, or live data
-  in source, tests, logs, docs, commits, or handoffs.
+  in source, tests, logs, docs, commits, handoffs.
 
 ## Verification
 
-Enter pinned environment when Cargo is unavailable:
-
 ```sh
-nix develop
+nix develop   # when Cargo unavailable
 ```
 
-Focused checks:
+Focused:
 
 ```sh
 cargo test --lib domain::
@@ -96,15 +85,13 @@ cargo test --lib protocol::
 cargo test --test daemon_protocol
 ```
 
-Optional Org parity: monorepo `clients/emacs` does not ship
-`lisp/gnosis-org.el`. `tools/check-org-parity.sh` needs an external
-tree via `GNOSIS_ELISP_DIR` and is not a monorepo handoff gate.
+Optional Org parity: monorepo `clients/emacs` ships no `lisp/gnosis-org.el`.
+`tools/check-org-parity.sh` needs external tree via `GNOSIS_ELISP_DIR`; not a
+monorepo handoff gate.
 
-Required handoff gates:
-
-`nix flake check` builds the default package. That package's checkPhase
-runs `cargo test` via cargoCheckHook. It does not run `cargo fmt`,
-`clippy`, or `cargo doc`. Keep the cargo gates below for those.
+Required handoff gates. `nix flake check` builds default package; checkPhase
+runs `cargo test` via cargoCheckHook only (not fmt/clippy/doc). Keep cargo
+gates below for those:
 
 ```sh
 nix flake check
@@ -118,9 +105,8 @@ cargo tree --depth 1
 
 ## Git
 
-- Commit completed work in coherent signed commits. Keep behavior and matching
-  tests together.
-- Use `module: Change` subjects.
+- Coherent signed commits. Behavior + matching tests together.
+- Subjects: `module: Change`.
 - Preserve unrelated work. Never commit plans, agent artifacts, generated
-  metadata, secrets, or private operational details.
+  metadata, secrets, private operational details.
 - Never amend, rebase, push, deploy, or activate without explicit permission.
