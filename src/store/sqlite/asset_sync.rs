@@ -38,8 +38,8 @@ impl SqliteStore {
             &operation.device_id,
             operation.device_sequence,
         )?;
-        staged_blob_conflict(&transaction, operation)?;
-        Ok(true)
+        let (blob_conflict, _) = staged_blob_conflict(&transaction, operation)?;
+        Ok(blob_conflict.is_none())
     }
 
     pub(crate) fn reconcile_asset_operation(

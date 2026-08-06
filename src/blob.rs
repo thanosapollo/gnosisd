@@ -88,6 +88,7 @@ impl BlobStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn read(&self, digest: &str) -> Result<Vec<u8>, BlobError> {
         let path = self.blob_path(digest)?;
         let bytes = fs::read(path)?;

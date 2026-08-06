@@ -367,10 +367,9 @@ async fn create_backup(
     destination: String,
 ) -> Result<ResponseResult, ProtocolError> {
     require_path(&destination)?;
-    let created_at_us = u64::try_from(now_us()?).map_err(|_| internal_error())?;
     let summary = state
         .store
-        .create_backup(destination.into(), created_at_us)
+        .create_backup(destination.into())
         .await
         .map_err(actor_error)?;
     Ok(ResponseResult::Backup(backup_view(summary)))

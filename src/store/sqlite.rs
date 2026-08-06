@@ -165,6 +165,7 @@ pub(crate) struct DocumentAssetSource {
     pub(crate) revision: u64,
     pub(crate) content_type: String,
     pub(crate) blob_sha256: Option<String>,
+    pub(crate) blob_size_bytes: Option<u64>,
     pub(crate) active_head: bool,
     pub(crate) head_revision: bool,
 }
@@ -2802,9 +2803,10 @@ fn load_document_asset_sources_page(
     let mut statement = connection
         .prepare(
             "SELECT revision.document_id, revision.revision, revision.blob_sha256,
-                    revision.content_type, 0, 0
+                    revision.content_type, blob.size_bytes, 0, 0
              FROM document_revision AS revision
              JOIN document USING(document_id)
+             LEFT JOIN blob ON blob.content_sha256 = revision.blob_sha256
              WHERE (revision.document_id, revision.revision) >
                    (coalesce(?1, ''), coalesce(?2, 0))
              ORDER BY revision.document_id, revision.revision LIMIT ?3",
@@ -2825,8 +2827,9 @@ fn load_document_asset_sources_page(
                     revision: row_u64(row, 1)?,
                     blob_sha256: row.get(2)?,
                     content_type: row.get(3)?,
-                    active_head: row.get(4)?,
-                    head_revision: row.get(5)?,
+                    blob_size_bytes: row_optional_u64(row, 4)?,
+                    active_head: row.get(5)?,
+                    head_revision: row.get(6)?,
                 })
             },
         )
@@ -2843,11 +2846,12 @@ fn load_document_asset_heads_page(
     let mut statement = connection
         .prepare(
             "SELECT document.document_id, document.revision, revision.blob_sha256,
-                    revision.content_type, document.active = 1, 1
+                    revision.content_type, blob.size_bytes, document.active = 1, 1
              FROM document
              JOIN document_revision AS revision
                ON revision.document_id = document.document_id
               AND revision.revision = document.revision
+             LEFT JOIN blob ON blob.content_sha256 = revision.blob_sha256
              WHERE document.document_id > coalesce(?1, '')
              ORDER BY document.document_id LIMIT ?2",
         )
@@ -2859,8 +2863,9 @@ fn load_document_asset_heads_page(
                 revision: row_u64(row, 1)?,
                 blob_sha256: row.get(2)?,
                 content_type: row.get(3)?,
-                active_head: row.get(4)?,
-                head_revision: row.get(5)?,
+                blob_size_bytes: row_optional_u64(row, 4)?,
+                active_head: row.get(5)?,
+                head_revision: row.get(6)?,
             })
         })
         .map_err(StoreError::storage)?
@@ -2936,6 +2941,19 @@ fn row_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
             Box::new(error),
         )
     })
+}
+
+fn row_optional_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })
 }
 
 fn load_document_head(
@@ -7555,6 +7573,14 @@ mod tests {
                 break;
             }
             assert!(sources.len() <= 1);
+            assert_eq!(
+                sources[0].blob_size_bytes,
+                match sources[0].revision {
+                    1 => Some(first.source.len() as u64),
+                    2 => Some(second.source.len() as u64),
+                    _ => None,
+                }
+            );
             let association = DocumentAssetAssociation {
                 document_id: sources[0].document_id.clone(),
                 revision: sources[0].revision,

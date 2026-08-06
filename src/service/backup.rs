@@ -18,6 +18,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+use chrono::NaiveDateTime;
+
 use crate::{
     blob::{BlobError, BlobStore},
     is_canonical_sha256,
@@ -28,6 +30,7 @@ const DATABASE_FILE: &str = "gnosis.sqlite";
 const MANIFEST_FILE: &str = "manifest.json";
 const RESTORE_STATE_FILE: &str = "restore-state.json";
 const BACKUP_FORMAT_VERSION: u32 = 1;
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct BackupSummary {
@@ -199,34 +202,24 @@ pub(crate) fn create_backup(
     snapshot: BackupSnapshot,
     blobs: &BlobStore,
     destination: &Path,
-    created_at_us: u64,
 ) -> Result<BackupSummary, BackupError> {
     let cancellation = BackupCancellation::new();
-    create_backup_cancellable(snapshot, blobs, destination, created_at_us, &cancellation)
+    create_backup_cancellable(snapshot, blobs, destination, &cancellation)
 }
 
 pub(crate) fn create_backup_cancellable(
     snapshot: BackupSnapshot,
     blobs: &BlobStore,
     destination: &Path,
-    created_at_us: u64,
     cancellation: &BackupCancellation,
 ) -> Result<BackupSummary, BackupError> {
-    create_backup_cancellable_with_hook(
-        snapshot,
-        blobs,
-        destination,
-        created_at_us,
-        cancellation,
-        || {},
-    )
+    create_backup_cancellable_with_hook(snapshot, blobs, destination, cancellation, || {})
 }
 
 fn create_backup_cancellable_with_hook(
     snapshot: BackupSnapshot,
     blobs: &BlobStore,
     destination: &Path,
-    created_at_us: u64,
     cancellation: &BackupCancellation,
     before_publication: impl FnOnce(),
 ) -> Result<BackupSummary, BackupError> {
@@ -234,7 +227,6 @@ fn create_backup_cancellable_with_hook(
         &snapshot,
         blobs,
         destination,
-        created_at_us,
         cancellation,
         before_publication,
     );
@@ -249,11 +241,11 @@ fn create_backup_inner(
     snapshot: &BackupSnapshot,
     blobs: &BlobStore,
     destination: &Path,
-    created_at_us: u64,
     cancellation: &BackupCancellation,
     before_publication: impl FnOnce(),
 ) -> Result<BackupSummary, BackupError> {
     ensure_not_cancelled(&cancellation.requested)?;
+    let created_at_us = backup_timestamp(destination)?;
     require_new_directory(destination)?;
     let staging = staging_path(destination)?;
     fs::create_dir(&staging)?;
@@ -519,36 +511,115 @@ pub(crate) fn ensure_restore_complete(
 }
 
 pub(crate) fn prune_backups(directory: &Path, keep: u16) -> Result<Vec<PathBuf>, BackupError> {
+    prune_backups_with_hook(directory, keep, |_| {})
+}
+
+fn prune_backups_with_hook(
+    directory: &Path,
+    keep: u16,
+    mut before_quarantine: impl FnMut(&Path),
+) -> Result<Vec<PathBuf>, BackupError> {
     require_directory(directory)?;
     if keep == 0 {
         return Err(BackupError::Destination);
     }
-    let mut backups = fs::read_dir(directory)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<Result<Vec<_>, _>>()?;
-    backups.retain(|path| is_managed_backup(path));
+    let mut backups = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if let Some(timestamp) = managed_backup_timestamp(&path)? {
+            backups.push((timestamp, path));
+        }
+    }
     backups.sort();
     let remove = backups.len().saturating_sub(usize::from(keep));
-    let removed = backups.into_iter().take(remove).collect::<Vec<_>>();
+    let removed = backups
+        .into_iter()
+        .take(remove)
+        .map(|(_, path)| path)
+        .collect::<Vec<_>>();
     for backup in &removed {
-        require_directory(backup)?;
-        fs::remove_dir_all(backup)?;
+        let timestamp = managed_backup_timestamp(backup)?.ok_or(BackupError::Format)?;
+        before_quarantine(backup);
+        quarantine_and_remove_owned_backup(backup, timestamp)?;
     }
     File::open(directory)?.sync_all()?;
     Ok(removed)
 }
 
-fn is_managed_backup(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
+fn quarantine_and_remove_owned_backup(path: &Path, timestamp: u64) -> Result<(), BackupError> {
+    if backup_timestamp(path)? != timestamp {
+        return Err(BackupError::Format);
+    }
+    let parent = path.parent().ok_or(BackupError::Destination)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(BackupError::Destination)?;
+    let quarantine = parent.join(format!(".gnosis-prune-{name}-{}", Uuid::now_v7()));
+    fs::rename(path, &quarantine)?;
+    match owned_quarantine_timestamp(&quarantine, timestamp) {
+        Ok(()) => fs::remove_dir_all(&quarantine).map_err(BackupError::from),
+        Err(error) => {
+            if !path.exists() {
+                let _ = fs::rename(&quarantine, path);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn owned_quarantine_timestamp(path: &Path, timestamp: u64) -> Result<(), BackupError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Err(BackupError::Format),
+        Err(error) => return Err(error.into()),
+    }
+    let manifest = match read_manifest(&path.join(MANIFEST_FILE)) {
+        Ok(manifest) => manifest,
+        Err(BackupError::Format) => return Err(BackupError::Format),
+        Err(BackupError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(BackupError::Format);
+        }
+        Err(error) => return Err(error),
     };
-    let bytes = name.as_bytes();
-    bytes.len() == 23
-        && bytes.starts_with(b"gnosis-")
-        && bytes[7..15].iter().all(u8::is_ascii_digit)
-        && bytes[15] == b'T'
-        && bytes[16..22].iter().all(u8::is_ascii_digit)
-        && bytes[22] == b'Z'
+    if manifest.format_version == BACKUP_FORMAT_VERSION && manifest.created_at_us == timestamp {
+        Ok(())
+    } else {
+        Err(BackupError::Format)
+    }
+}
+
+fn backup_timestamp(path: &Path) -> Result<u64, BackupError> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(BackupError::Destination);
+    };
+    let timestamp = name
+        .strip_prefix("gnosis-")
+        .and_then(|value| NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ").ok())
+        .filter(|value| format!("gnosis-{}", value.format("%Y%m%dT%H%M%SZ")) == name)
+        .ok_or(BackupError::Destination)?;
+    u64::try_from(timestamp.and_utc().timestamp_micros()).map_err(|_| BackupError::Destination)
+}
+
+fn managed_backup_timestamp(path: &Path) -> Result<Option<u64>, BackupError> {
+    let Ok(timestamp) = backup_timestamp(path) else {
+        return Ok(None);
+    };
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let manifest = match read_manifest(&path.join(MANIFEST_FILE)) {
+        Ok(manifest) => manifest,
+        Err(BackupError::Format) => return Ok(None),
+        Err(BackupError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(
+        (manifest.format_version == BACKUP_FORMAT_VERSION && manifest.created_at_us == timestamp)
+            .then_some(timestamp),
+    )
 }
 
 fn materialize_restore(
@@ -783,11 +854,7 @@ fn write_restore_state(rollback: &Path, state: &RestoreState) -> Result<(), Back
 fn read_restore_state(rollback: &Path) -> Result<RestoreState, BackupError> {
     require_directory(rollback)?;
     let path = rollback.join(RESTORE_STATE_FILE);
-    require_regular_file(&path)?;
-    if fs::symlink_metadata(&path)?.len() > 4096 {
-        return Err(BackupError::Format);
-    }
-    let bytes = fs::read(path)?;
+    let bytes = read_bounded_file(&path, 4096)?;
     let state: RestoreState = serde_json::from_slice(&bytes).map_err(|_| BackupError::Format)?;
     if state.format_version != BACKUP_FORMAT_VERSION {
         return Err(BackupError::Format);
@@ -875,12 +942,25 @@ fn write_manifest(path: &Path, manifest: &BackupManifest) -> Result<(), BackupEr
 }
 
 fn read_manifest(path: &Path) -> Result<BackupManifest, BackupError> {
+    let bytes = read_bounded_file(path, MAX_MANIFEST_BYTES)?;
+    serde_json::from_slice(&bytes).map_err(|_| BackupError::Format)
+}
+
+fn read_bounded_file(path: &Path, maximum_bytes: u64) -> Result<Vec<u8>, BackupError> {
     require_regular_file(path)?;
-    let bytes = fs::read(path)?;
-    if bytes.len() > 16 * 1024 * 1024 {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.len() > maximum_bytes {
         return Err(BackupError::Format);
     }
-    serde_json::from_slice(&bytes).map_err(|_| BackupError::Format)
+    let capacity = usize::try_from(metadata.len()).map_err(|_| BackupError::Format)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    File::open(path)?
+        .take(maximum_bytes.checked_add(1).ok_or(BackupError::Format)?)
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_err(|_| BackupError::Format)? > maximum_bytes {
+        return Err(BackupError::Format);
+    }
+    Ok(bytes)
 }
 
 fn summary(path: &Path, manifest: &BackupManifest) -> BackupSummary {
@@ -1147,11 +1227,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        ActivationStep, BackupCancellation, BackupError, canonical_restore_target, create_backup,
-        create_backup_cancellable_with_hook, ensure_restore_complete, read_manifest,
+        ActivationStep, BackupCancellation, BackupError, BackupManifest, MAX_MANIFEST_BYTES,
+        canonical_restore_target, create_backup, create_backup_cancellable_with_hook,
+        ensure_restore_complete, prune_backups, prune_backups_with_hook, read_manifest,
         restore_backup, restore_backup_with_hook, restore_backup_with_hooks,
         restore_backup_with_sync_hooks, restore_staging_path, sha256_file, snapshot_backup,
-        sqlite_sidecar_paths, sync_directory, verify_backup,
+        sqlite_sidecar_paths, sync_directory, verify_backup, write_manifest,
     };
     use crate::{
         application::{canonical_asset_path, prepare_asset},
@@ -1178,9 +1259,9 @@ mod tests {
             )
             .unwrap();
         drop(store);
-        let backup = root.join("backup");
+        let backup = root.join("gnosis-20260203T040506Z");
         let snapshot = snapshot_backup(&source_database, &backup).unwrap();
-        create_backup(snapshot, &blobs, &backup, 2).unwrap();
+        create_backup(snapshot, &blobs, &backup).unwrap();
         (backup, blob.sha256, bytes)
     }
 
@@ -1210,12 +1291,155 @@ mod tests {
     }
 
     #[test]
+    fn backup_creation_binds_manifest_time_to_canonical_destination() {
+        let directory = tempdir().unwrap();
+        let (database, blobs, _) = staged_blob_fixture(directory.path());
+        let destination = directory.path().join("gnosis-20260203T040506Z");
+        let snapshot = snapshot_backup(&database, &destination).unwrap();
+
+        let summary = create_backup(snapshot, &blobs, &destination).unwrap();
+
+        assert_eq!(summary.created_at_us, 1_770_091_506_000_000);
+        assert_eq!(
+            read_manifest(&destination.join("manifest.json"))
+                .unwrap()
+                .created_at_us,
+            1_770_091_506_000_000
+        );
+    }
+
+    #[test]
+    fn backup_creation_rejects_noncanonical_destination_name() {
+        let directory = tempdir().unwrap();
+        let (database, blobs, _) = staged_blob_fixture(directory.path());
+        let destination = directory.path().join("backup");
+        let snapshot = snapshot_backup(&database, &destination).unwrap();
+
+        assert!(matches!(
+            create_backup(snapshot, &blobs, &destination),
+            Err(BackupError::Destination)
+        ));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn pruning_uses_only_bounded_matching_manifests_as_ownership() {
+        let directory = tempdir().unwrap();
+        let backups = directory.path().join("backups");
+        fs::create_dir(&backups).unwrap();
+        let owned_old = backups.join("gnosis-20260713T010000Z");
+        let owned_new = backups.join("gnosis-20260715T010000Z");
+        for (path, created_at_us) in [
+            (&owned_old, 1_783_904_400_000_000),
+            (&owned_new, 1_784_077_200_000_000),
+        ] {
+            fs::create_dir(path).unwrap();
+            write_manifest(
+                &path.join("manifest.json"),
+                &BackupManifest {
+                    format_version: 1,
+                    created_at_us,
+                    database_sha256: "a".repeat(64),
+                    blobs: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let mismatched = backups.join("gnosis-20260714T010000Z");
+        fs::create_dir(&mismatched).unwrap();
+        write_manifest(
+            &mismatched.join("manifest.json"),
+            &BackupManifest {
+                format_version: 1,
+                created_at_us: 0,
+                database_sha256: "a".repeat(64),
+                blobs: Vec::new(),
+            },
+        )
+        .unwrap();
+        let oversized = backups.join("gnosis-20260716T010000Z");
+        fs::create_dir(&oversized).unwrap();
+        let oversized_manifest = fs::File::create(oversized.join("manifest.json")).unwrap();
+        oversized_manifest.set_len(MAX_MANIFEST_BYTES + 1).unwrap();
+
+        assert_eq!(prune_backups(&backups, 1).unwrap(), vec![owned_old.clone()]);
+        assert!(!owned_old.exists());
+        assert!(owned_new.exists());
+        assert!(mismatched.exists());
+        assert!(oversized.exists());
+        assert!(matches!(
+            read_manifest(&oversized.join("manifest.json")),
+            Err(BackupError::Format)
+        ));
+    }
+
+    #[test]
+    fn pruning_aborts_when_candidate_is_replaced_before_quarantine() {
+        let directory = tempdir().unwrap();
+        let backups = directory.path().join("backups");
+        fs::create_dir(&backups).unwrap();
+        let owned_old = backups.join("gnosis-20260713T010000Z");
+        let owned_new = backups.join("gnosis-20260715T010000Z");
+        for (path, created_at_us) in [
+            (&owned_old, 1_783_904_400_000_000),
+            (&owned_new, 1_784_077_200_000_000),
+        ] {
+            fs::create_dir(path).unwrap();
+            write_manifest(
+                &path.join("manifest.json"),
+                &BackupManifest {
+                    format_version: 1,
+                    created_at_us,
+                    database_sha256: "a".repeat(64),
+                    blobs: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        let stashed = backups.join("stashed-owned-old");
+        let planted = backups.join("planted-marker");
+
+        assert!(matches!(
+            prune_backups_with_hook(&backups, 1, |path| {
+                if path == owned_old {
+                    fs::rename(&owned_old, &stashed).unwrap();
+                    fs::create_dir(&owned_old).unwrap();
+                    fs::write(owned_old.join("marker"), b"preserve").unwrap();
+                    fs::write(&planted, b"side").unwrap();
+                }
+            }),
+            Err(BackupError::Format)
+        ));
+        assert!(owned_old.exists());
+        assert_eq!(fs::read(owned_old.join("marker")).unwrap(), b"preserve");
+        assert!(stashed.exists());
+        assert_eq!(
+            read_manifest(&stashed.join("manifest.json"))
+                .unwrap()
+                .created_at_us,
+            1_783_904_400_000_000
+        );
+        assert!(owned_new.exists());
+        assert!(planted.exists());
+        assert!(
+            !backups
+                .read_dir()
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".gnosis-prune-")))
+        );
+    }
+
+    #[test]
     fn staged_blob_survives_backup_restore_and_paged_repair() {
         let directory = tempdir().unwrap();
         let (source_database, source_blobs, blob) = staged_blob_fixture(directory.path());
-        let backup = directory.path().join("backup");
+        let backup = directory.path().join("gnosis-20260203T040506Z");
         let snapshot = snapshot_backup(&source_database, &backup).unwrap();
-        let summary = create_backup(snapshot, &source_blobs, &backup, 2).unwrap();
+        let summary = create_backup(snapshot, &source_blobs, &backup).unwrap();
         assert_eq!(summary.blob_count, 1);
         verify_backup(&backup).unwrap();
 
@@ -1241,7 +1465,7 @@ mod tests {
         for corruption in ["missing", "corrupt"] {
             let directory = tempdir().unwrap();
             let (source_database, source_blobs, blob) = staged_blob_fixture(directory.path());
-            let backup = directory.path().join("backup");
+            let backup = directory.path().join("gnosis-20260203T040506Z");
             let snapshot = snapshot_backup(&source_database, &backup).unwrap();
             let path = directory
                 .path()
@@ -1255,7 +1479,7 @@ mod tests {
             }
 
             assert!(matches!(
-                create_backup(snapshot, &source_blobs, &backup, 2),
+                create_backup(snapshot, &source_blobs, &backup),
                 Err(BackupError::Blob(_))
             ));
             assert!(!backup.exists());
@@ -1266,9 +1490,9 @@ mod tests {
     fn corrupt_staged_blob_rejects_restore_before_target_mutation() {
         let directory = tempdir().unwrap();
         let (source_database, source_blobs, blob) = staged_blob_fixture(directory.path());
-        let backup = directory.path().join("backup");
+        let backup = directory.path().join("gnosis-20260203T040506Z");
         let snapshot = snapshot_backup(&source_database, &backup).unwrap();
-        create_backup(snapshot, &source_blobs, &backup, 2).unwrap();
+        create_backup(snapshot, &source_blobs, &backup).unwrap();
         fs::write(
             backup
                 .join("blobs")
@@ -1368,7 +1592,7 @@ mod tests {
     fn cancellation_inside_publication_barrier_removes_all_temporary_state() {
         let directory = tempdir().unwrap();
         let (database, blobs, _) = staged_blob_fixture(directory.path());
-        let destination = directory.path().join("backup");
+        let destination = directory.path().join("gnosis-20260203T040506Z");
         let snapshot = snapshot_backup(&database, &destination).unwrap();
         let cancellation = Arc::new(BackupCancellation::new());
         let worker_cancellation = cancellation.clone();
@@ -1381,7 +1605,6 @@ mod tests {
                 snapshot,
                 &blobs,
                 &worker_destination,
-                2,
                 &worker_cancellation,
                 || {
                     publication_started.send(()).unwrap();

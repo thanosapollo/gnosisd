@@ -102,7 +102,6 @@ enum BackupCommand {
     Create {
         source: PathBuf,
         destination: PathBuf,
-        created_at_us: u64,
         response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
     },
     Verify {
@@ -268,7 +267,7 @@ impl ServiceHandle {
             return Ok(None);
         };
         let digest = head.blob_sha256.clone().ok_or(ServiceError::Corrupt)?;
-        let bytes = read_blob(self.blobs.clone(), digest).await?;
+        let bytes = self.read_stored_blob(digest).await?;
         Ok(Some((head, bytes)))
     }
 
@@ -306,7 +305,7 @@ impl ServiceHandle {
         let Some(digest) = record.blob_sha256.clone() else {
             return Ok(Some((record, Vec::new())));
         };
-        let bytes = read_blob(self.blobs.clone(), digest).await?;
+        let bytes = self.read_stored_blob(digest).await?;
         Ok(Some((record, bytes)))
     }
 
@@ -425,7 +424,7 @@ impl ServiceHandle {
         if digest != expected_digest {
             return Err(ServiceError::Corrupt);
         }
-        let bytes = read_blob(self.blobs.clone(), digest).await?;
+        let bytes = self.read_stored_blob(digest).await?;
         Ok(Some((head, bytes)))
     }
 
@@ -559,7 +558,7 @@ impl ServiceHandle {
             return Ok(None);
         };
         let digest = meta.sha256.clone();
-        let bytes = read_blob(self.blobs.clone(), digest).await?;
+        let bytes = read_blob(self.blobs.clone(), digest, meta.size_bytes).await?;
         Ok(Some((meta, bytes)))
     }
 
@@ -1185,10 +1184,12 @@ impl ServiceHandle {
         else {
             return Ok(None);
         };
-        let bytes = read_blob(self.blobs.clone(), asset.content_sha256.clone()).await?;
-        if bytes.len() as u64 != asset.size_bytes {
-            return Err(ServiceError::Corrupt);
-        }
+        let bytes = read_blob(
+            self.blobs.clone(),
+            asset.content_sha256.clone(),
+            asset.size_bytes,
+        )
+        .await?;
         Ok(Some((asset, bytes)))
     }
 
@@ -1290,11 +1291,9 @@ impl ServiceHandle {
     pub(crate) async fn create_backup(
         &self,
         destination: PathBuf,
-        created_at_us: u64,
     ) -> Result<BackupSummary, ServiceError> {
         request(&self.sender, |response| StoreCommand::CreateBackup {
             destination,
-            created_at_us,
             response,
         })
         .await?
@@ -1335,10 +1334,27 @@ impl ServiceHandle {
         })
         .await
     }
+
+    async fn read_stored_blob(&self, digest: String) -> Result<Vec<u8>, ServiceError> {
+        let meta = request(&self.sender, |response| StoreCommand::BlobMeta {
+            digest: digest.clone(),
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)?
+        .filter(|meta| meta.sha256 == digest)
+        .ok_or(ServiceError::Corrupt)?;
+        read_blob(self.blobs.clone(), digest, meta.size_bytes).await
+    }
 }
 
-async fn read_blob(blobs: Arc<BlobStore>, digest: String) -> Result<Vec<u8>, ServiceError> {
-    tokio::task::spawn_blocking(move || blobs.read(&digest))
+async fn read_blob(
+    blobs: Arc<BlobStore>,
+    digest: String,
+    expected_size: u64,
+) -> Result<Vec<u8>, ServiceError> {
+    let expected_size = usize::try_from(expected_size).map_err(|_| ServiceError::Corrupt)?;
+    tokio::task::spawn_blocking(move || blobs.read_bounded(&digest, expected_size))
         .await
         .map_err(|_| ServiceError::Stopped)?
         .map_err(ServiceError::Blob)
@@ -1906,7 +1922,6 @@ enum StoreCommand {
     },
     CreateBackup {
         destination: PathBuf,
-        created_at_us: u64,
         response: oneshot::Sender<Result<BackupSummary, ServiceError>>,
     },
 }
@@ -2079,8 +2094,14 @@ fn document_asset_associations(
         .iter()
         .map(|source| {
             let asset_paths = if let Some(blob_sha256) = &source.blob_sha256 {
+                let size = source.blob_size_bytes.ok_or(StoreError::CorruptData {
+                    field: "document blob size",
+                })?;
+                let size = usize::try_from(size).map_err(|_| StoreError::CorruptData {
+                    field: "document blob size",
+                })?;
                 let bytes = blobs
-                    .read(blob_sha256)
+                    .read_bounded(blob_sha256, size)
                     .map_err(|error| StoreError::Storage(Box::new(error)))?;
                 let source_text =
                     String::from_utf8(bytes).map_err(|_| StoreError::CorruptData {
@@ -2968,7 +2989,9 @@ fn run_store_command(
             );
             let result = needs_blob.and_then(|needs_blob| {
                 if needs_blob {
-                    match blobs.read(&operation.content_sha256) {
+                    let size = usize::try_from(operation.size_bytes)
+                        .map_err(|_| StoreError::BlobMetadata)?;
+                    match blobs.read_bounded(&operation.content_sha256, size) {
                         Ok(_) => {}
                         Err(BlobError::Io(error))
                             if error.kind() == std::io::ErrorKind::NotFound =>
@@ -2992,13 +3015,11 @@ fn run_store_command(
         }
         StoreCommand::CreateBackup {
             destination,
-            created_at_us,
             response,
         } => {
             let command = BackupCommand::Create {
                 source: database.to_owned(),
                 destination,
-                created_at_us,
                 response,
             };
             match backup_sender.try_send(command) {
@@ -3032,18 +3053,11 @@ fn backup_actor(
             BackupCommand::Create {
                 source,
                 destination,
-                created_at_us,
                 response,
             } => {
                 let result = snapshot_backup_cancellable(&source, &destination, &cancelled)
                     .and_then(|snapshot| {
-                        create_backup_cancellable(
-                            snapshot,
-                            &blobs,
-                            &destination,
-                            created_at_us,
-                            &cancelled,
-                        )
+                        create_backup_cancellable(snapshot, &blobs, &destination, &cancelled)
                     });
                 send(response, result.map_err(ServiceError::Backup));
             }
@@ -3172,7 +3186,7 @@ mod tests {
 
     use super::{
         BackupCommand, BackupError, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
-        complete_shutdown_phase, repair_canonical_state, sleep_until_next_shutdown_poll,
+        complete_shutdown_phase, read_blob, repair_canonical_state, sleep_until_next_shutdown_poll,
         stage_blob_command, store_actor,
     };
     use crate::application::{
@@ -3197,6 +3211,92 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_bounded_read_rejects_size_drift_before_reading_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("blobs");
+        let blobs = Arc::new(BlobStore::open(&root).unwrap());
+        let blob = blobs.put(b"small", "text/plain").unwrap();
+        std::fs::write(
+            root.join(&blob.sha256[..2]).join(&blob.sha256),
+            vec![b'x'; 1024 * 1024 + 1],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            read_blob(blobs, blob.sha256, blob.size_bytes).await,
+            Err(ServiceError::Blob(crate::blob::BlobError::Corrupt))
+        ));
+    }
+
+    #[tokio::test]
+    async fn content_reads_reject_stored_blob_size_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let runtime = runtime(&directory).await;
+        let service = runtime.handle();
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Bounded\n".into(),
+            None,
+        )
+        .unwrap();
+        let note_digest = note.blob_sha256.clone();
+        service.replace_note(note, 1, None).await.unwrap();
+        let asset_bytes = b"bounded asset".to_vec();
+        let asset_digest = format!("{:x}", sha2::Sha256::digest(&asset_bytes));
+        let asset_path = canonical_asset_path(&asset_digest, "asset.png").unwrap();
+        service
+            .put_asset(
+                prepare_asset(asset_path.clone(), "asset.png".into(), None).unwrap(),
+                asset_bytes,
+                "image/png".into(),
+                2,
+                None,
+            )
+            .await
+            .unwrap();
+        let connection = rusqlite::Connection::open(database).unwrap();
+
+        connection
+            .execute(
+                "UPDATE blob SET size_bytes = size_bytes + 1 WHERE content_sha256 = ?1",
+                [&note_digest],
+            )
+            .unwrap();
+        assert!(
+            service
+                .note(DocumentId::new("document").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .note_revision(DocumentId::new("document").unwrap(), 1)
+                .await
+                .is_err()
+        );
+        connection
+            .execute(
+                "UPDATE blob SET size_bytes = size_bytes - 1 WHERE content_sha256 = ?1",
+                [&note_digest],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE blob SET size_bytes = size_bytes + 1 WHERE content_sha256 = ?1",
+                [&asset_digest],
+            )
+            .unwrap();
+        assert!(service.asset(asset_path).await.is_err());
+        assert!(service.blob(asset_digest).await.is_err());
+
+        drop(connection);
+        drop(service);
+        runtime.finish().await.unwrap();
     }
 
     fn offline_put(
@@ -3714,7 +3814,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let history_blob = blob_path.join(&history_digest[..2]).join(&history_digest);
-        std::fs::write(&history_blob, b"corrupt").unwrap();
+        std::fs::write(&history_blob, vec![b'x'; 1024 * 1024 + 1]).unwrap();
 
         let runtime = ServiceRuntime::start(database.clone(), blob_path, 8)
             .await
@@ -3989,8 +4089,8 @@ mod tests {
         )
         .unwrap();
         service.replace_note(note, 10, None).await.unwrap();
-        let backup = directory.path().join("backup");
-        let created = service.create_backup(backup.clone(), 20).await.unwrap();
+        let backup = directory.path().join("gnosis-20260203T040506Z");
+        let created = service.create_backup(backup.clone()).await.unwrap();
         assert_eq!(created.blob_count, 1);
         assert_eq!(
             service.verify_backup(backup.clone()).await.unwrap(),
@@ -4043,8 +4143,7 @@ mod tests {
         service
             .sender
             .try_send(StoreCommand::CreateBackup {
-                destination: directory.path().join("backup"),
-                created_at_us: 1,
+                destination: directory.path().join("gnosis-20260203T040506Z"),
                 response,
             })
             .unwrap();
@@ -4088,7 +4187,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_deadline_cancels_an_accepted_backup_without_publication() {
         let directory = tempfile::tempdir().unwrap();
-        let backup = directory.path().join("backup");
+        let backup = directory.path().join("gnosis-20260203T040506Z");
         let runtime = ServiceRuntime::start(
             directory.path().join("gnosis.sqlite"),
             directory.path().join("blobs"),
@@ -4115,7 +4214,6 @@ mod tests {
             .sender
             .try_send(StoreCommand::CreateBackup {
                 destination: backup.clone(),
-                created_at_us: 1,
                 response,
             })
             .unwrap();
@@ -4164,8 +4262,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let runtime = runtime(&directory).await;
         let service = runtime.handle();
-        let backup = directory.path().join("backup");
-        service.create_backup(backup.clone(), 1).await.unwrap();
+        let backup = directory.path().join("gnosis-20260203T040506Z");
+        service.create_backup(backup.clone()).await.unwrap();
         let (started, started_receiver) = mpsc::sync_channel(1);
         let (release, release_receiver) = mpsc::sync_channel(1);
         service
@@ -4311,7 +4409,7 @@ mod tests {
         assert_eq!(repair.blobs_verified, 1);
         assert_eq!(repair.max_batch_observed, 1);
         let backup = service
-            .create_backup(directory.path().join("backup"), 5)
+            .create_backup(directory.path().join("gnosis-20260203T040506Z"))
             .await
             .unwrap();
         assert_eq!(backup.blob_count, 1);
@@ -4366,11 +4464,8 @@ mod tests {
             "gnosis-20260714T010000Z",
             "gnosis-20260715T010000Z",
         ];
-        for (index, name) in names.iter().enumerate() {
-            service
-                .create_backup(backups.join(name), index as u64)
-                .await
-                .unwrap();
+        for name in names {
+            service.create_backup(backups.join(name)).await.unwrap();
         }
 
         let removed = service.prune_backups(backups.clone(), 2).await.unwrap();
@@ -4384,7 +4479,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backup_pruning_removes_old_corruption_and_ignores_unrelated_entries() {
+    async fn backup_pruning_preserves_malformed_and_unrelated_entries() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = runtime(&directory).await;
         let service = runtime.handle();
@@ -4396,11 +4491,12 @@ mod tests {
         let unrelated = backups.join("manual-copy");
         std::fs::create_dir(&unrelated).unwrap();
         let newest = backups.join("gnosis-20260715T010000Z");
-        service.create_backup(newest.clone(), 10).await.unwrap();
+        service.create_backup(newest.clone()).await.unwrap();
 
         let removed = service.prune_backups(backups, 1).await.unwrap();
 
-        assert_eq!(removed, vec![corrupt]);
+        assert!(removed.is_empty());
+        assert!(corrupt.exists());
         assert!(newest.exists());
         assert!(unrelated.exists());
         drop(service);

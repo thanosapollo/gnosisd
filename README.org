@@ -112,7 +112,7 @@ gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup verify BACKUP_PATH
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
-  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 2
+  admin backup prune --directory "$HOME/.local/share/gnosis/backups" --keep 14
 gnosisd-admin --socket "$XDG_RUNTIME_DIR/gnosis/gnosis.sock" \
   admin backup restore-validate BACKUP_PATH \
   --temporary-directory "$HOME/.local/share/gnosis/restore-check"
@@ -137,9 +137,8 @@ SQLite sidecars under the reported mode-0700 rollback directory.
 
 * Deployment
 
-Systemd user units and Pi runbook live under ~deployment/~ and
-~docs/raspberry-pi.org~. The service keeps HTTP on loopback and grants writes
-only to Gnosis state/runtime paths.
+Systemd user units live under ~deployment/~. The service keeps HTTP on
+loopback and grants writes only to Gnosis state/runtime paths.
 
 * Validation
 

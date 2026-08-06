@@ -39,8 +39,6 @@
                 $out/share/systemd/user/gnosis-backup.timer
               install -Dm644 deployment/server.env.example \
                 $out/share/doc/gnosisd/server.env.example
-              install -Dm644 docs/raspberry-pi.org \
-                $out/share/doc/gnosisd/raspberry-pi.org
             '';
 
             meta = {
