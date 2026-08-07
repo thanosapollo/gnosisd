@@ -176,7 +176,11 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                  "https://example.org/path" "https://example.org?query"))
     (let ((gnosis-core-base-url url))
       (should-error (gnosis-core--validated-base-url)
-                    :type 'gnosis-core-validation-error))))
+                    :type 'gnosis-core-validation-error)))
+  (let ((gnosis-core-base-url "https://live.example")
+        (gnosis-core--base-url-override "https://pinned.example/"))
+    (should (equal "https://pinned.example"
+                   (gnosis-core--validated-base-url)))))
 
 (ert-deftest gnosis-core-validates-bearer-grammar ()
   (should (gnosis-core--valid-token-p (make-string 40 ?a)))
@@ -869,6 +873,22 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
          (gnosis-core-thema-catalog nil "thema-a" 2)
          :type 'gnosis-core-protocol-error)))))
 
+(defun gnosis-test-core--cursor (server-id position token)
+  "Return a canonical replica cursor for SERVER-ID, POSITION, and TOKEN."
+  (base64url-encode-string
+   (json-serialize `(:version 1 :server_id ,server-id
+                     :position ,position :token ,token))
+   t))
+
+(ert-deftest gnosis-core-decodes-canonical-generation-cursor ()
+  (let* ((cursor (gnosis-test-core--cursor "server-a" 7 "token-a"))
+         (decoded (gnosis-core--decode-cursor cursor)))
+    (should (equal "server-a" (plist-get decoded :server_id)))
+    (should (= 7 (plist-get decoded :position)))
+    (should (equal "token-a" (plist-get decoded :token))))
+  (dolist (invalid '(nil "" "+" "e30="))
+    (should-not (gnosis-core--decode-cursor invalid))))
+
 (ert-deftest gnosis-core-thema-suspension-correlates-authoritative-state ()
   (let (calls)
     (cl-letf
@@ -1030,14 +1050,64 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
           '(:thema_id "opaque" :revision 7 :kind "basic" :keimenon "Q"
             :answer ["A"] :concepts [(:node_id "node/id"
                                       :relation "primary")])))
-    (should
-     (equal '(:kind "basic" :keimenon "Q" :answer ["A"]
-              :concepts [(:node_id "node/id" :relation "primary")])
-            (gnosis-core-thema-write-view projection)))
+    (let ((request (gnosis-core-thema-write-view projection)))
+      (should
+       (equal '(:kind "basic" :keimenon "Q" :answer ["A"]
+                :concepts [(:node_id "node/id" :relation "primary")])
+              request))
+      (require 'gnosis-edit)
+      (with-temp-buffer
+        (insert (gnosis-edit--render request))
+        (should (equal request (gnosis-edit--parse)))))
     (setf (plist-get (aref (plist-get projection :concepts) 0) :relation)
           "invented")
     (should-error (gnosis-core-thema-write-view projection)
                   :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-edit-rejects-additional-live-schema-field ()
+  (let* ((contract (copy-tree (gnosis-test-core--thema-contract) t))
+         (schemas (plist-get (plist-get contract :components) :schemas))
+         (write-schema (plist-get schemas :ThemaWrite))
+         (properties (plist-get write-schema :properties))
+         (projection
+          '(:kind "basic" :keimenon "Q" :answer ["A"]
+            :future_hint "keep this")))
+    (setf (plist-get write-schema :properties)
+          (plist-put properties :future_hint '(:type "string")))
+    (let* ((gnosis-core--contract-cache
+            (list :base "http://127.0.0.1:7842" :document contract))
+           (request (gnosis-core-thema-write-view projection)))
+      (require 'gnosis-edit)
+      (should (equal "keep this" (plist-get request :future_hint)))
+      (should-error (gnosis-edit--render request) :type 'user-error))))
+
+(ert-deftest gnosis-edit-rejects-additional-live-concept-field ()
+  (let* ((contract (copy-tree (gnosis-test-core--thema-contract) t))
+         (schemas (plist-get (plist-get contract :components) :schemas))
+         (write-schema (plist-get schemas :ThemaWrite))
+         (concept-schema
+          (plist-get (plist-get (plist-get write-schema :properties) :concepts)
+                     :items))
+         (properties (plist-get concept-schema :properties))
+         (projection
+          '(:kind "basic" :keimenon "Q" :answer ["A"]
+            :concepts [(:node_id "node/id" :relation "primary"
+                        :future_hint "keep this")]))
+         (name " *gnosis-edit-future-concept*"))
+    (setf (plist-get concept-schema :properties)
+          (plist-put properties :future_hint '(:type "string")))
+    (let* ((gnosis-core--contract-cache
+            (list :base "http://127.0.0.1:7842" :document contract))
+           (request (gnosis-core-thema-write-view projection)))
+      (require 'gnosis-edit)
+      (unwind-protect
+          (progn
+            (should-error
+             (gnosis-edit--open name request nil nil 'authority nil)
+             :type 'user-error)
+            (should-not (get-buffer name)))
+        (when-let* ((buffer (get-buffer name)))
+          (kill-buffer buffer))))))
 
 (ert-deftest gnosis-core-mutation-rejects-incoherent-response-before-transport ()
   (let* ((contract (copy-tree (gnosis-test-core--contract) t))
@@ -1281,6 +1351,9 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
   (let (calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
+                 (when (equal "get_sync_changes" (car arguments))
+                   (should (= gnosis-core--replica-response-limit
+                              gnosis-core--response-limit-override)))
                  (push arguments calls)
                  '(:ok t))))
       (gnosis-core-sync-identity)

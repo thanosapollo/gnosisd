@@ -14,8 +14,10 @@
   parsing, projections, graph state, revisions, or scheduling.
 + Restored ~gnosis-nodes-insert~ for Org ID links, custom or region descriptions,
   and explicit root-node creation from a new completion title.
-+ Reduced the package to seven focused client modules.  Removed embedded
-  persistence, scheduling, grading, import, note, and compatibility backends.
++ Reduced the package to eight focused client modules, including the dedicated
+  ~gnosis-tl~ renderer for fast incremental tabulated-list updates.  Removed
+  embedded persistence, scheduling, grading, import, note, and compatibility
+  backends.
 + Added bounded HTTP transport, bearer credentials resolved through
   =auth-source=, future-compatible bounded error envelopes, safe GET retries,
   and strict loopback/HTTPS authority validation.
@@ -24,6 +26,11 @@
   not add another runtime module.
 + Removed handwritten success DTOs and direct route bindings.  Dashboard,
   authoring, and review operations resolve through the live OpenAPI contract.
++ Replaced raw JSON thema authoring with one type-aware text editor shared by
+  create, dashboard edit, and review edit.  Basic fields remain direct text,
+  choice answers are selected in place, and cloze markers derive answers and
+  hints from literal question text.  Secondary fields preserve absent,
+  nullable, multiline, concept-relation, and exact-retry request state.
 + Restored server-authoritative review creation, resume, structured response,
   accepted-result override, suspension, commit, and quit/abort.  Revision
   conflicts refresh authoritative attempt state; delivery-unknown mutations

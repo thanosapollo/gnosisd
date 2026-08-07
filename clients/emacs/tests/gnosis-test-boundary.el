@@ -14,9 +14,10 @@
     (insert-file-contents (locate-library (symbol-name feature)))
     (buffer-string)))
 
-(ert-deftest gnosis-boundary-loads-only-seven-runtime-modules ()
+(ert-deftest gnosis-boundary-loads-only-eight-runtime-modules ()
   (dolist (feature '(gnosis gnosis-core gnosis-core-assets
-                     gnosis-edit gnosis-nodes gnosis-review gnosis-completion))
+                     gnosis-edit gnosis-nodes gnosis-review gnosis-completion
+                     gnosis-tl))
     (should (require feature nil t)))
   (dolist (feature '(gnosis-db gnosis-sqlite gnosis-algorithm
                      gnosis-dashboard gnosis-history gnosis-anki))

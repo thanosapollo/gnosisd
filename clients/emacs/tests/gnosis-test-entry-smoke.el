@@ -10,6 +10,33 @@
   (unless (commandp command)
     (error "%S lacks a runtime autoload after requiring gnosis" command)))
 
+(ert-deftest gnosis-entry-themata-add-loads-editor-lazily ()
+  (let ((emacs (expand-file-name invocation-name invocation-directory))
+        (library-directory (file-name-directory (locate-library "gnosis"))))
+    (with-temp-buffer
+      (let ((status
+             (call-process
+              emacs nil t nil "--batch" "-Q" "-L" library-directory "--eval"
+              "(progn
+                 (require 'cl-lib)
+                 (require 'gnosis)
+                 (unless (autoloadp (symbol-function 'gnosis-edit-read-kind))
+                   (error \"gnosis-edit-read-kind is not lazy\"))
+                 (with-eval-after-load 'gnosis-edit
+                   (fset 'gnosis-edit--request-context
+                         (lambda () '(:authority test))))
+                 (let ((gnosis-themata--authority 'test))
+                   (cl-letf (((symbol-function 'gnosis-themata--ensure-authority)
+                              #'ignore)
+                             ((symbol-function 'completing-read)
+                              (lambda (&rest _) \"basic\")))
+                     (gnosis-themata-add)
+                     (unless (and (featurep 'gnosis-edit)
+                                  (derived-mode-p 'gnosis-edit-mode))
+                       (error \"Dashboard Add did not open editor\")))))")))
+        (unless (= status 0)
+          (ert-fail (buffer-string)))))))
+
 (ert-deftest gnosis-entry-and-dashboard-review-bindings-dispatch ()
   (let ((gnosis-dashboard--projection
          (list :active_session (list :session_id "session-1")))

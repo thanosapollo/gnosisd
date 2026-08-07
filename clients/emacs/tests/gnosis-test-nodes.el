@@ -2249,6 +2249,8 @@
                 ((symbol-function 'completing-read) (lambda (&rest _) selected))
                 ((symbol-function 'completing-read-multiple)
                  (lambda (&rest _) (list (current-buffer))))
+                ((symbol-function 'directory-files-recursively)
+                 (lambda (&rest _) nil))
                 ((symbol-function 'gnosis-nodes--bulk-target-buffer)
                  (lambda (target) target))
                 ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
