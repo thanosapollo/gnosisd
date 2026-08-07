@@ -30,6 +30,44 @@
       (should-not (string-match-p "\\`[[:space:]]*{" text))
       (should (equal gnosis-test-edit--request (gnosis-edit--parse))))))
 
+(ert-deftest gnosis-edit-text-round-trip-preserves-absent-fields ()
+  (let ((request '(:kind "basic" :keimenon "Question"
+                   :answer ["Answer"]
+                   :concepts [(:node_id "node/id" :relation "primary")])))
+    (with-temp-buffer
+      (insert (gnosis-edit--render request))
+      (should (string-match-p "^@absent$" (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-rejects-unknown-live-fields-before-opening ()
+  (let ((name " *gnosis-edit-future-field*")
+        (request (append gnosis-test-edit--request
+                         '(:future_hint "keep this"))))
+    (unwind-protect
+        (progn
+          (should-error
+           (gnosis-edit--open name request nil nil 'authority nil)
+           :type 'user-error)
+          (should-not (get-buffer name)))
+      (when-let* ((buffer (get-buffer name)))
+        (kill-buffer buffer)))))
+
+(ert-deftest gnosis-edit-save-preserves-absent-fields-in-payload ()
+  (let ((request '(:kind "basic" :keimenon "Question" :answer ["Answer"]))
+        sent)
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (insert (gnosis-edit--render request))
+      (cl-letf (((symbol-function 'gnosis-core-operation-id)
+                 (lambda () "op:absent"))
+                ((symbol-function 'gnosis-edit--send-authorized)
+                 (lambda (_operation-id payload _thema-id _revision)
+                   (setq sent payload)
+                   'projection))
+                ((symbol-function 'gnosis-edit--accept) #'identity))
+        (gnosis-edit-save))
+      (should (equal request sent)))))
+
 (ert-deftest gnosis-edit-text-parser-rejects-unknown-headings ()
   (with-temp-buffer
     (insert (replace-regexp-in-string

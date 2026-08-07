@@ -1050,14 +1050,36 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
           '(:thema_id "opaque" :revision 7 :kind "basic" :keimenon "Q"
             :answer ["A"] :concepts [(:node_id "node/id"
                                       :relation "primary")])))
-    (should
-     (equal '(:kind "basic" :keimenon "Q" :answer ["A"]
-              :concepts [(:node_id "node/id" :relation "primary")])
-            (gnosis-core-thema-write-view projection)))
+    (let ((request (gnosis-core-thema-write-view projection)))
+      (should
+       (equal '(:kind "basic" :keimenon "Q" :answer ["A"]
+                :concepts [(:node_id "node/id" :relation "primary")])
+              request))
+      (require 'gnosis-edit)
+      (with-temp-buffer
+        (insert (gnosis-edit--render request))
+        (should (equal request (gnosis-edit--parse)))))
     (setf (plist-get (aref (plist-get projection :concepts) 0) :relation)
           "invented")
     (should-error (gnosis-core-thema-write-view projection)
                   :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-edit-rejects-additional-live-schema-field ()
+  (let* ((contract (copy-tree (gnosis-test-core--thema-contract) t))
+         (schemas (plist-get (plist-get contract :components) :schemas))
+         (write-schema (plist-get schemas :ThemaWrite))
+         (properties (plist-get write-schema :properties))
+         (projection
+          '(:kind "basic" :keimenon "Q" :answer ["A"]
+            :future_hint "keep this")))
+    (setf (plist-get write-schema :properties)
+          (plist-put properties :future_hint '(:type "string")))
+    (let* ((gnosis-core--contract-cache
+            (list :base "http://127.0.0.1:7842" :document contract))
+           (request (gnosis-core-thema-write-view projection)))
+      (require 'gnosis-edit)
+      (should (equal "keep this" (plist-get request :future_hint)))
+      (should-error (gnosis-edit--render request) :type 'user-error))))
 
 (ert-deftest gnosis-core-mutation-rejects-incoherent-response-before-transport ()
   (let* ((contract (copy-tree (gnosis-test-core--contract) t))

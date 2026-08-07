@@ -34,7 +34,7 @@
     (:asset_paths "Asset paths" list))
   "Ordered thema request fields and their text representations.")
 
-(defconst gnosis-edit--markers '("@null" "@empty")
+(defconst gnosis-edit--markers '("@null" "@empty" "@absent")
   "Reserved scalar and list item markers.")
 
 (defconst gnosis-edit--font-lock-keywords
@@ -164,14 +164,34 @@ When NULLABLE is non-nil, VALUE may be JSON null."
     ('nullable-list (gnosis-edit--format-list value t))
     ('concepts (gnosis-edit--format-concepts value))))
 
+(defun gnosis-edit--validate-request-shape (request)
+  "Reject REQUEST fields this editor cannot preserve."
+  (unless (gnosis-core--json-object-p request)
+    (user-error "Invalid thema request object"))
+  (let* ((known (mapcar #'car gnosis-edit--fields))
+         (unknown
+          (cl-loop for tail on request by #'cddr
+                   for key = (car tail)
+                   unless (memq key known)
+                   collect key)))
+    (when unknown
+      (user-error
+       "Unsupported live thema fields: %s"
+       (mapconcat (lambda (key) (substring (symbol-name key) 1))
+                  unknown ", "))))
+  request)
+
 (defun gnosis-edit--format-field (request field)
   "Return one FIELD section encoded from REQUEST."
   (pcase-let ((`(,key ,label ,type) field))
     (format "** %s\n%s" label
-            (gnosis-edit--format-value (plist-get request key) type))))
+            (if (plist-member request key)
+                (gnosis-edit--format-value (plist-get request key) type)
+              "@absent"))))
 
 (defun gnosis-edit--render (request)
   "Return REQUEST as structured thema text."
+  (gnosis-edit--validate-request-shape request)
   (concat "* Thema\n\n"
           (mapconcat (lambda (field)
                        (gnosis-edit--format-field request field))
@@ -290,6 +310,7 @@ When NULLABLE is non-nil, VALUE may be JSON null."
          (sections (gnosis-edit--sections text)))
     (cl-loop for (key _label type) in gnosis-edit--fields
              for section in sections
+             unless (equal (cdr section) "@absent")
              append (list key (gnosis-edit--parse-value (cdr section) type)))))
 
 (defun gnosis-edit--protect-headings ()
@@ -327,6 +348,7 @@ When NULLABLE is non-nil, VALUE may be JSON null."
   "Open NAME with REQUEST for THEMA-ID at REVISION under AUTHORITY.
 Call AFTER-SAVE with the validated projection after a successful save."
   (gnosis-edit--ensure-buffer-available name)
+  (gnosis-edit--validate-request-shape request)
   (when (and after-save (not (functionp after-save)))
     (signal 'wrong-type-argument (list 'functionp after-save)))
   (let ((buffer (get-buffer-create name))
