@@ -799,6 +799,45 @@
                     :type 'gnosis-core-protocol-error))
     (should-not (plist-get gnosis-themata--refresh-state :records))))
 
+(ert-deftest gnosis-themata-bootstrap-reuses-accumulators-and-materializes-in-chunks ()
+  (let* ((generation (gnosis-test-dashboard--generation 3))
+         (a (gnosis-test-dashboard--thema :thema_id "a"))
+         (b (gnosis-test-dashboard--thema :thema_id "b"))
+         (seen-ids (make-hash-table :test #'equal))
+         (seen-cursors (make-hash-table :test #'equal))
+         (state (list :kind 'bootstrap :generation nil :records nil
+                      :record_tail nil :count 0 :bytes 0
+                      :seen_ids seen-ids :seen_cursors seen-cursors))
+         (gnosis-themata--materialize-chunk-size 1)
+         first second materializing done)
+    (setq first
+          (gnosis-themata--bootstrap-page-result
+           state `(:generation ,generation :items [,a] :next "page-2")))
+    (setq state (plist-get first :state))
+    (should (eq seen-ids (plist-get state :seen_ids)))
+    (should (eq seen-cursors (plist-get state :seen_cursors)))
+    (let ((records (plist-get state :records)))
+      (setq second
+            (gnosis-themata--bootstrap-page-result
+             state `(:generation ,generation :items [,b] :next "page-3")))
+      (should (eq records (plist-get (plist-get second :state) :records))))
+    (should (eq 'continue (plist-get second :status)))
+    (setq materializing
+          (gnosis-themata--bootstrap-page-result
+           (plist-get second :state)
+           `(:generation ,generation :items []
+             :next ,gnosis-core--json-null)))
+    (should (eq 'continue (plist-get materializing :status)))
+    (should (eq 'bootstrap-materialize
+                (plist-get (plist-get materializing :state) :kind)))
+    (setq done (gnosis-themata--refresh-fetch
+                (plist-get materializing :state)))
+    (should (eq 'done (plist-get done :status)))
+    (should (equal '("a" "b")
+                   (mapcar (lambda (record) (plist-get record :thema_id))
+                           (append (plist-get (plist-get done :catalog) :items)
+                                   nil))))))
+
 (ert-deftest gnosis-themata-reconciliation-reuses-record-table-across-pages ()
   (let* ((cursor-3 (gnosis-test-dashboard--generation 3))
          (cursor-4 (gnosis-test-dashboard--generation 4))
@@ -832,6 +871,34 @@
         (should-not (plist-get first :done))
         (should (plist-get second :done))))
     (should (= 1 table-builds))))
+
+(ert-deftest gnosis-themata-reconciliation-materializes-large-result-in-chunks ()
+  (let* ((cursor-3 (gnosis-test-dashboard--generation 3))
+         (cursor-4 (gnosis-test-dashboard--generation 4))
+         (a (gnosis-test-dashboard--thema :thema_id "a"))
+         (b (gnosis-test-dashboard--thema :thema_id "b"))
+         (items (vector a b))
+         (catalog `(:generation ,cursor-3 :items ,items))
+         (gnosis-themata--materialize-chunk-size 1))
+    (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+               (lambda (_)
+                 `(:from ,cursor-3 :next ,cursor-4
+                   :has_more ,gnosis-core--json-false
+                   :items [(:cursor ,cursor-4 :entity_kind "review_state"
+                            :projection
+                            (:thema_id "a"
+                             :state (:state_revision 3 :suspended t)))]))))
+      (let* ((page (gnosis-themata--reconcile-page catalog))
+             (state (plist-get page :catalog))
+             (done (gnosis-themata--refresh-fetch state)))
+        (should-not (plist-get page :done))
+        (should (eq 'reconcile-materialize (plist-get state :kind)))
+        (should (eq items (plist-get state :base_items)))
+        (should (eq 'done (plist-get done :status)))
+        (should (eq t (plist-get (aref (plist-get
+                                       (plist-get done :catalog) :items)
+                                      0)
+                                     :suspended)))))))
 
 (ert-deftest gnosis-themata-reconciliation-limits-before-table-mutation ()
   (let* ((cursor-3 (gnosis-test-dashboard--generation 3))
@@ -985,7 +1052,11 @@
     (should (eq (command-remapping 'tabulated-list-sort)
                 'gnosis-themata-sort))
     (should (eq (command-remapping 'tabulated-list-col-sort)
-                'gnosis-themata-col-sort))))
+                'gnosis-themata-col-sort))
+    (should (eq (command-remapping 'tabulated-list-widen-current-column)
+                'gnosis-themata-widen-current-column))
+    (should (eq (command-remapping 'tabulated-list-narrow-current-column)
+                'gnosis-themata-narrow-current-column))))
 
 (ert-deftest gnosis-themata-renders-large-catalog-in-cancellable-chunks ()
   (let* ((first (gnosis-test-dashboard--thema :thema_id "a" :keimenon "A"))
@@ -1068,6 +1139,32 @@
                        (cl-loop until (eobp)
                                 collect (tabulated-list-get-id)
                                 do (forward-line 1))))))))
+
+(ert-deftest gnosis-themata-column-width-changes-restart-progressive-render ()
+  (let ((a (gnosis-test-dashboard--thema :thema_id "a" :keimenon "Alpha"))
+        (b (gnosis-test-dashboard--thema :thema_id "b" :keimenon "Beta"))
+        (c (gnosis-test-dashboard--thema :thema_id "c" :keimenon "Gamma"))
+        (gnosis-themata--progressive-threshold 1)
+        (gnosis-themata--render-chunk-size 1)
+        scheduled)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (setq scheduled
+                         (append scheduled (list (cons function arguments))))
+                   'timer)))
+        (gnosis-themata--install `(:generation "g" :items [,a ,b ,c]))
+        (goto-char (point-min))
+        (move-to-column tabulated-list-padding)
+        (gnosis-themata-widen-current-column 1)
+        (gnosis-themata-narrow-current-column 1)
+        (while scheduled
+          (let ((job (pop scheduled)))
+            (apply (car job) (cdr job))))
+        (should (= 3 (length tabulated-list-entries)))
+        (should (= 3 (count-lines (point-min) (point-max))))
+        (should-not gnosis-themata--render-timer)))))
 
 (ert-deftest gnosis-themata-no-prefix-sort-works-after-full-and-progressive-render ()
   (dolist (threshold '(100 1))
@@ -1253,6 +1350,34 @@
       (should (= 1 (length tabulated-list-entries)))
       (gnosis-themata-filter-review-state :all)
       (should (equal "alpha" (tabulated-list-get-id))))))
+
+(ert-deftest gnosis-themata-filter-falls-back-when-selection-is-hidden ()
+  (dolist (threshold '(100 1))
+    (let* ((alpha (gnosis-test-dashboard--thema
+                   :thema_id "alpha" :keimenon "Alpha question"))
+           (beta (gnosis-test-dashboard--thema
+                  :thema_id "beta" :keimenon "Beta question" :archived t))
+           (gnosis-themata--progressive-threshold threshold)
+           (gnosis-themata--render-chunk-size 1)
+           scheduled)
+      (with-temp-buffer
+        (gnosis-dashboard-themata-mode)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (_time _repeat function &rest arguments)
+                     (setq scheduled
+                           (append scheduled (list (cons function arguments))))
+                     'timer)))
+          (gnosis-themata--install `(:generation "g" :items [,alpha ,beta]))
+          (while scheduled
+            (let ((job (pop scheduled)))
+              (apply (car job) (cdr job))))
+          (gnosis-themata--goto-id "alpha")
+          (gnosis-themata-filter-review-state :archived)
+          (while scheduled
+            (let ((job (pop scheduled)))
+              (apply (car job) (cdr job))))
+          (should (= (point) (point-min)))
+          (should (equal "beta" (tabulated-list-get-id))))))))
 
 (ert-deftest gnosis-themata-archive-and-tag-actions-use-authority ()
   (let* ((record (gnosis-test-dashboard--thema

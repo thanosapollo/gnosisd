@@ -95,6 +95,26 @@
       (should (= 3 (count-lines (point-min) (point-max))))
       (should-not (buffer-modified-p)))))
 
+(ert-deftest gnosis-tl-bulk-render-preserves-column-navigation ()
+  (dolist (append-row '(nil t))
+    (with-temp-buffer
+      (gnosis-test-tl--setup '(("a" ["Alice" "100"])))
+      (when append-row
+        (gnosis-tl-append-entries '(("b" ["Bob" "200"])))
+        (forward-line 1))
+      (move-to-column tabulated-list-padding)
+      (should (equal "Name"
+                     (get-text-property
+                      (point) 'tabulated-list-column-name)))
+      (tabulated-list-next-column 1)
+      (should (equal "Value"
+                     (get-text-property
+                      (point) 'tabulated-list-column-name)))
+      (tabulated-list-previous-column 1)
+      (should (equal "Name"
+                     (get-text-property
+                      (point) 'tabulated-list-column-name))))))
+
 
 (ert-deftest gnosis-tl-insert-entry-is-surgical-and-preserves-state ()
   (with-temp-buffer

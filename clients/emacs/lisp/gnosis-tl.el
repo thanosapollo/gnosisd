@@ -178,8 +178,8 @@ FORMAT is the `tabulated-list-format' vector.  PADDING is the
 `tabulated-list-padding' integer.
 
 Uses pre-computed format strings and an ASCII fast-path to
-minimise per-entry overhead.  Properties set per line:
-`tabulated-list-id', `tabulated-list-entry'."
+minimise per-entry overhead.  It preserves the column and row
+properties expected by `tabulated-list-mode'."
   (let* ((specs (gnosis-tl--column-specs format))
          (n-cols (length specs))
          (last-idx (1- n-cols))
@@ -197,6 +197,7 @@ minimise per-entry overhead.  Properties set per line:
                         (mapcar (lambda (s)
                                   (plist-get s :right-align))
                                 specs)))
+         (names (vconcat (mapcar (lambda (s) (plist-get s :name)) specs)))
          ;; Pre-computed format strings for ASCII fast-path
          (fmt-strs (vconcat
                     (cl-loop for i below n-cols
@@ -218,7 +219,8 @@ minimise per-entry overhead.  Properties set per line:
                  (text (if (stringp raw) raw (format "%s" raw)))
                  (len (length text))
                  (ascii-p (= len (string-bytes text)))
-                 (width (aref widths i)))
+                 (width (aref widths i))
+                 (column-beg (point)))
             (if (= i last-idx)
                 ;; Last column -- align or truncate, with no trailing padding
                 (insert (gnosis-tl--format-last-column
@@ -239,7 +241,10 @@ minimise per-entry overhead.  Properties set per line:
                                 (make-string pr ?\s))
                       (insert text
                               (make-string
-                               (+ (- width sw) pr) ?\s))))))))
+                               (+ (- width sw) pr) ?\s)))))))
+            (add-text-properties
+             column-beg (point)
+             (list 'tabulated-list-column-name (aref names i))))
           (setq i (1+ i)))
         (insert ?\n)
         (add-text-properties beg (point)
@@ -250,7 +255,7 @@ minimise per-entry overhead.  Properties set per line:
   "Render ENTRIES into a single propertized string.
 FORMAT is the `tabulated-list-format' vector.  PADDING is the
 `tabulated-list-padding' integer.  Returns the concatenated text
-of all formatted lines.  Pure function — no buffer side effects."
+of all formatted lines.  This function has no buffer side effects."
   (with-temp-buffer
     (let ((inhibit-modification-hooks t))
       (gnosis-tl--render-into-buffer entries format padding))
