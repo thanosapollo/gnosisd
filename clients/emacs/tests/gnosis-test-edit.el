@@ -6,10 +6,12 @@
 (require 'ert)
 (require 'gnosis-edit)
 
+(declare-function gnosis-edit-tab "gnosis-edit")
+(declare-function gnosis-edit-activate "gnosis-edit")
+
 (defconst gnosis-test-edit--request
   `(:kind "basic" :keimenon "  Question  \n\\opening\n** Answer\n"
-    :hypothesis ["guess" ,gnosis-core--json-null "" "hint\n\n"]
-    :answer ["first" "second\nline\n" "@null" ""]
+    :hypothesis ["guess"] :answer ["first"]
     :source_guid ,gnosis-core--json-null
     :parathema " Context " :review_image ""
     :tags ["logic" "  spaced  "]
@@ -20,15 +22,182 @@
     :asset_paths ["assets/abc/image.png" "assets/trailing "])
   "Complete thema request used by editor tests.")
 
-(ert-deftest gnosis-edit-text-round-trip-is-lossless ()
+(defconst gnosis-test-edit--cloze-request
+  `(:kind "cloze" :keimenon "Athens is the capital of Greece."
+    :hypothesis [,gnosis-core--json-null "country"]
+    :answer ["Athens" "Greece"]
+    :source_guid ,gnosis-core--json-null
+    :parathema ,gnosis-core--json-null
+    :review_image ,gnosis-core--json-null
+    :tags ["geography"] :concepts [] :asset_paths [])
+  "Cloze request used by editor tests.")
+
+(defconst gnosis-test-edit--choice-request
+  `(:kind "mcq" :keimenon "What is the capital of Greece?"
+    :hypothesis ["Athens" "London" "Berlin"] :answer ["Athens"]
+    :source_guid ,gnosis-core--json-null
+    :parathema ,gnosis-core--json-null
+    :review_image ,gnosis-core--json-null
+    :tags ["geography"] :concepts [] :asset_paths [])
+  "Multiple-choice request used by editor tests.")
+
+(ert-deftest gnosis-edit-basic-authoring-round-trip-is-lossless ()
   (with-temp-buffer
     (insert (gnosis-edit--render gnosis-test-edit--request))
     (let ((text (buffer-string)))
-      (should (string-prefix-p "* Thema\n\n** Kind\n" text))
+      (should (string-prefix-p "* Thema [basic]\n\n** Question\n" text))
+      (should (string-match-p (regexp-quote "\n** Hint\n") text))
+      (should (string-match-p (regexp-quote "\n** Answer\n") text))
       (should (string-match-p (regexp-quote "\n** Concepts\n") text))
       (should (string-match-p "\\\\\\*\\* Answer" text))
       (should-not (string-match-p "\\`[[:space:]]*{" text))
       (should (equal gnosis-test-edit--request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-authoring-derives-answers-and-hints ()
+  (with-temp-buffer
+    (insert (gnosis-edit--render gnosis-test-edit--cloze-request))
+    (let ((text (buffer-string)))
+      (should (string-prefix-p "* Thema [cloze]\n\n** Text\n" text))
+      (should (string-match-p
+               (regexp-quote "{{Athens :: [none]}}") text))
+      (should (string-match-p
+               (regexp-quote "{{Greece :: country}}") text))
+      (should-not (string-match-p "^\\*\\* Answer$" text))
+      (should (equal gnosis-test-edit--cloze-request
+                     (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-detached-answer ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (aref (plist-get request :answer) 1) "France")
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-preserves-daemon-answer-spelling ()
+  (let ((request
+         `(:kind "cloze" :keimenon "athens and Greece"
+           :hypothesis [] :answer ["Athens" "\"Greece\""]
+           :source_guid ,gnosis-core--json-null
+           :parathema ,gnosis-core--json-null
+           :review_image ,gnosis-core--json-null
+    :tags [] :concepts [] :asset_paths [])))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
+      (should (string-match-p (regexp-quote "{{athens => Athens}}")
+                              (buffer-string)))
+      (should (string-match-p (regexp-quote "{{Greece => \"Greece\"}}")
+                              (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-authoring-preserves-daemon-answer-order ()
+  (let ((request
+         `(:kind "cloze" :keimenon "A then B"
+           :hypothesis ["hint-b" "hint-a"] :answer ["B" "A"]
+           :source_guid ,gnosis-core--json-null
+           :parathema ,gnosis-core--json-null
+           :review_image ,gnosis-core--json-null
+           :tags [] :concepts [] :asset_paths []))
+        sent)
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
+      (should (equal request (gnosis-edit--parse)))
+      (goto-char (point-min))
+      (search-forward "{{A :: hint-a}}")
+      (replace-match "{{Alpha :: new-a}}" t t)
+      (search-forward "{{B :: hint-b}}")
+      (replace-match "{{Beta :: new-b}}" t t)
+      (should (equal `(:kind "cloze" :keimenon "Alpha then Beta"
+                        :hypothesis ["new-b" "new-a"] :answer ["Beta" "Alpha"]
+                        :source_guid ,gnosis-core--json-null
+                        :parathema ,gnosis-core--json-null
+                        :review_image ,gnosis-core--json-null
+                        :tags [] :concepts [] :asset_paths [])
+                     (gnosis-edit--parse)))
+      (gnosis-edit--replace-request request)
+      (cl-letf (((symbol-function 'gnosis-core-operation-id)
+                 (lambda () "op:ordered"))
+                ((symbol-function 'gnosis-edit--send-authorized)
+                 (lambda (_operation-id payload _thema-id _revision)
+                   (setq sent payload)
+                   'projection))
+                ((symbol-function 'gnosis-edit--accept) #'identity))
+        (gnosis-edit-save))
+      (should (equal request sent)))))
+
+(ert-deftest gnosis-edit-cloze-authoring-quotes-literal-delimiters ()
+  (let ((request
+         `(:kind "cloze"
+           :keimenon "Literal {{braces}} and A :: B \\ path"
+           :hypothesis ["hint }} :: \\ end"] :answer ["A :: B"]
+           :source_guid ,gnosis-core--json-null
+           :parathema ,gnosis-core--json-null
+           :review_image ,gnosis-core--json-null
+           :tags [] :concepts [] :asset_paths [])))
+    (with-temp-buffer
+      (insert (gnosis-edit--render request))
+      (should (string-match-p (regexp-quote "\\{{braces}}")
+                              (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-authoring-quotes-heading-like-text ()
+  (let ((request
+         `(:kind "cloze" :keimenon "Prompt\n** literal heading\nAnswer"
+           :hypothesis [] :answer ["Answer"]
+           :source_guid ,gnosis-core--json-null
+           :parathema ,gnosis-core--json-null
+           :review_image ,gnosis-core--json-null
+           :tags [] :concepts [] :asset_paths [])))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
+      (should (string-match-p "^\\\\\\*\\* literal heading$"
+                              (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-authoring-quotes-multiline-marker-headings ()
+  (let ((request
+         `(:kind "cloze"
+           :keimenon "Before alpha\n* answer heading\n** second answer heading"
+           :hypothesis ["hint\n* hint heading\n** second hint heading"]
+           :answer ["alpha\n* answer heading\n** second answer heading"]
+           :source_guid ,gnosis-core--json-null
+           :parathema ,gnosis-core--json-null
+           :review_image ,gnosis-core--json-null
+           :tags [] :concepts [] :asset_paths [])))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
+      (should (string-match-p "^\\\\\\* answer heading$" (buffer-string)))
+      (should (string-match-p "^\\\\\\* hint heading$" (buffer-string)))
+      (should (string-match-p
+               (regexp-quote "\\** second hint heading}}")
+               (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-authoring-compiles-edited-markers ()
+  (with-temp-buffer
+    (insert (gnosis-edit--render gnosis-test-edit--cloze-request))
+    (goto-char (point-min))
+    (search-forward "{{Greece :: country}}")
+    (replace-match "{{Hellas :: nation}}" t t)
+    (let ((request (gnosis-edit--parse)))
+      (should (equal "Athens is the capital of Hellas."
+                     (plist-get request :keimenon)))
+      (should (equal ["Athens" "Hellas"]
+                     (plist-get request :answer)))
+      (should (equal (vector gnosis-core--json-null "nation")
+                     (plist-get request :hypothesis))))))
+
+(ert-deftest gnosis-edit-choice-authoring-selects-answer-in-place ()
+  (with-temp-buffer
+    (insert (gnosis-edit--render gnosis-test-edit--choice-request))
+    (let ((text (buffer-string)))
+      (should (string-prefix-p "* Thema [mcq]\n\n** Question\n" text))
+      (should (string-match-p (regexp-quote "- [x] Athens") text))
+      (should (string-match-p (regexp-quote "- [ ] London") text))
+      (should-not (string-match-p "^\\*\\* Answer$" text))
+      (should (equal gnosis-test-edit--choice-request
+                     (gnosis-edit--parse))))))
 
 (ert-deftest gnosis-edit-text-round-trip-preserves-absent-fields ()
   (let ((request '(:kind "basic" :keimenon "Question"
@@ -36,7 +205,16 @@
                    :concepts [(:node_id "node/id" :relation "primary")])))
     (with-temp-buffer
       (insert (gnosis-edit--render request))
-      (should (string-match-p "^@absent$" (buffer-string)))
+      (should (string-match-p "^\\*\\* Tags \\[omitted\\]$"
+                              (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
+(ert-deftest gnosis-edit-cloze-round-trip-preserves-absent-hypothesis ()
+  (let ((request '(:kind "cloze" :keimenon "Athens is ancient"
+                   :answer ["Athens"])))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
       (should (equal request (gnosis-edit--parse))))))
 
 (ert-deftest gnosis-edit-rejects-unknown-live-fields-before-opening ()
@@ -71,15 +249,43 @@
 (ert-deftest gnosis-edit-text-parser-rejects-unknown-headings ()
   (with-temp-buffer
     (insert (replace-regexp-in-string
-             "^\\*\\* Kind$" "** Unknown"
+             "^\\*\\* Question$" "** Unknown"
              (gnosis-edit--render gnosis-test-edit--request)))
     (should-error (gnosis-edit--parse) :type 'user-error)))
 
 (ert-deftest gnosis-edit-text-parser-rejects-malformed-list-items ()
   (with-temp-buffer
     (insert (replace-regexp-in-string
-             "^- first$" "first"
+             "^- logic$" "logic"
              (gnosis-edit--render gnosis-test-edit--request)))
+    (should-error (gnosis-edit--parse) :type 'user-error)))
+
+(ert-deftest gnosis-edit-text-parser-preserves-blank-separated-deep-heading ()
+  (let* ((question "Lead-in\n\n*** Hidden\n\nTail")
+         (request (list :kind "basic" :keimenon question
+                        :answer ["Answer"]
+                        :source_guid gnosis-core--json-null
+                        :parathema gnosis-core--json-null
+                        :review_image gnosis-core--json-null
+                        :tags ["logic"] :concepts [] :asset_paths [])))
+    (with-temp-buffer
+      (insert (gnosis-edit--render request))
+      (should (string-match-p "^\\\\\\*\\*\\* Hidden$" (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))
+    (with-temp-buffer
+      (insert (replace-regexp-in-string
+               "^\\\\\\*\\*\\* Hidden$" "*** Hidden"
+               (gnosis-edit--render request)
+               nil t))
+      (should (equal question (plist-get (gnosis-edit--parse) :keimenon))))))
+
+(ert-deftest gnosis-edit-text-parser-rejects-metadata-prologue-text ()
+  (with-temp-buffer
+    (insert (replace-regexp-in-string
+             "^\\* Metadata\n\n"
+             "* Metadata\n\nstray prologue\n\n"
+             (gnosis-edit--render gnosis-test-edit--request)
+             nil t))
     (should-error (gnosis-edit--parse) :type 'user-error)))
 
 (ert-deftest gnosis-edit-mode-protects-structure-not-values ()
@@ -88,11 +294,21 @@
     (gnosis-edit--replace-request gnosis-test-edit--request)
     (goto-char (point-min))
     (should (get-text-property (point) 'read-only))
-    (re-search-forward "^\\*\\* Keimenon$")
+    (re-search-forward "^\\*\\* Question$")
     (should (get-text-property (line-beginning-position) 'read-only))
     (forward-line 1)
     (should-not (get-text-property (point) 'read-only))
     (insert "editable ")))
+
+(ert-deftest gnosis-edit-mode-collapses-secondary-metadata ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (gnosis-edit--replace-request gnosis-test-edit--request)
+    (goto-char (point-min))
+    (re-search-forward "^\\* Metadata$")
+    (forward-line 1)
+    (should (invisible-p (point)))
+    (should (equal gnosis-test-edit--request (gnosis-edit--parse)))))
 
 (ert-deftest gnosis-edit-undo-stops-at-rendered-request ()
   (let ((buffer (generate-new-buffer " *gnosis-edit-undo*")))
@@ -103,7 +319,7 @@
           (gnosis-edit--replace-request gnosis-test-edit--request)
           (let ((baseline (buffer-string)))
             (goto-char (point-min))
-            (re-search-forward "^\\*\\* Keimenon$")
+            (re-search-forward "^\\*\\* Question$")
             (forward-line 1)
             (insert "edited ")
             (undo-boundary)
@@ -130,7 +346,23 @@
       (should-not gnosis-edit--thema-id)
       (should-not gnosis-edit--revision)
       (should (eq 'opening-authority gnosis-edit--authority))
-      (should (equal "basic" (plist-get (gnosis-edit--parse) :kind))))
+      (should (equal "basic" (plist-get (gnosis-edit--parse t) :kind))))
+    (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
+      (kill-buffer buffer))))
+
+(ert-deftest gnosis-add-thema-opens-selected-authoring-kind ()
+  (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
+    (kill-buffer buffer))
+  (unwind-protect
+      (cl-letf (((symbol-function 'gnosis-edit--request-context)
+                 (lambda () '(:base_url "https://a.example"
+                              :token "token"
+                              :authority opening-authority))))
+        (save-window-excursion (gnosis-add-thema nil "cloze"))
+        (with-current-buffer gnosis-edit-new-buffer-name
+          (should (string-prefix-p "* Thema [cloze]" (buffer-string)))
+          (should (equal "cloze"
+                         (plist-get (gnosis-edit--parse t) :kind)))))
     (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
       (kill-buffer buffer))))
 
@@ -138,7 +370,94 @@
   (with-temp-buffer
     (gnosis-edit-mode)
     (should (derived-mode-p 'text-mode))
-    (should outline-minor-mode)))
+    (should outline-minor-mode)
+    (should (eq (key-binding (kbd "TAB")) #'gnosis-edit-tab))))
+
+(ert-deftest gnosis-edit-tab-folds-heading-without-indenting-it ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (gnosis-edit--replace-request gnosis-test-edit--request)
+    (goto-char (point-min))
+    (let (folded indented)
+      (cl-letf (((symbol-function 'outline-toggle-children)
+                 (lambda () (setq folded t)))
+                ((symbol-function 'indent-for-tab-command)
+                 (lambda () (setq indented t))))
+        (gnosis-edit-tab))
+      (should folded)
+      (should-not indented))))
+
+(ert-deftest gnosis-edit-activate-makes-null-field-editable ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (gnosis-edit--replace-request gnosis-test-edit--request)
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Source GUID \\[none\\]$")
+    (beginning-of-line)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "value")))
+      (gnosis-edit-activate))
+    (should-not (get-text-property (point) 'read-only))
+    (should (equal "** Source GUID"
+                   (buffer-substring-no-properties
+                    (line-beginning-position 0) (line-end-position 0))))
+    (insert "source-guid")
+    (should (equal "source-guid"
+                   (plist-get (gnosis-edit--parse) :source_guid)))))
+
+(ert-deftest gnosis-edit-activate-selects-choice-at-point ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (gnosis-edit--replace-request gnosis-test-edit--choice-request)
+    (goto-char (point-min))
+    (re-search-forward "^- \\[ \\] London$")
+    (beginning-of-line)
+    (gnosis-edit-activate)
+    (should (equal ["London"]
+                   (plist-get (gnosis-edit--parse) :answer)))))
+
+(ert-deftest gnosis-edit-selecting-choice-preserves-question-checkboxes ()
+  (let ((request (copy-tree gnosis-test-edit--choice-request t)))
+    (plist-put request :keimenon "Literal checkbox:\n- [x] keep")
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
+      (goto-char (point-min))
+      (re-search-forward "^- \\[ \\] London$")
+      (beginning-of-line)
+      (gnosis-edit-activate)
+      (should (string-match-p "^- \\[x\\] keep$" (buffer-string)))
+      (should (equal ["London"]
+                     (plist-get (gnosis-edit--parse) :answer))))))
+
+(ert-deftest gnosis-edit-activate-does-not-select-choice-like-question-text ()
+  (let ((request
+         `(:kind "cloze" :keimenon "Literal list:\n- [ ] item\nAnswer"
+           :hypothesis [] :answer ["Answer"]
+           :source_guid ,gnosis-core--json-null
+           :parathema ,gnosis-core--json-null
+           :review_image ,gnosis-core--json-null
+           :tags [] :concepts [] :asset_paths [])))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (gnosis-edit--replace-request request)
+      (goto-char (point-min))
+      (re-search-forward "^- \\[ \\] item$")
+      (gnosis-edit-activate)
+      (should-not (string-match-p "^- \\[x\\] item$" (buffer-string))))))
+
+(ert-deftest gnosis-edit-thema-refuses-archived-content-before-opening ()
+  (when-let* ((buffer (get-buffer gnosis-edit-buffer-name)))
+    (kill-buffer buffer))
+  (cl-letf (((symbol-function 'gnosis-edit--request-context)
+             (lambda () '(:base_url "https://a.example" :token "token"
+                          :authority opening-authority)))
+            ((symbol-function 'gnosis-core-thema)
+             (lambda (_)
+               (append '(:thema_id "archived" :revision 7 :archived t)
+                       gnosis-test-edit--request))))
+    (should-error (gnosis-edit-thema "archived") :type 'user-error)
+    (should-not (get-buffer gnosis-edit-buffer-name))))
 
 (ert-deftest gnosis-edit-thema-fetches-before-opening-buffer ()
   (when-let* ((buffer (get-buffer gnosis-edit-buffer-name))) (kill-buffer buffer))

@@ -99,14 +99,21 @@ supports text/review/tag filters, create/edit, archive, suspension, and confirme
 tag-page suspension.  The daemon remains authoritative for all projections and
 mutations.
 
-Thema creation, dashboard editing, and review editing share one text buffer.
-Fields use fixed =** Field= headings.  Repeated values use =- value=; subsequent
-lines use =  |value=.  =@null=, =@empty=, and =@absent= keep null, empty, and
-omitted values distinct; a leading backslash quotes literal markers or
-heading-like content.  Unknown live-contract fields stop editing before a
-mutation can discard them.
-Concepts preserve server order as =- RELATION "NODE-ID"=.  Save with =C-c C-c=,
-cancel with =C-c C-k=, or retry a retained uncertain mutation with =C-c C-r=.
+Thema creation, dashboard editing, and review editing share one type-aware text
+buffer.  Basic themata expose question, hint, and answer sections.  Choice
+themata use =- [x] answer= and =- [ ] choice= lines; press =RET= to select one.
+Cloze themata derive their answers and hints from inline
+={{answer :: hint}}= markers, so every answer remains literal question text.
+Use ={{answer}}= without a hint, ={{answer :: [none]}}= for an explicit null
+hint, and a backslash to quote literal delimiters.  Existing data whose stored
+answer spelling differs from the question uses ={{question text => answer}}=.
+
+Secondary fields retain absent, null, empty, and value states without exposing
+JSON.  Press =RET= on a secondary heading to change its state.  Repeated values
+use =- value= and =  |continuation=; concepts remain
+=- RELATION "NODE-ID"=.  =TAB= folds headings.  Save with =C-c C-c=, cancel with
+=C-c C-k=, or retry a retained uncertain mutation with =C-c C-r=.  Unknown
+live-contract fields stop editing before a mutation can discard them.
 
 ** Development
 

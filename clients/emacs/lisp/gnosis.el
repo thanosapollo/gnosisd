@@ -28,6 +28,7 @@
 (require 'gnosis-tl)
 
 (declare-function gnosis-add-thema "gnosis-edit")
+(declare-function gnosis-edit-read-kind "gnosis-edit")
 (declare-function gnosis-edit-thema "gnosis-edit")
 (declare-function gnosis-review "gnosis-review")
 (declare-function gnosis-review-resume "gnosis-review")
@@ -36,6 +37,7 @@
 (autoload 'gnosis-review-resume "gnosis-review" nil t)
 (autoload 'gnosis-review-topic "gnosis-review" nil t)
 (autoload 'gnosis-add-thema "gnosis-edit" nil t)
+(autoload 'gnosis-edit-read-kind "gnosis-edit")
 (autoload 'gnosis-edit-thema "gnosis-edit" nil t)
 
 (defgroup gnosis nil
@@ -1494,7 +1496,8 @@ With numeric prefix -1, restore the authoritative catalog order."
   (gnosis-themata--ensure-authority)
   (let ((buffer (current-buffer))
         (authority gnosis-themata--authority)
-        (incarnation gnosis-themata--incarnation))
+        (incarnation gnosis-themata--incarnation)
+        (kind (gnosis-edit-read-kind)))
     (gnosis-add-thema
      (lambda (_projection)
        (when (buffer-live-p buffer)
@@ -1504,7 +1507,8 @@ With numeric prefix -1, restore the authoritative catalog order."
                       (or (null authority)
                           (equal authority (gnosis-themata--current-authority)))
                       (equal incarnation gnosis-themata--incarnation))
-             (gnosis-themata-refresh))))))))
+             (gnosis-themata-refresh)))))
+     kind)))
 
 (defalias 'gnosis-themata-new #'gnosis-themata-add)
 
