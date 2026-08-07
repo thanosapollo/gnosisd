@@ -13,7 +13,7 @@
     :source_guid ,gnosis-core--json-null
     :parathema " Context " :review_image ""
     :tags ["logic" "  spaced  "]
-    :concepts [(:node_id "primary/node" :relation "primary")
+    :concepts [(:node_id "primary/κόμβος/雪" :relation "primary")
                (:node_id "reference/node\nquoted" :relation "reference")
                (:node_id "supporting/node" :relation "supporting")
                (:node_id "second/primary" :relation "primary")]

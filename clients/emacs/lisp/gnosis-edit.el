@@ -151,7 +151,8 @@ When NULLABLE is non-nil, VALUE may be JSON null."
    (lambda (concept)
      (format "- %s %s"
              (plist-get concept :relation)
-             (json-serialize (plist-get concept :node_id))))
+             (decode-coding-string
+              (json-serialize (plist-get concept :node_id)) 'utf-8-unix)))
    (append concepts nil) "\n"))
 
 (defun gnosis-edit--format-value (value type)
@@ -261,7 +262,8 @@ When NULLABLE is non-nil, VALUE may be JSON null."
   (let ((relation (match-string 1 line))
         (encoded (match-string 2 line)))
     (condition-case nil
-        (let ((node-id (json-parse-string encoded)))
+        (let ((node-id
+               (json-parse-string (encode-coding-string encoded 'utf-8-unix))))
           (unless (stringp node-id)
             (user-error "Thema concept node ID must be a string"))
           (list :node_id node-id :relation relation))
