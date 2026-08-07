@@ -869,6 +869,22 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
          (gnosis-core-thema-catalog nil "thema-a" 2)
          :type 'gnosis-core-protocol-error)))))
 
+(defun gnosis-test-core--cursor (server-id position token)
+  "Return a canonical replica cursor for SERVER-ID, POSITION, and TOKEN."
+  (base64url-encode-string
+   (json-serialize `(:version 1 :server_id ,server-id
+                     :position ,position :token ,token))
+   t))
+
+(ert-deftest gnosis-core-decodes-canonical-generation-cursor ()
+  (let* ((cursor (gnosis-test-core--cursor "server-a" 7 "token-a"))
+         (decoded (gnosis-core--decode-cursor cursor)))
+    (should (equal "server-a" (plist-get decoded :server_id)))
+    (should (= 7 (plist-get decoded :position)))
+    (should (equal "token-a" (plist-get decoded :token))))
+  (dolist (invalid '(nil "" "+" "e30="))
+    (should-not (gnosis-core--decode-cursor invalid))))
+
 (ert-deftest gnosis-core-thema-suspension-correlates-authoritative-state ()
   (let (calls)
     (cl-letf
@@ -1281,6 +1297,9 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
   (let (calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
+                 (when (equal "get_sync_changes" (car arguments))
+                   (should (= gnosis-core--replica-response-limit
+                              gnosis-core--response-limit-override)))
                  (push arguments calls)
                  '(:ok t))))
       (gnosis-core-sync-identity)

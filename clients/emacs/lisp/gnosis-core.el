@@ -52,6 +52,12 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
 (defconst gnosis-core--response-limit (* 1024 1024)
   "Maximum accepted JSON response body size in bytes.")
 
+(defconst gnosis-core--replica-response-limit (* 4 1024 1024)
+  "Maximum accepted replica change response body size in bytes.")
+
+(defvar gnosis-core--response-limit-override nil
+  "Dynamically bound JSON response limit for one typed operation.")
+
 (defconst gnosis-core--binary-response-limit (* 32 1024 1024)
   "Maximum accepted binary response body size in bytes.")
 
@@ -135,19 +141,30 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
               (memq character '(?- ?. ?_ ?~ ?+ ?/ ?=))))
         (string-to-list token))))
 
+(defvar gnosis-core--token-override nil
+  "Dynamically bound bearer token for one already-authorized request.")
+
 (defun gnosis-core--token ()
   "Return bearer token resolved through `auth-source'."
-  (let* ((url (url-generic-parse-url (gnosis-core--validated-base-url)))
+  (if gnosis-core--token-override
+      gnosis-core--token-override
+    (let* ((url (url-generic-parse-url (gnosis-core--validated-base-url)))
          (entry (car (auth-source-search
                       :host (url-host url) :port (url-port url)
                       :user gnosis-core-auth-user :max 1
                       :require '(:secret))))
          (secret (plist-get entry :secret))
          (token (if (functionp secret) (funcall secret) secret)))
-    (unless (gnosis-core--valid-token-p token)
-      (signal 'gnosis-core-authentication-error
-              '("No valid Gnosis token in auth-source")))
-    (encode-coding-string token 'us-ascii)))
+      (unless (gnosis-core--valid-token-p token)
+        (signal 'gnosis-core-authentication-error
+                '("No valid Gnosis token in auth-source")))
+      (encode-coding-string token 'us-ascii))))
+
+(defun gnosis-core--authenticated-authority (&optional token)
+  "Return non-secret authority identity for TOKEN or the live bearer token."
+  (let ((token (or token (gnosis-core--token))))
+    (vector (gnosis-core--validated-base-url)
+            (secure-hash 'sha256 token))))
 
 (defun gnosis-core--json-body (value)
   "Return UTF-8 JSON bytes for VALUE."
@@ -165,6 +182,60 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
        :null-object gnosis-core--json-null
        :false-object gnosis-core--json-false)
     (error (gnosis-core--invalid "Invalid JSON response"))))
+
+(defun gnosis-core--decode-cursor (token &optional snapshot-p)
+  "Return validated decoded TOKEN, or nil.
+Require snapshot cursor shape when SNAPSHOT-P is non-nil."
+  (condition-case nil
+      (when (and (stringp token)
+                 (string-match-p "\\`[A-Za-z0-9_-]+\\'" token))
+        (let* ((translated
+                (replace-regexp-in-string
+                 "_" "/" (replace-regexp-in-string "-" "+" token t t) t t))
+               (remainder (% (length translated) 4))
+               (padded (concat translated
+                               (make-string (if (= remainder 0)
+                                                0
+                                              (- 4 remainder))
+                                            ?=)))
+               (raw (base64-decode-string padded))
+               (canonical
+                (replace-regexp-in-string
+                 "=+\\'" ""
+                 (replace-regexp-in-string
+                  "/" "_" (replace-regexp-in-string
+                           "+" "-" (base64-encode-string raw t) t t)
+                  t t)))
+               (text (decode-coding-string raw 'utf-8))
+               (decoded
+                (json-parse-string
+                 text :object-type 'plist :array-type 'array
+                 :null-object nil :false-object nil))
+               (keys (cl-loop for (key _) on decoded by #'cddr collect key))
+               (expected (if snapshot-p
+                             '(:version :snapshot_id :server_id
+                               :cut_cursor :cut_token :after)
+                           '(:version :server_id :position :token)))
+               (numeric-keys (if snapshot-p '(:cut_cursor :after) '(:position))))
+          (and (/= remainder 1)
+               (equal token canonical)
+               (equal raw (encode-coding-string text 'utf-8))
+               (= (length keys) (length expected))
+               (seq-every-p (lambda (key) (memq key expected)) keys)
+               (equal 1 (plist-get decoded :version))
+               (stringp (plist-get decoded :server_id))
+               (seq-every-p
+                (lambda (key)
+                  (let ((value (plist-get decoded key)))
+                    (and (integerp value)
+                         (<= 0 value #xffffffffffffffff))))
+                numeric-keys)
+               (if snapshot-p
+                   (and (stringp (plist-get decoded :snapshot_id))
+                        (stringp (plist-get decoded :cut_token)))
+                 (stringp (plist-get decoded :token)))
+               decoded)))
+    (error nil)))
 
 (defun gnosis-core--path-segment (value)
   "Return opaque VALUE encoded as one URL path segment."
@@ -507,7 +578,8 @@ validated caller-supplied HEADERS.  Require EXPECTED-ETAG when non-nil."
              (url-max-redirections 0)
              (url-http-attempt-keepalives nil)
              (limit (if binary-p gnosis-core--binary-response-limit
-                      gnosis-core--response-limit))
+                      (or gnosis-core--response-limit-override
+                          gnosis-core--response-limit)))
              (buffer (gnosis-core--retrieve-bounded url limit)))
         (unwind-protect
             (with-current-buffer buffer
@@ -1118,8 +1190,10 @@ EXPECTED-ETAG requires an exact successful response ETag."
 
 (defun gnosis-core-sync-changes (cursor)
   "Return replica change page after opaque CURSOR."
-  (gnosis-core--typed-request
-   "get_sync_changes" nil (list (cons "cursor" cursor))))
+  (let ((gnosis-core--response-limit-override
+         gnosis-core--replica-response-limit))
+    (gnosis-core--typed-request
+     "get_sync_changes" nil (list (cons "cursor" cursor)))))
 
 (defun gnosis-core-blob (digest)
   "Return immutable blob bytes matching hexadecimal SHA-256 DIGEST."

@@ -31,11 +31,14 @@
   (dolist (buffer (list gnosis-edit-new-buffer-name gnosis-edit-buffer-name))
     (when-let* ((live (get-buffer buffer))) (kill-buffer live)))
   (unwind-protect
-      (save-window-excursion (gnosis-add-thema))
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _) 'opening-authority)))
+        (save-window-excursion (gnosis-add-thema)))
     (with-current-buffer gnosis-edit-new-buffer-name
       (should (derived-mode-p 'gnosis-edit-mode))
       (should-not gnosis-edit--thema-id)
       (should-not gnosis-edit--revision)
+      (should (eq 'opening-authority gnosis-edit--authority))
       (should (equal "basic" (plist-get (gnosis-edit--parse) :kind))))
     (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
       (kill-buffer buffer))))
@@ -47,9 +50,16 @@
 
 (ert-deftest gnosis-edit-thema-fetches-before-opening-buffer ()
   (when-let* ((buffer (get-buffer gnosis-edit-buffer-name))) (kill-buffer buffer))
-  (cl-letf (((symbol-function 'gnosis-core-thema)
+  (cl-letf (((symbol-function 'gnosis-core--token)
+             (lambda () "opening-token"))
+            ((symbol-function 'gnosis-core--authenticated-authority)
+             (lambda (&optional token)
+               (should (equal "opening-token" token))
+               'opening-authority))
+            ((symbol-function 'gnosis-core-thema)
              (lambda (id)
                (should (equal "opaque/thema" id))
+               (should (equal "opening-token" gnosis-core--token-override))
                (append '(:thema_id "opaque/thema" :revision 7)
                        gnosis-test-edit--request)))
             ((symbol-function 'gnosis-core-thema-write-view)
@@ -59,6 +69,7 @@
       (with-current-buffer gnosis-edit-buffer-name
         (should (equal "opaque/thema" gnosis-edit--thema-id))
         (should (= 7 gnosis-edit--revision))
+        (should (eq 'opening-authority gnosis-edit--authority))
         (should (equal gnosis-test-edit--request (gnosis-edit--parse))))
       (when-let* ((buffer (get-buffer gnosis-edit-buffer-name)))
         (kill-buffer buffer)))))
@@ -201,6 +212,7 @@
   (let (calls callback (operation-calls 0))
     (with-temp-buffer
       (gnosis-edit-mode)
+      (setq-local gnosis-edit--authority 'test-authority)
       (setq-local gnosis-edit--after-save
                   (lambda (projection) (setq callback projection)))
       (insert (gnosis-edit--render gnosis-test-edit--request))
@@ -208,6 +220,10 @@
                  (lambda ()
                    (cl-incf operation-calls)
                    "op:save"))
+                ((symbol-function 'gnosis-core--token)
+                 (lambda () "test-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _) 'test-authority))
                 ((symbol-function 'gnosis-core--typed-request)
                  (lambda (&rest arguments)
                    (push arguments calls)
@@ -235,9 +251,38 @@
       (should (equal "created" (plist-get callback :thema_id)))
       (should-not (buffer-modified-p)))))
 
+(ert-deftest gnosis-edit-save-rejects-missing-opening-authority ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (let ((mutations 0))
+      (cl-letf (((symbol-function 'gnosis-core-thema-create)
+                 (lambda (&rest _) (cl-incf mutations))))
+        (should-error (gnosis-edit-save)
+                      :type 'gnosis-core-authorization-error))
+      (should (= 0 mutations)))))
+
+(ert-deftest gnosis-edit-save-rejects-changed-opening-authority ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (setq-local gnosis-edit--authority 'opening-authority)
+    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (let ((mutations 0))
+      (cl-letf (((symbol-function 'gnosis-core--token) (lambda () "live-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _) 'changed-authority))
+                ((symbol-function 'gnosis-core-thema-create)
+                 (lambda (&rest _)
+                   (cl-incf mutations))))
+        (should-error (gnosis-edit-save)
+                      :type 'gnosis-core-authorization-error))
+      (should (= 0 mutations))
+      (should (buffer-modified-p)))))
+
 (ert-deftest gnosis-edit-conflict-preserves-buffer-and-revision ()
   (with-temp-buffer
     (gnosis-edit-mode)
+    (setq-local gnosis-edit--authority 'test-authority)
     (setq-local gnosis-edit--thema-id "opaque/thema")
     (setq-local gnosis-edit--revision 7)
     (insert (gnosis-edit--render gnosis-test-edit--request))
@@ -245,6 +290,10 @@
           calls)
       (cl-letf (((symbol-function 'gnosis-core-operation-id)
                  (lambda () "op:update"))
+                ((symbol-function 'gnosis-core--token)
+                 (lambda () "test-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _) 'test-authority))
                 ((symbol-function 'gnosis-core-thema-update)
                  (lambda (&rest arguments)
                    (push arguments calls)
@@ -260,6 +309,7 @@
 (ert-deftest gnosis-edit-uncertain-mutation-locks-blind-retry ()
   (with-temp-buffer
     (gnosis-edit-mode)
+    (setq-local gnosis-edit--authority 'test-authority)
     (insert (gnosis-edit--render gnosis-test-edit--request))
     (let ((calls 0)
           operation-ids)
@@ -267,6 +317,10 @@
                  (lambda ()
                    (push "op:uncertain" operation-ids)
                    "op:uncertain"))
+                ((symbol-function 'gnosis-core--token)
+                 (lambda () "test-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _) 'test-authority))
                 ((symbol-function 'gnosis-core-thema-create)
                  (lambda (operation-id _request)
                    (should (equal "op:uncertain" operation-id))
@@ -277,6 +331,7 @@
         (should-error (gnosis-edit-save) :type 'user-error))
       (should
        (equal (list :operation-id "op:uncertain"
+                    :authority 'test-authority
                     :thema-id nil :revision nil
                     :request gnosis-test-edit--request)
               gnosis-edit--recovery))
@@ -288,6 +343,7 @@
     (gnosis-edit-mode)
     (setq-local gnosis-edit--thema-id "changed-target")
     (setq-local gnosis-edit--revision 99)
+    (setq-local gnosis-edit--authority 'test-authority)
     (insert (gnosis-edit--render gnosis-test-edit--request))
     (let ((retained (copy-tree gnosis-test-edit--request t))
           arguments)
@@ -297,7 +353,11 @@
                         :request retained))
       (erase-buffer)
       (insert "{\"kind\":\"changed\"}")
-      (cl-letf (((symbol-function 'gnosis-core-thema-update)
+      (cl-letf (((symbol-function 'gnosis-core--token)
+                 (lambda () "test-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _) 'test-authority))
+                ((symbol-function 'gnosis-core-thema-update)
                  (lambda (thema-id operation-id revision request)
                    (setq arguments
                          (list thema-id operation-id revision request))
@@ -320,12 +380,17 @@
                    (gnosis-core-authentication-error "unauthorized")))
     (with-temp-buffer
       (gnosis-edit-mode)
+      (setq-local gnosis-edit--authority 'test-authority)
       (let ((recovery
              (list :operation-id "op:uncertain"
                    :thema-id "original-target" :revision 7
                    :request (copy-tree gnosis-test-edit--request t))))
         (setq-local gnosis-edit--recovery recovery)
-        (cl-letf (((symbol-function 'gnosis-core-thema-update)
+        (cl-letf (((symbol-function 'gnosis-core--token)
+                   (lambda () "test-token"))
+                  ((symbol-function 'gnosis-core--authenticated-authority)
+                   (lambda (&optional _) 'test-authority))
+                  ((symbol-function 'gnosis-core-thema-update)
                    (lambda (&rest _) (signal (car error) (cdr error)))))
           (should-error (gnosis-edit-retry-uncertain) :type (car error)))
         (should (equal recovery gnosis-edit--recovery))))))

@@ -38,6 +38,9 @@
 
 (put 'gnosis-edit--recovery 'permanent-local t)
 
+(defvar-local gnosis-edit--authority nil
+  "Non-secret authenticated authority that opened this editor.")
+
 (defvar-keymap gnosis-edit-mode-map
   "C-c C-c" #'gnosis-edit-save
   "C-c C-r" #'gnosis-edit-retry-uncertain
@@ -109,8 +112,9 @@
     (when (buffer-modified-p buffer)
       (user-error "Gnosis editor has unsaved changes"))))
 
-(defun gnosis-edit--open (name request thema-id revision after-save)
-  "Open NAME with REQUEST, THEMA-ID, REVISION, and AFTER-SAVE callback."
+(defun gnosis-edit--open (name request thema-id revision authority after-save)
+  "Open NAME with REQUEST for THEMA-ID at REVISION under AUTHORITY.
+Call AFTER-SAVE with the validated projection after a successful save."
   (gnosis-edit--ensure-buffer-available name)
   (when (and after-save (not (functionp after-save)))
     (signal 'wrong-type-argument (list 'functionp after-save)))
@@ -119,6 +123,7 @@
     (gnosis-edit-mode)
     (setq-local gnosis-edit--thema-id thema-id)
     (setq-local gnosis-edit--revision revision)
+    (setq-local gnosis-edit--authority authority)
     (setq-local gnosis-edit--after-save after-save)
     (setq-local gnosis-edit--recovery nil)
     (gnosis-edit--replace-request request)
@@ -130,7 +135,8 @@
   (interactive)
   (gnosis-edit--ensure-buffer-available gnosis-edit-new-buffer-name)
   (gnosis-edit--open gnosis-edit-new-buffer-name
-                     (gnosis-edit--new-request) nil nil after-save))
+                     (gnosis-edit--new-request) nil nil
+                     (gnosis-core--authenticated-authority) after-save))
 
 ;;;###autoload
 (defun gnosis-edit-thema (&optional thema-id after-save)
@@ -138,10 +144,15 @@
   (interactive (list (read-string "Thema ID: ")))
   (gnosis-edit--ensure-buffer-available gnosis-edit-buffer-name)
   (let* ((thema-id (or thema-id (read-string "Thema ID: ")))
-         (projection (gnosis-core-thema thema-id))
+         (token (gnosis-core--token))
+         (authority (gnosis-core--authenticated-authority token))
+         (projection
+          (let ((gnosis-core--token-override token))
+            (gnosis-core-thema thema-id)))
          (request (gnosis-core-thema-write-view projection)))
     (gnosis-edit--open gnosis-edit-buffer-name request thema-id
-                       (plist-get projection :revision) after-save)))
+                       (plist-get projection :revision)
+                       authority after-save)))
 
 (defun gnosis-edit--send (operation-id request thema-id revision)
   "Send REQUEST once under OPERATION-ID for THEMA-ID at REVISION.
@@ -154,6 +165,7 @@ Record the complete immutable request context after unknown delivery."
     (gnosis-core-mutation-uncertain
      (setq gnosis-edit--recovery
            (list :operation-id operation-id
+                 :authority gnosis-edit--authority
                  :thema-id thema-id
                  :revision revision
                  :request (copy-tree request t)))
@@ -173,6 +185,21 @@ Record the complete immutable request context after unknown delivery."
     (message "Saved thema %s at revision %s" thema-id revision)
     projection))
 
+(defun gnosis-edit--send-authorized
+    (operation-id request thema-id revision)
+  "Send REQUEST under OPERATION-ID using the editor's opening authority.
+THEMA-ID and REVISION identify an update; both are nil for a create."
+  (unless gnosis-edit--authority
+    (signal 'gnosis-core-authorization-error
+            '("Gnosis editor authority is unavailable")))
+  (let* ((token (gnosis-core--token))
+         (authority (gnosis-core--authenticated-authority token)))
+    (unless (equal authority gnosis-edit--authority)
+      (signal 'gnosis-core-authorization-error
+              '("Gnosis authenticated authority changed")))
+    (let ((gnosis-core--token-override token))
+      (gnosis-edit--send operation-id request thema-id revision))))
+
 (defun gnosis-edit-save ()
   "Save the current thema through the server contract."
   (interactive)
@@ -183,8 +210,8 @@ Record the complete immutable request context after unknown delivery."
   (let* ((request (gnosis-edit--parse))
          (operation-id (gnosis-core-operation-id))
          (projection
-          (gnosis-edit--send operation-id request
-                             gnosis-edit--thema-id gnosis-edit--revision)))
+          (gnosis-edit--send-authorized
+           operation-id request gnosis-edit--thema-id gnosis-edit--revision)))
     (gnosis-edit--accept projection)))
 
 (defun gnosis-edit-retry-uncertain ()
@@ -193,11 +220,15 @@ Record the complete immutable request context after unknown delivery."
   (unless gnosis-edit--recovery
     (user-error "No uncertain Gnosis mutation to retry"))
   (let ((operation-id (plist-get gnosis-edit--recovery :operation-id))
+        (authority (or (plist-get gnosis-edit--recovery :authority)
+                       gnosis-edit--authority))
         (thema-id (plist-get gnosis-edit--recovery :thema-id))
         (revision (plist-get gnosis-edit--recovery :revision))
         (request (plist-get gnosis-edit--recovery :request)))
-    (gnosis-edit--accept
-     (gnosis-edit--send operation-id request thema-id revision))))
+    (let ((gnosis-edit--authority authority))
+      (gnosis-edit--accept
+       (gnosis-edit--send-authorized
+        operation-id request thema-id revision)))))
 
 (defun gnosis-edit-cancel ()
   "Close the current Gnosis editing shell without mutation."

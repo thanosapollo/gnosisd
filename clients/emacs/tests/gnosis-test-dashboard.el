@@ -328,42 +328,395 @@
     (should (equal review-arguments '(nil)))
     (should resumed)))
 
-(ert-deftest gnosis-themata-fetches-every-generation-bound-page ()
-  (let ((first (gnosis-test-dashboard--thema))
-        (second (gnosis-test-dashboard--thema :thema_id "thema-b"))
-        calls)
-    (cl-letf (((symbol-function 'gnosis-core-thema-catalog)
-               (lambda (_query after limit)
-                 (push (list after limit) calls)
-                 (if after
-                     `(:generation "feed-3" :items [,second]
-                       :next ,gnosis-core--json-null)
-                   `(:generation "feed-3" :items [,first] :next "thema-a")))))
-      (let ((catalog (gnosis-themata--fetch)))
-        (should (equal "feed-3" (plist-get catalog :generation)))
-        (should
-         (equal '("thema-a" "thema-b")
-                (mapcar (lambda (record) (plist-get record :thema_id))
-                        (append (plist-get catalog :items) nil)))))
-      (should (equal '((nil 100) ("thema-a" 100)) (nreverse calls))))))
+(defun gnosis-test-dashboard--generation (position &optional server-id)
+  "Return a generation cursor at POSITION for optional SERVER-ID."
+  (base64url-encode-string
+   (json-serialize `(:version 1 :server_id ,(or server-id "server-a")
+                     :position ,position :token ,(format "token-%d" position)))
+   t))
 
-(ert-deftest gnosis-themata-fetch-rejects-generation-and-cursor-races ()
-  (let ((calls 0))
+(defmacro gnosis-test-dashboard--with-authority (&rest body)
+  "Evaluate BODY with deterministic dashboard authority and token."
+  `(let ((gnosis-themata--authority 'test-authority))
+     (cl-letf (((symbol-function 'gnosis-core--token)
+                (lambda () "test-token"))
+               ((symbol-function 'gnosis-core--authenticated-authority)
+                (lambda (&optional _) 'test-authority)))
+       ,@body)))
+
+(ert-deftest gnosis-themata-cache-round-trips-complete-catalog-privately ()
+  (let* ((directory (make-temp-file "gnosis-themata-cache-" t))
+         (gnosis-themata-cache-file (expand-file-name "thema.json" directory))
+         (generation (gnosis-test-dashboard--generation 3))
+         (catalog `(:generation ,generation
+                    :items [,(gnosis-test-dashboard--thema)])))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-themata--current-authority)
+                   (lambda () ["https://test.example" "token-hash"])))
+          (gnosis-themata--cache-write catalog)
+          (should (equal catalog (gnosis-themata--cache-read)))
+          (should (= #o600 (logand #o777 (file-modes gnosis-themata-cache-file))))
+          (should (= #o700 (logand #o777 (file-modes directory)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-themata-cache-rejects-corruption-and-wrong-authority ()
+  (let* ((directory (make-temp-file "gnosis-themata-cache-" t))
+         (gnosis-themata-cache-file (expand-file-name "thema.json" directory))
+         (generation (gnosis-test-dashboard--generation 3))
+         (catalog `(:generation ,generation
+                    :items [,(gnosis-test-dashboard--thema)])))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-themata--current-authority)
+                   (lambda () (vector gnosis-core-base-url "token-hash"))))
+          (gnosis-themata--cache-write catalog)
+          (let ((gnosis-core-base-url "https://other.example"))
+            (should-not (gnosis-themata--cache-read)))
+          (with-temp-file gnosis-themata-cache-file (insert "not json"))
+          (should-not (gnosis-themata--cache-read)))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-themata-cache-is-bound-to-credential-context ()
+  (let* ((directory (make-temp-file "gnosis-themata-cache-" t))
+         (gnosis-themata-cache-file (expand-file-name "thema.json" directory))
+         (catalog `(:generation ,(gnosis-test-dashboard--generation 3)
+                    :items [,(gnosis-test-dashboard--thema)]))
+         (token "token-a"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core--token) (lambda () token)))
+          (gnosis-themata--cache-write catalog)
+          (should (equal catalog (gnosis-themata--cache-read)))
+          (setq token "token-b")
+          (should-not (gnosis-themata--cache-read)))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-themata-disposable-cache-cannot-block-fresh-catalog ()
+  (let ((catalog `(:generation ,(gnosis-test-dashboard--generation 3)
+                   :items [,(gnosis-test-dashboard--thema)])))
+    (cl-letf (((symbol-function 'gnosis-themata--cache-write)
+               (lambda (_) (signal 'file-error '("read only")))))
+      (should (equal catalog (gnosis-themata--cache-try-write catalog))))))
+
+(ert-deftest gnosis-themata-reconciles-exact-authenticated-replica-projections ()
+  (let* ((directory (make-temp-file "gnosis-themata-cache-" t))
+         (gnosis-themata-cache-file (expand-file-name "thema.json" directory))
+         (from (gnosis-test-dashboard--generation 3))
+         (middle (gnosis-test-dashboard--generation 4))
+         (target (gnosis-test-dashboard--generation 5))
+         (catalog `(:generation ,from
+                    :items [,(gnosis-test-dashboard--thema)]))
+         calls)
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-themata--current-authority)
+                   (lambda () ["https://test.example" "token-hash"]))
+                  ((symbol-function 'gnosis-core-sync-changes)
+                   (lambda (cursor)
+                     (push cursor calls)
+                     `(:version 1 :from ,from :next ,target
+                       :has_more ,gnosis-core--json-false
+                       :items
+                       [(:cursor ,middle :entity_kind "thema"
+                         :projection
+                         (:thema_id "thema-a" :revision 4 :kind "basic"
+                          :keimenon "Updated" :hypothesis [] :answer ["A"]
+                          :tags ["tag"] :archived ,gnosis-core--json-false))
+                        (:cursor ,target :entity_kind "review_state"
+                         :projection
+                         (:thema_id "thema-a"
+                          :state (:state_revision 3 :review_count 2
+                                  :suspended t))) ]))))
+          (let* ((result (gnosis-themata--reconcile-page catalog))
+                 (updated (plist-get result :catalog))
+                 (record (aref (plist-get updated :items) 0)))
+            (gnosis-themata--cache-try-write updated)
+            (should (equal target (plist-get updated :generation)))
+            (should (equal "Updated" (plist-get record :keimenon)))
+            (should (= 4 (plist-get record :thema_revision)))
+            (should (= 3 (plist-get record :state_revision)))
+            (should (eq t (plist-get record :suspended)))
+            (should (equal updated (gnosis-themata--cache-read))))
+          (should (equal (list from) calls)))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-themata-rejects-replica-cursor-gaps ()
+  (let* ((from (gnosis-test-dashboard--generation 3))
+         (item-cursor (gnosis-test-dashboard--generation 4))
+         (next (gnosis-test-dashboard--generation 5))
+         (catalog `(:generation ,from
+                    :items [,(gnosis-test-dashboard--thema)])))
+    (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+               (lambda (_)
+                 `(:version 1 :from ,from :next ,next
+                   :has_more ,gnosis-core--json-false
+                   :items [(:cursor ,item-cursor :entity_kind "thema"
+                            :projection
+                            (:thema_id "thema-a" :revision 4 :kind "basic"
+                             :keimenon "Gap" :hypothesis [] :answer ["A"]
+                             :tags [] :archived ,gnosis-core--json-false))]))))
+      (should-error (gnosis-themata--reconcile-page catalog)
+                    :type 'gnosis-core-conflict))))
+
+(ert-deftest gnosis-themata-rejects-empty-nonterminal-replica-page ()
+  (let* ((cursor (gnosis-test-dashboard--generation 3))
+         (catalog `(:generation ,cursor
+                    :items [,(gnosis-test-dashboard--thema)]))
+         (invalid `(:version 1 :from ,cursor :next ,cursor
+                    :has_more t :items []))
+         (terminal `(:version 1 :from ,cursor :next ,cursor
+                     :has_more ,gnosis-core--json-false :items [])))
+    (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+               (lambda (_) invalid)))
+      (should-error (gnosis-themata--reconcile-page catalog)
+                    :type 'gnosis-core-protocol-error))
+    (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+               (lambda (_) terminal)))
+      (should (plist-get (gnosis-themata--reconcile-page catalog) :done)))
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (let ((run 7)
+            (scheduled 0)
+            (authority ["https://test.example" "token-hash"]))
+        (setq gnosis-themata--authority authority
+              gnosis-themata--refresh-run run
+              gnosis-themata--refresh-state
+              (list :kind 'reconcile :catalog catalog :selected nil))
+        (cl-letf (((symbol-function 'gnosis-themata--current-authority)
+                   (lambda () authority))
+                  ((symbol-function 'gnosis-core-sync-changes)
+                   (lambda (_) invalid))
+                  ((symbol-function 'run-at-time)
+                   (lambda (&rest _)
+                     (cl-incf scheduled)
+                     'timer)))
+          (gnosis-themata--refresh-step (current-buffer) run))
+        (should (= 0 scheduled))
+        (should-not gnosis-themata--refresh-state)))))
+
+(ert-deftest gnosis-themata-cache-read-is-bounded-by-bytes-not-stale-stat ()
+  (let* ((directory (make-temp-file "gnosis-themata-cache-" t))
+         (gnosis-themata-cache-file (expand-file-name "thema.json" directory))
+         (gnosis-themata--cache-maximum-bytes 10)
+         (original (symbol-function 'insert-file-contents))
+         observed-end)
+    (unwind-protect
+        (progn
+          (with-temp-file gnosis-themata-cache-file
+            (insert (make-string 100 ?x)))
+          (set-file-modes gnosis-themata-cache-file #o600)
+          (cl-letf (((symbol-function 'insert-file-contents)
+                     (lambda (file &optional visit beg end replace)
+                       (setq observed-end end)
+                       (funcall original file visit beg end replace))))
+            (should-not
+             (gnosis-themata--cache-read
+              ["https://test.example" "token-hash"])))
+          (should (= 11 observed-end)))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-themata-bootstrap-rejects-byte-budget-before-retention ()
+  (let* ((gnosis-themata--cache-envelope-reserve 0)
+         (gnosis-themata--cache-maximum-bytes 100)
+         (gnosis-themata--refresh-state
+          (list :kind 'bootstrap :after nil :generation nil :records nil
+                :bytes 0 :seen_ids (make-hash-table :test #'equal)
+                :seen_cursors (make-hash-table :test #'equal)))
+         (record (gnosis-test-dashboard--thema
+                  :keimenon (make-string 200 ?q))))
     (cl-letf (((symbol-function 'gnosis-core-thema-catalog)
                (lambda (&rest _)
-                 (cl-incf calls)
-                 (if (= calls 1)
-                     `(:generation "feed-3"
-                       :items [,(gnosis-test-dashboard--thema)]
-                       :next "thema-a")
-                   `(:generation "feed-4" :items []
-                     :next ,gnosis-core--json-null)))))
-      (should-error (gnosis-themata--fetch) :type 'gnosis-core-conflict)))
-  (cl-letf (((symbol-function 'gnosis-core-thema-catalog)
-             (lambda (&rest _)
-               '(:generation "feed-3" :items [] :next "thema-a"))))
-    (should-error (gnosis-themata--fetch)
-                  :type 'gnosis-core-protocol-error)))
+                 `(:generation ,(gnosis-test-dashboard--generation 1)
+                   :items [,record] :next ,gnosis-core--json-null))))
+      (should-error (gnosis-themata--bootstrap-step)
+                    :type 'gnosis-core-protocol-error))
+    (should-not (plist-get gnosis-themata--refresh-state :records))))
+
+(ert-deftest gnosis-themata-reconciliation-reuses-record-table-across-pages ()
+  (let* ((cursor-3 (gnosis-test-dashboard--generation 3))
+         (cursor-4 (gnosis-test-dashboard--generation 4))
+         (cursor-5 (gnosis-test-dashboard--generation 5))
+         (catalog `(:generation ,cursor-3
+                    :items [,(gnosis-test-dashboard--thema)]))
+         (pages
+          (list
+           `(:from ,cursor-3 :next ,cursor-4 :has_more t
+             :items [(:cursor ,cursor-4 :entity_kind "review_state"
+                      :projection (:thema_id "thema-a"
+                                   :state (:state_revision 3 :suspended t)))])
+           `(:from ,cursor-4 :next ,cursor-5
+             :has_more ,gnosis-core--json-false
+             :items [(:cursor ,cursor-5 :entity_kind "review_state"
+                      :projection (:thema_id "thema-a"
+                                   :state (:state_revision 4
+                                           :suspended ,gnosis-core--json-false)))])
+           ))
+         (original (symbol-function 'gnosis-themata--record-table))
+         (table-builds 0))
+    (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+               (lambda (_) (pop pages)))
+              ((symbol-function 'gnosis-themata--record-table)
+               (lambda (items)
+                 (cl-incf table-builds)
+                 (funcall original items))))
+      (let* ((first (gnosis-themata--reconcile-page catalog))
+             (second (gnosis-themata--reconcile-page
+                      (plist-get first :catalog))))
+        (should-not (plist-get first :done))
+        (should (plist-get second :done))))
+    (should (= 1 table-builds))))
+
+(ert-deftest gnosis-themata-reconciliation-limits-before-table-mutation ()
+  (let* ((cursor-3 (gnosis-test-dashboard--generation 3))
+         (cursor-4 (gnosis-test-dashboard--generation 4))
+         (record (gnosis-test-dashboard--thema))
+         (records (gnosis-themata--record-table (vector record)))
+         (bytes (gnosis-themata--records-byte-size (vector record)))
+         (catalog `(:generation ,cursor-3 :record_table ,records :bytes ,bytes))
+         (before (copy-tree record)))
+    (let ((gnosis-themata--cache-maximum-bytes (+ bytes 10)))
+      (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+                 (lambda (_)
+                   `(:from ,cursor-3 :next ,cursor-4
+                     :has_more ,gnosis-core--json-false
+                     :items
+                     [(:cursor ,cursor-4 :entity_kind "thema"
+                       :projection
+                       (:thema_id "thema-a" :revision 2 :kind "basic"
+                        :keimenon ,(make-string 200 ?q)
+                        :hypothesis [] :answer ["A"] :tags []
+                        :archived ,gnosis-core--json-false))]))))
+        (should-error (gnosis-themata--reconcile-page catalog)
+                      :type 'gnosis-core-protocol-error)))
+    (should (equal before (gethash "thema-a" records)))
+    (let ((gnosis-themata--catalog-max-items 1))
+      (cl-letf (((symbol-function 'gnosis-core-sync-changes)
+                 (lambda (_)
+                   `(:from ,cursor-3 :next ,cursor-4
+                     :has_more ,gnosis-core--json-false
+                     :items
+                     [(:cursor ,cursor-4 :entity_kind "thema"
+                       :projection
+                       (:thema_id "thema-b" :revision 1 :kind "basic"
+                        :keimenon "New" :hypothesis [] :answer ["B"]
+                        :tags [] :archived ,gnosis-core--json-false))]))))
+        (should-error (gnosis-themata--reconcile-page catalog)
+                      :type 'gnosis-core-protocol-error)))
+    (should (= 1 (hash-table-count records)))
+    (should-not (gethash "thema-b" records))))
+
+(ert-deftest gnosis-themata-keymap-hides-transport-pagination ()
+  (should-not (memq (keymap-lookup gnosis-dashboard-themata-mode-map "n")
+                    '(gnosis-themata-next-page gnosis-themata-previous-page)))
+  (should-not (memq (keymap-lookup gnosis-dashboard-themata-mode-map "p")
+                    '(gnosis-themata-next-page gnosis-themata-previous-page)))
+  (should (eq (keymap-lookup gnosis-dashboard-themata-mode-map "/")
+              'gnosis-themata-filter-search))
+  (with-temp-buffer
+    (gnosis-dashboard-themata-mode)
+    (should (eq (command-remapping 'tabulated-list-sort)
+                'gnosis-themata-sort))
+    (should (eq (command-remapping 'tabulated-list-col-sort)
+                'gnosis-themata-col-sort))))
+
+(ert-deftest gnosis-themata-renders-large-catalog-in-cancellable-chunks ()
+  (let* ((first (gnosis-test-dashboard--thema :thema_id "a" :keimenon "A"))
+         (second (gnosis-test-dashboard--thema :thema_id "b" :keimenon "B"))
+         (third (gnosis-test-dashboard--thema :thema_id "c" :keimenon "C"))
+         (gnosis-themata--progressive-threshold 1)
+         (gnosis-themata--render-chunk-size 1)
+         (original-entry (symbol-function 'gnosis-themata--entry))
+         (entry-calls 0)
+         scheduled)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (setq scheduled (cons function arguments))
+                   'timer))
+                ((symbol-function 'gnosis-themata--entry)
+                 (lambda (record)
+                   (cl-incf entry-calls)
+                   (funcall original-entry record))))
+        (gnosis-themata--install
+         `(:generation "generation" :items [,first ,second ,third]))
+        (should (= 1 entry-calls))
+        (should (= 1 (how-many "^[^\n]" (point-min) (point-max))))
+        (should scheduled)
+        (apply (car scheduled) (cdr scheduled))
+        (should (= 2 entry-calls))
+        (should (= 2 (how-many "^[^\n]" (point-min) (point-max))))))))
+
+(ert-deftest gnosis-themata-progressive-render-respects-question-sort ()
+  (let ((zeta (gnosis-test-dashboard--thema :thema_id "a" :keimenon "Zeta"))
+        (alpha (gnosis-test-dashboard--thema :thema_id "b" :keimenon "Alpha"))
+        (gnosis-themata--progressive-threshold 1)
+        (gnosis-themata--render-chunk-size 1))
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (cl-letf (((symbol-function 'run-at-time) (lambda (&rest _) 'timer)))
+        (gnosis-themata--install
+         `(:generation "generation" :items [,zeta ,alpha]))
+        (goto-char (point-min))
+        (should (equal "b" (tabulated-list-get-id)))))))
+
+(ert-deftest gnosis-themata-progressive-sort-restarts-complete-render ()
+  (let ((a (gnosis-test-dashboard--thema :thema_id "a" :keimenon "Alpha"))
+        (b (gnosis-test-dashboard--thema :thema_id "b" :keimenon "Beta"))
+        (c (gnosis-test-dashboard--thema :thema_id "c" :keimenon "Gamma"))
+        (gnosis-themata--progressive-threshold 1)
+        (gnosis-themata--render-chunk-size 1)
+        scheduled)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (setq scheduled
+                         (append scheduled (list (cons function arguments))))
+                   'timer)))
+        (gnosis-themata--install `(:generation "g" :items [,a ,b ,c]))
+        (should (= 1 (how-many "^[^\n]" (point-min) (point-max))))
+        (let ((current-prefix-arg 0))
+          (call-interactively #'gnosis-themata-sort))
+        (while scheduled
+          (let ((job (pop scheduled)))
+            (apply (car job) (cdr job))))
+        (should (= 3 (how-many "^[^\n]" (point-min) (point-max))))
+        (goto-char (point-min))
+        (should (equal '("c" "b" "a")
+                       (cl-loop until (eobp)
+                                collect (tabulated-list-get-id)
+                                do (forward-line 1))))
+        (let ((current-prefix-arg -1))
+          (call-interactively #'gnosis-themata-sort))
+        (while scheduled
+          (let ((job (pop scheduled)))
+            (apply (car job) (cdr job))))
+        (should-not tabulated-list-sort-key)
+        (goto-char (point-min))
+        (should (equal '("a" "b" "c")
+                       (cl-loop until (eobp)
+                                collect (tabulated-list-get-id)
+                                do (forward-line 1))))))))
+
+(ert-deftest gnosis-themata-mode-reentry-rejects-obsolete-render-callback ()
+  (let ((old-a (gnosis-test-dashboard--thema :thema_id "old-a" :keimenon "Old A"))
+        (old-b (gnosis-test-dashboard--thema :thema_id "old-b" :keimenon "Old B"))
+        (new (gnosis-test-dashboard--thema :thema_id "new" :keimenon "New"))
+        (gnosis-themata--progressive-threshold 1)
+        (gnosis-themata--render-chunk-size 1)
+        scheduled)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (setq scheduled (cons function arguments))
+                   'timer)))
+        (gnosis-themata--install
+         `(:generation "old" :items [,old-a ,old-b]))
+        (let ((obsolete scheduled))
+          (gnosis-dashboard-themata-mode)
+          (gnosis-themata--install `(:generation "new" :items [,new]))
+          (apply (car obsolete) (cdr obsolete))
+          (should (string-search "New" (buffer-string)))
+          (should-not (string-search "Old B" (buffer-string))))))))
 
 (ert-deftest gnosis-themata-buffer-displays-archive-and-suspension-state ()
   (with-temp-buffer
@@ -377,6 +730,66 @@
     (should (string-search "Answer" (buffer-string)))
     (goto-char (point-min))
     (should (= 2 (how-many "\\_<Yes\\_>" (point-min) (point-max))))))
+
+(ert-deftest gnosis-themata-confirmed-mutations-recheck-live-authority ()
+  (dolist (command '(gnosis-themata-toggle-suspension
+                     gnosis-themata-toggle-archive))
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (gnosis-themata--install
+       `(:generation "g" :items [,(gnosis-test-dashboard--thema)]))
+      (gnosis-themata--goto-id "thema-a")
+      (let ((live 'authority-a)
+            (gnosis-themata--authority 'authority-a)
+            (mutations 0))
+        (cl-letf (((symbol-function 'gnosis-core--token)
+                   (lambda () "live-token"))
+                  ((symbol-function 'gnosis-core--authenticated-authority)
+                   (lambda (&optional _) live))
+                  ((symbol-function 'y-or-n-p)
+                   (lambda (&rest _)
+                     (setq live 'authority-b)
+                     t))
+                  ((symbol-function 'gnosis-core-thema-set-suspended)
+                   (lambda (&rest _) (cl-incf mutations)))
+                  ((symbol-function 'gnosis-core-thema-set-archived)
+                   (lambda (&rest _) (cl-incf mutations))))
+          (should-error (funcall command)
+                        :type 'gnosis-core-authorization-error))
+        (should (= 0 mutations))))))
+
+(ert-deftest gnosis-themata-bulk-mutation-pins-one-token ()
+  (let ((first (gnosis-test-dashboard--thema
+                :thema_id "first" :tags ["tag"] :state_revision 1))
+        (second (gnosis-test-dashboard--thema
+                 :thema_id "second" :tags ["tag"] :state_revision 2))
+        (token-calls 0)
+        requests)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (gnosis-themata--install `(:generation "g" :items [,first ,second]))
+      (setq-local gnosis-themata--tag-filter "tag")
+      (let ((gnosis-themata--authority 'authority-a))
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                  ((symbol-function 'gnosis-core--token)
+                   (lambda ()
+                     (cl-incf token-calls)
+                     "pinned-token"))
+                  ((symbol-function 'gnosis-core--authenticated-authority)
+                   (lambda (&optional token)
+                     (when token
+                       (should (equal "pinned-token" token)))
+                     'authority-a))
+                  ((symbol-function 'gnosis-core-thema-set-suspended)
+                   (lambda (id revision desired)
+                     (should (equal "pinned-token" gnosis-core--token-override))
+                     (push id requests)
+                     `(:thema_id ,id
+                       :state (:state_revision ,(1+ revision)
+                               :suspended ,desired)))))
+          (gnosis-themata-suspend-tag)))
+      (should (= 1 token-calls))
+      (should (equal '("first" "second") (nreverse requests))))))
 
 (ert-deftest gnosis-themata-suspension-mutates-only-after-authority ()
   (with-temp-buffer
@@ -393,7 +806,8 @@
                  (should desired)
                  '(:thema_id "thema-a"
                    :state (:state_revision 3 :suspended t)))))
-      (gnosis-themata-toggle-suspension))
+      (gnosis-test-dashboard--with-authority
+       (gnosis-themata-toggle-suspension)))
     (let ((record (gethash "thema-a" gnosis-themata--records)))
       (should (= 3 (plist-get record :state_revision)))
       (should (eq t (plist-get record :suspended))))
@@ -406,7 +820,8 @@
                  `(:thema_id "thema-a"
                    :state (:state_revision 4
                            :suspended ,gnosis-core--json-false)))))
-      (gnosis-themata-toggle-suspension))
+      (gnosis-test-dashboard--with-authority
+       (gnosis-themata-toggle-suspension)))
     (should (string-search "No" (buffer-string)))
     (should
      (eq gnosis-core--json-false
@@ -446,10 +861,38 @@
                    (setq archived (list id revision desired))
                    (plist-put (copy-tree record) :archived t)))
                 )
-        (gnosis-themata-toggle-archive)
+        (gnosis-test-dashboard--with-authority
+         (gnosis-themata-toggle-archive))
         (gnosis-themata-find-tag "tag"))
       (should (equal "tag" gnosis-themata--tag-filter)))
     (should (equal '("thema-a" 3 t) archived))))
+
+(ert-deftest gnosis-themata-suspend-tag-freezes-complete-progressive-target-set ()
+  (let ((a (gnosis-test-dashboard--thema :thema_id "a" :keimenon "Alpha"
+                                          :tags ["tag"]))
+        (b (gnosis-test-dashboard--thema :thema_id "b" :keimenon "Beta"
+                                          :tags ["tag"]))
+        (c (gnosis-test-dashboard--thema :thema_id "c" :keimenon "Gamma"
+                                          :tags ["tag"]))
+        (gnosis-themata--progressive-threshold 1)
+        (gnosis-themata--render-chunk-size 1)
+        mutated)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (setq gnosis-themata--tag-filter "tag")
+      (cl-letf (((symbol-function 'run-at-time) (lambda (&rest _) 'timer))
+                ((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'gnosis-core-thema-set-suspended)
+                 (lambda (thema-id revision suspended)
+                   (setq mutated (append mutated (list thema-id)))
+                   `(:thema_id ,thema-id
+                     :state (:state_revision ,(1+ revision)
+                             :suspended ,suspended)))))
+        (gnosis-themata--install `(:generation "g" :items [,c ,a ,b]))
+        (should (= 1 (length tabulated-list-entries)))
+        (gnosis-test-dashboard--with-authority
+         (gnosis-themata-suspend-tag)))
+      (should (equal '("a" "b" "c") mutated)))))
 
 (ert-deftest gnosis-themata-suspend-tag-mutates-visible-page-in-order ()
   (let ((first (gnosis-test-dashboard--thema
@@ -467,43 +910,13 @@
                    (push (list id revision desired) calls)
                    `(:thema_id ,id
                      :state (:state_revision ,(1+ revision) :suspended t)))))
-        (gnosis-themata-suspend-tag))
+        (gnosis-test-dashboard--with-authority
+         (gnosis-themata-suspend-tag)))
       (should (equal '(("first" 1 t) ("second" 2 t)) (nreverse calls)))
       (should (eq t (plist-get (gethash "first" gnosis-themata--records)
                                :suspended)))
       (should (eq t (plist-get (gethash "second" gnosis-themata--records)
                                :suspended))))))
-
-(ert-deftest gnosis-themata-show-new-filters-current-bounded-page ()
-  (let ((first (gnosis-test-dashboard--thema :thema_id "first"))
-        (second (gnosis-test-dashboard--thema :thema_id "second")))
-    (with-temp-buffer
-      (gnosis-dashboard-themata-mode)
-      (gnosis-themata--install `(:generation "g" :items [,first ,second]))
-      (cl-letf (((symbol-function 'gnosis-core-thema-review-state)
-                 (lambda (id)
-                   `(:thema_id ,id
-                     :state (:state_revision 1 :review_count
-                             ,(if (equal id "first") 0 2)
-                             :suspended ,gnosis-core--json-false)))))
-        (gnosis-themata-filter-review-state :new))
-      (should (= 1 (length tabulated-list-entries)))
-      (should (equal "first" (caar tabulated-list-entries))))))
-
-(ert-deftest gnosis-themata-next-page-rejects-generation-race-without-advancing ()
-  (let ((record (gnosis-test-dashboard--thema :thema_id "first")))
-    (with-temp-buffer
-      (gnosis-dashboard-themata-mode)
-      (gnosis-themata--install
-       `(:generation "stable" :items [,record] :next "cursor"))
-      (cl-letf (((symbol-function 'gnosis-core-thema-catalog)
-                 (lambda (&rest _)
-                   `(:generation "changed" :items []
-                     :next ,gnosis-core--json-null))))
-        (should-error (gnosis-themata-next-page) :type 'gnosis-core-conflict))
-      (should-not gnosis-themata--cursor)
-      (should-not gnosis-themata--history)
-      (should (equal "first" (tabulated-list-get-id))))))
 
 (ert-deftest gnosis-themata-mutation-failures-preserve-visible-row ()
   (dolist (error '(gnosis-core-authorization-error
@@ -520,7 +933,10 @@
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                   ((symbol-function 'gnosis-core-thema-set-suspended)
                    (lambda (&rest _) (signal error '("failure")))))
-          (should-error (gnosis-themata-toggle-suspension) :type error))
+          (should-error
+           (gnosis-test-dashboard--with-authority
+            (gnosis-themata-toggle-suspension))
+           :type error))
         (should (equal before (buffer-string)))
         (should
          (eq gnosis-core--json-false
@@ -531,15 +947,20 @@
   (with-temp-buffer
     (gnosis-dashboard-themata-mode)
     (gnosis-themata--install
-     `(:generation "feed-3"
+     `(:generation ,(gnosis-test-dashboard--generation 3)
        :items [,(gnosis-test-dashboard--thema)]))
     (let ((before (buffer-string))
-          (generation gnosis-themata--generation))
-      (cl-letf (((symbol-function 'gnosis-core-thema-catalog)
+          (generation gnosis-themata--generation)
+          scheduled)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (setq scheduled (cons function arguments))
+                   'timer)))
+        (gnosis-themata-refresh))
+      (cl-letf (((symbol-function 'gnosis-core-sync-changes)
                  (lambda (&rest _)
                    (signal 'gnosis-core-unavailable '("offline")))))
-        (should-error (gnosis-themata-refresh)
-                      :type 'gnosis-core-unavailable))
+        (apply (car scheduled) (cdr scheduled)))
       (should (equal before (buffer-string)))
       (should (equal generation gnosis-themata--generation)))))
 
@@ -566,6 +987,61 @@
       (should (= 2 (plist-get record :state_revision))))
     (should (string-search "Edited question" (buffer-string)))
     (should (string-search "Edited answer" (buffer-string)))))
+
+(ert-deftest gnosis-themata-edit-callback-cannot-cross-buffer-incarnation ()
+  (with-temp-buffer
+    (let ((authority ["https://a" "hash-a"])
+          callback)
+      (cl-letf (((symbol-function 'gnosis-themata--current-authority)
+                 (lambda () authority))
+                ((symbol-function 'gnosis-edit-thema)
+                 (lambda (_id after-save) (setq callback after-save))))
+        (gnosis-dashboard-themata-mode)
+        (setq gnosis-themata--authority authority)
+        (gnosis-themata--install
+         `(:generation "first"
+           :items [,(gnosis-test-dashboard--thema :keimenon "First")]))
+        (gnosis-themata--goto-id "thema-a")
+        (gnosis-themata-edit)
+        (setq authority ["https://b" "hash-b"])
+        (gnosis-dashboard-themata-mode)
+        (setq gnosis-themata--authority authority)
+        (gnosis-themata--install
+         `(:generation "second"
+           :items [,(gnosis-test-dashboard--thema :keimenon "Second")]))
+        (funcall callback
+                 `(:thema_id "thema-a" :revision 4 :kind "basic"
+                   :keimenon "Stale" :hypothesis [] :answer ["A"]
+                   :tags [] :archived ,gnosis-core--json-false))
+        (should
+         (equal "Second"
+                (plist-get (gethash "thema-a" gnosis-themata--records)
+                           :keimenon)))))))
+
+(ert-deftest gnosis-themata-edit-callback-rejects-live-authority-drift ()
+  (with-temp-buffer
+    (let ((live-authority ["https://a" "hash-a"])
+          callback)
+      (cl-letf (((symbol-function 'gnosis-themata--current-authority)
+                 (lambda () live-authority))
+                ((symbol-function 'gnosis-edit-thema)
+                 (lambda (_id after-save) (setq callback after-save))))
+        (gnosis-dashboard-themata-mode)
+        (setq gnosis-themata--authority live-authority)
+        (gnosis-themata--install
+         `(:generation "first"
+           :items [,(gnosis-test-dashboard--thema :keimenon "First")]))
+        (gnosis-themata--goto-id "thema-a")
+        (gnosis-themata-edit)
+        (setq live-authority ["https://b" "hash-b"])
+        (funcall callback
+                 `(:thema_id "thema-a" :revision 4 :kind "basic"
+                   :keimenon "Stale" :hypothesis [] :answer ["A"]
+                   :tags [] :archived ,gnosis-core--json-false))
+        (should
+         (equal "First"
+                (plist-get (gethash "thema-a" gnosis-themata--records)
+                           :keimenon)))))))
 
 (provide 'gnosis-test-dashboard)
 ;;; gnosis-test-dashboard.el ends here
