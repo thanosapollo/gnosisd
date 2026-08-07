@@ -1081,6 +1081,34 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (should (equal "keep this" (plist-get request :future_hint)))
       (should-error (gnosis-edit--render request) :type 'user-error))))
 
+(ert-deftest gnosis-edit-rejects-additional-live-concept-field ()
+  (let* ((contract (copy-tree (gnosis-test-core--thema-contract) t))
+         (schemas (plist-get (plist-get contract :components) :schemas))
+         (write-schema (plist-get schemas :ThemaWrite))
+         (concept-schema
+          (plist-get (plist-get (plist-get write-schema :properties) :concepts)
+                     :items))
+         (properties (plist-get concept-schema :properties))
+         (projection
+          '(:kind "basic" :keimenon "Q" :answer ["A"]
+            :concepts [(:node_id "node/id" :relation "primary"
+                        :future_hint "keep this")]))
+         (name " *gnosis-edit-future-concept*"))
+    (setf (plist-get concept-schema :properties)
+          (plist-put properties :future_hint '(:type "string")))
+    (let* ((gnosis-core--contract-cache
+            (list :base "http://127.0.0.1:7842" :document contract))
+           (request (gnosis-core-thema-write-view projection)))
+      (require 'gnosis-edit)
+      (unwind-protect
+          (progn
+            (should-error
+             (gnosis-edit--open name request nil nil 'authority nil)
+             :type 'user-error)
+            (should-not (get-buffer name)))
+        (when-let* ((buffer (get-buffer name)))
+          (kill-buffer buffer))))))
+
 (ert-deftest gnosis-core-mutation-rejects-incoherent-response-before-transport ()
   (let* ((contract (copy-tree (gnosis-test-core--contract) t))
          (write (plist-get

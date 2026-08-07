@@ -164,21 +164,40 @@ When NULLABLE is non-nil, VALUE may be JSON null."
     ('nullable-list (gnosis-edit--format-list value t))
     ('concepts (gnosis-edit--format-concepts value))))
 
+(defun gnosis-edit--unsupported-keys (object supported)
+  "Return keys in OBJECT that are not members of SUPPORTED."
+  (cl-loop for tail on object by #'cddr
+           for key = (car tail)
+           unless (memq key supported)
+           collect key))
+
 (defun gnosis-edit--validate-request-shape (request)
   "Reject REQUEST fields this editor cannot preserve."
   (unless (gnosis-core--json-object-p request)
     (user-error "Invalid thema request object"))
-  (let* ((known (mapcar #'car gnosis-edit--fields))
-         (unknown
-          (cl-loop for tail on request by #'cddr
-                   for key = (car tail)
-                   unless (memq key known)
-                   collect key)))
+  (let ((unknown
+         (gnosis-edit--unsupported-keys
+          request (mapcar #'car gnosis-edit--fields))))
     (when unknown
       (user-error
        "Unsupported live thema fields: %s"
        (mapconcat (lambda (key) (substring (symbol-name key) 1))
                   unknown ", "))))
+  (when (plist-member request :concepts)
+    (unless (vectorp (plist-get request :concepts))
+      (user-error "Invalid thema concepts"))
+    (cl-loop for concept across (plist-get request :concepts)
+             for object-p = (gnosis-core--json-object-p concept)
+             for unknown = (and object-p
+                                (gnosis-edit--unsupported-keys
+                                 concept '(:node_id :relation)))
+             unless object-p
+             do (user-error "Invalid thema concept object")
+             when unknown
+             do (user-error "Unsupported live thema concept fields: %s"
+                            (mapconcat
+                             (lambda (key) (substring (symbol-name key) 1))
+                             unknown ", "))))
   request)
 
 (defun gnosis-edit--format-field (request field)
