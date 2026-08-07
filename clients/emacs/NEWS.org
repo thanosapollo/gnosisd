@@ -14,8 +14,10 @@
   parsing, projections, graph state, revisions, or scheduling.
 + Restored ~gnosis-nodes-insert~ for Org ID links, custom or region descriptions,
   and explicit root-node creation from a new completion title.
-+ Reduced the package to seven focused client modules.  Removed embedded
-  persistence, scheduling, grading, import, note, and compatibility backends.
++ Reduced the package to eight focused client modules, including the dedicated
+  ~gnosis-tl~ renderer for fast incremental tabulated-list updates.  Removed
+  embedded persistence, scheduling, grading, import, note, and compatibility
+  backends.
 + Added bounded HTTP transport, bearer credentials resolved through
   =auth-source=, future-compatible bounded error envelopes, safe GET retries,
   and strict loopback/HTTPS authority validation.

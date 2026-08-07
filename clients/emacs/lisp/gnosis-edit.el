@@ -41,6 +41,9 @@
 (defvar-local gnosis-edit--authority nil
   "Non-secret authenticated authority that opened this editor.")
 
+(defvar-local gnosis-edit--window-configuration nil
+  "Window configuration restored when this editor exits.")
+
 (defvar-keymap gnosis-edit-mode-map
   "C-c C-c" #'gnosis-edit-save
   "C-c C-r" #'gnosis-edit-retry-uncertain
@@ -118,25 +121,37 @@ Call AFTER-SAVE with the validated projection after a successful save."
   (gnosis-edit--ensure-buffer-available name)
   (when (and after-save (not (functionp after-save)))
     (signal 'wrong-type-argument (list 'functionp after-save)))
-  (let ((buffer (get-buffer-create name)))
+  (let ((buffer (get-buffer-create name))
+        (window-configuration (current-window-configuration)))
     (pop-to-buffer-same-window buffer)
     (gnosis-edit-mode)
     (setq-local gnosis-edit--thema-id thema-id)
     (setq-local gnosis-edit--revision revision)
     (setq-local gnosis-edit--authority authority)
     (setq-local gnosis-edit--after-save after-save)
+    (setq-local gnosis-edit--window-configuration window-configuration)
     (setq-local gnosis-edit--recovery nil)
     (gnosis-edit--replace-request request)
     buffer))
+
+(defun gnosis-edit--request-context ()
+  "Return pinned base, token, and authority for one request chain."
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (gnosis-core--token))
+         (authority
+          (let ((gnosis-core--base-url-override base-url))
+            (gnosis-core--authenticated-authority token))))
+    (list :base_url base-url :token token :authority authority)))
 
 ;;;###autoload
 (defun gnosis-add-thema (&optional after-save)
   "Open a new thema editor and call AFTER-SAVE with its saved projection."
   (interactive)
   (gnosis-edit--ensure-buffer-available gnosis-edit-new-buffer-name)
-  (gnosis-edit--open gnosis-edit-new-buffer-name
-                     (gnosis-edit--new-request) nil nil
-                     (gnosis-core--authenticated-authority) after-save))
+  (let ((context (gnosis-edit--request-context)))
+    (gnosis-edit--open gnosis-edit-new-buffer-name
+                       (gnosis-edit--new-request) nil nil
+                       (plist-get context :authority) after-save)))
 
 ;;;###autoload
 (defun gnosis-edit-thema (&optional thema-id after-save)
@@ -144,10 +159,13 @@ Call AFTER-SAVE with the validated projection after a successful save."
   (interactive (list (read-string "Thema ID: ")))
   (gnosis-edit--ensure-buffer-available gnosis-edit-buffer-name)
   (let* ((thema-id (or thema-id (read-string "Thema ID: ")))
-         (token (gnosis-core--token))
-         (authority (gnosis-core--authenticated-authority token))
+         (context (gnosis-edit--request-context))
+         (base-url (plist-get context :base_url))
+         (token (plist-get context :token))
+         (authority (plist-get context :authority))
          (projection
-          (let ((gnosis-core--token-override token))
+          (let ((gnosis-core--base-url-override base-url)
+                (gnosis-core--token-override token))
             (gnosis-core-thema thema-id)))
          (request (gnosis-core-thema-write-view projection)))
     (gnosis-edit--open gnosis-edit-buffer-name request thema-id
@@ -175,29 +193,41 @@ Record the complete immutable request context after unknown delivery."
   "Accept authoritative PROJECTION and return it."
   (let ((saved-request (gnosis-core-thema-write-view projection))
         (thema-id (plist-get projection :thema_id))
-        (revision (plist-get projection :revision)))
+        (revision (plist-get projection :revision))
+        (after-save gnosis-edit--after-save))
     (setq gnosis-edit--thema-id thema-id
           gnosis-edit--revision revision
           gnosis-edit--recovery nil)
     (gnosis-edit--replace-request saved-request)
-    (when gnosis-edit--after-save
-      (funcall gnosis-edit--after-save projection))
+    (gnosis-edit--exit)
+    (when after-save
+      (funcall after-save projection))
     (message "Saved thema %s at revision %s" thema-id revision)
     projection))
 
+(defun gnosis-edit--exit ()
+  "Kill current editor and restore its opening window configuration."
+  (let ((window-configuration gnosis-edit--window-configuration))
+    (quit-window t)
+    (when window-configuration
+      (set-window-configuration window-configuration))))
+
 (defun gnosis-edit--send-authorized
     (operation-id request thema-id revision)
-  "Send REQUEST under OPERATION-ID using the editor's opening authority.
+  "Send REQUEST once under opening authority and immutable OPERATION-ID.
 THEMA-ID and REVISION identify an update; both are nil for a create."
   (unless gnosis-edit--authority
     (signal 'gnosis-core-authorization-error
             '("Gnosis editor authority is unavailable")))
-  (let* ((token (gnosis-core--token))
-         (authority (gnosis-core--authenticated-authority token)))
+  (let* ((context (gnosis-edit--request-context))
+         (base-url (plist-get context :base_url))
+         (token (plist-get context :token))
+         (authority (plist-get context :authority)))
     (unless (equal authority gnosis-edit--authority)
       (signal 'gnosis-core-authorization-error
               '("Gnosis authenticated authority changed")))
-    (let ((gnosis-core--token-override token))
+    (let ((gnosis-core--base-url-override base-url)
+          (gnosis-core--token-override token))
       (gnosis-edit--send operation-id request thema-id revision))))
 
 (defun gnosis-edit-save ()
@@ -237,7 +267,7 @@ THEMA-ID and REVISION identify an update; both are nil for a create."
     (user-error "Not in a Gnosis editing buffer"))
   (when gnosis-edit--recovery
     (user-error "Mutation outcome is uncertain; retry or explicitly discard it"))
-  (quit-window t))
+  (gnosis-edit--exit))
 
 (defun gnosis-edit-discard-uncertain ()
   "Explicitly discard retained uncertain mutation recovery and close editor."
@@ -247,7 +277,7 @@ THEMA-ID and REVISION identify an update; both are nil for a create."
   (unless (yes-or-no-p "Discard uncertain Gnosis mutation recovery? ")
     (user-error "Gnosis recovery preserved"))
   (setq gnosis-edit--recovery nil)
-  (quit-window t))
+  (gnosis-edit--exit))
 
 (provide 'gnosis-edit)
 ;;; gnosis-edit.el ends here

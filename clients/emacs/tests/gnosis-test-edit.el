@@ -31,8 +31,10 @@
   (dolist (buffer (list gnosis-edit-new-buffer-name gnosis-edit-buffer-name))
     (when-let* ((live (get-buffer buffer))) (kill-buffer live)))
   (unwind-protect
-      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
-                 (lambda (&optional _) 'opening-authority)))
+      (cl-letf (((symbol-function 'gnosis-edit--request-context)
+                 (lambda () '(:base_url "https://a.example"
+                              :token "token"
+                              :authority opening-authority))))
         (save-window-excursion (gnosis-add-thema)))
     (with-current-buffer gnosis-edit-new-buffer-name
       (should (derived-mode-p 'gnosis-edit-mode))
@@ -73,6 +75,82 @@
         (should (equal gnosis-test-edit--request (gnosis-edit--parse))))
       (when-let* ((buffer (get-buffer gnosis-edit-buffer-name)))
         (kill-buffer buffer)))))
+
+(ert-deftest gnosis-edit-fetch-pins-base-when-configuration-rotates ()
+  (when-let* ((buffer (get-buffer gnosis-edit-buffer-name))) (kill-buffer buffer))
+  (let* ((base-a "https://a.example")
+         (base-b "https://b.example")
+         (token (make-string 40 ?a))
+         (gnosis-core-base-url base-a))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core--token)
+                   (lambda ()
+                     (setq gnosis-core-base-url base-b)
+                     token))
+                  ((symbol-function 'gnosis-core-thema)
+                   (lambda (_)
+                     (should (equal base-a gnosis-core--base-url-override))
+                     (should (equal token gnosis-core--token-override))
+                     (append '(:thema_id "opaque" :revision 7)
+                             gnosis-test-edit--request)))
+                  ((symbol-function 'gnosis-core-thema-write-view)
+                   (lambda (_) gnosis-test-edit--request))
+                  ((symbol-function 'pop-to-buffer-same-window) #'switch-to-buffer))
+          (save-window-excursion (gnosis-edit-thema "opaque"))
+          (with-current-buffer gnosis-edit-buffer-name
+            (should
+             (equal (vector base-a (secure-hash 'sha256 token))
+                    gnosis-edit--authority))))
+      (when-let* ((buffer (get-buffer gnosis-edit-buffer-name)))
+        (kill-buffer buffer)))))
+
+(ert-deftest gnosis-edit-mutations-pin-base-when-configuration-rotates ()
+  (dolist (kind '(create update retry))
+    (let* ((base-a "https://a.example")
+           (base-b "https://b.example")
+           (token (make-string 40 ?a))
+           (authority (vector base-a (secure-hash 'sha256 token)))
+           (gnosis-core-base-url base-a)
+           (calls 0)
+           (projection
+            (append '(:thema_id "opaque" :revision 8)
+                    gnosis-test-edit--request)))
+      (with-temp-buffer
+        (gnosis-edit-mode)
+        (setq-local gnosis-edit--authority authority)
+        (cl-letf (((symbol-function 'gnosis-core--token)
+                   (lambda ()
+                     (setq gnosis-core-base-url base-b)
+                     token))
+                  ((symbol-function 'gnosis-core-thema-create)
+                   (lambda (&rest _)
+                     (should (equal base-a gnosis-core--base-url-override))
+                     (should (equal token gnosis-core--token-override))
+                     (cl-incf calls)
+                     projection))
+                  ((symbol-function 'gnosis-core-thema-update)
+                   (lambda (&rest _)
+                     (should (equal base-a gnosis-core--base-url-override))
+                     (should (equal token gnosis-core--token-override))
+                     (cl-incf calls)
+                     projection))
+                  ((symbol-function 'gnosis-core-thema-write-view)
+                   (lambda (_) gnosis-test-edit--request))
+                  ((symbol-function 'quit-window) #'ignore))
+          (pcase kind
+            ('create
+             (gnosis-edit--send-authorized
+              "op:create" gnosis-test-edit--request nil nil))
+            ('update
+             (gnosis-edit--send-authorized
+              "op:update" gnosis-test-edit--request "opaque" 7))
+            ('retry
+             (setq-local gnosis-edit--recovery
+                         (list :operation-id "op:retry" :authority authority
+                               :thema-id "opaque" :revision 7
+                               :request gnosis-test-edit--request))
+             (gnosis-edit-retry-uncertain))))
+        (should (= 1 calls))))))
 
 (ert-deftest gnosis-edit-thema-preserves-existing-unsaved-buffer ()
   (let ((buffer (get-buffer-create gnosis-edit-buffer-name))
@@ -141,6 +219,7 @@
   (dolist (mode '(gnosis-edit-mode fundamental-mode))
     (let* ((buffer (generate-new-buffer "*Gnosis Edit*"))
            (recovery (list :operation-id "op:uncertain"
+                           :authority 'opening-authority
                            :thema-id "original" :revision 7
                            :request (copy-tree gnosis-test-edit--request t))))
       (unwind-protect
@@ -160,6 +239,56 @@
         (when (buffer-live-p buffer)
           (with-current-buffer buffer (setq gnosis-edit--recovery nil))
           (kill-buffer buffer))))))
+
+(ert-deftest gnosis-edit-retry-after-mode-reinit-uses-retained-authority ()
+  (let* ((request (copy-tree gnosis-test-edit--request t))
+         (recovery (list :operation-id "op:uncertain"
+                         :authority 'opening-authority
+                         :thema-id "original" :revision 7
+                         :request request))
+         arguments exited)
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (setq-local gnosis-edit--recovery recovery)
+      (fundamental-mode)
+      (cl-letf (((symbol-function 'gnosis-core--token)
+                 (lambda () "opening-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _token) 'opening-authority))
+                ((symbol-function 'gnosis-core-thema-update)
+                 (lambda (&rest args)
+                   (setq arguments args)
+                   `(:thema_id "original" :thema_revision 8
+                     :kind "basic" :keimenon "Question" :hypothesis ""
+                     :answer "Answer" :tags [])))
+                ((symbol-function 'gnosis-core-thema-write-view)
+                 (lambda (_) request))
+                ((symbol-function 'quit-window)
+                 (lambda (&rest _) (setq exited t))))
+        (gnosis-edit-retry-uncertain)))
+    (should (equal arguments (list "original" "op:uncertain" 7 request)))
+    (should exited)))
+
+(ert-deftest gnosis-edit-retry-after-mode-reinit-rejects-authority-drift ()
+  (let ((recovery (list :operation-id "op:uncertain"
+                        :authority 'opening-authority
+                        :thema-id "original" :revision 7
+                        :request (copy-tree gnosis-test-edit--request t)))
+        called)
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (setq-local gnosis-edit--recovery recovery)
+      (fundamental-mode)
+      (cl-letf (((symbol-function 'gnosis-core--token)
+                 (lambda () "changed-token"))
+                ((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&optional _token) 'changed-authority))
+                ((symbol-function 'gnosis-core-thema-update)
+                 (lambda (&rest _) (setq called t))))
+        (should-error (gnosis-edit-retry-uncertain)
+                      :type 'gnosis-core-authorization-error))
+      (should-not called)
+      (should (equal recovery gnosis-edit--recovery)))))
 
 (ert-deftest gnosis-edit-renamed-buffer-confirmed-discard-clears-before-close ()
   (let ((buffer (generate-new-buffer "*Gnosis New*"))
@@ -208,8 +337,8 @@
     (should (kill-buffer buffer))
     (should-not (buffer-live-p buffer))))
 
-(ert-deftest gnosis-edit-save-promotes-create-after-valid-response ()
-  (let (calls callback (operation-calls 0))
+(ert-deftest gnosis-edit-save-promotes-create-and-exits-after-valid-response ()
+  (let (calls callback exited (operation-calls 0))
     (with-temp-buffer
       (gnosis-edit-mode)
       (setq-local gnosis-edit--authority 'test-authority)
@@ -238,7 +367,9 @@
                  (lambda (projection)
                    (cl-loop for (key value) on projection by #'cddr
                             unless (memq key '(:thema_id :revision))
-                            append (list key value)))))
+                            append (list key value))))
+                ((symbol-function 'quit-window)
+                 (lambda (&rest _) (setq exited t))))
         (gnosis-edit-save))
       (should (= 1 (length calls)))
       (should (= 1 operation-calls))
@@ -249,7 +380,42 @@
       (should (equal "created" gnosis-edit--thema-id))
       (should (= 1 gnosis-edit--revision))
       (should (equal "created" (plist-get callback :thema_id)))
+      (should exited)
       (should-not (buffer-modified-p)))))
+
+(ert-deftest gnosis-edit-success-exits-when-after-save-signals ()
+  (dolist (update '(nil t))
+    (with-temp-buffer
+      (gnosis-edit-mode)
+      (setq-local gnosis-edit--thema-id (and update "thema-a"))
+      (setq-local gnosis-edit--revision (and update 7))
+      (setq-local gnosis-edit--authority 'opening-authority)
+      (setq-local gnosis-edit--after-save
+                  (lambda (_) (signal 'error '("callback failed"))))
+      (insert (gnosis-edit--render gnosis-test-edit--request))
+      (let ((projection
+             `(:thema_id "thema-a" :revision 8
+               :kind "basic" :keimenon "Question" :hypothesis ["guess"]
+               :answer ["Answer"] :tags []))
+            (exits 0))
+        (cl-letf (((symbol-function 'gnosis-edit--request-context)
+                   (lambda () '(:base_url "https://a.example"
+                                :token "token" :authority opening-authority)))
+                  ((symbol-function 'gnosis-core-operation-id)
+                   (lambda () "op:save"))
+                  ((symbol-function 'gnosis-core-thema-create)
+                   (lambda (&rest _) projection))
+                  ((symbol-function 'gnosis-core-thema-update)
+                   (lambda (&rest _) projection))
+                  ((symbol-function 'gnosis-core-thema-write-view)
+                   (lambda (_) gnosis-test-edit--request))
+                  ((symbol-function 'quit-window)
+                   (lambda (&rest _) (cl-incf exits))))
+          (should-error (gnosis-edit-save) :type 'error))
+        (should (= 1 exits))
+        (should (equal "thema-a" gnosis-edit--thema-id))
+        (should (= 8 gnosis-edit--revision))
+        (should-not gnosis-edit--recovery)))))
 
 (ert-deftest gnosis-edit-save-rejects-missing-opening-authority ()
   (with-temp-buffer

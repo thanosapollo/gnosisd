@@ -41,6 +41,7 @@
             "lisp/gnosis-core-assets.el"
             "lisp/gnosis-edit.el"
             "lisp/gnosis-nodes.el"
+            "lisp/gnosis-tl.el"
             "lisp/gnosis.el"
             "lisp/gnosis-review.el"
           ];
@@ -54,6 +55,7 @@
             "tests/gnosis-test-edit.el"
             "tests/gnosis-test-entry-smoke.el"
             "tests/gnosis-test-nodes.el"
+            "tests/gnosis-test-tl.el"
             "tests/gnosis-test-boundary.el"
             "tests/gnosis-test-review.el"
           ];

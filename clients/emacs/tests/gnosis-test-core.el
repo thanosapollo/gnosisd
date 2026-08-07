@@ -176,7 +176,11 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                  "https://example.org/path" "https://example.org?query"))
     (let ((gnosis-core-base-url url))
       (should-error (gnosis-core--validated-base-url)
-                    :type 'gnosis-core-validation-error))))
+                    :type 'gnosis-core-validation-error)))
+  (let ((gnosis-core-base-url "https://live.example")
+        (gnosis-core--base-url-override "https://pinned.example/"))
+    (should (equal "https://pinned.example"
+                   (gnosis-core--validated-base-url)))))
 
 (ert-deftest gnosis-core-validates-bearer-grammar ()
   (should (gnosis-core--valid-token-p (make-string 40 ?a)))

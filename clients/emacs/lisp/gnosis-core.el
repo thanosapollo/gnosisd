@@ -111,10 +111,15 @@ HTTPS.  User information, paths, queries, and fragments are rejected."
   (member (downcase (or host ""))
           '("localhost" "127.0.0.1" "::1" "[::1]")))
 
+(defvar gnosis-core--base-url-override nil
+  "Dynamically bound validated base URL for one request chain.")
+
 (defun gnosis-core--validated-base-url ()
-  "Return `gnosis-core-base-url' without a trailing slash.
+  "Return configured base URL without a trailing slash.
 Signal `gnosis-core-validation-error' when its authority is unsafe."
-  (let* ((url (url-generic-parse-url gnosis-core-base-url))
+  (let* ((base-url (or gnosis-core--base-url-override
+                       gnosis-core-base-url))
+         (url (url-generic-parse-url base-url))
          (scheme (url-type url))
          (host (url-host url))
          (path (url-filename url)))
@@ -124,9 +129,9 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
                           (gnosis-core--loopback-host-p host)))
                  (string-empty-p (or (url-user url) ""))
                  (member path '(nil "" "/"))
-                 (not (string-match-p "[?#]" gnosis-core-base-url)))
+                 (not (string-match-p "[?#]" base-url)))
       (signal 'gnosis-core-validation-error '("Unsafe Gnosis base URL")))
-    (string-remove-suffix "/" gnosis-core-base-url)))
+    (string-remove-suffix "/" base-url)))
 
 (defun gnosis-core--valid-token-p (token)
   "Return non-nil when TOKEN satisfies gnosisd's bearer-token grammar."
@@ -142,7 +147,7 @@ Signal `gnosis-core-validation-error' when its authority is unsafe."
         (string-to-list token))))
 
 (defvar gnosis-core--token-override nil
-  "Dynamically bound bearer token for one already-authorized request.")
+  "Dynamically bound bearer token for one authorized request chain.")
 
 (defun gnosis-core--token ()
   "Return bearer token resolved through `auth-source'."

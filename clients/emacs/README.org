@@ -110,12 +110,13 @@ nix build
 nix flake check
 #+end_src
 
-Runtime source consists of exactly seven modules:
+Runtime source consists of exactly eight modules:
 
 + =gnosis.el=
 + =gnosis-core.el=
 + =gnosis-core-assets.el=
 + =gnosis-edit.el=
 + =gnosis-nodes.el=
++ =gnosis-tl.el=
 + =gnosis-review.el=
 + =gnosis-completion.el=

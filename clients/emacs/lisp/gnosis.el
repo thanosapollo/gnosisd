@@ -25,6 +25,7 @@
 (require 'org)
 (require 'seq)
 (require 'tabulated-list)
+(require 'gnosis-tl)
 
 (declare-function gnosis-add-thema "gnosis-edit")
 (declare-function gnosis-edit-thema "gnosis-edit")
@@ -68,7 +69,9 @@
   :group 'gnosis)
 
 (defface gnosis-face-separator
-  '((t :inherit shadow :strike-through t))
+  '((default :inherit org-hide)
+    (((background light)) :strike-through "gray70")
+    (t :strike-through "gray30"))
   "Face reserved for review separators."
   :group 'gnosis)
 
@@ -115,11 +118,16 @@
 (defconst gnosis-themata--catalog-max-items 50000
   "Maximum themata materialized by the management dashboard.")
 
-(defconst gnosis-themata--cache-version 2)
+(defconst gnosis-themata--cache-version 3)
 (defconst gnosis-themata--cache-maximum-bytes (* 128 1024 1024))
 (defconst gnosis-themata--cache-envelope-reserve (* 1024 1024))
 (defconst gnosis-themata--progressive-threshold 1000)
 (defconst gnosis-themata--render-chunk-size 500)
+(defvar gnosis-themata--cache-read-chunk-bytes (* 256 1024))
+(defvar gnosis-themata--preloaded-cache nil)
+(defvar gnosis-themata--preload-state nil)
+(defvar gnosis-themata--preload-run 0)
+(defvar gnosis-themata--preload-timer nil)
 
 (defvar-local gnosis-themata--generation nil
   "Generation of the visible thema catalog.")
@@ -133,6 +141,8 @@
 (defvar-local gnosis-themata--tag-filter nil)
 (defvar-local gnosis-themata--render-epoch 0)
 (defvar-local gnosis-themata--render-timer nil)
+(defvar-local gnosis-themata--layout-width nil)
+(defvar-local gnosis-themata--layout-timer nil)
 (defvar-local gnosis-themata--refresh-timer nil)
 (defvar-local gnosis-themata--authority nil)
 (defvar-local gnosis-themata--refresh-run nil)
@@ -223,26 +233,58 @@
 (define-key gnosis-dashboard-themata-mode-map
             [remap tabulated-list-col-sort] #'gnosis-themata-col-sort)
 
+(defun gnosis-themata--column-format (width)
+  "Return thema columns proportioned for window WIDTH."
+  (let ((available (max 0 (- width 7))))
+    `[("Question" ,(max 10 (/ (* available 28) 100)) t)
+      ("Hypothesis" ,(max 8 (/ (* available 16) 100)) t)
+      ("Answer" ,(max 8 (/ (* available 16) 100)) t)
+      ("Tags" ,(max 8 (/ (* available 18) 100)) t)
+      ("Kind" ,(max 5 (/ (* available 10) 100)) t)
+      ("Archived" ,(max 5 (/ (* available 6) 100)) t)
+      ("Suspended" ,(max 5 (/ (* available 6) 100)) t)]))
+
+(defun gnosis-themata--apply-layout (buffer incarnation width)
+  "Apply WIDTH to BUFFER when INCARNATION still owns it."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
+                 (equal incarnation gnosis-themata--incarnation))
+        (setq gnosis-themata--layout-timer nil
+              gnosis-themata--layout-width width
+              tabulated-list-format (gnosis-themata--column-format width))
+        (tabulated-list-init-header)
+        (when (vectorp gnosis-themata--catalog-records)
+          (gnosis-themata--render (tabulated-list-get-id)))))))
+
+(defun gnosis-themata--window-size-change (window)
+  "Debounce thema column adjustment for resized WINDOW."
+  (let ((width (window-width window)))
+    (unless (equal width gnosis-themata--layout-width)
+      (when (timerp gnosis-themata--layout-timer)
+        (cancel-timer gnosis-themata--layout-timer))
+      (setq gnosis-themata--layout-timer
+            (run-with-idle-timer
+             0.1 nil #'gnosis-themata--apply-layout
+             (current-buffer) gnosis-themata--incarnation width)))))
+
 (define-derived-mode gnosis-dashboard-themata-mode
   tabulated-list-mode "Gnosis Themata"
   "Major mode for the server-owned thema management projection."
   (display-line-numbers-mode -1)
   (setq-local truncate-lines t
               tabulated-list-padding 2
-              tabulated-list-sort-key (cons "Question" nil)
+              tabulated-list-sort-key nil
+              gnosis-themata--layout-width (window-width)
               tabulated-list-format
-              [("Question" 36 t)
-               ("Hypothesis" 24 t)
-               ("Answer" 28 t)
-               ("Tags" 20 t)
-               ("Kind" 10 t)
-               ("Archived" 9 t)
-               ("Suspended" 9 t)]
+              (gnosis-themata--column-format gnosis-themata--layout-width)
               revert-buffer-function
               (lambda (&rest _) (gnosis-themata-refresh)))
   (setq gnosis-themata--incarnation (cl-incf gnosis-themata--sequence))
   (add-hook 'kill-buffer-hook #'gnosis-themata--cancel-timers nil t)
   (add-hook 'change-major-mode-hook #'gnosis-themata--cancel-timers nil t)
+  (add-hook 'window-size-change-functions
+            #'gnosis-themata--window-size-change nil t)
   (tabulated-list-init-header))
 
 (defun gnosis-themata--cache-items-p (items)
@@ -257,19 +299,56 @@
                       (not (prog1 (gethash thema-id seen)
                              (puthash thema-id t seen))))))))
 
-(defun gnosis-themata--cache-payload-p (payload &optional authority)
-  "Return non-nil when PAYLOAD is a valid cache for AUTHORITY.
+(defun gnosis-themata--cache-header-p (header &optional authority)
+  "Return non-nil when HEADER is valid for AUTHORITY.
 When AUTHORITY is nil, resolve the current authenticated authority."
-  (let* ((generation (plist-get payload :generation))
+  (let* ((generation (plist-get header :generation))
          (cursor (gnosis-core--decode-cursor generation))
-         (keys (cl-loop for (key _) on payload by #'cddr collect key)))
-    (and (equal keys '(:version :authority :server_id :generation :items))
-         (equal gnosis-themata--cache-version (plist-get payload :version))
+         (count (plist-get header :count))
+         (keys (cl-loop for (key _) on header by #'cddr collect key)))
+    (and (equal keys '(:version :authority :server_id :generation :count
+                       :payload_sha256))
+         (equal gnosis-themata--cache-version (plist-get header :version))
          (equal (or authority (gnosis-themata--current-authority))
-                (plist-get payload :authority))
+                (plist-get header :authority))
          cursor
-         (equal (plist-get cursor :server_id) (plist-get payload :server_id))
-         (gnosis-themata--cache-items-p (plist-get payload :items)))))
+         (equal (plist-get cursor :server_id) (plist-get header :server_id))
+         (integerp count)
+         (<= 0 count gnosis-themata--catalog-max-items)
+         (stringp (plist-get header :payload_sha256))
+         (string-match-p "\\`[[:xdigit:]]\\{64\\}\\'"
+                         (plist-get header :payload_sha256)))))
+
+(defun gnosis-themata--json-line (value)
+  "Return VALUE encoded as one UTF-8 JSON cache line."
+  (encode-coding-string
+   (json-serialize value
+                   :null-object gnosis-core--json-null
+                   :false-object gnosis-core--json-false)
+   'utf-8-unix))
+
+(defun gnosis-themata--parse-json-line (line)
+  "Return plist parsed from UTF-8 JSON cache LINE."
+  (json-parse-string
+   (decode-coding-string line 'utf-8-unix)
+   :object-type 'plist :array-type 'array
+   :null-object gnosis-core--json-null
+   :false-object gnosis-core--json-false))
+
+(defun gnosis-themata--cache-digest-initial ()
+  "Return the binary initial state for cache payload integrity."
+  (encode-coding-string (make-string 32 0) 'binary))
+
+(defun gnosis-themata--cache-digest-step (digest line)
+  "Return integrity chain after exact payload LINE following DIGEST."
+  (secure-hash
+   'sha256
+   (concat digest (secure-hash 'sha256 line nil nil t))
+   nil nil t))
+
+(defun gnosis-themata--cache-digest-hex (digest)
+  "Return lowercase hexadecimal encoding of binary DIGEST."
+  (mapconcat (lambda (byte) (format "%02x" byte)) digest ""))
 
 (defun gnosis-themata--cache-directory ()
   "Return the expanded private thema cache directory."
@@ -307,8 +386,8 @@ When AUTHORITY is nil, resolve the current authenticated authority."
     (set-file-modes directory #o700)
     directory))
 
-(defun gnosis-themata--cache-write (catalog)
-  "Atomically persist validated complete CATALOG and return CATALOG."
+(defun gnosis-themata--cache-write (catalog &optional authority)
+  "Persist complete CATALOG for AUTHORITY atomically and return it."
   (let* ((generation (plist-get catalog :generation))
          (cursor (gnosis-core--decode-cursor generation))
          (items (plist-get catalog :items)))
@@ -317,17 +396,29 @@ When AUTHORITY is nil, resolve the current authenticated authority."
     (when (> (gnosis-themata--records-byte-size items)
              gnosis-themata--cache-maximum-bytes)
       (signal 'gnosis-core-validation-error '("Gnosis thema cache is too large")))
-    (let* ((directory (gnosis-themata--secure-cache-directory))
+    (let* ((authority (or authority (gnosis-themata--current-authority)))
+           (directory (gnosis-themata--secure-cache-directory))
            (path (expand-file-name gnosis-themata-cache-file))
-           (payload `(:version ,gnosis-themata--cache-version
-                      :authority ,(gnosis-themata--current-authority)
-                      :server_id ,(plist-get cursor :server_id)
-                      :generation ,generation :items ,items))
-           (bytes (encode-coding-string
-                   (json-serialize payload
-                                   :null-object gnosis-core--json-null
-                                   :false-object gnosis-core--json-false)
-                   'utf-8-unix))
+           (bytes
+            (with-temp-buffer
+              (set-buffer-multibyte nil)
+              (let ((digest (gnosis-themata--cache-digest-initial)))
+                (cl-loop for item across items
+                         for line = (gnosis-themata--json-line item)
+                         do (setq digest
+                                  (gnosis-themata--cache-digest-step digest line))
+                         do (insert line "\n"))
+                (goto-char (point-min))
+                (insert
+                 (gnosis-themata--json-line
+                  `(:version ,gnosis-themata--cache-version
+                    :authority ,authority
+                    :server_id ,(plist-get cursor :server_id)
+                    :generation ,generation :count ,(length items)
+                    :payload_sha256
+                    ,(gnosis-themata--cache-digest-hex digest)))
+                 "\n"))
+              (buffer-string)))
            temporary)
       (when (or (file-symlink-p path)
                 (> (string-bytes bytes) gnosis-themata--cache-maximum-bytes))
@@ -361,16 +452,175 @@ When AUTHORITY is nil, resolve the current authenticated authority."
             (when (> (buffer-size) gnosis-themata--cache-maximum-bytes)
               (signal 'gnosis-core-validation-error
                       '("Gnosis thema cache is too large")))
-            (decode-coding-region (point-min) (point-max) 'utf-8-unix)
-            (let ((payload
-                   (json-parse-buffer
-                    :object-type 'plist :array-type 'array
-                    :null-object gnosis-core--json-null
-                    :false-object gnosis-core--json-false)))
-              (when (gnosis-themata--cache-payload-p payload authority)
-                (list :generation (plist-get payload :generation)
-                      :items (plist-get payload :items)))))))
+            (unless (and (> (buffer-size) 0)
+                         (eq (char-before (point-max)) ?\n))
+              (signal 'gnosis-core-validation-error
+                      '("Truncated Gnosis thema cache")))
+            (goto-char (point-min))
+            (let* ((header (gnosis-themata--parse-json-line
+                            (buffer-substring-no-properties
+                             (line-beginning-position) (line-end-position))))
+                   (expected (plist-get header :count))
+                   (seen (make-hash-table :test #'equal))
+                   (digest (gnosis-themata--cache-digest-initial))
+                   records)
+              (forward-line 1)
+              (while (< (point) (point-max))
+                (let* ((line (buffer-substring-no-properties
+                              (line-beginning-position) (line-end-position)))
+                       (record (gnosis-themata--parse-json-line line))
+                       (thema-id (plist-get record :thema_id)))
+                  (unless (and (gnosis-core--catalog-thema-p record)
+                               (not (gethash thema-id seen))
+                               (< (length records) gnosis-themata--catalog-max-items))
+                    (signal 'gnosis-core-validation-error
+                            '("Invalid Gnosis thema cache")))
+                  (puthash thema-id t seen)
+                  (setq digest (gnosis-themata--cache-digest-step digest line))
+                  (push record records))
+                (forward-line 1))
+              (let ((items (vconcat (nreverse records))))
+                (when (and (gnosis-themata--cache-header-p header authority)
+                           (= expected (length items))
+                           (equal (plist-get header :payload_sha256)
+                                  (gnosis-themata--cache-digest-hex digest))
+                           (gnosis-themata--cache-items-p items))
+                  (list :generation (plist-get header :generation)
+                        :items items)))))))
     (error nil)))
+
+(defun gnosis-themata--finish-cache-preload (run catalog)
+  "Finish cache preload RUN with validated CATALOG or nil."
+  (when (equal run gnosis-themata--preload-run)
+    (let* ((authority (plist-get gnosis-themata--preload-state :authority))
+           (live-authority
+            (condition-case nil
+                (gnosis-themata--current-authority)
+              (error nil)))
+           (current-p (and live-authority
+                           (equal authority live-authority))))
+      (setq gnosis-themata--preload-timer nil
+            gnosis-themata--preload-state nil
+            gnosis-themata--preloaded-cache
+            (and current-p catalog
+                 (list :authority authority :catalog catalog)))
+      (when-let* ((buffer (and current-p
+                              (get-buffer gnosis-dashboard-buffer-name))))
+        (with-current-buffer buffer
+          (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
+                     (equal authority gnosis-themata--authority))
+            (if catalog
+                (progn
+                  (gnosis-themata--install catalog)
+                  (gnosis-themata-refresh))
+              (gnosis-themata--start-bootstrap))))))))
+
+(defun gnosis-themata--consume-cache-line (state line)
+  "Return preload STATE after consuming one raw JSON LINE."
+  (if (null (plist-get state :header))
+      (let ((header (gnosis-themata--parse-json-line line)))
+        (unless (gnosis-themata--cache-header-p
+                 header (plist-get state :authority))
+          (signal 'gnosis-core-validation-error '("Invalid Gnosis thema cache")))
+        (plist-put state :header header))
+    (let* ((record (gnosis-themata--parse-json-line line))
+           (thema-id (plist-get record :thema_id))
+           (seen (plist-get state :seen))
+           (count (1+ (plist-get state :count))))
+      (unless (and (<= count gnosis-themata--catalog-max-items)
+                   (gnosis-core--catalog-thema-p record)
+                   (not (gethash thema-id seen)))
+        (signal 'gnosis-core-validation-error '("Invalid Gnosis thema cache")))
+      (puthash thema-id t seen)
+      (plist-put state :count count)
+      (plist-put state :digest
+                 (gnosis-themata--cache-digest-step
+                  (plist-get state :digest) line))
+      (plist-put state :records (cons record (plist-get state :records))))))
+
+(defun gnosis-themata--cache-preload-step (run)
+  "Read one bounded cache chunk for preload RUN."
+  (when (and (equal run gnosis-themata--preload-run)
+             gnosis-themata--preload-state)
+    (condition-case nil
+        (let* ((state gnosis-themata--preload-state)
+               (path (plist-get state :path))
+               (offset (plist-get state :offset))
+               (size (plist-get state :size))
+               (end (min size (+ offset gnosis-themata--cache-read-chunk-bytes)))
+               (chunk
+                (with-temp-buffer
+                  (set-buffer-multibyte nil)
+                  (insert-file-contents-literally path nil offset end)
+                  (buffer-string)))
+               (parts (split-string
+                       (concat (plist-get state :remainder) chunk) "\n"))
+               (remainder (car (last parts))))
+          (dolist (line (butlast parts))
+            (when (string-empty-p line)
+              (signal 'gnosis-core-validation-error
+                      '("Invalid Gnosis thema cache")))
+            (setq state (gnosis-themata--consume-cache-line state line)))
+          (when (> (string-bytes remainder)
+                   gnosis-themata--cache-envelope-reserve)
+            (signal 'gnosis-core-validation-error
+                    '("Invalid Gnosis thema cache")))
+          (setq state (plist-put state :offset end)
+                state (plist-put state :remainder remainder)
+                gnosis-themata--preload-state state)
+          (if (< end size)
+              (setq gnosis-themata--preload-timer
+                    (run-at-time 0 nil #'gnosis-themata--cache-preload-step run))
+            (let* ((header (plist-get state :header))
+                   (items (vconcat (nreverse (plist-get state :records))))
+                   (attributes (file-attributes path 'integer)))
+              (unless (and (string-empty-p remainder)
+                           attributes
+                           (= size (file-attribute-size attributes))
+                           (equal (plist-get state :modified)
+                                  (file-attribute-modification-time attributes))
+                           (= (plist-get header :count) (length items))
+                           (equal (plist-get header :payload_sha256)
+                                  (gnosis-themata--cache-digest-hex
+                                   (plist-get state :digest)))
+                           (gnosis-themata--cache-items-p items))
+                (signal 'gnosis-core-validation-error
+                        '("Invalid Gnosis thema cache")))
+              (gnosis-themata--finish-cache-preload
+               run (list :generation (plist-get header :generation)
+                         :items items)))))
+      (error (gnosis-themata--finish-cache-preload run nil)))))
+
+(defun gnosis-themata--start-cache-preload ()
+  "Start bounded background hydration of the disposable thema cache."
+  (when (timerp gnosis-themata--preload-timer)
+    (cancel-timer gnosis-themata--preload-timer))
+  (let ((run (cl-incf gnosis-themata--preload-run)))
+    (setq gnosis-themata--preload-timer nil
+          gnosis-themata--preload-state nil
+          gnosis-themata--preloaded-cache nil)
+    (condition-case nil
+        (let* ((authority (gnosis-themata--current-authority))
+             (path (expand-file-name gnosis-themata-cache-file))
+             (attributes (and (file-regular-p path)
+                              (not (file-symlink-p path))
+                              (file-attributes path 'integer)))
+             (size (and attributes (file-attribute-size attributes))))
+        (unless (and attributes size
+                     (<= size gnosis-themata--cache-maximum-bytes)
+                     (= #o600 (logand #o777 (file-modes path)))
+                     (equal (file-attribute-user-id attributes) (user-uid)))
+          (signal 'gnosis-core-validation-error '("Unsafe Gnosis thema cache")))
+          (setq gnosis-themata--preload-state
+                (list :authority authority :path path :size size :offset 0
+                      :modified (file-attribute-modification-time attributes)
+                      :remainder (encode-coding-string "" 'binary) :header nil
+                      :records nil :count 0
+                      :digest (gnosis-themata--cache-digest-initial)
+                      :seen (make-hash-table :test #'equal))
+                gnosis-themata--preload-timer
+                (run-at-time 0 nil #'gnosis-themata--cache-preload-step run)))
+      (error nil))))
 
 (defun gnosis-themata--content-record (projection previous)
   "Return compact catalog record from PROJECTION and PREVIOUS review state."
@@ -446,7 +696,14 @@ Return a plist containing updated `:catalog' and boolean `:done'."
       (signal 'gnosis-core-conflict '("Invalid Gnosis replica continuation")))
     (let ((overlay (make-hash-table :test #'equal))
           (missing (make-symbol "missing"))
-          (count (hash-table-count records)))
+          (count (hash-table-count records))
+          (order
+           (copy-sequence
+            (or (plist-get catalog :item_order)
+                (and (vectorp (plist-get catalog :items))
+                     (cl-loop for item across (plist-get catalog :items)
+                              collect (plist-get item :thema_id)))
+                '()))))
       (cl-loop
        for change across items
        for thema-id = (plist-get (plist-get change :projection) :thema_id)
@@ -470,23 +727,31 @@ Return a plist containing updated `:catalog' and boolean `:done'."
                       '("Gnosis thema catalog exceeds cache byte budget")))
             (setq bytes prospective-bytes
                   count prospective-count)
+            (when (and (null previous) (not (member thema-id order)))
+              (setq order (nconc order (list thema-id))))
             (puthash thema-id updated overlay)))
       (maphash (lambda (thema-id record)
                  (puthash thema-id record records))
-               overlay))
-    (let* ((done (not (eq t (plist-get page :has_more))))
-           (updated
-            (if done
+               overlay)
+      (let* ((done (not (eq t (plist-get page :has_more))))
+             (updated
+              (if done
+                  (list :generation next-generation
+                        :items
+                        (vconcat
+                         (mapcar (lambda (thema-id)
+                                   (gethash thema-id records))
+                                 order)))
                 (list :generation next-generation
-                      :items (vconcat (hash-table-values records)))
-              (list :generation next-generation
-                    :record_table records :bytes bytes))))
-      (list :catalog updated :done done))))
+                      :record_table records
+                      :item_order order
+                      :bytes bytes))))
+        (list :catalog updated :done done)))))
 
-(defun gnosis-themata--cache-try-write (catalog)
-  "Best-effort persist CATALOG without making cache I/O authoritative."
+(defun gnosis-themata--cache-try-write (catalog &optional authority)
+  "Best-effort persist CATALOG for pinned AUTHORITY."
   (condition-case error
-      (gnosis-themata--cache-write catalog)
+      (gnosis-themata--cache-write catalog authority)
     ((file-error gnosis-core-validation-error)
      (message "Gnosis thema cache persistence disabled: %s"
               (error-message-string error))
@@ -573,6 +838,12 @@ Return a plist containing updated `:catalog' and boolean `:done'."
       (member gnosis-themata--tag-filter
               (append (plist-get record :tags) nil))))
 
+(defun gnosis-themata--visible-p (record)
+  "Return non-nil when RECORD belongs in the current projection."
+  (and (gnosis-themata--matches-search-p record)
+       (gnosis-themata--matches-review-filter-p record)
+       (gnosis-themata--matches-tag-filter-p record)))
+
 (defun gnosis-themata--cancel-render ()
   "Cancel any pending progressive render in the current buffer."
   (when (timerp gnosis-themata--render-timer)
@@ -583,9 +854,12 @@ Return a plist containing updated `:catalog' and boolean `:done'."
 (defun gnosis-themata--cancel-timers ()
   "Cancel pending thema rendering and reconciliation timers."
   (gnosis-themata--cancel-render)
+  (when (timerp gnosis-themata--layout-timer)
+    (cancel-timer gnosis-themata--layout-timer))
   (when (timerp gnosis-themata--refresh-timer)
     (cancel-timer gnosis-themata--refresh-timer))
-  (setq gnosis-themata--refresh-timer nil
+  (setq gnosis-themata--layout-timer nil
+        gnosis-themata--refresh-timer nil
         gnosis-themata--refresh-run (cl-incf gnosis-themata--sequence)
         gnosis-themata--refresh-state nil))
 
@@ -638,16 +912,16 @@ render completes."
           (if tabulated-list-entries
               (nconc tabulated-list-entries entries)
             (setq tabulated-list-entries entries))
-          (goto-char (point-max))
-          (dolist (entry entries)
-            (tabulated-list-print-entry (car entry) (cadr entry)))
+          (gnosis-tl-append-entries entries)
           (if remaining
               (setq gnosis-themata--render-timer
                     (run-at-time 0 nil #'gnosis-themata--render-chunk
                                  buffer epoch (buffer-chars-modified-tick)
                                  remaining selected-id))
             (setq gnosis-themata--render-timer nil)
-            (when selected-id (gnosis-themata--goto-id selected-id))))))))
+            (if selected-id
+                (gnosis-themata--goto-id selected-id)
+              (goto-char (point-min)))))))))
 
 (defun gnosis-themata--render (&optional selected-id)
   "Render filtered authoritative records and restore SELECTED-ID."
@@ -661,8 +935,10 @@ render completes."
                                    (gnosis-themata--matches-review-filter-p record)
                                    (gnosis-themata--matches-tag-filter-p record))
                          collect (gnosis-themata--entry record)))
-          (tabulated-list-print t)
-          (when selected-id (gnosis-themata--goto-id selected-id)))
+          (gnosis-tl-print t)
+          (if selected-id
+              (gnosis-themata--goto-id selected-id)
+            (goto-char (point-min))))
       (let ((inhibit-read-only t)
             (epoch gnosis-themata--render-epoch))
         (setq tabulated-list-entries nil)
@@ -701,7 +977,8 @@ With numeric prefix -1, restore the authoritative catalog order."
     (gnosis-themata--sort-by-column-name
      (if column
          (car (aref tabulated-list-format column))
-       (get-text-property (point) 'tabulated-list-column-name)))))
+       (car (aref tabulated-list-format
+                  (gnosis-tl--column-at-point)))))))
 
 (defun gnosis-themata-col-sort (event)
   "Sort the header column selected by mouse EVENT and restart rendering."
@@ -738,25 +1015,14 @@ With numeric prefix -1, restore the authoritative catalog order."
   (setq gnosis-themata--refresh-timer
         (run-at-time 0 nil #'gnosis-themata--refresh-step buffer run)))
 
-(defun gnosis-themata--finish-refresh (catalog selected-id)
-  "Persist and install reconciled CATALOG, restoring SELECTED-ID."
-  (gnosis-themata--cache-try-write catalog)
-  (setq gnosis-themata--refresh-timer nil
-        gnosis-themata--refresh-state nil)
-  (gnosis-themata--install catalog selected-id))
-
-(defun gnosis-themata--bootstrap-step ()
-  "Fetch one bounded catalog page for the active bootstrap run."
-  (let* ((state gnosis-themata--refresh-state)
-         (after (plist-get state :after))
-         (generation (plist-get state :generation))
-         (records (plist-get state :records))
-         (seen-ids (plist-get state :seen_ids))
-         (seen-cursors (plist-get state :seen_cursors))
+(defun gnosis-themata--bootstrap-page-result (state page)
+  "Return a pure bounded bootstrap result from STATE and PAGE."
+  (let* ((generation (plist-get state :generation))
+         (records (copy-sequence (plist-get state :records)))
+         (seen-ids (copy-hash-table (plist-get state :seen_ids)))
+         (seen-cursors (copy-hash-table (plist-get state :seen_cursors)))
          (bytes (or (plist-get state :bytes)
                     gnosis-themata--cache-envelope-reserve))
-         (page (gnosis-core-thema-catalog
-                nil after gnosis-core--thema-catalog-page-limit))
          (items (plist-get page :items))
          (next (plist-get page :next))
          (page-generation (plist-get page :generation)))
@@ -770,63 +1036,122 @@ With numeric prefix -1, restore the authoritative catalog order."
       (signal 'gnosis-core-protocol-error '("Gnosis thema catalog is too large")))
     (cl-loop for record across items
              for thema-id = (plist-get record :thema_id)
-             do (when (gethash thema-id seen-ids)
+             for record-bytes = (1+ (gnosis-themata--json-bytes record))
+             do (when (or (gethash thema-id seen-ids)
+                          (> (+ bytes record-bytes)
+                             gnosis-themata--cache-maximum-bytes))
                   (signal 'gnosis-core-protocol-error
-                          '("Duplicate Gnosis catalog thema")))
+                          '("Invalid or oversized Gnosis catalog page")))
              do (puthash thema-id t seen-ids)
-             do (cl-incf bytes (1+ (gnosis-themata--json-bytes record)))
-             do (when (> bytes gnosis-themata--cache-maximum-bytes)
-                  (signal 'gnosis-core-protocol-error
-                          '("Gnosis thema catalog exceeds cache byte budget")))
+             do (cl-incf bytes record-bytes)
              do (push record records))
     (if (eq next gnosis-core--json-null)
-        (gnosis-themata--finish-refresh
-         (list :generation generation :items (vconcat (nreverse records)))
-         (plist-get state :selected))
+        (list :status 'done
+              :catalog (list :generation generation
+                             :items (vconcat (nreverse records)))
+              :selected (plist-get state :selected))
       (when (or (= 0 (length items)) (gethash next seen-cursors))
         (signal 'gnosis-core-protocol-error
                 '("Gnosis catalog bootstrap did not advance")))
       (puthash next t seen-cursors)
-      (setq gnosis-themata--refresh-state
+      (list :status 'continue
+            :state
             (list :kind 'bootstrap :after next :generation generation
                   :records records :seen_ids seen-ids
-                  :seen_cursors seen-cursors
-                  :bytes bytes
+                  :seen_cursors seen-cursors :bytes bytes
                   :selected (plist-get state :selected))))))
 
-(defun gnosis-themata--reconcile-step ()
-  "Apply one authenticated replica page for the active refresh run."
-  (let* ((state gnosis-themata--refresh-state)
-         (result (gnosis-themata--reconcile-page (plist-get state :catalog)))
-         (catalog (plist-get result :catalog)))
-    (if (plist-get result :done)
-        (gnosis-themata--finish-refresh catalog (plist-get state :selected))
-      (setq gnosis-themata--refresh-state
-            (list :kind 'reconcile :catalog catalog
-                  :selected (plist-get state :selected))))))
+(defun gnosis-themata--bootstrap-step (&optional state)
+  "Fetch one bootstrap page from STATE without publishing it."
+  (let* ((state (or state gnosis-themata--refresh-state))
+         (page (gnosis-core-thema-catalog
+                nil (plist-get state :after)
+                gnosis-core--thema-catalog-page-limit)))
+    (gnosis-themata--bootstrap-page-result state page)))
+
+(defun gnosis-themata--refresh-fetch (state)
+  "Fetch and materialize one private result from refresh STATE."
+  (pcase (plist-get state :kind)
+    ('bootstrap
+     (gnosis-themata--bootstrap-step state))
+    ('reconcile
+     (let* ((page-result
+             (gnosis-themata--reconcile-page (plist-get state :catalog)))
+            (catalog (plist-get page-result :catalog)))
+       (if (plist-get page-result :done)
+           (list :status 'done :catalog catalog
+                 :selected (plist-get state :selected))
+         (list :status 'continue
+               :state (list :kind 'reconcile :catalog catalog
+                            :selected (plist-get state :selected))))))))
+
+(defun gnosis-themata--refresh-context-p (buffer run incarnation authority)
+  "Return non-nil when BUFFER owns RUN, INCARNATION, and AUTHORITY."
+  (and (buffer-live-p buffer)
+       (with-current-buffer buffer
+         (and (derived-mode-p 'gnosis-dashboard-themata-mode)
+              (equal run gnosis-themata--refresh-run)
+              (equal incarnation gnosis-themata--incarnation)
+              (equal authority gnosis-themata--authority)
+              (condition-case nil
+                  (equal authority (gnosis-themata--current-authority))
+                (error nil))))))
+
+(defun gnosis-themata--publish-refresh-result
+    (buffer run incarnation authority result)
+  "Publish RESULT while BUFFER owns RUN, INCARNATION, and AUTHORITY."
+  (when (gnosis-themata--refresh-context-p
+         buffer run incarnation authority)
+    (with-current-buffer buffer
+      (pcase (plist-get result :status)
+        ('continue
+         (setq gnosis-themata--refresh-state (plist-get result :state))
+         (gnosis-themata--schedule-refresh-step buffer run))
+        ('done
+         (let ((catalog (plist-get result :catalog))
+               (selected (plist-get result :selected)))
+           (gnosis-themata--cache-try-write catalog authority)
+           (when (gnosis-themata--refresh-context-p
+                  buffer run incarnation authority)
+             (setq gnosis-themata--refresh-timer nil
+                   gnosis-themata--refresh-state nil)
+             (gnosis-themata--install catalog selected))))))))
 
 (defun gnosis-themata--refresh-step (buffer run)
-  "Execute one bounded refresh step for BUFFER and RUN."
+  "Execute one bounded two-phase refresh step for BUFFER and RUN."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
                  (equal run gnosis-themata--refresh-run))
-        (setq gnosis-themata--refresh-timer nil)
-        (condition-case error
-            (progn
-              (gnosis-themata--ensure-authority)
-              (pcase (plist-get gnosis-themata--refresh-state :kind)
-                ('bootstrap (gnosis-themata--bootstrap-step))
-                ('reconcile (gnosis-themata--reconcile-step)))
-              (when gnosis-themata--refresh-state
-                (gnosis-themata--schedule-refresh-step buffer run)))
-          (gnosis-core-conflict
-           (message "Gnosis thema cursor expired; rebuilding cache")
-           (gnosis-themata--start-bootstrap (tabulated-list-get-id)))
-          ((gnosis-core-error file-error)
-           (setq gnosis-themata--refresh-state nil)
-           (message "Gnosis thema refresh failed: %s"
-                    (error-message-string error))))))))
+        (let ((incarnation gnosis-themata--incarnation)
+              (opening-authority gnosis-themata--authority)
+              (state gnosis-themata--refresh-state))
+          (setq gnosis-themata--refresh-timer nil)
+          (condition-case error
+              (let* ((token (gnosis-core--token))
+                     (base-url (gnosis-core--validated-base-url))
+                     (request-authority
+                      (vector base-url (secure-hash 'sha256 token))))
+                (unless (equal opening-authority request-authority)
+                  (signal 'gnosis-core-authorization-error
+                          '("Gnosis credentials changed; reopen Themata")))
+                (let ((result
+                       (let ((gnosis-core--token-override token)
+                             (gnosis-core--base-url-override base-url))
+                         (gnosis-themata--refresh-fetch state))))
+                  (gnosis-themata--publish-refresh-result
+                   buffer run incarnation opening-authority result)))
+            (gnosis-core-conflict
+             (when (gnosis-themata--refresh-context-p
+                    buffer run incarnation opening-authority)
+               (message "Gnosis thema cursor expired; rebuilding cache")
+               (gnosis-themata--start-bootstrap (tabulated-list-get-id))))
+            ((gnosis-core-error file-error)
+             (when (gnosis-themata--refresh-context-p
+                    buffer run incarnation opening-authority)
+               (setq gnosis-themata--refresh-state nil)
+               (message "Gnosis thema refresh failed: %s"
+                        (error-message-string error))))))))))
 
 (defun gnosis-themata--start-bootstrap (&optional selected-id)
   "Start cancellable complete catalog bootstrap, restoring SELECTED-ID."
@@ -867,7 +1192,12 @@ With numeric prefix -1, restore the authoritative catalog order."
   "Open the complete cached server-owned thema management projection."
   (interactive)
   (let* ((authority (gnosis-themata--current-authority))
-         (cached (gnosis-themata--cache-read authority))
+         (cached (and (equal authority
+                             (plist-get gnosis-themata--preloaded-cache
+                                        :authority))
+                      (plist-get gnosis-themata--preloaded-cache :catalog)))
+         (warming (equal authority
+                         (plist-get gnosis-themata--preload-state :authority)))
          (buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (gnosis-dashboard-themata-mode)
@@ -878,9 +1208,12 @@ With numeric prefix -1, restore the authoritative catalog order."
           (gnosis-themata-refresh))
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert (propertize "Loading complete thema catalog…\n"
+        (insert (propertize (if warming
+                                "Warming thema cache…\n"
+                              "Loading complete thema catalog…\n")
                             'face 'gnosis-face-muted)))
-      (gnosis-themata--start-bootstrap))
+      (unless warming
+        (gnosis-themata--start-bootstrap)))
     (keymap-popup gnosis-dashboard-themata-mode-map)))
 
 (defun gnosis-themata--record-at-point ()
@@ -890,19 +1223,99 @@ With numeric prefix -1, restore the authoritative catalog order."
     (or (and thema-id (gethash thema-id gnosis-themata--records))
         (user-error "No thema at point"))))
 
+(defun gnosis-themata--sort-before-p (left right)
+  "Return non-nil when LEFT should sort before RIGHT under the active key."
+  (let* ((column (car tabulated-list-sort-key))
+         (descending (cdr tabulated-list-sort-key))
+         (left-value (gnosis-themata--sort-value left column))
+         (right-value (gnosis-themata--sort-value right column)))
+    (if descending
+        (string-lessp right-value left-value)
+      (string-lessp left-value right-value))))
+
+(defun gnosis-themata--insert-entry-sorted (entry entries)
+  "Return ENTRIES with ENTRY inserted under the active sort key."
+  (let* ((record (gethash (car entry) gnosis-themata--records))
+         (result nil)
+         (inserted nil))
+    (dolist (item entries)
+      (unless inserted
+        (let ((other (gethash (car item) gnosis-themata--records)))
+          (when (and record other (gnosis-themata--sort-before-p record other))
+            (push entry result)
+            (setq inserted t))))
+      (push item result))
+    (unless inserted
+      (push entry result))
+    (nreverse result)))
+
+(defun gnosis-themata--next-entry-id (thema-id entries)
+  "Return the id following THEMA-ID in ENTRIES, or nil when last."
+  (let ((cell (cl-member thema-id entries :key #'car :test #'equal)))
+    (car-safe (car-safe (cdr cell)))))
+
 (defun gnosis-themata--replace-record (record)
   "Replace visible catalog RECORD after an authoritative mutation."
-  (let ((thema-id (plist-get record :thema_id)))
+  (let* ((thema-id (plist-get record :thema_id))
+         (previous (gethash thema-id gnosis-themata--records))
+         (old-visible (and previous (gnosis-themata--visible-p previous)))
+         (new-visible (gnosis-themata--visible-p record))
+         (sort-column (car-safe tabulated-list-sort-key))
+         (sort-stable
+          (or (null sort-column)
+              (and previous
+                   (equal (gnosis-themata--sort-value previous sort-column)
+                          (gnosis-themata--sort-value record sort-column)))))
+         (displayed (assoc thema-id tabulated-list-entries))
+         (entry (gnosis-themata--entry record))
+         (selected-id (tabulated-list-get-id))
+         (selected-column (current-column))
+         (start-id (and (get-buffer-window (current-buffer))
+                        (get-text-property (window-start) 'tabulated-list-id))))
     (puthash thema-id record gnosis-themata--records)
     (setq gnosis-themata--catalog-records
           (vconcat
            (mapcar (lambda (item)
                      (if (equal thema-id (plist-get item :thema_id)) record item))
                    (append gnosis-themata--catalog-records nil))))
-    (gnosis-themata--render thema-id)
-    (when (and gnosis-themata--authority
-               (gnosis-core--decode-cursor gnosis-themata--generation))
-      (gnosis-themata-refresh))))
+    (cond
+     ((and old-visible new-visible sort-stable displayed)
+      (setq tabulated-list-entries
+            (mapcar (lambda (item)
+                      (if (equal thema-id (car item)) entry item))
+                    tabulated-list-entries))
+      (gnosis-tl-replace-entry thema-id (cadr entry)))
+     ((and old-visible new-visible displayed)
+      (let* ((without (cl-remove thema-id tabulated-list-entries
+                                 :key #'car :test #'equal))
+             (entries (gnosis-themata--insert-entry-sorted entry without))
+             (before-id (gnosis-themata--next-entry-id thema-id entries)))
+        (setq tabulated-list-entries entries)
+        (gnosis-tl-delete-entry thema-id)
+        (gnosis-tl-insert-entry thema-id (cadr entry) before-id)
+        (when (and start-id (gnosis-tl--goto-id start-id)
+                   (get-buffer-window (current-buffer)))
+          (set-window-start (selected-window) (line-beginning-position)))
+        (when (and selected-id (gnosis-tl--goto-id selected-id))
+          (move-to-column selected-column))))
+     ((and old-visible (not new-visible) displayed)
+      (setq tabulated-list-entries
+            (cl-delete thema-id tabulated-list-entries
+                       :key #'car :test #'equal))
+      (gnosis-tl-delete-entry thema-id))
+     ((and (not old-visible) new-visible)
+      (let* ((entries (gnosis-themata--insert-entry-sorted
+                       entry tabulated-list-entries))
+             (before-id (gnosis-themata--next-entry-id thema-id entries)))
+        (setq tabulated-list-entries entries)
+        (gnosis-tl-insert-entry thema-id (cadr entry) before-id)
+        (when (and start-id (gnosis-tl--goto-id start-id)
+                   (get-buffer-window (current-buffer)))
+          (set-window-start (selected-window) (line-beginning-position)))
+        (when (and selected-id (gnosis-tl--goto-id selected-id))
+          (move-to-column selected-column))))
+     ((and (not old-visible) (not new-visible)) nil)
+     (t (gnosis-themata--render thema-id)))))
 
 (defun gnosis-themata--edited (buffer authority incarnation projection)
   "Update BUFFER from PROJECTION when AUTHORITY and INCARNATION still own it."
@@ -964,12 +1377,16 @@ With numeric prefix -1, restore the authoritative catalog order."
   (unless gnosis-themata--authority
     (signal 'gnosis-core-authorization-error
             '("Gnosis dashboard authority is unavailable")))
-  (let* ((token (gnosis-core--token))
-         (authority (gnosis-core--authenticated-authority token)))
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (gnosis-core--token))
+         (authority
+          (let ((gnosis-core--base-url-override base-url))
+            (gnosis-core--authenticated-authority token))))
     (unless (equal authority gnosis-themata--authority)
       (signal 'gnosis-core-authorization-error
               '("Gnosis authenticated authority changed")))
-    (let ((gnosis-core--token-override token))
+    (let ((gnosis-core--base-url-override base-url)
+          (gnosis-core--token-override token))
       (funcall function))))
 
 (defun gnosis-themata-toggle-suspension ()
@@ -1302,6 +1719,7 @@ visible as authoritative partial progress."
       (gnosis-core-error
        (setq gnosis-dashboard--projection nil)
        (gnosis--render-dashboard-failure condition)))
+    (gnosis-themata--start-cache-preload)
     (keymap-popup gnosis-dashboard-mode-map)))
 
 ;;;###autoload
