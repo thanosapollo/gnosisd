@@ -34,9 +34,8 @@
 ;;    eliminating per-mutation Elisp hook dispatch.  Standard
 ;;    `tabulated-list-print' does NOT use this flag.
 ;;
-;; 2. Skip `tabulated-list-column-name' text properties (one per
-;;    column per entry).  Instead, `gnosis-tl--column-at-point'
-;;    computes the column from cursor position and format widths.
+;; 2. Precompute column formatting metadata once per batch while
+;;    retaining the native text properties used for navigation.
 ;;
 ;; Also provides single-entry replace/delete operations that avoid
 ;; re-rendering the entire buffer when only one line changes.
