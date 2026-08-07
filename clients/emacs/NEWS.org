@@ -26,6 +26,9 @@
   not add another runtime module.
 + Removed handwritten success DTOs and direct route bindings.  Dashboard,
   authoring, and review operations resolve through the live OpenAPI contract.
++ Replaced raw JSON thema authoring with one heading-based text editor shared
+  by create, dashboard edit, and review edit.  The format preserves nullable,
+  multiline, concept-relation, and exact-retry request state losslessly.
 + Restored server-authoritative review creation, resume, structured response,
   accepted-result override, suspension, commit, and quit/abort.  Revision
   conflicts refresh authoritative attempt state; delivery-unknown mutations

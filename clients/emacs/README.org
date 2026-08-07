@@ -99,6 +99,13 @@ supports text/review/tag filters, create/edit, archive, suspension, and confirme
 tag-page suspension.  The daemon remains authoritative for all projections and
 mutations.
 
+Thema creation, dashboard editing, and review editing share one text buffer.
+Fields use fixed =** Field= headings.  Repeated values use =- value=; subsequent
+lines use =  |value=.  =@null= and =@empty= keep null and empty values distinct,
+and a leading backslash quotes literal markers or heading-like content.
+Concepts preserve server order as =- RELATION "NODE-ID"=.  Save with =C-c C-c=,
+cancel with =C-c C-k=, or retry a retained uncertain mutation with =C-c C-r=.
+
 ** Development
 
 #+begin_src sh

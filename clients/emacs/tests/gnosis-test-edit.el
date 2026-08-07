@@ -7,25 +7,54 @@
 (require 'gnosis-edit)
 
 (defconst gnosis-test-edit--request
-  `(:kind "basic" :keimenon "Question\nline two"
-    :hypothesis ["guess" ,gnosis-core--json-null]
-    :answer ["first" "second\nline"]
+  `(:kind "basic" :keimenon "  Question  \n\\opening\n** Answer\n"
+    :hypothesis ["guess" ,gnosis-core--json-null "" "hint\n\n"]
+    :answer ["first" "second\nline\n" "@null" ""]
     :source_guid ,gnosis-core--json-null
-    :parathema "Context" :review_image ,gnosis-core--json-null
-    :tags ["logic"]
-    :concepts [(:node_id "opaque/node?id" :relation "primary")]
-    :asset_paths ["assets/abc/image.png"])
+    :parathema " Context " :review_image ""
+    :tags ["logic" "  spaced  "]
+    :concepts [(:node_id "primary/node" :relation "primary")
+               (:node_id "reference/node\nquoted" :relation "reference")
+               (:node_id "supporting/node" :relation "supporting")
+               (:node_id "second/primary" :relation "primary")]
+    :asset_paths ["assets/abc/image.png" "assets/trailing "])
   "Complete thema request used by editor tests.")
 
-(ert-deftest gnosis-edit-json-round-trip-is-lossless ()
+(ert-deftest gnosis-edit-text-round-trip-is-lossless ()
   (with-temp-buffer
     (insert (gnosis-edit--render gnosis-test-edit--request))
-    (should (equal gnosis-test-edit--request (gnosis-edit--parse)))))
+    (let ((text (buffer-string)))
+      (should (string-prefix-p "* Thema\n\n** Kind\n" text))
+      (should (string-match-p (regexp-quote "\n** Concepts\n") text))
+      (should (string-match-p "\\\\\\*\\* Answer" text))
+      (should-not (string-match-p "\\`[[:space:]]*{" text))
+      (should (equal gnosis-test-edit--request (gnosis-edit--parse))))))
 
-(ert-deftest gnosis-edit-rejects-duplicate-json-fields ()
+(ert-deftest gnosis-edit-text-parser-rejects-unknown-headings ()
   (with-temp-buffer
-    (insert "{\"kind\":\"basic\",\"kind\":\"cloze\"}")
+    (insert (replace-regexp-in-string
+             "^\\*\\* Kind$" "** Unknown"
+             (gnosis-edit--render gnosis-test-edit--request)))
     (should-error (gnosis-edit--parse) :type 'user-error)))
+
+(ert-deftest gnosis-edit-text-parser-rejects-malformed-list-items ()
+  (with-temp-buffer
+    (insert (replace-regexp-in-string
+             "^- first$" "first"
+             (gnosis-edit--render gnosis-test-edit--request)))
+    (should-error (gnosis-edit--parse) :type 'user-error)))
+
+(ert-deftest gnosis-edit-mode-protects-structure-not-values ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (gnosis-edit--replace-request gnosis-test-edit--request)
+    (goto-char (point-min))
+    (should (get-text-property (point) 'read-only))
+    (re-search-forward "^\\*\\* Keimenon$")
+    (should (get-text-property (line-beginning-position) 'read-only))
+    (forward-line 1)
+    (should-not (get-text-property (point) 'read-only))
+    (insert "editable ")))
 
 (ert-deftest gnosis-add-thema-opens-shared-text-editor ()
   (dolist (buffer (list gnosis-edit-new-buffer-name gnosis-edit-buffer-name))
@@ -45,10 +74,11 @@
     (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
       (kill-buffer buffer))))
 
-(ert-deftest gnosis-edit-mode-uses-js-json-mode ()
+(ert-deftest gnosis-edit-mode-uses-text-mode ()
   (with-temp-buffer
     (gnosis-edit-mode)
-    (should (derived-mode-p 'js-json-mode))))
+    (should (derived-mode-p 'text-mode))
+    (should outline-minor-mode)))
 
 (ert-deftest gnosis-edit-thema-fetches-before-opening-buffer ()
   (when-let* ((buffer (get-buffer gnosis-edit-buffer-name))) (kill-buffer buffer))

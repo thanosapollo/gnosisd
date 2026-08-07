@@ -15,8 +15,31 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'gnosis-core)
-(require 'js)
+(require 'json)
+(require 'outline)
+(require 'subr-x)
+
+(defconst gnosis-edit--fields
+  '((:kind "Kind" scalar)
+    (:keimenon "Keimenon" scalar)
+    (:hypothesis "Hypothesis" nullable-list)
+    (:answer "Answer" list)
+    (:source_guid "Source GUID" nullable)
+    (:parathema "Parathema" nullable)
+    (:review_image "Review image" nullable)
+    (:tags "Tags" list)
+    (:concepts "Concepts" concepts)
+    (:asset_paths "Asset paths" list))
+  "Ordered thema request fields and their text representations.")
+
+(defconst gnosis-edit--markers '("@null" "@empty")
+  "Reserved scalar and list item markers.")
+
+(defconst gnosis-edit--font-lock-keywords
+  '(("^\\* .*$" . font-lock-type-face)
+    ("^\\*\\* .*$" . font-lock-keyword-face)))
 
 (defvar gnosis-edit-new-buffer-name "*Gnosis New*"
   "Buffer name reserved for adding Gnosis content.")
@@ -59,12 +82,15 @@
 
 (put 'gnosis-edit--allow-kill 'permanent-local-hook t)
 
-(define-derived-mode gnosis-edit-mode js-json-mode "Gnosis-Edit"
-  "Major mode for editing one Gnosis thema request as JSON."
+(define-derived-mode gnosis-edit-mode text-mode "Gnosis-Edit"
+  "Major mode for editing one Gnosis thema as structured text."
   (add-hook 'kill-buffer-query-functions #'gnosis-edit--allow-kill nil t)
-  (setq-local header-line-format
+  (setq-local font-lock-defaults '(gnosis-edit--font-lock-keywords)
+              outline-regexp "\\*+ "
+              header-line-format
               (substitute-command-keys
-               " Save \\[gnosis-edit-save], retry \\[gnosis-edit-retry-uncertain], cancel \\[gnosis-edit-cancel]")))
+               " Save \\[gnosis-edit-save], retry \\[gnosis-edit-retry-uncertain], cancel \\[gnosis-edit-cancel]"))
+  (outline-minor-mode 1))
 
 (defun gnosis-edit--new-request ()
   "Return a complete initial thema request document."
@@ -74,37 +100,215 @@
     :review_image ,gnosis-core--json-null
     :tags [] :concepts [] :asset_paths []))
 
+(defun gnosis-edit--escape-line (line &optional structural)
+  "Escape reserved LINE, including a STRUCTURAL heading when requested."
+  (if (or (string-prefix-p "\\" line)
+          (member line gnosis-edit--markers)
+          (and structural (string-match-p "\\`\\*+ " line)))
+      (concat "\\" line)
+    line))
+
+(defun gnosis-edit--unescape-line (line &optional structural)
+  "Remove one reserved escape from LINE when valid for STRUCTURAL text."
+  (if (and (string-prefix-p "\\" line)
+           (let ((value (substring line 1)))
+             (or (string-prefix-p "\\" value)
+                 (member value gnosis-edit--markers)
+                 (and structural (string-match-p "\\`\\*+ " value)))))
+      (substring line 1)
+    line))
+
+(defun gnosis-edit--format-string (value nullable)
+  "Return string VALUE encoded as scalar text.
+When NULLABLE is non-nil, VALUE may be JSON null."
+  (cond
+   ((eq value gnosis-core--json-null)
+    (if nullable "@null" (user-error "Required thema field cannot be null")))
+   ((string-empty-p value) "@empty")
+   (t (mapconcat (lambda (line) (gnosis-edit--escape-line line t))
+                 (split-string value "\n" nil) "\n"))))
+
+(defun gnosis-edit--format-list-item (value nullable)
+  "Return VALUE encoded as one list item, allowing null when NULLABLE."
+  (cond
+   ((eq value gnosis-core--json-null)
+    (if nullable "- @null" (user-error "Thema list item cannot be null")))
+   ((string-empty-p value) "- @empty")
+   (t
+    (let ((lines (split-string value "\n" nil)))
+      (concat "- " (gnosis-edit--escape-line (car lines))
+              (mapconcat (lambda (line) (concat "\n  |" line))
+                         (cdr lines) ""))))))
+
+(defun gnosis-edit--format-list (values nullable)
+  "Return vector VALUES as list text, allowing null when NULLABLE."
+  (mapconcat (lambda (value) (gnosis-edit--format-list-item value nullable))
+             (append values nil) "\n"))
+
+(defun gnosis-edit--format-concepts (concepts)
+  "Return ordered CONCEPTS as readable relation and node ID lines."
+  (mapconcat
+   (lambda (concept)
+     (format "- %s %s"
+             (plist-get concept :relation)
+             (json-serialize (plist-get concept :node_id))))
+   (append concepts nil) "\n"))
+
+(defun gnosis-edit--format-value (value type)
+  "Return VALUE encoded according to field TYPE."
+  (pcase type
+    ('scalar (gnosis-edit--format-string value nil))
+    ('nullable (gnosis-edit--format-string value t))
+    ('list (gnosis-edit--format-list value nil))
+    ('nullable-list (gnosis-edit--format-list value t))
+    ('concepts (gnosis-edit--format-concepts value))))
+
+(defun gnosis-edit--format-field (request field)
+  "Return one FIELD section encoded from REQUEST."
+  (pcase-let ((`(,key ,label ,type) field))
+    (format "** %s\n%s" label
+            (gnosis-edit--format-value (plist-get request key) type))))
+
 (defun gnosis-edit--render (request)
-  "Return REQUEST as pretty-printed JSON text."
-  (with-temp-buffer
-    (insert (decode-coding-string (gnosis-core--json-body request) 'utf-8-unix))
-    (json-pretty-print-buffer)
-    (buffer-string)))
+  "Return REQUEST as structured thema text."
+  (concat "* Thema\n\n"
+          (mapconcat (lambda (field)
+                       (gnosis-edit--format-field request field))
+                     gnosis-edit--fields "\n\n")
+          "\n"))
+
+(defun gnosis-edit--section-records (text)
+  "Return ordered heading records found in structured thema TEXT."
+  (let ((start 0) records)
+    (while (string-match "^\\*\\* \\([^\n]+\\)$" text start)
+      (push (list (match-string 1 text)
+                  (match-beginning 0) (1+ (match-end 0)))
+            records)
+      (setq start (1+ (match-end 0))))
+    (nreverse records)))
+
+(defun gnosis-edit--section-value (text records index)
+  "Return section value from TEXT at INDEX in RECORDS."
+  (let* ((record (nth index records))
+         (next (nth (1+ index) records))
+         (start (nth 2 record))
+         (end (if next (- (nth 1 next) 2) (1- (length text))))
+         (separator (if next
+                        (substring text end (nth 1 next))
+                      (substring text end))))
+    (unless (and (<= start end)
+                 (equal separator (if next "\n\n" "\n")))
+      (user-error "Malformed thema field boundary"))
+    (substring text start end)))
+
+(defun gnosis-edit--sections (text)
+  "Return ordered field labels and exact values parsed from TEXT."
+  (unless (string-prefix-p "* Thema\n\n** " text)
+    (user-error "Thema title is missing"))
+  (let* ((records (gnosis-edit--section-records text))
+         (labels (mapcar #'car records))
+         (expected (mapcar #'cadr gnosis-edit--fields)))
+    (unless (equal labels expected)
+      (user-error "Thema headings are missing, reordered, or unknown"))
+    (cl-loop for index from 0 below (length records)
+             collect (cons (nth index labels)
+                           (gnosis-edit--section-value text records index)))))
+
+(defun gnosis-edit--parse-string (text nullable)
+  "Return scalar TEXT, allowing a null marker when NULLABLE."
+  (cond
+   ((equal text "@null")
+    (if nullable gnosis-core--json-null
+      (user-error "Required thema field cannot be null")))
+   ((equal text "@empty") "")
+   (t (mapconcat (lambda (line) (gnosis-edit--unescape-line line t))
+                 (split-string text "\n" nil) "\n"))))
+
+(defun gnosis-edit--parse-list-item (first rest nullable)
+  "Decode list item FIRST and REST, allowing null when NULLABLE."
+  (cond
+   ((member first gnosis-edit--markers)
+    (when rest (user-error "Thema marker cannot have continuation lines"))
+    (if (equal first "@empty") ""
+      (if nullable gnosis-core--json-null
+        (user-error "Thema list item cannot be null"))))
+   (t (mapconcat #'identity
+                 (cons (gnosis-edit--unescape-line first) rest) "\n"))))
+
+(defun gnosis-edit--parse-list (text nullable)
+  "Return list vector parsed from TEXT, allowing null when NULLABLE."
+  (if (string-empty-p text)
+      []
+    (let (values first rest started)
+      (dolist (line (split-string text "\n" nil))
+        (cond
+         ((string-match "\\`- \\(.*\\)\\'" line)
+          (when started
+            (push (gnosis-edit--parse-list-item
+                   first (nreverse rest) nullable) values))
+          (setq first (match-string 1 line) rest nil started t))
+         ((and started (string-match "\\`  |\\(.*\\)\\'" line))
+          (push (match-string 1 line) rest))
+         (t (user-error "Malformed thema list item: %s" line))))
+      (push (gnosis-edit--parse-list-item first (nreverse rest) nullable) values)
+      (vconcat (nreverse values)))))
+
+(defun gnosis-edit--parse-concept (line)
+  "Return one concept parsed from LINE."
+  (unless (string-match
+           "\\`- \\(primary\\|supporting\\|reference\\) \\(.+\\)\\'" line)
+    (user-error "Malformed thema concept: %s" line))
+  (let ((relation (match-string 1 line))
+        (encoded (match-string 2 line)))
+    (condition-case nil
+        (let ((node-id (json-parse-string encoded)))
+          (unless (stringp node-id)
+            (user-error "Thema concept node ID must be a string"))
+          (list :node_id node-id :relation relation))
+      (json-parse-error (user-error "Invalid thema concept node ID")))))
+
+(defun gnosis-edit--parse-concepts (text)
+  "Return ordered concept vector parsed from TEXT."
+  (if (string-empty-p text) []
+    (vconcat (mapcar #'gnosis-edit--parse-concept
+                     (split-string text "\n" nil)))))
+
+(defun gnosis-edit--parse-value (text type)
+  "Return field TEXT decoded according to TYPE."
+  (pcase type
+    ('scalar (gnosis-edit--parse-string text nil))
+    ('nullable (gnosis-edit--parse-string text t))
+    ('list (gnosis-edit--parse-list text nil))
+    ('nullable-list (gnosis-edit--parse-list text t))
+    ('concepts (gnosis-edit--parse-concepts text))))
 
 (defun gnosis-edit--parse ()
-  "Return the JSON request in the current edit buffer."
+  "Return the thema request in the current edit buffer."
+  (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
+         (sections (gnosis-edit--sections text)))
+    (cl-loop for (key _label type) in gnosis-edit--fields
+             for section in sections
+             append (list key (gnosis-edit--parse-value (cdr section) type)))))
+
+(defun gnosis-edit--protect-headings ()
+  "Make structural headings read-only in the current editor."
   (save-excursion
     (goto-char (point-min))
-    (condition-case nil
-        (let ((value
-               (json-parse-buffer
-                :object-type 'plist :array-type 'array
-                :null-object gnosis-core--json-null
-                :false-object gnosis-core--json-false)))
-          (skip-chars-forward " \t\r\n")
-          (unless (and (eobp) (gnosis-core--json-object-p value))
-            (user-error "Thema buffer must contain one JSON object"))
-          value)
-      (json-parse-error (user-error "Invalid thema JSON")))))
+    (while (re-search-forward "^\\*+ .*$" nil t)
+      (add-text-properties
+       (line-beginning-position) (min (point-max) (1+ (line-end-position)))
+       '(read-only t front-sticky (read-only)
+                   rear-nonsticky (read-only))))))
 
 (defun gnosis-edit--replace-request (request)
   "Replace the current buffer with rendered REQUEST."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (insert (gnosis-edit--render request))
+    (gnosis-edit--protect-headings)
     (goto-char (point-min))
-    (when (search-forward "\"keimenon\":" nil t)
-      (skip-chars-forward " "))
+    (when (re-search-forward "^\\*\\* Keimenon$" nil t)
+      (forward-line 1))
     (set-buffer-modified-p nil)))
 
 (defun gnosis-edit--ensure-buffer-available (name)
