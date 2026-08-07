@@ -56,6 +56,28 @@
     (should-not (get-text-property (point) 'read-only))
     (insert "editable ")))
 
+(ert-deftest gnosis-edit-undo-stops-at-rendered-request ()
+  (let ((buffer (generate-new-buffer " *gnosis-edit-undo*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (buffer-enable-undo)
+          (gnosis-edit-mode)
+          (gnosis-edit--replace-request gnosis-test-edit--request)
+          (let ((baseline (buffer-string)))
+            (goto-char (point-min))
+            (re-search-forward "^\\*\\* Keimenon$")
+            (forward-line 1)
+            (insert "edited ")
+            (undo-boundary)
+            (undo-start)
+            (while (condition-case nil
+                       (progn (undo-more 1) t)
+                     (user-error nil)))
+            (should (equal baseline (buffer-string)))
+            (should (get-text-property (point-min) 'read-only))
+            (should (equal gnosis-test-edit--request (gnosis-edit--parse)))))
+      (kill-buffer buffer))))
+
 (ert-deftest gnosis-add-thema-opens-shared-text-editor ()
   (dolist (buffer (list gnosis-edit-new-buffer-name gnosis-edit-buffer-name))
     (when-let* ((live (get-buffer buffer))) (kill-buffer live)))

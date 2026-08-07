@@ -311,6 +311,8 @@ When NULLABLE is non-nil, VALUE may be JSON null."
     (goto-char (point-min))
     (when (re-search-forward "^\\*\\* Keimenon$" nil t)
       (forward-line 1))
+    (unless (eq buffer-undo-list t)
+      (setq buffer-undo-list nil))
     (set-buffer-modified-p nil)))
 
 (defun gnosis-edit--ensure-buffer-available (name)
