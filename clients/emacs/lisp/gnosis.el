@@ -966,41 +966,45 @@ Return a plist containing updated `:catalog' and boolean `:done'."
       records)))
 
 (defun gnosis-themata--render-chunk
-    (buffer epoch expected-tick records selected-id)
+    (buffer epoch expected-tick records selected-id expected-point expected-column)
   "Filter one bounded RECORDS chunk into BUFFER for EPOCH.
-Proceed only when EXPECTED-TICK is current.  Restore SELECTED-ID when the
-render completes."
+Proceed only when EXPECTED-TICK is current.  Restore SELECTED-ID only while
+point and column still equal EXPECTED-POINT and EXPECTED-COLUMN."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (cond
-       ((or (not (derived-mode-p 'gnosis-dashboard-themata-mode))
-            (/= epoch gnosis-themata--render-epoch)))
-       ((/= expected-tick (buffer-chars-modified-tick))
-        (setq gnosis-themata--render-timer nil)
-        (gnosis-themata--render selected-id))
-       (t
-        (let* ((count (min gnosis-themata--render-chunk-size (length records)))
-               (chunk (seq-take records count))
-               (remaining (nthcdr count records))
-               (entries
-                (cl-loop for record in chunk
-                         when (and (gnosis-themata--matches-search-p record)
-                                   (gnosis-themata--matches-review-filter-p record)
-                                   (gnosis-themata--matches-tag-filter-p record))
-                         collect (gnosis-themata--entry record)))
-               (inhibit-read-only t))
-          (if tabulated-list-entries
-              (nconc tabulated-list-entries entries)
-            (setq tabulated-list-entries entries))
-          (gnosis-tl-append-entries entries)
-          (if remaining
-              (setq gnosis-themata--render-timer
-                    (run-at-time 0 nil #'gnosis-themata--render-chunk
-                                 buffer epoch (buffer-chars-modified-tick)
-                                 remaining selected-id))
-            (setq gnosis-themata--render-timer nil)
-            (when selected-id
-              (gnosis-themata--goto-id selected-id)))))))))
+      (let ((restore-id (and selected-id
+                             (= expected-point (point))
+                             (= expected-column (current-column))
+                             selected-id)))
+        (cond
+         ((or (not (derived-mode-p 'gnosis-dashboard-themata-mode))
+              (/= epoch gnosis-themata--render-epoch)))
+         ((/= expected-tick (buffer-chars-modified-tick))
+          (setq gnosis-themata--render-timer nil)
+          (gnosis-themata--render restore-id))
+         (t
+          (let* ((count (min gnosis-themata--render-chunk-size (length records)))
+                 (chunk (seq-take records count))
+                 (remaining (nthcdr count records))
+                 (entries
+                  (cl-loop for record in chunk
+                           when (and (gnosis-themata--matches-search-p record)
+                                     (gnosis-themata--matches-review-filter-p record)
+                                     (gnosis-themata--matches-tag-filter-p record))
+                           collect (gnosis-themata--entry record)))
+                 (inhibit-read-only t))
+            (if tabulated-list-entries
+                (nconc tabulated-list-entries entries)
+              (setq tabulated-list-entries entries))
+            (gnosis-tl-append-entries entries)
+            (if remaining
+                (setq gnosis-themata--render-timer
+                      (run-at-time 0 nil #'gnosis-themata--render-chunk
+                                   buffer epoch (buffer-chars-modified-tick)
+                                   remaining restore-id (point) (current-column)))
+              (setq gnosis-themata--render-timer nil)
+              (when restore-id
+                (gnosis-themata--goto-id restore-id))))))))))
 
 (defun gnosis-themata--render (&optional selected-id)
   "Render filtered authoritative records and restore SELECTED-ID."
@@ -1024,7 +1028,7 @@ render completes."
         (erase-buffer)
         (gnosis-themata--render-chunk
          (current-buffer) epoch (buffer-chars-modified-tick)
-         records selected-id)))))
+         records selected-id (point) (current-column))))))
 
 (defun gnosis-themata--sort-by-column-name (name)
   "Set or flip the complete projection sort for column NAME."

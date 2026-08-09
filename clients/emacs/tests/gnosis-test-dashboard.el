@@ -1106,6 +1106,28 @@
         (apply (car scheduled) (cdr scheduled))
         (should (equal "b" (tabulated-list-get-id)))))))
 
+(ert-deftest gnosis-themata-progressive-render-prefers-new-user-point ()
+  (let ((first (gnosis-test-dashboard--thema :thema_id "a" :keimenon "A"))
+        (second (gnosis-test-dashboard--thema :thema_id "b" :keimenon "B"))
+        (third (gnosis-test-dashboard--thema :thema_id "c" :keimenon "C"))
+        (gnosis-themata--progressive-threshold 10)
+        (gnosis-themata--render-chunk-size 2)
+        scheduled)
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest arguments)
+                   (setq scheduled (cons function arguments))
+                   'timer)))
+        (gnosis-themata--install
+         `(:generation "generation" :items [,first ,second ,third]))
+        (should (gnosis-themata--goto-id "a"))
+        (setq gnosis-themata--progressive-threshold 1)
+        (gnosis-themata--render "a")
+        (should (gnosis-themata--goto-id "b"))
+        (apply (car scheduled) (cdr scheduled))
+        (should (equal "b" (tabulated-list-get-id)))))))
+
 (ert-deftest gnosis-themata-progressive-render-respects-question-sort ()
   (let ((zeta (gnosis-test-dashboard--thema :thema_id "a" :keimenon "Zeta"))
         (alpha (gnosis-test-dashboard--thema :thema_id "b" :keimenon "Alpha"))
