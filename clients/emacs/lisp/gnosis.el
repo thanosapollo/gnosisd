@@ -999,9 +999,8 @@ render completes."
                                  buffer epoch (buffer-chars-modified-tick)
                                  remaining selected-id))
             (setq gnosis-themata--render-timer nil)
-            (if selected-id
-                (gnosis-themata--goto-id selected-id)
-              (goto-char (point-min))))))))))
+            (when selected-id
+              (gnosis-themata--goto-id selected-id)))))))))
 
 (defun gnosis-themata--render (&optional selected-id)
   "Render filtered authoritative records and restore SELECTED-ID."
