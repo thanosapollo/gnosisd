@@ -1540,6 +1540,48 @@
     (gnosis-themata--goto-id "thema-a")
     (should (equal "Edited answer" (aref (tabulated-list-get-entry) 2)))))
 
+(ert-deftest gnosis-themata-add-updates-one-row-and-preserves-point ()
+  (with-temp-buffer
+    (gnosis-dashboard-themata-mode)
+    (gnosis-themata--install
+     `(:generation "feed-3"
+       :items [,(gnosis-test-dashboard--thema :thema_id "thema-a")
+               ,(gnosis-test-dashboard--thema
+                 :thema_id "thema-b" :keimenon "Second question")]))
+    (gnosis-themata--goto-id "thema-b")
+    (move-to-column 5)
+    (let ((saved-point (point))
+          callback
+          (refreshes 0)
+          (renders 0))
+      (cl-letf (((symbol-function 'gnosis-themata--ensure-authority) #'ignore)
+                ((symbol-function 'gnosis-edit-read-kind) (lambda () "basic"))
+                ((symbol-function 'gnosis-add-thema)
+                 (lambda (after-save kind)
+                   (should (equal kind "basic"))
+                   (setq callback after-save)))
+                ((symbol-function 'gnosis-themata-refresh)
+                 (lambda () (cl-incf refreshes)))
+                ((symbol-function 'gnosis-themata--render)
+                 (lambda (&rest _) (cl-incf renders))))
+        (gnosis-themata-add)
+        (funcall callback
+                 `(:thema_id "thema-c" :revision 1 :kind "basic"
+                   :keimenon "New question" :hypothesis []
+                   :answer ["New answer"] :tags []
+                   :archived ,gnosis-core--json-false)))
+      (should (= 0 refreshes))
+      (should (= 0 renders))
+      (should (= saved-point (point)))
+      (should (equal "thema-b" (tabulated-list-get-id)))
+      (should (gethash "thema-c" gnosis-themata--records))
+      (should (seq-find
+               (lambda (record)
+                 (equal "thema-c" (plist-get record :thema_id)))
+               gnosis-themata--catalog-records))
+      (gnosis-themata--goto-id "thema-c")
+      (should (equal "New question" (aref (tabulated-list-get-entry) 0))))))
+
 (ert-deftest gnosis-themata-edit-save-exits-and-restores-exact-row-point ()
   (when-let* ((buffer (get-buffer gnosis-edit-buffer-name)))
     (kill-buffer buffer))

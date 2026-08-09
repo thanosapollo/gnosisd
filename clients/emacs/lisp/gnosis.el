@@ -1412,10 +1412,13 @@ With numeric prefix -1, restore the authoritative catalog order."
                         (get-text-property (window-start) 'tabulated-list-id))))
     (puthash thema-id record gnosis-themata--records)
     (setq gnosis-themata--catalog-records
-          (vconcat
-           (mapcar (lambda (item)
-                     (if (equal thema-id (plist-get item :thema_id)) record item))
-                   (append gnosis-themata--catalog-records nil))))
+          (if previous
+              (vconcat
+               (mapcar
+                (lambda (item)
+                  (if (equal thema-id (plist-get item :thema_id)) record item))
+                (append gnosis-themata--catalog-records nil)))
+            (vconcat gnosis-themata--catalog-records (vector record))))
     (cond
      ((and old-visible new-visible sort-stable displayed)
       (setq tabulated-list-entries
@@ -1499,7 +1502,7 @@ With numeric prefix -1, restore the authoritative catalog order."
         (incarnation gnosis-themata--incarnation)
         (kind (gnosis-edit-read-kind)))
     (gnosis-add-thema
-     (lambda (_projection)
+     (lambda (projection)
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
@@ -1507,7 +1510,8 @@ With numeric prefix -1, restore the authoritative catalog order."
                       (or (null authority)
                           (equal authority (gnosis-themata--current-authority)))
                       (equal incarnation gnosis-themata--incarnation))
-             (gnosis-themata-refresh)))))
+             (gnosis-themata--replace-record
+              (gnosis-themata--content-record projection nil))))))
      kind)))
 
 (defalias 'gnosis-themata-new #'gnosis-themata-add)
