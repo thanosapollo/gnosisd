@@ -16,6 +16,7 @@ use crate::domain::{DocumentId, DocumentProjection, DueThema};
 pub struct DashboardV1 {
     pub generated_at_us: u64,
     pub review_day: u32,
+    pub current_streak_days: u64,
     pub today: ReviewTotalsV1,
     pub window: ReviewWindowV1,
     pub queue: ReviewQueueCountsV1,
@@ -32,6 +33,7 @@ impl DashboardV1 {
         Ok(Self {
             generated_at_us: value.generated_at_us,
             review_day: value.review_day,
+            current_streak_days: value.current_streak_days,
             today: ReviewTotalsV1::from(&value.today),
             window: ReviewWindowV1::from(&value.window),
             queue: ReviewQueueCountsV1::from(&value.queue),

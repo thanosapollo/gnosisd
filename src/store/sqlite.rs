@@ -4402,10 +4402,11 @@ fn load_thema_catalog_record(
     connection: &Connection,
     thema_id: &str,
 ) -> Result<ThemaCatalogRecord, StoreError> {
-    type CatalogRow = (i64, i64, String, String, String, String, bool, bool);
+    type CatalogRow = (i64, i64, i64, String, String, String, String, bool, bool);
     let row = connection
         .query_row(
-            "SELECT thema.revision, review_state.state_revision, thema.kind,
+            "SELECT thema.revision, review_state.state_revision, review_state.review_count,
+                    thema.kind,
                     thema.keimenon, thema.hypothesis_json, thema.answer_json,
                     thema.archived_at_us IS NOT NULL, review_state.suspended
              FROM thema JOIN review_state USING(thema_id)
@@ -4421,6 +4422,7 @@ fn load_thema_catalog_record(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
@@ -4434,12 +4436,13 @@ fn load_thema_catalog_record(
         thema_id: thema_id.to_owned(),
         thema_revision: to_u64(row.0, "thema revision")?,
         state_revision: to_u64(row.1, "state revision")?,
-        kind: ThemaKind::parse(&row.2).map_err(StoreError::storage)?,
-        keimenon: row.3,
-        hypothesis: serde_json::from_str(&row.4).map_err(StoreError::storage)?,
-        answer: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
-        archived: row.6,
-        suspended: row.7,
+        review_count: to_u64(row.2, "review count")?,
+        kind: ThemaKind::parse(&row.3).map_err(StoreError::storage)?,
+        keimenon: row.4,
+        hypothesis: serde_json::from_str(&row.5).map_err(StoreError::storage)?,
+        answer: serde_json::from_str(&row.6).map_err(StoreError::storage)?,
+        archived: row.7,
+        suspended: row.8,
     })
 }
 
@@ -6553,11 +6556,21 @@ mod tests {
             DeviceMutationResult::Rejected { .. }
         ));
 
+        store
+            .connection
+            .execute(
+                "UPDATE review_state
+                 SET review_count = 7, total_successes = 7,
+                     interval_days = 1, stability = 1.0, difficulty = 5.0",
+                [],
+            )
+            .unwrap();
         store.set_thema_archived("thema", 1, true, 6, None).unwrap();
         let page = store.thema_catalog(&device_id, "", 10, None).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].thema_revision, 2);
         assert_eq!(page.items[0].state_revision, 1);
+        assert_eq!(page.items[0].review_count, 7);
         assert!(page.items[0].archived);
         assert!(page.items[0].suspended);
         let history: (i64, Option<String>, String) = store

@@ -19,6 +19,7 @@
 (require 'keymap-popup)
 (require 'seq)
 (require 'subr-x)
+(require 'tabulated-list)
 
 (declare-function gnosis--dashboard-text "gnosis")
 (declare-function gnosis--separator "gnosis")
@@ -40,6 +41,16 @@
 (defvar gnosis-dashboard-buffer-name)
 (defvar gnosis-dashboard-mode-map)
 
+(defvar gnosis-review-history-buffer-name "*Gnosis Review History*"
+  "Name of the bounded review history buffer.")
+
+(defvar-local gnosis-review-history--authority nil)
+(defvar-local gnosis-review-history--cursor nil)
+(defvar-local gnosis-review-history--next nil)
+(defvar-local gnosis-review-history--previous nil)
+(defvar-local gnosis-review-history--records nil)
+(defvar-local gnosis-review-history--status nil)
+
 (defconst gnosis-themata--render-chunk-size 500
   "Maximum EWOC rows formatted by one timer callback.")
 
@@ -51,6 +62,7 @@
 (defvar-local gnosis-themata--search-filter nil)
 (defvar-local gnosis-themata--review-filter :all)
 (defvar-local gnosis-themata--tag-filter nil)
+(defvar-local gnosis-themata--max-reviews nil)
 (defvar-local gnosis-themata--sort-key nil)
 (defvar-local gnosis-themata--column-widths nil)
 (defvar-local gnosis-themata--layout-width nil)
@@ -270,7 +282,10 @@
   "Return non-nil when RECORD belongs in current projection."
   (and (gnosis-themata--matches-search-p record)
        (gnosis-themata--matches-review-filter-p record)
-       (gnosis-themata--matches-tag-filter-p record)))
+       (gnosis-themata--matches-tag-filter-p record)
+       (or (null gnosis-themata--max-reviews)
+           (<= (plist-get record :review_count)
+               gnosis-themata--max-reviews))))
 
 (defun gnosis-themata--sort-value (record column)
   "Return RECORD sort value for COLUMN index."
@@ -724,6 +739,19 @@ When FRESH is non-nil, publish each accepted page progressively."
   (setq gnosis-themata--review-filter state)
   (gnosis-themata--render (gnosis-themata--current-id)))
 
+(defun gnosis-themata-filter-max-reviews (maximum)
+  "Show authoritative themata reviewed at most MAXIMUM times.
+Without a prefix argument, show only never-reviewed themata."
+  (interactive
+   (list (if current-prefix-arg
+             (read-number "Maximum reviews: " 0)
+           0)))
+  (unless (natnump maximum)
+    (user-error "Maximum reviews must be non-negative"))
+  (let ((selected (gnosis-themata--current-id)))
+    (setq gnosis-themata--max-reviews maximum)
+    (gnosis-themata--render selected)))
+
 (defun gnosis-themata--column-at-point ()
   "Return column index at point, defaulting to Question."
   (or (get-text-property (point) 'gnosis-column-index) 0))
@@ -851,7 +879,8 @@ With numeric prefix -1, restore authoritative catalog order."
   "Return compact record from PROJECTION and PREVIOUS review state."
   (let ((record (or (copy-tree previous)
                     `(:thema_id ,(plist-get projection :thema_id)
-                      :state_revision 0 :suspended ,gnosis-core--json-false))))
+                      :state_revision 0 :review_count 0
+                      :suspended ,gnosis-core--json-false))))
     (dolist (field '(:kind :keimenon :hypothesis :answer :tags :archived))
       (setq record (plist-put record field (plist-get projection field))))
     (plist-put record :thema_revision (plist-get projection :revision))))
@@ -1001,7 +1030,176 @@ With numeric prefix -1, restore authoritative catalog order."
         gnosis-themata--search-filter nil
         gnosis-themata--review-filter :all
         gnosis-themata--tag-filter nil
+        gnosis-themata--max-reviews nil
         gnosis-themata--sort-key nil))
+
+(defun gnosis-review-history--current-authority ()
+  "Return non-secret identity of the authenticated review authority."
+  (gnosis-core--authenticated-authority))
+
+(defun gnosis-review-history--ensure-authority ()
+  "Reject history use when its authenticated authority changed."
+  (unless (equal gnosis-review-history--authority
+                 (gnosis-review-history--current-authority))
+    (signal 'gnosis-core-authorization-error
+            '("Gnosis authenticated authority changed"))))
+
+(defun gnosis-review-history--date (review-day)
+  "Return readable date for numeric REVIEW-DAY."
+  (format "%04d-%02d-%02d"
+          (/ review-day 10000)
+          (% (/ review-day 100) 100)
+          (% review-day 100)))
+
+(defun gnosis-review-history--entry (event)
+  "Return a public tabulated-list entry for review EVENT."
+  (let ((accepted (eq t (plist-get event :accepted_success)))
+        (detected (eq t (plist-get event :detected_success)))
+        (overrides (plist-get event :override_count)))
+    (list
+     (plist-get event :event_id)
+     (vector
+      (propertize (gnosis-review-history--date (plist-get event :review_day))
+                  'face 'font-lock-type-face)
+      (propertize (if accepted "Success" "Failure")
+                  'face (if accepted 'success 'error))
+      (propertize (if detected "Success" "Failure")
+                  'face (if detected 'success 'error))
+      (propertize (number-to-string overrides)
+                  'face (if (> overrides 0) 'warning 'shadow))))))
+
+(defun gnosis-review-history--status-text ()
+  "Return actionable text for current history status."
+  (pcase gnosis-review-history--status
+    ('loading (propertize "Loading review history…" 'face 'shadow))
+    ('empty (propertize "No review history yet. Press g to refresh."
+                       'face 'shadow))
+    ('end (propertize "End of review history." 'face 'shadow))
+    ('error (propertize "Review history unavailable. Press g to retry."
+                       'face 'error))
+    (_ "")))
+
+(defun gnosis-review-history--render ()
+  "Render current bounded history page and status."
+  (setq tabulated-list-entries
+        (mapcar #'gnosis-review-history--entry
+                gnosis-review-history--records))
+  (let ((inhibit-read-only t))
+    (tabulated-list-print t)
+    (save-excursion
+      (goto-char (point-max))
+      (insert "\n" (gnosis-review-history--status-text) "\n"))))
+
+(defun gnosis-review-history--load (cursor)
+  "Load bounded history page after CURSOR.
+Return `installed', `terminal', or `error'."
+  (gnosis-review-history--ensure-authority)
+  (setq gnosis-review-history--status 'loading)
+  (gnosis-review-history--render)
+  (condition-case nil
+      (let* ((page (gnosis-core-review-history cursor 100))
+             (items (plist-get page :items))
+             (next (plist-get page :next)))
+        (if (and cursor (= (length items) 0))
+            (progn
+              (setq gnosis-review-history--next gnosis-core--json-null
+                    gnosis-review-history--status 'end)
+              (gnosis-review-history--render)
+              'terminal)
+          (setq gnosis-review-history--cursor cursor
+                gnosis-review-history--next next
+                gnosis-review-history--records (append items nil)
+                gnosis-review-history--status
+                (if (= (length items) 0) 'empty nil))
+          (gnosis-review-history--render)
+          'installed))
+    (gnosis-core-error
+     (setq gnosis-review-history--status 'error)
+     (gnosis-review-history--render)
+     'error)))
+
+(defun gnosis-review-history-refresh ()
+  "Refresh the current bounded review history page."
+  (interactive)
+  (gnosis-review-history--load gnosis-review-history--cursor))
+
+(defun gnosis-review-history-next ()
+  "Show the next bounded review history page."
+  (interactive)
+  (gnosis-review-history--ensure-authority)
+  (when (or (null gnosis-review-history--next)
+            (eq gnosis-review-history--next gnosis-core--json-null))
+    (user-error "No later review history page"))
+  (let ((cursor gnosis-review-history--cursor))
+    (when (eq 'installed
+              (gnosis-review-history--load gnosis-review-history--next))
+      (push cursor gnosis-review-history--previous))))
+
+(defun gnosis-review-history-previous ()
+  "Show the previous bounded review history page."
+  (interactive)
+  (gnosis-review-history--ensure-authority)
+  (unless gnosis-review-history--previous
+    (user-error "No earlier review history page"))
+  (when (eq 'installed
+            (gnosis-review-history--load
+             (car gnosis-review-history--previous)))
+    (pop gnosis-review-history--previous)))
+
+(defun gnosis-review-history--next-inapt-p ()
+  "Return non-nil when no next history page is available."
+  (or (null gnosis-review-history--next)
+      (eq gnosis-review-history--next gnosis-core--json-null)))
+
+(defun gnosis-review-history--previous-inapt-p ()
+  "Return non-nil when no previous history page is available."
+  (null gnosis-review-history--previous))
+
+(keymap-popup-define gnosis-review-history-mode-map
+  "Keymap for `gnosis-review-history-mode'."
+  :parent tabulated-list-mode-map
+  :popup-key "?"
+  :exit-key "C-g"
+  :description "Review history"
+  :group "Page"
+  "n" ("Next page" gnosis-review-history-next
+       :inapt-if #'gnosis-review-history--next-inapt-p)
+  "p" ("Previous page" gnosis-review-history-previous
+       :inapt-if #'gnosis-review-history--previous-inapt-p)
+  "g" ("Refresh page" gnosis-review-history-refresh :stay-open t)
+  "q" ("Quit" quit-window))
+
+(define-derived-mode gnosis-review-history-mode tabulated-list-mode
+  "Gnosis-History"
+  "Major mode for bounded server-authoritative review history."
+  (setq tabulated-list-format
+        [("Date" 12 t)
+         ("Result" 10 t)
+         ("Detected" 10 t)
+         ("Overrides" 10 t)])
+  (setq-local tabulated-list-padding 0
+              revert-buffer-function
+              (lambda (&rest _) (gnosis-review-history-refresh)))
+  (tabulated-list-init-header))
+
+;;;###autoload
+(defun gnosis-review-history ()
+  "Open bounded server-authoritative review history."
+  (interactive)
+  (let* ((buffer (get-buffer-create gnosis-review-history-buffer-name))
+         (authority (gnosis-review-history--current-authority)))
+    (pop-to-buffer-same-window buffer)
+    (unless (derived-mode-p 'gnosis-review-history-mode)
+      (gnosis-review-history-mode))
+    (unless (equal authority gnosis-review-history--authority)
+      (setq gnosis-review-history--authority authority
+            gnosis-review-history--cursor nil
+            gnosis-review-history--next nil
+            gnosis-review-history--previous nil
+            gnosis-review-history--records nil))
+    (gnosis-review-history--load nil)
+    (goto-char (point-min))
+    (keymap-popup gnosis-review-history-mode-map)))
 
 (defun gnosis-dashboard--load-ewoc (&optional initial)
   "Load summary into EWOC dashboard.
@@ -1084,8 +1282,9 @@ Start fresh catalog traversal when INITIAL is non-nil."
        :if #'gnosis-dashboard--active-session-p)
   :group "Browse"
   "n" ("Nodes / documents" gnosis-nodes-find)
+  "h" ("Review history" gnosis-review-history)
+  "t" ("Show themata" gnosis-dashboard-themata)
   "g" ("Refresh dashboard" gnosis-dashboard-refresh :stay-open t)
-  "q" ("Quit" quit-window)
   :group "Thema"
   "RET" ("Edit at point" gnosis-themata-edit)
   "e" ("Edit at point" gnosis-themata-edit)
@@ -1095,14 +1294,16 @@ Start fresh catalog traversal when INITIAL is non-nil."
   "A" ("Archive or unarchive" gnosis-themata-toggle-archive)
   "S" ("Suspend visible tag set" gnosis-themata-suspend-tag)
   :group "Filter"
-  "t" ("Show themata" gnosis-dashboard-themata)
   "v" ("Show tag" gnosis-themata-find-tag)
   "/" ("Search themata" gnosis-themata-filter-search)
   "f" ("Review state" gnosis-themata-filter-review-state)
+  "m" ("Maximum reviews" gnosis-themata-filter-max-reviews)
   :group "Layout"
   "o" ("Sort at point" gnosis-themata-sort)
   ">" ("Widen column" gnosis-themata-widen-current-column)
-  "<" ("Narrow column" gnosis-themata-narrow-current-column))
+  "<" ("Narrow column" gnosis-themata-narrow-current-column)
+  :group "System"
+  "q" ("Quit" quit-window))
 
 (define-derived-mode gnosis-dashboard-mode special-mode "Gnosis"
   "Major mode for the Gnosis summary and complete thema projection."

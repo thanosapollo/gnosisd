@@ -1368,6 +1368,75 @@ Use OPERATION-ID as stable mutation identity and require EXPECTED-DIGEST."
        "get_dashboard" nil (list (cons "days" days)))
     (gnosis-core--typed-request "get_dashboard")))
 
+(defconst gnosis-core--review-history-page-limit 100
+  "Default bounded review history page size.")
+
+(defun gnosis-core--review-history-event-p (event)
+  "Return non-nil when EVENT satisfies review history invariants."
+  (and (gnosis-core--json-object-p event)
+       (gnosis-core--opaque-id-p (plist-get event :event_id))
+       (gnosis-core--opaque-id-p (plist-get event :thema_id))
+       (gnosis-core--opaque-id-p (plist-get event :session_id))
+       (natnump (plist-get event :reviewed_at_us))
+       (natnump (plist-get event :review_day))
+       (memq (plist-get event :detected_success)
+             (list t gnosis-core--json-false))
+       (memq (plist-get event :accepted_success)
+             (list t gnosis-core--json-false))
+       (natnump (plist-get event :override_count))))
+
+(defun gnosis-core--review-history-order-p (items after)
+  "Return non-nil when history ITEMS descend uniquely after AFTER."
+  (let ((seen (make-hash-table :test #'equal))
+        previous-time
+        previous-id)
+    (cl-loop
+     for event across items
+     for event-id = (plist-get event :event_id)
+     for reviewed-at = (plist-get event :reviewed_at_us)
+     always
+     (prog1
+         (and (not (equal event-id after))
+              (not (gethash event-id seen))
+              (or (null previous-time)
+                  (< reviewed-at previous-time)
+                  (and (= reviewed-at previous-time)
+                       (string-lessp event-id previous-id))))
+       (puthash event-id t seen)
+       (setq previous-time reviewed-at
+             previous-id event-id)))))
+
+(defun gnosis-core--review-history-page-p (page after limit)
+  "Return non-nil when history PAGE after AFTER fits LIMIT."
+  (let* ((items (plist-get page :items))
+         (next (plist-get page :next))
+         (last (and (vectorp items) (> (length items) 0)
+                    (plist-get (aref items (1- (length items))) :event_id))))
+    (and (vectorp items)
+         (<= (length items) limit)
+         (cl-every #'gnosis-core--review-history-event-p items)
+         (gnosis-core--review-history-order-p items after)
+         (if last
+             (equal next last)
+           (eq next gnosis-core--json-null)))))
+
+(defun gnosis-core-review-history (&optional after limit)
+  "Return a bounded review history page after opaque cursor AFTER.
+LIMIT defaults to 100 and must be between 1 and 500."
+  (let ((limit (or limit gnosis-core--review-history-page-limit)))
+    (unless (and (integerp limit) (<= 1 limit 500))
+      (signal 'gnosis-core-validation-error
+              '("Gnosis review history limit must be between 1 and 500")))
+    (let* ((parameters
+            (delq nil (list (and after (cons "after" after))
+                            (cons "limit" limit))))
+           (page
+            (gnosis-core--typed-read-request
+             "get_review_history" nil parameters)))
+      (unless (gnosis-core--review-history-page-p page after limit)
+        (gnosis-core--invalid "Invalid Gnosis review history page"))
+      page)))
+
 (defun gnosis-core--opaque-id-p (value)
   "Return non-nil when VALUE is a valid opaque protocol identifier."
   (and (stringp value)
@@ -1605,6 +1674,7 @@ Optionally filter by DOCUMENT-ID, page after AFTER, and request LIMIT items."
        (integerp (plist-get thema :thema_revision))
        (> (plist-get thema :thema_revision) 0)
        (natnump (plist-get thema :state_revision))
+       (natnump (plist-get thema :review_count))
        (member (plist-get thema :kind) '("basic" "cloze" "mcq" "mc-cloze"))
        (stringp (plist-get thema :keimenon))
        (vectorp (plist-get thema :hypothesis))

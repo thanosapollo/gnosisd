@@ -722,6 +722,7 @@ fn public_content_dtos_preserve_existing_resource_shapes() {
         "generation":"opaque-generation",
         "items":[{
             "thema_id":"thema","thema_revision":1,"state_revision":0,
+            "review_count":7,
             "kind":"basic","keimenon":"Question","hypothesis":[null],
             "answer":["Answer"],"tags":["tag"],"archived":false,"suspended":true
         }],

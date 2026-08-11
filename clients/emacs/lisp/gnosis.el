@@ -263,6 +263,30 @@
            'font-lock-type-face)
           (gnosis--dashboard-success-rate window)))
 
+(defun gnosis--dashboard-activity-text (window)
+  "Return server-projected activity averages for WINDOW."
+  (let ((active-average (plist-get window :average_per_active_day)))
+    (format "%s %s; %s/calendar day, %s/active day"
+            (gnosis--dashboard-style "Activity:" 'shadow)
+            (gnosis--dashboard-style
+             (format "%d active days" (plist-get window :active_days))
+             'font-lock-type-face)
+            (gnosis--dashboard-style
+             (format "%.2f" (plist-get window :average_per_calendar_day))
+             'font-lock-type-face)
+            (if (eq active-average gnosis-core--json-null)
+                (gnosis--dashboard-style "unavailable" 'shadow)
+              (gnosis--dashboard-style
+               (format "%.2f" active-average) 'font-lock-type-face)))))
+
+(defun gnosis--dashboard-streak-text (days)
+  "Return server-projected current streak DAYS."
+  (format "%s %s"
+          (gnosis--dashboard-style "Current streak:" 'shadow)
+          (gnosis--dashboard-style
+           (format "%d %s" days (if (= days 1) "day" "days"))
+           (if (> days 0) 'success 'shadow))))
+
 (defun gnosis--dashboard-session-text (session)
   "Return a warning when server-projected SESSION is active."
   (unless (eq session gnosis-core--json-null)
@@ -274,14 +298,17 @@
         (window (plist-get state :window))
         (queue (plist-get state :queue))
         (content (plist-get state :content))
-        (session (plist-get state :active_session)))
+        (session (plist-get state :active_session))
+        (streak (plist-get state :current_streak_days)))
     (string-join
      (append
       (list (gnosis--dashboard-connection-text)
             (gnosis--dashboard-today-text today)
             (gnosis--dashboard-queue-text queue)
             (gnosis--dashboard-content-text content)
-            (gnosis--dashboard-window-text window))
+            (gnosis--dashboard-window-text window)
+            (gnosis--dashboard-activity-text window)
+            (gnosis--dashboard-streak-text streak))
       (when-let* ((warning (gnosis--dashboard-session-text session)))
         (list warning)))
      "\n")))

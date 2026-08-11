@@ -54,6 +54,7 @@
   (let ((thema
          (copy-tree
           `(:thema_id "thema-a" :thema_revision 3 :state_revision 2
+            :review_count 0
             :kind "basic" :keimenon "Question" :hypothesis [,gnosis-core--json-null]
             :answer ["Answer"] :tags ["tag"] :archived ,gnosis-core--json-false
             :suspended ,gnosis-core--json-false)
@@ -871,6 +872,37 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                  (lambda (&rest _) page)))
         (should-error
          (gnosis-core-thema-catalog nil "thema-a" 2)
+         :type 'gnosis-core-protocol-error)))))
+
+(ert-deftest gnosis-core-review-history-validates-terminal-pagination ()
+  (let ((event
+         `(:event_id "event-a" :thema_id "thema-a" :session_id "session-a"
+           :reviewed_at_us 10 :review_day 20260811 :detected_success t
+           :accepted_success t :override_count 0
+           :transition ,gnosis-core--json-null)))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest arguments)
+                 (should
+                  (equal '("get_review_history" nil
+                           (("after" . "event-b") ("limit" . 100)))
+                         arguments))
+                 `(:items [,event] :next "event-a"))))
+      (should
+       (equal "event-a"
+              (plist-get (gnosis-core-review-history "event-b" 100) :next))))
+    (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+               (lambda (&rest _) `(:items [] :next ,gnosis-core--json-null))))
+      (should
+       (eq gnosis-core--json-null
+           (plist-get (gnosis-core-review-history "event-a" 100) :next))))
+    (dolist (page
+             (list `(:items [,event] :next "wrong")
+                   `(:items [,event] :next "event-a")
+                   '(:items [] :next "wrong")))
+      (cl-letf (((symbol-function 'gnosis-core--typed-read-request)
+                 (lambda (&rest _) page)))
+        (should-error
+         (gnosis-core-review-history "event-a" 100)
          :type 'gnosis-core-protocol-error)))))
 
 (defun gnosis-test-core--cursor (server-id position token)

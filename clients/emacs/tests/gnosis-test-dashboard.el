@@ -5,10 +5,17 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'gnosis)
+(require 'gnosis-dashboard)
+
+(defvar gnosis-review-history-buffer-name)
+(defvar gnosis-review-history--authority)
+(defvar gnosis-review-history--next)
+(defvar gnosis-review-history--status)
 
 (defun gnosis-test-dashboard--projection (&optional active-session)
   "Return a server dashboard projection with ACTIVE-SESSION."
   `(:generated_at_us 1 :review_day 42
+    :current_streak_days 3
     :today (:review_count 8 :new_count 2 :success_count 6
             :failure_count 2 :override_count 1)
     :window (:from_day 13 :through_day 42 :days 30 :active_days 4
@@ -34,7 +41,9 @@
                      "Reviewed today: 8 (New: 2)"
                      "Due themata: 4 (Overdue: 1)"
                      "Content: 12 themata, 3 archived, 2 documents, 7 nodes"
-                     "Last 30 days: 20 reviews, success rate 0.75"))
+                     "Last 30 days: 20 reviews, success rate 0.75"
+                     "Activity: 4 active days; 0.67/calendar day, 5.00/active day"
+                     "Current streak: 3 days"))
       (should (string-match-p (regexp-quote value) text)))
     (should-not (string-match-p "Review day\\|Queue:\\|Active session" text))))
 
@@ -52,6 +61,91 @@
                 'warning))
     (should-not
      (string-match-p "private-session-id\\|owner\\|standard" text))))
+
+(defun gnosis-test-dashboard--history-event (id day success)
+  "Return public review event ID on DAY with SUCCESS."
+  (let ((success (if success t gnosis-core--json-false)))
+    `(:event_id ,id :thema_id ,(concat "thema-" id)
+      :session_id ,(concat "session-" id) :reviewed_at_us 1
+      :review_day ,day :detected_success ,success :accepted_success ,success
+      :override_count 0 :transition ,gnosis-core--json-null)))
+
+(ert-deftest gnosis-review-history-renders-public-terminal-pages ()
+  (let ((calls 0)
+        (first (gnosis-test-dashboard--history-event "event-b" 20260811 t))
+        (last (gnosis-test-dashboard--history-event "event-a" 20260810 nil)))
+    (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+               (lambda (&rest _) ["https://example.invalid" "digest"]))
+              ((symbol-function 'gnosis-core-review-history)
+               (lambda (after limit)
+                 (should (= limit 100))
+                 (cl-incf calls)
+                 (pcase after
+                   ('nil `(:items [,first] :next "event-b"))
+                   ("event-b" `(:items [,last] :next "event-a"))
+                   ("event-a" `(:items [] :next ,gnosis-core--json-null)))))
+              ((symbol-function 'pop-to-buffer-same-window)
+               (lambda (buffer &rest _) (set-buffer buffer)))
+              ((symbol-function 'keymap-popup) #'ignore))
+      (unwind-protect
+          (progn
+            (gnosis-review-history)
+            (should (derived-mode-p 'gnosis-review-history-mode))
+            (should (string-search "Success" (buffer-string)))
+            (should-not
+             (string-match-p "event-b\\|thema-event-b\\|session-event-b"
+                             (buffer-string)))
+            (gnosis-review-history-next)
+            (should (string-search "Failure" (buffer-string)))
+            (gnosis-review-history-next)
+            (should (= calls 3))
+            (should (eq gnosis-review-history--next gnosis-core--json-null))
+            (should (string-search "End of review history" (buffer-string)))
+            (should (string-search "Failure" (buffer-string))))
+        (when-let* ((buffer (get-buffer gnosis-review-history-buffer-name)))
+          (kill-buffer buffer))))))
+
+(ert-deftest gnosis-review-history-preserves-selection-on-refresh ()
+  (let* ((first (gnosis-test-dashboard--history-event "event-b" 20260811 t))
+         (second (gnosis-test-dashboard--history-event "event-a" 20260810 nil))
+         (page `(:items [,first ,second] :next "event-a")))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (setq gnosis-review-history--authority ["https://example.invalid" "digest"])
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&rest _) gnosis-review-history--authority))
+                ((symbol-function 'gnosis-core-review-history)
+                 (lambda (&rest _) page)))
+        (gnosis-review-history--load nil)
+        (goto-char (point-min))
+        (search-forward "Failure")
+        (beginning-of-line)
+        (should (equal "event-a" (tabulated-list-get-id)))
+        (gnosis-review-history-refresh)
+        (should (equal "event-a" (tabulated-list-get-id)))))))
+
+(ert-deftest gnosis-review-history-empty-and-error-states-are-actionable ()
+  (with-temp-buffer
+    (gnosis-review-history-mode)
+    (setq gnosis-review-history--authority ["https://example.invalid" "digest"])
+    (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+               (lambda (&rest _) gnosis-review-history--authority))
+              ((symbol-function 'gnosis-core-review-history)
+               (lambda (&rest _)
+                 (should (eq gnosis-review-history--status 'loading))
+                 `(:items [] :next ,gnosis-core--json-null))))
+      (gnosis-review-history--load nil)
+      (should (string-search "No review history yet. Press g to refresh."
+                             (buffer-string))))
+    (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+               (lambda (&rest _) gnosis-review-history--authority))
+              ((symbol-function 'gnosis-core-review-history)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-unavailable '("private detail")))))
+      (gnosis-review-history-refresh)
+      (should (string-search "Review history unavailable. Press g to retry."
+                             (buffer-string)))
+      (should-not (string-search "private detail" (buffer-string))))))
 
 (ert-deftest gnosis-dashboard-summary-renders-missing-success-rate ()
   (let* ((state (copy-tree (gnosis-test-dashboard--projection)))
@@ -71,6 +165,7 @@
                      ("<" . gnosis-themata-narrow-current-column)
                      ("e" . gnosis-themata-edit)
                      ("a" . gnosis-themata-add)
+                     ("h" . gnosis-review-history)
                      ("T" . gnosis-review-topic)))
     (should (eq (keymap-lookup gnosis-dashboard-mode-map (car binding))
                 (cdr binding))))
@@ -78,6 +173,15 @@
   (should (eq (keymap-lookup gnosis-dashboard-mode-map "?")
               'gnosis-dashboard-mode-map-popup))
   (dolist (row (keymap-popup--meta gnosis-dashboard-mode-map 'descriptions))
+    (dolist (group row)
+      (should (<= (length (plist-get group :entries)) 4))))
+  (dolist (binding '(("n" . gnosis-review-history-next)
+                     ("p" . gnosis-review-history-previous)
+                     ("g" . gnosis-review-history-refresh)
+                     ("q" . quit-window)))
+    (should (eq (keymap-lookup gnosis-review-history-mode-map (car binding))
+                (cdr binding))))
+  (dolist (row (keymap-popup--meta gnosis-review-history-mode-map 'descriptions))
     (dolist (group row)
       (should (<= (length (plist-get group :entries)) 4)))))
 
@@ -96,7 +200,9 @@
                     ("Ready" . success)
                     ("6 successful" . success)
                     ("2 failed" . error)
-                    ("3 archived" . shadow)))
+                    ("3 archived" . shadow)
+                    ("4 active days" . font-lock-type-face)
+                    ("3 days" . success)))
       (goto-char (point-min))
       (search-forward (car pair))
       (should (eq (get-text-property (1- (point)) 'face) (cdr pair))))

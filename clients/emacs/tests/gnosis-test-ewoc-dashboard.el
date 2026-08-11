@@ -10,6 +10,7 @@
 
 (defvar gnosis-themata--ewoc)
 (defvar gnosis-themata--loading-p)
+(defvar gnosis-themata--max-reviews)
 
 (declare-function gnosis-themata--current-id "gnosis-dashboard")
 (declare-function gnosis-themata--pretty-print "gnosis-dashboard")
@@ -18,7 +19,7 @@
 (defun gnosis-test-ewoc-dashboard--record (index)
   "Return valid compact thema record for INDEX."
   `(:thema_id ,(format "thema-%06d" index)
-    :thema_revision 1 :state_revision 1 :kind "basic"
+    :thema_revision 1 :state_revision 1 :review_count 0 :kind "basic"
     :keimenon ,(format "Question %d" index)
     :hypothesis [,gnosis-core--json-null] :answer ["Answer"] :tags []
     :archived ,gnosis-core--json-false
@@ -61,6 +62,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (defun gnosis-test-ewoc-dashboard--projection ()
   "Return compact valid dashboard projection."
   '(:generated_at_us 1 :review_day 1
+    :current_streak_days 1
     :today (:review_count 1 :new_count 1 :success_count 1
             :failure_count 0 :override_count 0)
     :window (:from_day 1 :through_day 1 :days 30 :active_days 1
@@ -194,6 +196,45 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should (equal "thema-000001"
                        (plist-get (ewoc-data (ewoc-nth gnosis-themata--ewoc 0))
                                   :thema_id)))))))
+
+(ert-deftest gnosis-dashboard-max-review-filter-combines-with-live-projection ()
+  (let* ((first (gnosis-test-ewoc-dashboard--record 0))
+         (second (plist-put (gnosis-test-ewoc-dashboard--record 1)
+                            :review_count 1))
+         (third (plist-put (gnosis-test-ewoc-dashboard--record 2)
+                           :review_count 2))
+         (pages (list `(:generation "g1" :items [,first ,second ,third]
+                        :next ,gnosis-core--json-null))))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-buffer-name
+        (gnosis-themata-filter-search "Question")
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (gnosis-themata-sort 0)
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (gnosis-themata--goto-id "thema-000000"))
+        (let ((current-prefix-arg nil))
+          (call-interactively #'gnosis-themata-filter-max-reviews))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (= gnosis-themata--max-reviews 0))
+        (should (equal "Question" gnosis-themata--search-filter))
+        (should (equal '(0) gnosis-themata--sort-key))
+        (should (equal "thema-000000" (gnosis-themata--current-id)))
+        (should (string-search "Question 0" (buffer-string)))
+        (should-not (string-search "Question 1" (buffer-string)))
+        (cl-letf (((symbol-function 'read-number)
+                   (lambda (&rest _) 1)))
+          (let ((current-prefix-arg '(4)))
+            (call-interactively #'gnosis-themata-filter-max-reviews)))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (= gnosis-themata--max-reviews 1))
+        (should (string-search "Question 1" (buffer-string)))
+        (should-not (string-search "Question 2" (buffer-string)))
+        (gnosis-themata-filter-search "Question 1")
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should-not (string-search "Question 0" (buffer-string)))
+        (should (string-search "Question 1" (buffer-string)))))))
 
 (ert-deftest gnosis-dashboard-sort-reset-restores-server-order ()
   (let* ((first (gnosis-test-ewoc-dashboard--record 1))

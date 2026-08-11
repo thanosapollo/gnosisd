@@ -19,7 +19,7 @@
 (defun gnosis-benchmark-ewoc-dashboard--record (index)
   "Return deterministic valid catalog record for INDEX."
   `(:thema_id ,(format "thema-%06d" index)
-    :thema_revision 1 :state_revision 1 :kind "basic"
+    :thema_revision 1 :state_revision 1 :review_count 0 :kind "basic"
     :keimenon ,(format "Question %d" index)
     :hypothesis [,gnosis-core--json-null] :answer ["Answer"] :tags []
     :archived ,gnosis-core--json-false
@@ -36,6 +36,7 @@
 (defun gnosis-benchmark-ewoc-dashboard--projection ()
   "Return deterministic dashboard summary projection."
   '(:generated_at_us 1 :review_day 1
+    :current_streak_days 1
     :today (:review_count 1 :new_count 1 :success_count 1
             :failure_count 0 :override_count 0)
     :window (:from_day 1 :through_day 1 :days 30 :active_days 1

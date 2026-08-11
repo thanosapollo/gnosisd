@@ -23,6 +23,7 @@ impl SqliteStore {
         Ok(DashboardSummary {
             generated_at_us: now_us,
             review_day,
+            current_streak_days: review_streak(&self.connection, review_day)?,
             today: review_totals(&self.connection, review_day, review_day)?.1,
             window: review_window(&self.connection, from_day, review_day, days)?,
             queue: queue_counts(&self.connection, review_day)?,
@@ -128,12 +129,7 @@ impl SqliteStore {
 }
 
 fn review_window_start(review_day: u32, days: u16) -> Result<u32, StoreError> {
-    let year = i32::try_from(review_day / 10_000).map_err(StoreError::storage)?;
-    let month = review_day / 100 % 100;
-    let day = review_day % 100;
-    let date = NaiveDate::from_ymd_opt(year, month, day).ok_or(StoreError::CorruptData {
-        field: "review day",
-    })?;
+    let date = review_date(review_day)?;
     let start = date
         .checked_sub_signed(Duration::days(i64::from(days.saturating_sub(1))))
         .ok_or(StoreError::CorruptData {
@@ -146,6 +142,58 @@ fn review_window_start(review_day: u32, days: u16) -> Result<u32, StoreError> {
         .ok_or(StoreError::CorruptData {
             field: "review day window",
         })
+}
+
+fn review_date(review_day: u32) -> Result<NaiveDate, StoreError> {
+    let year = i32::try_from(review_day / 10_000).map_err(StoreError::storage)?;
+    NaiveDate::from_ymd_opt(year, review_day / 100 % 100, review_day % 100).ok_or(
+        StoreError::CorruptData {
+            field: "review day",
+        },
+    )
+}
+
+fn review_streak(connection: &rusqlite::Connection, review_day: u32) -> Result<u64, StoreError> {
+    let today = review_date(review_day)?;
+    let yesterday = today
+        .checked_sub_signed(Duration::days(1))
+        .ok_or(StoreError::CorruptData {
+            field: "review day streak",
+        })?;
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT review_day FROM review_day
+             WHERE review_day <= ?1 AND review_count > 0
+             ORDER BY review_day DESC",
+        )
+        .map_err(StoreError::storage)?;
+    let rows = statement
+        .query_map([review_day], |row| row.get::<_, i64>(0))
+        .map_err(StoreError::storage)?;
+    let mut expected = today;
+    let mut streak = 0_u64;
+    for row in rows {
+        let day = review_date(super::to_u32(
+            row.map_err(StoreError::storage)?,
+            "review day",
+        )?)?;
+        if streak == 0 && day == yesterday {
+            expected = yesterday;
+        }
+        if day != expected {
+            break;
+        }
+        streak = streak.checked_add(1).ok_or(StoreError::CorruptData {
+            field: "review day streak",
+        })?;
+        expected =
+            expected
+                .checked_sub_signed(Duration::days(1))
+                .ok_or(StoreError::CorruptData {
+                    field: "review day streak",
+                })?;
+    }
+    Ok(streak)
 }
 
 fn review_window(
@@ -466,6 +514,47 @@ mod tests {
         assert_eq!(dashboard.today.review_count, 0);
         assert_eq!(queue.matched_count, 1);
         assert_eq!(state.state.review_count, 0);
+    }
+
+    #[test]
+    fn dashboard_projects_current_review_day_streak() {
+        let store = store_with_thema();
+        store
+            .connection
+            .execute(
+                "INSERT INTO review_day(
+                   review_day, review_count, new_count, success_count,
+                   failure_count, override_count
+                 ) VALUES (20260713, 1, 0, 1, 0, 0),
+                          (20260714, 1, 0, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .dashboard(30, REVIEWED_AT_US)
+                .unwrap()
+                .current_streak_days,
+            2
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO review_day(
+                   review_day, review_count, new_count, success_count,
+                   failure_count, override_count
+                 ) VALUES (20260715, 1, 0, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .dashboard(30, REVIEWED_AT_US)
+                .unwrap()
+                .current_streak_days,
+            3
+        );
     }
 
     #[test]

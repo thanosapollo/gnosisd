@@ -251,6 +251,7 @@ pub(crate) struct ThemaCatalogRecord {
     pub(crate) thema_id: String,
     pub(crate) thema_revision: u64,
     pub(crate) state_revision: u64,
+    pub(crate) review_count: u64,
     pub(crate) kind: ThemaKind,
     pub(crate) keimenon: String,
     pub(crate) hypothesis: Vec<Option<String>>,

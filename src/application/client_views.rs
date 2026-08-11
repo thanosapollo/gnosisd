@@ -4,6 +4,7 @@ use super::{ReviewSessionView, ReviewSource, ReviewStateSnapshot, TransitionSnap
 pub(crate) struct DashboardSummary {
     pub(crate) generated_at_us: u64,
     pub(crate) review_day: u32,
+    pub(crate) current_streak_days: u64,
     pub(crate) today: ReviewTotals,
     pub(crate) window: ReviewWindow,
     pub(crate) queue: ReviewQueueCounts,
