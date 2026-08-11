@@ -290,7 +290,10 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                     (if descending
                         (string-lessp right left)
                       (string-lessp left right))))))
-      records)))
+      (sort records
+            (lambda (left-record right-record)
+              (< (plist-get left-record :catalog-ordinal)
+                 (plist-get right-record :catalog-ordinal)))))))
 
 (defun gnosis-themata--capture-context ()
   "Return selected row, column, and visible `window-start' identity."
@@ -335,6 +338,12 @@ When RECORDS is nil, collect records from the dashboard EWOC."
            (ewoc-enter-last gnosis-themata--ewoc record)
            gnosis-themata--nodes))
 
+(defun gnosis-themata--next-catalog-ordinal ()
+  "Return ordinal following every EWOC-owned catalog record."
+  (cl-loop for record in (ewoc-collect gnosis-themata--ewoc #'identity)
+           maximize (plist-get record :catalog-ordinal) into maximum
+           finally return (1+ (or maximum -1))))
+
 (defun gnosis-themata--cancel-render ()
   "Cancel pending projection render."
   (when (timerp gnosis-themata--render-timer)
@@ -359,10 +368,21 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                 (+ (plist-get state :visible-count)
                    (cl-count-if #'gnosis-themata--visible-p chunk))))
           (setq gnosis-themata--render-timer nil)
+          (when (and (plist-get state :expected-point)
+                     (or (/= (point) (plist-get state :expected-point))
+                         (/= (current-column)
+                             (plist-get state :expected-column))
+                         (not (equal (gnosis-themata--current-id)
+                                     (plist-get state :expected-selected)))))
+            (setq state (plist-put state :context nil)))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
             (dolist (record chunk) (gnosis-themata--enter-last record)))
+          (setq state (plist-put state :expected-point (point))
+                state (plist-put state :expected-column (current-column))
+                state (plist-put state :expected-selected
+                                 (gnosis-themata--current-id)))
           (if remaining
               (progn
                 (setq state (plist-put state :records remaining)
@@ -371,7 +391,8 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                       gnosis-themata--render-timer
                       (run-at-time 0 nil #'gnosis-themata--render-step buffer run)))
             (setq gnosis-themata--render-state nil)
-            (gnosis-themata--restore-context (plist-get state :context))
+            (when-let* ((context (plist-get state :context)))
+              (gnosis-themata--restore-context context))
             (gnosis-themata--set-footer
              (if (zerop visible-count)
                  (if (zerop (hash-table-count gnosis-themata--nodes))
@@ -409,6 +430,7 @@ When RECORDS is nil, collect records from the dashboard EWOC."
          (after (plist-get state :after))
          (seen-ids (plist-get state :seen-ids))
          (seen-cursors (plist-get state :seen-cursors))
+         (next-ordinal (plist-get state :next-ordinal))
          (page-seen (make-hash-table :test #'equal))
          page-records)
     (unless (or (null generation) (equal generation page-generation))
@@ -423,7 +445,10 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                   (signal 'gnosis-core-protocol-error
                           '("Duplicate or invalid Gnosis thema catalog item")))
              do (puthash id t page-seen)
-             do (push record page-records))
+             do (push (plist-put (copy-tree record)
+                                 :catalog-ordinal next-ordinal)
+                      page-records)
+             do (cl-incf next-ordinal))
     (unless (eq next gnosis-core--json-null)
       (when (or (= 0 (length items))
                 (equal next after)
@@ -437,6 +462,7 @@ When RECORDS is nil, collect records from the dashboard EWOC."
       (setq state (gnosis-themata--append-refresh-records state page-records)))
     (setq state (plist-put state :generation page-generation)
           state (plist-put state :after next)
+          state (plist-put state :next-ordinal next-ordinal)
           state (plist-put state :page-records page-records))
     (list :status (if (eq next gnosis-core--json-null) 'done 'continue)
           :state state)))
@@ -550,6 +576,7 @@ When FRESH is non-nil, publish each accepted page progressively."
           gnosis-themata--refresh-state
           (list :kind 'bootstrap :fresh fresh :after nil :generation nil
                 :records nil :records-tail nil
+                :next-ordinal 0
                 :seen-ids (make-hash-table :test #'equal)
                 :seen-cursors (make-hash-table :test #'equal)
                 :context context))
@@ -661,6 +688,11 @@ With numeric prefix -1, restore authoritative catalog order."
   (let* ((id (plist-get record :thema_id))
          (node (gethash id gnosis-themata--nodes))
          (previous (and node (ewoc-data node)))
+         (record
+          (plist-put (copy-tree record) :catalog-ordinal
+                     (if previous
+                         (plist-get previous :catalog-ordinal)
+                       (gnosis-themata--next-catalog-ordinal))))
          (sort-stable
           (or (null gnosis-themata--sort-key)
               (and previous

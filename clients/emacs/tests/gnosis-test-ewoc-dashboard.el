@@ -33,6 +33,20 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
     `(:generation ,(or generation "g1") :items ,items
       :next ,(or next gnosis-core--json-null))))
 
+(defun gnosis-test-ewoc-dashboard--pages (total)
+  "Return bounded catalog pages containing TOTAL records."
+  (cl-loop for start from 0 below total by 100
+           for count = (min 100 (- total start))
+           for next = (if (< (+ start count) total)
+                          (format "cursor-%06d" (+ start count))
+                        gnosis-core--json-null)
+           collect (gnosis-test-ewoc-dashboard--page start count next)))
+
+(defun gnosis-test-ewoc-dashboard--ids ()
+  "Return thema identities in current EWOC order."
+  (mapcar (lambda (record) (plist-get record :thema_id))
+          (ewoc-collect gnosis-themata--ewoc #'identity)))
+
 (defun gnosis-test-ewoc-dashboard--projection ()
   "Return compact valid dashboard projection."
   '(:generated_at_us 1 :review_day 1
@@ -160,6 +174,62 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should (equal "thema-000001"
                        (plist-get (ewoc-data (ewoc-nth gnosis-themata--ewoc 0))
                                   :thema_id)))))))
+
+(ert-deftest gnosis-dashboard-sort-reset-restores-server-order ()
+  (let* ((first (gnosis-test-ewoc-dashboard--record 1))
+         (second (gnosis-test-ewoc-dashboard--record 0))
+         (pages (list `(:generation "g1" :items [,first ,second]
+                        :next ,gnosis-core--json-null))))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-buffer-name
+        (should (equal '("thema-000001" "thema-000000")
+                       (gnosis-test-ewoc-dashboard--ids)))
+        (should (equal '(0 1)
+                       (mapcar (lambda (record)
+                                 (plist-get record :catalog-ordinal))
+                               (ewoc-collect gnosis-themata--ewoc #'identity))))
+        (gnosis-themata-sort 0)
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (equal '("thema-000000" "thema-000001")
+                       (gnosis-test-ewoc-dashboard--ids)))
+        (gnosis-themata-sort -1)
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (equal '("thema-000001" "thema-000000")
+                       (gnosis-test-ewoc-dashboard--ids)))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-restores-unchanged-context ()
+  (let ((pages (gnosis-test-ewoc-dashboard--pages 501)))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-buffer-name
+        (should (gnosis-themata--goto-id "thema-000042"))
+        (move-to-column 7)
+        (let ((column (current-column)))
+          (gnosis-themata-sort 0)
+          (should jobs)
+          (gnosis-test-ewoc-dashboard--drain 'jobs)
+          (should (equal "thema-000042" (gnosis-themata--current-id)))
+          (should (= column (current-column))))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-preserves-intervening-movement ()
+  (let ((pages (gnosis-test-ewoc-dashboard--pages 501)))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-buffer-name
+        (should (gnosis-themata--goto-id "thema-000000"))
+        (move-to-column 5)
+        (gnosis-themata-sort 0)
+        (should jobs)
+        (should (gnosis-themata--goto-id "thema-000001"))
+        (move-to-column 9)
+        (let ((column (current-column)))
+          (gnosis-test-ewoc-dashboard--drain 'jobs)
+          (should (equal "thema-000001" (gnosis-themata--current-id)))
+          (should (= column (current-column))))))))
 
 (ert-deftest gnosis-dashboard-terminal-traversal-has-no-total-ceiling ()
   (let ((next-index 0)
@@ -352,15 +422,24 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
       (gnosis-test-ewoc-dashboard--drain 'jobs)
       (with-current-buffer gnosis-dashboard-buffer-name
         (gnosis-themata--goto-id "thema-000001")
-        (cl-letf (((symbol-function 'gnosis-edit-thema)
-                   (lambda (id callback)
-                     (funcall callback
-                              `(:thema_id ,id :revision 2 :kind "basic"
-                                :keimenon "Edited" :hypothesis ["H"]
-                                :answer ["A"] :tags ["tag"]
-                                :archived ,gnosis-core--json-false)))))
-          (gnosis-themata-edit))
-        (should (string-search "Edited" (buffer-string)))
+        (let ((ordinal (plist-get
+                        (ewoc-data (gethash "thema-000001"
+                                            gnosis-themata--nodes))
+                        :catalog-ordinal)))
+          (cl-letf (((symbol-function 'gnosis-edit-thema)
+                     (lambda (id callback)
+                       (funcall callback
+                                `(:thema_id ,id :revision 2 :kind "basic"
+                                  :keimenon "Edited" :hypothesis ["H"]
+                                  :answer ["A"] :tags ["tag"]
+                                  :archived ,gnosis-core--json-false)))))
+            (gnosis-themata-edit))
+          (should (string-search "Edited" (buffer-string)))
+          (should (= ordinal
+                     (plist-get
+                      (ewoc-data (gethash "thema-000001"
+                                          gnosis-themata--nodes))
+                      :catalog-ordinal))))
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                   ((symbol-function 'gnosis-core-thema-set-archived)
                    (lambda (id _revision desired)
@@ -389,6 +468,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                                 :archived ,gnosis-core--json-false)))))
           (gnosis-themata-add))
         (should (gethash "thema-new" gnosis-themata--nodes))
+        (should (= 2 (plist-get
+                      (ewoc-data (gethash "thema-new" gnosis-themata--nodes))
+                      :catalog-ordinal)))
         (should (equal "thema-000001" (gnosis-themata--current-id)))))))
 
 (provide 'gnosis-test-ewoc-dashboard)
