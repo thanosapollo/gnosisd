@@ -1,6 +1,7 @@
 .POSIX:
 .PHONY: all doc do-doc compile do-compile test do-test test-oneshot \
-	openapi do-openapi integration do-integration lint do-lint load clean
+	benchmark-ewoc-dashboard do-benchmark-ewoc-dashboard openapi do-openapi \
+	integration do-integration lint do-lint load clean
 
 NIX := $(shell command -v nix 2>/dev/null)
 ENV_MAKE = $(MAKE) --no-print-directory
@@ -19,7 +20,8 @@ TEST_DIR := tests
 TOOL_DIR := tools
 EL_FILES := gnosis-completion.el gnosis-core.el gnosis-core-assets.el gnosis-edit.el gnosis-nodes.el gnosis-dashboard.el gnosis.el gnosis-review.el
 LISP_FILES := $(addprefix $(LISP_DIR)/,$(EL_FILES))
-TOOL_FILES := $(TOOL_DIR)/gnosis-openapi-generator.el
+TOOL_FILES := $(TOOL_DIR)/gnosis-benchmark-ewoc-dashboard.el \
+	$(TOOL_DIR)/gnosis-openapi-generator.el
 TEST_FILES := tests/gnosis-test-core.el \
 	tests/gnosis-test-core-assets.el \
 	tests/gnosis-test-openapi.el \
@@ -74,6 +76,14 @@ do-test:
 		--eval "(ert-run-tests-batch-and-exit (read (getenv \"ERT_SELECTOR\")))"
 
 test-oneshot: test
+
+benchmark-ewoc-dashboard:
+	@$(ENV_MAKE) do-benchmark-ewoc-dashboard
+
+do-benchmark-ewoc-dashboard:
+	$(EMACS) --batch -q -L $(LISP_DIR) \
+		--eval "(setq load-prefer-newer t)" \
+		-l $(TOOL_DIR)/gnosis-benchmark-ewoc-dashboard.el
 
 openapi:
 	@$(ENV_MAKE) do-openapi

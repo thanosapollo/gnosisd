@@ -65,6 +65,7 @@
           ] ++ elispFiles;
           checkFiles = packageFiles ++ [
             "NEWS.org"
+            "tools/gnosis-benchmark-ewoc-dashboard.el"
             "tools/gnosis-openapi-generator.el"
             "tools/run-temp-integration.sh"
           ] ++ testFiles;
@@ -206,6 +207,7 @@
             git
             gnumake
             texinfo
+            time
           ];
           EMACS = "emacs";
           GNOSIS_ENV_WRAPPED = "1";
