@@ -47,6 +47,17 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
   (mapcar (lambda (record) (plist-get record :thema_id))
           (ewoc-collect gnosis-themata--ewoc #'identity)))
 
+(defun gnosis-test-ewoc-dashboard--window-start-id (window)
+  "Return opaque thema identity at WINDOW start."
+  (with-current-buffer (window-buffer window)
+    (gnosis-themata--id-at-position (window-start window))))
+
+(defun gnosis-test-ewoc-dashboard--assert-complete-records (total)
+  "Assert current EWOC owns TOTAL unique records."
+  (let ((ids (gnosis-test-ewoc-dashboard--ids)))
+    (should (= total (length ids)))
+    (should (= total (length (delete-dups (copy-sequence ids)))))))
+
 (defun gnosis-test-ewoc-dashboard--projection ()
   "Return compact valid dashboard projection."
   '(:generated_at_us 1 :review_day 1
@@ -100,6 +111,15 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
            ,@body)
        (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
          (kill-buffer buffer)))))
+
+(defmacro gnosis-test-ewoc-dashboard--with-records (total &rest body)
+  "Open a deterministic dashboard with TOTAL records, then evaluate BODY."
+  (declare (indent 1) (debug (form body)))
+  `(let ((pages (gnosis-test-ewoc-dashboard--pages ,total)))
+     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+       (gnosis-dashboard)
+       (gnosis-test-ewoc-dashboard--drain 'jobs)
+       ,@body)))
 
 (ert-deftest gnosis-dashboard-default-journey-is-summary-plus-ewoc-catalog ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 2 "thema-000001")
@@ -230,6 +250,216 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
           (gnosis-test-ewoc-dashboard--drain 'jobs)
           (should (equal "thema-000001" (gnosis-themata--current-id)))
           (should (= column (current-column))))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-drops-only-moved-selection ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (save-window-excursion
+      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+            (window (selected-window)))
+        (set-window-buffer window buffer)
+        (with-current-buffer buffer
+          (should (gnosis-themata--goto-id "thema-000042"))
+          (set-window-start
+           window (ewoc-location (gethash "thema-000020" gnosis-themata--nodes)) t)
+          (gnosis-themata-sort 0)
+          (should jobs)
+          (should (gnosis-themata--goto-id "thema-000043"))
+          (gnosis-test-ewoc-dashboard--drain 'jobs)
+          (should (equal "thema-000043" (gnosis-themata--current-id)))
+          (should (equal "thema-000020"
+                         (gnosis-test-ewoc-dashboard--window-start-id window))))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-drops-only-moved-viewport ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (save-window-excursion
+      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+            (window (selected-window)))
+        (set-window-buffer window buffer)
+        (with-current-buffer buffer
+          (should (gnosis-themata--goto-id "thema-000042"))
+          (move-to-column 7)
+          (set-window-start
+           window (ewoc-location (gethash "thema-000020" gnosis-themata--nodes)) t)
+          (let ((column (current-column)))
+            (gnosis-themata-sort 0)
+            (should jobs)
+            (let* ((moved-node (ewoc-nth gnosis-themata--ewoc 30))
+                   (moved-id (plist-get (ewoc-data moved-node) :thema_id)))
+              (set-window-start window (ewoc-location moved-node) t)
+              (gnosis-test-ewoc-dashboard--drain 'jobs)
+              (should (equal "thema-000042" (gnosis-themata--current-id)))
+              (should (= column (current-column)))
+              (should (equal moved-id
+                             (gnosis-test-ewoc-dashboard--window-start-id
+                              window))))))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-does-not-retarget-replaced-window ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (save-window-excursion
+      (delete-other-windows)
+      (let* ((buffer (get-buffer gnosis-dashboard-buffer-name))
+             (target (selected-window))
+             (other (split-window-right))
+             (scratch (get-buffer-create " *gnosis-window-owner-test*")))
+        (unwind-protect
+            (progn
+              (set-window-buffer target buffer)
+              (set-window-buffer other buffer)
+              (with-selected-window target
+                (with-current-buffer buffer
+                  (should (gnosis-themata--goto-id "thema-000042"))
+                  (set-window-start
+                   target
+                   (ewoc-location (gethash "thema-000020" gnosis-themata--nodes))
+                   t)
+                  (gnosis-themata-sort 0)
+                  (should jobs)
+                  (let* ((other-node (ewoc-nth gnosis-themata--ewoc 30))
+                         (other-id (plist-get (ewoc-data other-node) :thema_id)))
+                    (set-window-start other (ewoc-location other-node) t)
+                    (set-window-buffer target scratch)
+                    (gnosis-test-ewoc-dashboard--drain 'jobs)
+                    (should (equal "thema-000042" (gnosis-themata--current-id)))
+                    (should (equal other-id
+                                   (gnosis-test-ewoc-dashboard--window-start-id
+                                    other)))))))
+          (kill-buffer scratch))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-tolerates-deleted-window ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (save-window-excursion
+      (delete-other-windows)
+      (let* ((buffer (get-buffer gnosis-dashboard-buffer-name))
+             (other (selected-window))
+             (target (split-window-right))
+             (scratch (get-buffer-create " *gnosis-deleted-window-test*")))
+        (unwind-protect
+            (progn
+              (set-window-buffer other scratch)
+              (set-window-buffer target buffer)
+              (with-current-buffer buffer
+                (should (gnosis-themata--goto-id "thema-000042"))
+                (gnosis-themata-sort 0)
+                (should jobs)
+                (delete-window target)
+                (should (gnosis-themata--goto-id "thema-000042"))
+                (gnosis-test-ewoc-dashboard--drain 'jobs)
+                (should (equal "thema-000042"
+                               (gnosis-themata--current-id)))))
+          (kill-buffer scratch))))))
+
+(ert-deftest gnosis-dashboard-progressive-render-needs-no-visible-window ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (let ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+      (should-not (get-buffer-window buffer))
+      (with-current-buffer buffer
+        (should (gnosis-themata--goto-id "thema-000042"))
+        (gnosis-themata-sort 0)
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (equal "thema-000042" (gnosis-themata--current-id)))))))
+
+(ert-deftest gnosis-dashboard-sort-replacement-retains-pending-records ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (save-window-excursion
+      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+            (window (selected-window)))
+        (set-window-buffer window buffer)
+        (with-current-buffer buffer
+          (should (gnosis-themata--goto-id "thema-000042"))
+          (set-window-start
+           window (ewoc-location (gethash "thema-000020" gnosis-themata--nodes)) t)
+          (gnosis-themata-sort 0)
+          (let ((stale (pop jobs)))
+            (gnosis-themata-sort 0)
+            (let ((run gnosis-themata--render-run)
+                  (count (hash-table-count gnosis-themata--nodes)))
+              (apply (car stale) (cdr stale))
+              (should (equal run gnosis-themata--render-run))
+              (should (= count (hash-table-count gnosis-themata--nodes))))
+            (gnosis-test-ewoc-dashboard--drain 'jobs)
+            (gnosis-test-ewoc-dashboard--assert-complete-records 1001)
+            (should (equal "thema-000042" (gnosis-themata--current-id)))
+            (should (equal "thema-000020"
+                           (gnosis-test-ewoc-dashboard--window-start-id
+                            window)))))))))
+
+(ert-deftest gnosis-dashboard-filter-replacement-retains-pending-records ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (gnosis-themata-sort 0)
+      (let ((stale (pop jobs)))
+        (gnosis-themata-filter-search "Question 1")
+        (apply (car stale) (cdr stale))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (gnosis-test-ewoc-dashboard--assert-complete-records 1001)))))
+
+(ert-deftest gnosis-dashboard-layout-replacement-retains-pending-records ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (gnosis-themata-sort 0)
+      (let ((stale (pop jobs)))
+        (gnosis-themata--apply-layout
+         (current-buffer) gnosis-themata--incarnation
+         (1+ gnosis-themata--layout-width))
+        (apply (car stale) (cdr stale))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (gnosis-test-ewoc-dashboard--assert-complete-records 1001)))))
+
+(ert-deftest gnosis-dashboard-mutation-replaces-pending-record-during-render ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (setq gnosis-themata--search-filter "Question")
+      (should (gnosis-themata--goto-id "thema-000042"))
+      (gnosis-themata-sort 0)
+      (let* ((stale (pop jobs))
+             (updated (gnosis-test-ewoc-dashboard--record 1000)))
+        (setq updated (plist-put updated :keimenon "Changed pending"))
+        (gnosis-themata--replace-record updated)
+        (apply (car stale) (cdr stale))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (gnosis-test-ewoc-dashboard--assert-complete-records 1001)
+        (should (equal "Changed pending"
+                       (plist-get
+                        (ewoc-data (gethash "thema-001000"
+                                            gnosis-themata--nodes))
+                        :keimenon)))
+        (should (= 1000
+                   (plist-get
+                    (ewoc-data (gethash "thema-001000" gnosis-themata--nodes))
+                    :catalog-ordinal)))
+        (should (equal "thema-000042" (gnosis-themata--current-id)))
+        (should (equal "Question" gnosis-themata--search-filter))
+        (should gnosis-themata--sort-key)))))
+
+(ert-deftest gnosis-dashboard-render-run-replacement-rejects-stale-callback ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (gnosis-themata-sort 0)
+      (let ((stale (pop jobs))
+            (count (hash-table-count gnosis-themata--nodes)))
+        (gnosis-themata--cancel-render)
+        (apply (car stale) (cdr stale))
+        (should (= count (hash-table-count gnosis-themata--nodes)))))))
+
+(ert-deftest gnosis-dashboard-render-incarnation-replacement-rejects-stale-callback ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (gnosis-themata-sort 0)
+      (let ((stale (pop jobs))
+            (count (hash-table-count gnosis-themata--nodes)))
+        (setq gnosis-themata--incarnation (cl-incf gnosis-themata--sequence))
+        (apply (car stale) (cdr stale))
+        (should (= count (hash-table-count gnosis-themata--nodes)))))))
+
+(ert-deftest gnosis-dashboard-render-authority-replacement-rejects-stale-callback ()
+  (gnosis-test-ewoc-dashboard--with-records 1001
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (gnosis-themata-sort 0)
+      (let ((stale (pop jobs))
+            (count (hash-table-count gnosis-themata--nodes)))
+        (setq gnosis-themata--authority ["https://changed.example" "owner"])
+        (apply (car stale) (cdr stale))
+        (should (= count (hash-table-count gnosis-themata--nodes)))))))
 
 (ert-deftest gnosis-dashboard-terminal-traversal-has-no-total-ceiling ()
   (let ((next-index 0)
@@ -399,6 +629,84 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                         (ewoc-locate gnosis-themata--ewoc
                                      (window-start (selected-window))))
                        :thema_id))))))))))
+
+(ert-deftest gnosis-dashboard-refresh-preserves-selection-moved-after-dispatch ()
+  (gnosis-test-ewoc-dashboard--with-records 501
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (should (gnosis-themata--goto-id "thema-000042"))
+      (setq pages (gnosis-test-ewoc-dashboard--pages 501))
+      (gnosis-themata-refresh)
+      (should jobs)
+      (should (gnosis-themata--goto-id "thema-000043"))
+      (move-to-column 9)
+      (let ((column (current-column)))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (equal "thema-000043" (gnosis-themata--current-id)))
+        (should (= column (current-column)))))))
+
+(ert-deftest gnosis-dashboard-refresh-preserves-viewport-moved-after-dispatch ()
+  (gnosis-test-ewoc-dashboard--with-records 501
+    (save-window-excursion
+      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+            (window (selected-window)))
+        (set-window-buffer window buffer)
+        (with-current-buffer buffer
+          (should (gnosis-themata--goto-id "thema-000042"))
+          (set-window-start
+           window (ewoc-location (gethash "thema-000020" gnosis-themata--nodes)) t)
+          (setq pages (gnosis-test-ewoc-dashboard--pages 501))
+          (gnosis-themata-refresh)
+          (set-window-start
+           window (ewoc-location (gethash "thema-000030" gnosis-themata--nodes)) t)
+          (gnosis-test-ewoc-dashboard--drain 'jobs)
+          (should (equal "thema-000042" (gnosis-themata--current-id)))
+          (should (equal "thema-000030"
+                         (gnosis-test-ewoc-dashboard--window-start-id window))))))))
+
+(ert-deftest gnosis-dashboard-refresh-missing-selected-row-falls-back-only-while-owned ()
+  (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-buffer-name
+        (should (gnosis-themata--goto-id "thema-000001"))
+        (setq pages (list (gnosis-test-ewoc-dashboard--page 100 3)))
+        (gnosis-themata-refresh)
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should (equal "thema-000100" (gnosis-themata--current-id))))))
+  (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-buffer-name
+        (should (gnosis-themata--goto-id "thema-000001"))
+        (setq pages (list (gnosis-test-ewoc-dashboard--page 100 3)))
+        (gnosis-themata-refresh)
+        (should (gnosis-themata--goto-id "thema-000002"))
+        (gnosis-test-ewoc-dashboard--drain 'jobs)
+        (should-not (gnosis-themata--current-id))))))
+
+(ert-deftest gnosis-dashboard-refresh-missing-start-row-has-no-viewport-fallback ()
+  (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (save-window-excursion
+        (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+              (window (selected-window)))
+          (set-window-buffer window buffer)
+          (with-current-buffer buffer
+            (should (gnosis-themata--goto-id "thema-000001"))
+            (set-window-start
+             window
+             (ewoc-location (gethash "thema-000000" gnosis-themata--nodes)) t)
+            (setq pages (list (gnosis-test-ewoc-dashboard--page 100 3)))
+            (gnosis-themata-refresh)
+            (gnosis-test-ewoc-dashboard--drain 'jobs)
+            (should (equal "thema-000100" (gnosis-themata--current-id)))
+            (should-not
+             (equal "thema-000100"
+                    (gnosis-test-ewoc-dashboard--window-start-id window)))))))))
 
 (ert-deftest gnosis-dashboard-surgical-ewoc-update-preserves-selected-id ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))

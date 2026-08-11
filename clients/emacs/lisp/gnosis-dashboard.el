@@ -276,11 +276,15 @@
   "Return RECORD sort value for COLUMN index."
   (aref (gnosis-themata--columns record) column))
 
+(defun gnosis-themata--complete-records ()
+  "Return current materialized and pending EWOC records exactly once."
+  (append (ewoc-collect gnosis-themata--ewoc #'identity)
+          (copy-sequence (plist-get gnosis-themata--render-state :records))))
+
 (defun gnosis-themata--ordered-records (&optional records)
-  "Return EWOC-owned RECORDS in requested display order.
-When RECORDS is nil, collect records from the dashboard EWOC."
-  (let ((records (or records
-                     (ewoc-collect gnosis-themata--ewoc #'identity))))
+  "Return complete RECORDS in requested display order.
+When RECORDS is nil, use materialized and pending EWOC records."
+  (let ((records (or records (gnosis-themata--complete-records))))
     (if-let* ((column (car-safe gnosis-themata--sort-key)))
         (let ((descending (cdr gnosis-themata--sort-key)))
           (sort records
@@ -296,13 +300,106 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                  (plist-get right-record :catalog-ordinal)))))))
 
 (defun gnosis-themata--capture-context ()
-  "Return selected row, column, and visible `window-start' identity."
-  (let* ((window (get-buffer-window (current-buffer)))
-         (start-id (and window
-                        (gnosis-themata--id-at-position (window-start window)))))
-    (list :selected (gnosis-themata--current-id)
+  "Return immutable selection and viewport ownership token."
+  (let* ((buffer (current-buffer))
+         (window (get-buffer-window buffer))
+         (start-position (and window (window-start window)))
+         (start-id (and start-position
+                        (gnosis-themata--id-at-position start-position))))
+    (list :buffer buffer
+          :incarnation gnosis-themata--incarnation
+          :authority gnosis-themata--authority
+          :selected (gnosis-themata--current-id)
           :column (current-column)
-          :start-id start-id)))
+          :window window
+          :start-id start-id
+          :selection-owned t
+          :selection-fallback t
+          :viewport-owned (and window start-id t)
+          :expected-point (point)
+          :expected-column (current-column)
+          :expected-selected (gnosis-themata--current-id)
+          :expected-window-start start-position
+          :expected-start-id start-id)))
+
+(defun gnosis-themata--context-owner-p (context)
+  "Return non-nil when CONTEXT still owns the current dashboard."
+  (and context
+       (eq (current-buffer) (plist-get context :buffer))
+       (derived-mode-p 'gnosis-dashboard-mode)
+       (equal gnosis-themata--incarnation (plist-get context :incarnation))
+       (equal gnosis-themata--authority (plist-get context :authority))
+       (condition-case nil
+           (equal gnosis-themata--authority
+                  (gnosis-themata--current-authority))
+         (error nil))))
+
+(defun gnosis-themata--reconcile-context (context)
+  "Return next CONTEXT after dropping independently lost claims."
+  (when (gnosis-themata--context-owner-p context)
+    (let* ((next (copy-sequence context))
+           (buffer (plist-get context :buffer))
+           (window (plist-get context :window))
+           (selected (gnosis-themata--current-id))
+           (selection-unchanged
+            (and (equal (point) (plist-get context :expected-point))
+                 (equal (current-column) (plist-get context :expected-column))
+                 (equal selected (plist-get context :expected-selected))))
+           (window-valid
+            (and (window-live-p window)
+                 (eq (window-buffer window) buffer)))
+           (start-position (and window-valid (window-start window)))
+           (start-id (and start-position
+                          (gnosis-themata--id-at-position start-position)))
+           (viewport-unchanged
+            (and window-valid
+                 (equal start-position
+                        (plist-get context :expected-window-start))
+                 (equal start-id (plist-get context :expected-start-id)))))
+      (when (and (plist-get context :selection-owned)
+                 (not selection-unchanged))
+        (setq next (plist-put next :selected selected)
+              next (plist-put next :column (current-column))
+              next (plist-put next :selection-owned (and selected t))
+              next (plist-put next :selection-fallback nil)))
+      (when (and (plist-get context :viewport-owned)
+                 (not viewport-unchanged))
+        (setq next (plist-put next :start-id start-id)
+              next (plist-put next :viewport-owned (and start-id t))))
+      (setq next (plist-put next :expected-point (point))
+            next (plist-put next :expected-column (current-column))
+            next (plist-put next :expected-selected selected)
+            next (plist-put next :expected-window-start start-position)
+            next (plist-put next :expected-start-id start-id))
+      next)))
+
+(defun gnosis-themata--observe-context (context)
+  "Return next CONTEXT with observations after owned buffer mutation."
+  (when (gnosis-themata--context-owner-p context)
+    (let* ((next (copy-sequence context))
+           (buffer (plist-get context :buffer))
+           (window (plist-get context :window))
+           (viewport-owned
+            (and (plist-get context :viewport-owned)
+                 (window-live-p window)
+                 (eq (window-buffer window) buffer)))
+           (start-position (and viewport-owned (window-start window))))
+      (setq next (plist-put next :expected-point (point))
+            next (plist-put next :expected-column (current-column))
+            next (plist-put next :expected-selected
+                            (gnosis-themata--current-id))
+            next (plist-put next :viewport-owned viewport-owned)
+            next (plist-put next :expected-window-start start-position)
+            next (plist-put next :expected-start-id
+                            (and start-position
+                                 (gnosis-themata--id-at-position
+                                  start-position))))
+      next)))
+
+(defun gnosis-themata--context-select (context selected-id)
+  "Return copy of CONTEXT restoring SELECTED-ID."
+  (let ((next (copy-sequence context)))
+    (plist-put next :selected selected-id)))
 
 (defun gnosis-themata--first-visible-node ()
   "Return first visible EWOC node, or nil."
@@ -313,16 +410,27 @@ When RECORDS is nil, collect records from the dashboard EWOC."
     node))
 
 (defun gnosis-themata--restore-context (context)
-  "Restore selection, column, and window from CONTEXT when possible."
-  (if-let* ((selected (plist-get context :selected))
-            (_ (gnosis-themata--goto-id selected)))
-      (move-to-column (plist-get context :column))
-    (when-let* ((first (gnosis-themata--first-visible-node)))
-      (ewoc-goto-node gnosis-themata--ewoc first)))
-  (when-let* ((window (get-buffer-window (current-buffer)))
-              (start-id (plist-get context :start-id))
-              (node (gethash start-id gnosis-themata--nodes)))
-    (set-window-start window (ewoc-location node) t)))
+  "Restore still-owned selection and viewport dimensions from CONTEXT."
+  (when (gnosis-themata--context-owner-p context)
+    (when (plist-get context :selection-owned)
+      (if-let* ((selected (plist-get context :selected))
+                (_ (gnosis-themata--goto-id selected)))
+          (move-to-column (plist-get context :column))
+        (if (plist-get context :selection-fallback)
+            (when-let* ((first (gnosis-themata--first-visible-node)))
+              (ewoc-goto-node gnosis-themata--ewoc first))
+          (goto-char (point-min)))))
+    (when-let* (((plist-get context :viewport-owned))
+                (window (plist-get context :window))
+                (_ (window-live-p window))
+                (_ (eq (window-buffer window) (current-buffer)))
+                (start-id (plist-get context :start-id))
+                (node (gethash start-id gnosis-themata--nodes))
+                (_ (gnosis-themata--visible-p (ewoc-data node)))
+                (position (ewoc-location node))
+                (_ (equal start-id
+                          (gnosis-themata--id-at-position position))))
+      (set-window-start window position t))))
 
 (defun gnosis-themata--clear-ewoc ()
   "Delete all current EWOC nodes and reset node index."
@@ -339,8 +447,8 @@ When RECORDS is nil, collect records from the dashboard EWOC."
            gnosis-themata--nodes))
 
 (defun gnosis-themata--next-catalog-ordinal ()
-  "Return ordinal following every EWOC-owned catalog record."
-  (cl-loop for record in (ewoc-collect gnosis-themata--ewoc #'identity)
+  "Return ordinal following every complete catalog record."
+  (cl-loop for record in (gnosis-themata--complete-records)
            maximize (plist-get record :catalog-ordinal) into maximum
            finally return (1+ (or maximum -1))))
 
@@ -358,8 +466,13 @@ When RECORDS is nil, collect records from the dashboard EWOC."
     (with-current-buffer buffer
       (when (and (derived-mode-p 'gnosis-dashboard-mode)
                  (equal run gnosis-themata--render-run)
-                 gnosis-themata--render-state)
+                 gnosis-themata--render-state
+                 (gnosis-themata--context-owner-p
+                  (plist-get gnosis-themata--render-state :context)))
         (let* ((state gnosis-themata--render-state)
+               (context
+                (gnosis-themata--reconcile-context
+                 (plist-get state :context)))
                (records (plist-get state :records))
                (count (min gnosis-themata--render-chunk-size (length records)))
                (chunk (seq-take records count))
@@ -368,21 +481,12 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                 (+ (plist-get state :visible-count)
                    (cl-count-if #'gnosis-themata--visible-p chunk))))
           (setq gnosis-themata--render-timer nil)
-          (when (and (plist-get state :expected-point)
-                     (or (/= (point) (plist-get state :expected-point))
-                         (/= (current-column)
-                             (plist-get state :expected-column))
-                         (not (equal (gnosis-themata--current-id)
-                                     (plist-get state :expected-selected)))))
-            (setq state (plist-put state :context nil)))
           (let ((inhibit-read-only t)
                 (inhibit-modification-hooks t)
                 (buffer-undo-list t))
             (dolist (record chunk) (gnosis-themata--enter-last record)))
-          (setq state (plist-put state :expected-point (point))
-                state (plist-put state :expected-column (current-column))
-                state (plist-put state :expected-selected
-                                 (gnosis-themata--current-id)))
+          (setq context (gnosis-themata--observe-context context)
+                state (plist-put state :context context))
           (if remaining
               (progn
                 (setq state (plist-put state :records remaining)
@@ -391,26 +495,34 @@ When RECORDS is nil, collect records from the dashboard EWOC."
                       gnosis-themata--render-timer
                       (run-at-time 0 nil #'gnosis-themata--render-step buffer run)))
             (setq gnosis-themata--render-state nil)
-            (when-let* ((context (plist-get state :context)))
-              (gnosis-themata--restore-context context))
+            (gnosis-themata--restore-context context)
             (gnosis-themata--set-footer
              (if (zerop visible-count)
                  (if (zerop (hash-table-count gnosis-themata--nodes))
                      'empty 'empty-filter)
                nil))))))))
 
-(defun gnosis-themata--render (&optional selected-id)
-  "Progressively render current filter and sort, restoring SELECTED-ID."
-  (let ((context (gnosis-themata--capture-context))
-        (records (gnosis-themata--ordered-records)))
-    (when selected-id (setq context (plist-put context :selected selected-id)))
+(defun gnosis-themata--start-render (records context)
+  "Progressively publish ordered RECORDS while CONTEXT owns the buffer."
+  (when-let* ((context (gnosis-themata--reconcile-context context)))
     (gnosis-themata--cancel-render)
     (gnosis-themata--clear-ewoc)
+    (setq context (gnosis-themata--observe-context context))
     (let ((run (cl-incf gnosis-themata--sequence)))
       (setq gnosis-themata--render-run run
             gnosis-themata--render-state
             (list :records records :visible-count 0 :context context))
       (gnosis-themata--render-step (current-buffer) run))))
+
+(defun gnosis-themata--render (&optional selected-id)
+  "Progressively render current filter and sort, restoring SELECTED-ID."
+  (let* ((active-context
+          (plist-get gnosis-themata--render-state :context))
+         (context (or active-context (gnosis-themata--capture-context)))
+         (records (gnosis-themata--ordered-records)))
+    (when (and selected-id (null active-context))
+      (setq context (gnosis-themata--context-select context selected-id)))
+    (gnosis-themata--start-render records context)))
 
 (defun gnosis-themata--append-refresh-records (state records)
   "Return refresh STATE after appending RECORDS in O(1) list time."
@@ -495,16 +607,10 @@ When RECORDS is nil, collect records from the dashboard EWOC."
 
 (defun gnosis-themata--install-refresh-state (state context)
   "Install terminal refresh STATE and progressively publish CONTEXT."
-  (gnosis-themata--cancel-render)
-  (gnosis-themata--clear-ewoc)
-  (setq gnosis-themata--generation (plist-get state :generation))
-  (let ((run (cl-incf gnosis-themata--sequence)))
-    (setq gnosis-themata--render-run run
-          gnosis-themata--render-state
-          (list :records (gnosis-themata--ordered-records
-                          (plist-get state :records))
-                :visible-count 0 :context context))
-    (gnosis-themata--render-step (current-buffer) run)))
+  (when (gnosis-themata--context-owner-p context)
+    (setq gnosis-themata--generation (plist-get state :generation))
+    (gnosis-themata--start-render
+     (gnosis-themata--ordered-records (plist-get state :records)) context)))
 
 (defun gnosis-themata--refresh-step (buffer run)
   "Fetch and publish one bounded catalog page for BUFFER and RUN."
@@ -513,55 +619,64 @@ When RECORDS is nil, collect records from the dashboard EWOC."
       (when (and (derived-mode-p 'gnosis-dashboard-mode)
                  (equal run gnosis-themata--refresh-run)
                  gnosis-themata--refresh-state)
-        (let ((incarnation gnosis-themata--incarnation)
-              (authority gnosis-themata--authority)
-              (state gnosis-themata--refresh-state))
+        (let* ((incarnation gnosis-themata--incarnation)
+               (authority gnosis-themata--authority)
+               (state gnosis-themata--refresh-state)
+               (context
+                (gnosis-themata--reconcile-context
+                 (plist-get state :context))))
           (setq gnosis-themata--refresh-timer nil)
-          (condition-case nil
-              (let* ((token (gnosis-core--token))
-                     (base-url (gnosis-core--validated-base-url))
-                     (request-authority
-                      (vector base-url (secure-hash 'sha256 token))))
-                (unless (equal authority request-authority)
-                  (signal 'gnosis-core-authorization-error
-                          '("Gnosis credentials changed; reopen dashboard")))
-                (let* ((gnosis-core--token-override token)
-                       (gnosis-core--base-url-override base-url)
-                       (page (gnosis-core-thema-catalog
-                              nil (plist-get state :after)
-                              gnosis-core--thema-catalog-page-limit))
-                       (result (gnosis-themata--bootstrap-page-result state page))
-                       (updated (plist-get result :state)))
-                  (when (gnosis-themata--refresh-context-p
-                         buffer run incarnation authority)
-                    (setq gnosis-themata--refresh-state updated)
-                    (when (plist-get state :fresh)
-                      (gnosis-themata--publish-initial-page
-                       updated (plist-get updated :page-records)))
-                    (if (eq 'continue (plist-get result :status))
-                        (gnosis-themata--schedule-refresh-step buffer run)
-                      (setq gnosis-themata--refresh-state nil
-                            gnosis-themata--refresh-timer nil
-                            gnosis-themata--loading-p nil)
-                      (if (plist-get state :fresh)
-                          (gnosis-themata--set-footer
-                           (if (zerop (hash-table-count gnosis-themata--nodes))
-                               'empty nil))
-                        (gnosis-themata--install-refresh-state
-                         updated (plist-get state :context)))))))
-            (gnosis-core-conflict
-             (when (gnosis-themata--refresh-context-p
-                    buffer run incarnation authority)
-               (setq gnosis-themata--refresh-state nil
-                     gnosis-themata--loading-p nil)
-               (gnosis-themata--set-footer 'conflict)))
-            (gnosis-core-error
-             (when (gnosis-themata--refresh-context-p
-                    buffer run incarnation authority)
-               (setq gnosis-themata--refresh-state nil
-                     gnosis-themata--loading-p nil)
-               (gnosis-themata--set-footer
-                'error "Thema catalog unavailable. Press g to retry.")))))))))
+          (when context
+            (setq state (plist-put state :context context))
+            (condition-case nil
+                (let* ((token (gnosis-core--token))
+                       (base-url (gnosis-core--validated-base-url))
+                       (request-authority
+                        (vector base-url (secure-hash 'sha256 token))))
+                  (unless (equal authority request-authority)
+                    (signal 'gnosis-core-authorization-error
+                            '("Gnosis credentials changed; reopen dashboard")))
+                  (let* ((gnosis-core--token-override token)
+                         (gnosis-core--base-url-override base-url)
+                         (page (gnosis-core-thema-catalog
+                                nil (plist-get state :after)
+                                gnosis-core--thema-catalog-page-limit))
+                         (result (gnosis-themata--bootstrap-page-result state page))
+                         (updated (plist-get result :state)))
+                    (when (gnosis-themata--refresh-context-p
+                           buffer run incarnation authority)
+                      (when (plist-get state :fresh)
+                        (gnosis-themata--publish-initial-page
+                         updated (plist-get updated :page-records))
+                        (setq updated
+                              (plist-put updated :context
+                                         (gnosis-themata--observe-context
+                                          (plist-get updated :context)))))
+                      (setq gnosis-themata--refresh-state updated)
+                      (if (eq 'continue (plist-get result :status))
+                          (gnosis-themata--schedule-refresh-step buffer run)
+                        (setq gnosis-themata--refresh-state nil
+                              gnosis-themata--refresh-timer nil
+                              gnosis-themata--loading-p nil)
+                        (if (plist-get state :fresh)
+                            (gnosis-themata--set-footer
+                             (if (zerop (hash-table-count gnosis-themata--nodes))
+                                 'empty nil))
+                          (gnosis-themata--install-refresh-state
+                           updated (plist-get updated :context)))))))
+              (gnosis-core-conflict
+               (when (gnosis-themata--refresh-context-p
+                      buffer run incarnation authority)
+                 (setq gnosis-themata--refresh-state nil
+                       gnosis-themata--loading-p nil)
+                 (gnosis-themata--set-footer 'conflict)))
+              (gnosis-core-error
+               (when (gnosis-themata--refresh-context-p
+                      buffer run incarnation authority)
+                 (setq gnosis-themata--refresh-state nil
+                       gnosis-themata--loading-p nil)
+                 (gnosis-themata--set-footer
+                  'error "Thema catalog unavailable. Press g to retry."))))))))))
 
 (defun gnosis-themata--start-bootstrap (&optional selected-id fresh)
   "Start terminal catalog traversal, restoring SELECTED-ID.
@@ -570,7 +685,8 @@ When FRESH is non-nil, publish each accepted page progressively."
     (cancel-timer gnosis-themata--refresh-timer))
   (let ((run (cl-incf gnosis-themata--sequence))
         (context (gnosis-themata--capture-context)))
-    (when selected-id (setq context (plist-put context :selected selected-id)))
+    (when selected-id
+      (setq context (gnosis-themata--context-select context selected-id)))
     (setq gnosis-themata--refresh-run run
           gnosis-themata--loading-p t
           gnosis-themata--refresh-state
@@ -686,8 +802,12 @@ With numeric prefix -1, restore authoritative catalog order."
 (defun gnosis-themata--replace-record (record)
   "Replace catalog RECORD after an authoritative mutation."
   (let* ((id (plist-get record :thema_id))
+         (records (gnosis-themata--complete-records))
          (node (gethash id gnosis-themata--nodes))
-         (previous (and node (ewoc-data node)))
+         (previous
+          (seq-find (lambda (candidate)
+                      (equal id (plist-get candidate :thema_id)))
+                    records))
          (record
           (plist-put (copy-tree record) :catalog-ordinal
                      (if previous
@@ -700,18 +820,32 @@ With numeric prefix -1, restore authoritative catalog order."
                            previous (car gnosis-themata--sort-key))
                           (gnosis-themata--sort-value
                            record (car gnosis-themata--sort-key))))))
-         (context (gnosis-themata--capture-context)))
-    (if node
-        (ewoc-set-data node record)
-      (gnosis-themata--enter-last record))
-    (if (or (and node sort-stable)
-            (and (null node) (null gnosis-themata--sort-key)))
-        (progn
-          (when node
-            (let ((inhibit-read-only t))
-              (ewoc-invalidate gnosis-themata--ewoc node)))
-          (gnosis-themata--restore-context context))
-      (gnosis-themata--render (plist-get context :selected)))))
+         (context
+          (if gnosis-themata--render-state
+              (plist-get gnosis-themata--render-state :context)
+            (gnosis-themata--capture-context)))
+         (updated-records
+          (if previous
+              (mapcar (lambda (candidate)
+                        (if (equal id (plist-get candidate :thema_id))
+                            record candidate))
+                      records)
+            (append records (list record)))))
+    (if gnosis-themata--render-state
+        (gnosis-themata--start-render
+         (gnosis-themata--ordered-records updated-records) context)
+      (if node
+          (ewoc-set-data node record)
+        (gnosis-themata--enter-last record))
+      (if (or (and node sort-stable)
+              (and (null node) (null gnosis-themata--sort-key)))
+          (progn
+            (when node
+              (let ((inhibit-read-only t))
+                (ewoc-invalidate gnosis-themata--ewoc node)))
+            (gnosis-themata--restore-context context))
+        (gnosis-themata--start-render
+         (gnosis-themata--ordered-records) context)))))
 
 (defun gnosis-themata--content-record (projection previous)
   "Return compact record from PROJECTION and PREVIOUS review state."
@@ -731,8 +865,10 @@ With numeric prefix -1, restore authoritative catalog order."
                  (equal authority (gnosis-themata--current-authority))
                  (equal incarnation gnosis-themata--incarnation))
         (let* ((id (plist-get projection :thema_id))
-               (node (gethash id gnosis-themata--nodes))
-               (previous (and node (ewoc-data node))))
+               (previous
+                (seq-find (lambda (record)
+                            (equal id (plist-get record :thema_id)))
+                          (gnosis-themata--complete-records))))
           (gnosis-themata--replace-record
            (gnosis-themata--content-record projection previous)))))))
 
