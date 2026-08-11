@@ -17,7 +17,7 @@ INFO := docs/gnosis.info
 LISP_DIR := lisp
 TEST_DIR := tests
 TOOL_DIR := tools
-EL_FILES := gnosis-completion.el gnosis-core.el gnosis-core-assets.el gnosis-edit.el gnosis-nodes.el gnosis-tl.el gnosis.el gnosis-review.el
+EL_FILES := gnosis-completion.el gnosis-core.el gnosis-core-assets.el gnosis-edit.el gnosis-nodes.el gnosis-dashboard.el gnosis.el gnosis-review.el
 LISP_FILES := $(addprefix $(LISP_DIR)/,$(EL_FILES))
 TOOL_FILES := $(TOOL_DIR)/gnosis-openapi-generator.el
 TEST_FILES := tests/gnosis-test-core.el \
@@ -27,7 +27,7 @@ TEST_FILES := tests/gnosis-test-core.el \
 	tests/gnosis-test-nodes.el \
 	tests/gnosis-test-entry-smoke.el \
 	tests/gnosis-test-dashboard.el \
-	tests/gnosis-test-tl.el \
+	tests/gnosis-test-ewoc-dashboard.el \
 	tests/gnosis-test-review.el \
 	tests/gnosis-test-boundary.el \
 	tests/gnosis-package-smoke.el \
@@ -122,7 +122,7 @@ load:
 	rm -f $(LISP_DIR)/*.elc
 	@emacsclient --eval "(dolist (symbol \
 	    '(gnosis-dashboard-mode-map gnosis-edit-mode-map \
-	      gnosis-dashboard-themata-mode-map gnosis-review-mode-map)) \
+	      gnosis-review-mode-map)) \
 	  (when (boundp symbol) (makunbound symbol)))" > /dev/null
 	@set -e; for file in $(EL_FILES); do \
 		emacsclient -e "(load-file \"$(shell pwd)/$(LISP_DIR)/$$file\")" > /dev/null; \
@@ -131,8 +131,6 @@ load:
 	  (with-current-buffer buffer \
 	    (pcase major-mode \
 	      ('gnosis-dashboard-mode (use-local-map gnosis-dashboard-mode-map)) \
-	      ('gnosis-dashboard-themata-mode \
-	       (use-local-map gnosis-dashboard-themata-mode-map)) \
 	      ('gnosis-edit-mode (use-local-map gnosis-edit-mode-map)) \
 	      ('gnosis-review-mode (use-local-map gnosis-review-mode-map)) \
 	      )))" > /dev/null

@@ -133,6 +133,6 @@ Runtime source consists of exactly eight modules:
 + =gnosis-core-assets.el=
 + =gnosis-edit.el=
 + =gnosis-nodes.el=
-+ =gnosis-tl.el=
++ =gnosis-dashboard.el=
 + =gnosis-review.el=
 + =gnosis-completion.el=

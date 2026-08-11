@@ -5,6 +5,7 @@
 (require 'cl-lib)
 (require 'ert)
 (require 'gnosis)
+(require 'gnosis-dashboard)
 
 (dolist (command '(gnosis-review gnosis-review-topic gnosis-review-resume))
   (unless (commandp command)
@@ -20,6 +21,7 @@
               "(progn
                  (require 'cl-lib)
                  (require 'gnosis)
+                 (require 'gnosis-dashboard)
                  (unless (autoloadp (symbol-function 'gnosis-edit-read-kind))
                    (error \"gnosis-edit-read-kind is not lazy\"))
                  (with-eval-after-load 'gnosis-edit
@@ -34,6 +36,21 @@
                      (unless (and (featurep 'gnosis-edit)
                                   (derived-mode-p 'gnosis-edit-mode))
                        (error \"Dashboard Add did not open editor\")))))")))
+        (unless (= status 0)
+          (ert-fail (buffer-string)))))))
+
+(ert-deftest gnosis-dashboard-module-loads-main-contract-standalone ()
+  (let ((emacs (expand-file-name invocation-name invocation-directory))
+        (library-directory (file-name-directory (locate-library "gnosis"))))
+    (with-temp-buffer
+      (let ((status
+             (call-process
+              emacs nil t nil "--batch" "-Q" "-L" library-directory "--eval"
+              "(progn
+                 (require 'gnosis-dashboard)
+                 (unless (and (featurep 'gnosis)
+                              (fboundp 'gnosis--dashboard-text))
+                   (error \"Dashboard omitted its main contract\")))")))
         (unless (= status 0)
           (ert-fail (buffer-string)))))))
 

@@ -7,15 +7,15 @@
 (require 'gnosis-completion)
 (require 'gnosis-core)
 (require 'gnosis-core-assets)
+(require 'gnosis-dashboard)
 (require 'gnosis-edit)
 (require 'gnosis-nodes)
 (require 'gnosis-review)
-(require 'gnosis-tl)
 
 (ert-deftest gnosis-package-loads-eight-public-modules ()
   (dolist (feature '(gnosis gnosis-core gnosis-core-assets
                      gnosis-edit gnosis-nodes gnosis-review gnosis-completion
-                     gnosis-tl))
+                     gnosis-dashboard))
     (should (featurep feature))))
 
 (ert-deftest gnosis-package-exposes-foundation-entrypoints ()

@@ -17,10 +17,10 @@
 (ert-deftest gnosis-boundary-loads-only-eight-runtime-modules ()
   (dolist (feature '(gnosis gnosis-core gnosis-core-assets
                      gnosis-edit gnosis-nodes gnosis-review gnosis-completion
-                     gnosis-tl))
+                     gnosis-dashboard))
     (should (require feature nil t)))
   (dolist (feature '(gnosis-db gnosis-sqlite gnosis-algorithm
-                     gnosis-dashboard gnosis-history gnosis-anki))
+                     gnosis-tl gnosis-history gnosis-anki))
     (should-not (locate-library (symbol-name feature)))))
 
 (ert-deftest gnosis-boundary-exposes-no-domain-or-database-api ()
