@@ -72,6 +72,8 @@
 
 (ert-deftest gnosis-review-history-renders-public-terminal-pages ()
   (let ((calls 0)
+        (gnosis-core--base-url-override "https://example.invalid")
+        (gnosis-core--token-override (make-string 40 ?a))
         (first (gnosis-test-dashboard--history-event "event-b" 20260811 t))
         (last (gnosis-test-dashboard--history-event "event-a" 20260810 nil)))
     (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
@@ -105,10 +107,52 @@
         (when-let* ((buffer (get-buffer gnosis-review-history-buffer-name)))
           (kill-buffer buffer))))))
 
+(ert-deftest gnosis-review-history-load-pins-rotating-authority-pair ()
+  (let* ((base-a "https://a.example")
+         (base-b "https://b.example")
+         (token-a (make-string 40 ?a))
+         (token-b (make-string 40 ?b))
+         (authority-a (vector base-a (secure-hash 'sha256 token-a)))
+         (event-a (gnosis-test-dashboard--history-event "event-a" 20260811 t))
+         (event-b (gnosis-test-dashboard--history-event "event-b" 20260811 nil))
+         (base-calls 0)
+         (token-calls 0))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (setq gnosis-review-history--authority authority-a)
+      (cl-letf (((symbol-function 'gnosis-core--validated-base-url)
+                 (lambda ()
+                   (or gnosis-core--base-url-override
+                       (progn
+                         (cl-incf base-calls)
+                         (if (= base-calls 1) base-a base-b)))))
+                ((symbol-function 'gnosis-core--token)
+                 (lambda ()
+                   (or gnosis-core--token-override
+                       (progn
+                         (cl-incf token-calls)
+                         (if (= token-calls 1) token-a token-b)))))
+                ((symbol-function 'gnosis-core-review-history)
+                 (lambda (&rest _)
+                   (let ((base-url (gnosis-core--validated-base-url))
+                         (token (gnosis-core--token)))
+                     `(:items [,(if (and (equal base-a base-url)
+                                         (equal token-a token))
+                                    event-a
+                                  event-b)]
+                       :next ,gnosis-core--json-null)))))
+        (should (eq 'installed (gnosis-review-history--load nil)))
+        (should (equal authority-a gnosis-review-history--authority))
+        (should (equal (list event-a) gnosis-review-history--records))
+        (should (= base-calls 1))
+        (should (= token-calls 1))))))
+
 (ert-deftest gnosis-review-history-preserves-selection-on-refresh ()
   (let* ((first (gnosis-test-dashboard--history-event "event-b" 20260811 t))
          (second (gnosis-test-dashboard--history-event "event-a" 20260810 nil))
-         (page `(:items [,first ,second] :next "event-a")))
+         (page `(:items [,first ,second] :next "event-a"))
+         (gnosis-core--base-url-override "https://example.invalid")
+         (gnosis-core--token-override (make-string 40 ?a)))
     (with-temp-buffer
       (gnosis-review-history-mode)
       (setq gnosis-review-history--authority ["https://example.invalid" "digest"])
@@ -125,27 +169,29 @@
         (should (equal "event-a" (tabulated-list-get-id)))))))
 
 (ert-deftest gnosis-review-history-empty-and-error-states-are-actionable ()
-  (with-temp-buffer
-    (gnosis-review-history-mode)
-    (setq gnosis-review-history--authority ["https://example.invalid" "digest"])
-    (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
-               (lambda (&rest _) gnosis-review-history--authority))
-              ((symbol-function 'gnosis-core-review-history)
-               (lambda (&rest _)
-                 (should (eq gnosis-review-history--status 'loading))
-                 `(:items [] :next ,gnosis-core--json-null))))
-      (gnosis-review-history--load nil)
-      (should (string-search "No review history yet. Press g to refresh."
-                             (buffer-string))))
-    (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
-               (lambda (&rest _) gnosis-review-history--authority))
-              ((symbol-function 'gnosis-core-review-history)
-               (lambda (&rest _)
-                 (signal 'gnosis-core-unavailable '("private detail")))))
-      (gnosis-review-history-refresh)
-      (should (string-search "Review history unavailable. Press g to retry."
-                             (buffer-string)))
-      (should-not (string-search "private detail" (buffer-string))))))
+  (let ((gnosis-core--base-url-override "https://example.invalid")
+        (gnosis-core--token-override (make-string 40 ?a)))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (setq gnosis-review-history--authority ["https://example.invalid" "digest"])
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&rest _) gnosis-review-history--authority))
+                ((symbol-function 'gnosis-core-review-history)
+                 (lambda (&rest _)
+                   (should (eq gnosis-review-history--status 'loading))
+                   `(:items [] :next ,gnosis-core--json-null))))
+        (gnosis-review-history--load nil)
+        (should (string-search "No review history yet. Press g to refresh."
+                               (buffer-string))))
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&rest _) gnosis-review-history--authority))
+                ((symbol-function 'gnosis-core-review-history)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-unavailable '("private detail")))))
+        (gnosis-review-history-refresh)
+        (should (string-search "Review history unavailable. Press g to retry."
+                               (buffer-string)))
+        (should-not (string-search "private detail" (buffer-string)))))))
 
 (ert-deftest gnosis-dashboard-summary-renders-missing-success-rate ()
   (let* ((state (copy-tree (gnosis-test-dashboard--projection)))

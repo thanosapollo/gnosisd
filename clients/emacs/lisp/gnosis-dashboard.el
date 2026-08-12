@@ -1093,30 +1093,40 @@ With numeric prefix -1, restore authoritative catalog order."
 (defun gnosis-review-history--load (cursor)
   "Load bounded history page after CURSOR.
 Return `installed', `terminal', or `error'."
-  (gnosis-review-history--ensure-authority)
-  (setq gnosis-review-history--status 'loading)
-  (gnosis-review-history--render)
-  (condition-case nil
-      (let* ((page (gnosis-core-review-history cursor 100))
-             (items (plist-get page :items))
-             (next (plist-get page :next)))
-        (if (and cursor (= (length items) 0))
-            (progn
-              (setq gnosis-review-history--next gnosis-core--json-null
-                    gnosis-review-history--status 'end)
-              (gnosis-review-history--render)
-              'terminal)
-          (setq gnosis-review-history--cursor cursor
-                gnosis-review-history--next next
-                gnosis-review-history--records (append items nil)
-                gnosis-review-history--status
-                (if (= (length items) 0) 'empty nil))
-          (gnosis-review-history--render)
-          'installed))
-    (gnosis-core-error
-     (setq gnosis-review-history--status 'error)
-     (gnosis-review-history--render)
-     'error)))
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (let ((gnosis-core--base-url-override base-url))
+                  (gnosis-core--token)))
+         (authority
+          (let ((gnosis-core--base-url-override base-url))
+            (gnosis-core--authenticated-authority token))))
+    (unless (equal gnosis-review-history--authority authority)
+      (signal 'gnosis-core-authorization-error
+              '("Gnosis authenticated authority changed")))
+    (setq gnosis-review-history--status 'loading)
+    (gnosis-review-history--render)
+    (condition-case nil
+        (let* ((gnosis-core--base-url-override base-url)
+               (gnosis-core--token-override token)
+               (page (gnosis-core-review-history cursor 100))
+               (items (plist-get page :items))
+               (next (plist-get page :next)))
+          (if (and cursor (= (length items) 0))
+              (progn
+                (setq gnosis-review-history--next gnosis-core--json-null
+                      gnosis-review-history--status 'end)
+                (gnosis-review-history--render)
+                'terminal)
+            (setq gnosis-review-history--cursor cursor
+                  gnosis-review-history--next next
+                  gnosis-review-history--records (append items nil)
+                  gnosis-review-history--status
+                  (if (= (length items) 0) 'empty nil))
+            (gnosis-review-history--render)
+            'installed))
+      (gnosis-core-error
+       (setq gnosis-review-history--status 'error)
+       (gnosis-review-history--render)
+       'error))))
 
 (defun gnosis-review-history-refresh ()
   "Refresh the current bounded review history page."
