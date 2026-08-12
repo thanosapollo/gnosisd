@@ -9,7 +9,10 @@
 
 (defvar gnosis-review-history-buffer-name)
 (defvar gnosis-review-history--authority)
+(defvar gnosis-review-history--cursor)
 (defvar gnosis-review-history--next)
+(defvar gnosis-review-history--previous)
+(defvar gnosis-review-history--records)
 (defvar gnosis-review-history--status)
 
 (defun gnosis-test-dashboard--projection (&optional active-session)
@@ -107,19 +110,25 @@
         (when-let* ((buffer (get-buffer gnosis-review-history-buffer-name)))
           (kill-buffer buffer))))))
 
-(ert-deftest gnosis-review-history-load-pins-rotating-authority-pair ()
+(ert-deftest gnosis-review-history-replacement-pins-one-authority-pair ()
   (let* ((base-a "https://a.example")
          (base-b "https://b.example")
          (token-a (make-string 40 ?a))
          (token-b (make-string 40 ?b))
          (authority-a (vector base-a (secure-hash 'sha256 token-a)))
+         (authority-c ["https://c.example" "digest-c"])
          (event-a (gnosis-test-dashboard--history-event "event-a" 20260811 t))
-         (event-b (gnosis-test-dashboard--history-event "event-b" 20260811 nil))
+         (event-c (gnosis-test-dashboard--history-event "event-c" 20260810 nil))
          (base-calls 0)
          (token-calls 0))
     (with-temp-buffer
       (gnosis-review-history-mode)
-      (setq gnosis-review-history--authority authority-a)
+      (setq gnosis-review-history--authority authority-c
+            gnosis-review-history--cursor "cursor-c"
+            gnosis-review-history--next "next-c"
+            gnosis-review-history--previous '("previous-c")
+            gnosis-review-history--records (list event-c))
+      (gnosis-review-history--render)
       (cl-letf (((symbol-function 'gnosis-core--validated-base-url)
                  (lambda ()
                    (or gnosis-core--base-url-override
@@ -134,18 +143,129 @@
                          (if (= token-calls 1) token-a token-b)))))
                 ((symbol-function 'gnosis-core-review-history)
                  (lambda (&rest _)
-                   (let ((base-url (gnosis-core--validated-base-url))
-                         (token (gnosis-core--token)))
-                     `(:items [,(if (and (equal base-a base-url)
-                                         (equal token-a token))
-                                    event-a
-                                  event-b)]
-                       :next ,gnosis-core--json-null)))))
-        (should (eq 'installed (gnosis-review-history--load nil)))
+                   (should (equal base-a gnosis-core--base-url-override))
+                   (should (equal token-a gnosis-core--token-override))
+                   (should (equal authority-a gnosis-review-history--authority))
+                   (should-not gnosis-review-history--cursor)
+                   (should-not gnosis-review-history--next)
+                   (should-not gnosis-review-history--previous)
+                   (should-not gnosis-review-history--records)
+                   (should (eq 'loading gnosis-review-history--status))
+                   `(:items [,event-a] :next ,gnosis-core--json-null))))
+        (should (eq 'installed (gnosis-review-history--load nil t)))
         (should (equal authority-a gnosis-review-history--authority))
         (should (equal (list event-a) gnosis-review-history--records))
+        (should-not (string-search "Failure" (buffer-string)))
         (should (= base-calls 1))
         (should (= token-calls 1))))))
+
+(ert-deftest gnosis-review-history-replacement-capture-failure-preserves-owner ()
+  (let* ((authority-c ["https://c.example" "digest-c"])
+         (event-c (gnosis-test-dashboard--history-event "event-c" 20260810 nil)))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (setq gnosis-review-history--authority authority-c
+            gnosis-review-history--cursor "cursor-c"
+            gnosis-review-history--next "next-c"
+            gnosis-review-history--previous '("previous-c")
+            gnosis-review-history--records (list event-c))
+      (gnosis-review-history--render)
+      (cl-letf (((symbol-function 'gnosis-core--validated-base-url)
+                 (lambda ()
+                   (signal 'gnosis-core-validation-error '("invalid base")))))
+        (should-error (gnosis-review-history--load nil t)
+                      :type 'gnosis-core-validation-error))
+      (should (equal authority-c gnosis-review-history--authority))
+      (should (equal "cursor-c" gnosis-review-history--cursor))
+      (should (equal "next-c" gnosis-review-history--next))
+      (should (equal '("previous-c") gnosis-review-history--previous))
+      (should (equal (list event-c) gnosis-review-history--records))
+      (should (string-search "Failure" (buffer-string))))))
+
+(ert-deftest gnosis-review-history-pagination-authority-mismatch-preserves-page ()
+  (let* ((authority-a ["https://a.example" "digest-a"])
+         (authority-b ["https://b.example" "digest-b"])
+         (event-a (gnosis-test-dashboard--history-event "event-a" 20260811 t))
+         (gnosis-core--base-url-override "https://b.example")
+         (gnosis-core--token-override (make-string 40 ?b)))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (setq gnosis-review-history--authority authority-a
+            gnosis-review-history--cursor "cursor-a"
+            gnosis-review-history--next "next-a"
+            gnosis-review-history--previous '("previous-a")
+            gnosis-review-history--records (list event-a))
+      (gnosis-review-history--render)
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&rest _) authority-b)))
+        (should-error (gnosis-review-history--load "next-a")
+                      :type 'gnosis-core-authorization-error))
+      (should (equal authority-a gnosis-review-history--authority))
+      (should (equal "cursor-a" gnosis-review-history--cursor))
+      (should (equal "next-a" gnosis-review-history--next))
+      (should (equal '("previous-a") gnosis-review-history--previous))
+      (should (equal (list event-a) gnosis-review-history--records))
+      (should (string-search "Success" (buffer-string))))))
+
+(ert-deftest gnosis-review-history-replacement-request-error-clears-old-page ()
+  (let* ((authority-a ["https://a.example" "digest-a"])
+         (authority-c ["https://c.example" "digest-c"])
+         (event-c (gnosis-test-dashboard--history-event "event-c" 20260810 nil))
+         (gnosis-core--base-url-override "https://a.example")
+         (gnosis-core--token-override (make-string 40 ?a)))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (setq gnosis-review-history--authority authority-c
+            gnosis-review-history--cursor "cursor-c"
+            gnosis-review-history--next "next-c"
+            gnosis-review-history--previous '("previous-c")
+            gnosis-review-history--records (list event-c))
+      (gnosis-review-history--render)
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&rest _) authority-a))
+                ((symbol-function 'gnosis-core-review-history)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-unavailable '("private detail")))))
+        (should (eq 'error (gnosis-review-history--load nil t))))
+      (should (equal authority-a gnosis-review-history--authority))
+      (should-not gnosis-review-history--cursor)
+      (should-not gnosis-review-history--next)
+      (should-not gnosis-review-history--previous)
+      (should-not gnosis-review-history--records)
+      (should (string-search "Review history unavailable. Press g to retry."
+                             (buffer-string)))
+      (should-not (string-search "Failure\|private detail" (buffer-string))))))
+
+(ert-deftest gnosis-review-history-stale-result-cannot-overwrite-new-owner ()
+  (let* ((authority-a ["https://a.example" "digest-a"])
+         (authority-b ["https://b.example" "digest-b"])
+         (event-a (gnosis-test-dashboard--history-event "event-a" 20260811 nil))
+         (event-b (gnosis-test-dashboard--history-event "event-b" 20260812 t))
+         (gnosis-core--base-url-override "https://a.example")
+         (gnosis-core--token-override (make-string 40 ?a)))
+    (with-temp-buffer
+      (gnosis-review-history-mode)
+      (cl-letf (((symbol-function 'gnosis-core--authenticated-authority)
+                 (lambda (&rest _) authority-a))
+                ((symbol-function 'gnosis-core-review-history)
+                 (lambda (&rest _)
+                   (setq gnosis-review-history--authority authority-b
+                         gnosis-review-history--cursor "cursor-b"
+                         gnosis-review-history--next "next-b"
+                         gnosis-review-history--previous '("previous-b")
+                         gnosis-review-history--records (list event-b)
+                         gnosis-review-history--status 'loading)
+                   (gnosis-review-history--render)
+                   `(:items [,event-a] :next ,gnosis-core--json-null))))
+        (should (eq 'stale (gnosis-review-history--load nil t))))
+      (should (equal authority-b gnosis-review-history--authority))
+      (should (equal "cursor-b" gnosis-review-history--cursor))
+      (should (equal "next-b" gnosis-review-history--next))
+      (should (equal '("previous-b") gnosis-review-history--previous))
+      (should (equal (list event-b) gnosis-review-history--records))
+      (should (eq 'loading gnosis-review-history--status))
+      (should (string-search "Success" (buffer-string)))
+      (should-not (string-search "Failure" (buffer-string))))))
 
 (ert-deftest gnosis-review-history-preserves-selection-on-refresh ()
   (let* ((first (gnosis-test-dashboard--history-event "event-b" 20260811 t))

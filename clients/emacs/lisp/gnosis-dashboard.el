@@ -1033,17 +1033,6 @@ With numeric prefix -1, restore authoritative catalog order."
         gnosis-themata--max-reviews nil
         gnosis-themata--sort-key nil))
 
-(defun gnosis-review-history--current-authority ()
-  "Return non-secret identity of the authenticated review authority."
-  (gnosis-core--authenticated-authority))
-
-(defun gnosis-review-history--ensure-authority ()
-  "Reject history use when its authenticated authority changed."
-  (unless (equal gnosis-review-history--authority
-                 (gnosis-review-history--current-authority))
-    (signal 'gnosis-core-authorization-error
-            '("Gnosis authenticated authority changed"))))
-
 (defun gnosis-review-history--date (review-day)
   "Return readable date for numeric REVIEW-DAY."
   (format "%04d-%02d-%02d"
@@ -1090,18 +1079,25 @@ With numeric prefix -1, restore authoritative catalog order."
       (goto-char (point-max))
       (insert "\n" (gnosis-review-history--status-text) "\n"))))
 
-(defun gnosis-review-history--load (cursor)
+(defun gnosis-review-history--load (cursor &optional replace-authority)
   "Load bounded history page after CURSOR.
-Return `installed', `terminal', or `error'."
+When REPLACE-AUTHORITY is non-nil, replace buffer ownership first.
+Return `installed', `terminal', `error', or `stale'."
   (let* ((base-url (gnosis-core--validated-base-url))
          (token (let ((gnosis-core--base-url-override base-url))
                   (gnosis-core--token)))
          (authority
           (let ((gnosis-core--base-url-override base-url))
             (gnosis-core--authenticated-authority token))))
-    (unless (equal gnosis-review-history--authority authority)
-      (signal 'gnosis-core-authorization-error
-              '("Gnosis authenticated authority changed")))
+    (if replace-authority
+        (setq gnosis-review-history--authority authority
+              gnosis-review-history--cursor nil
+              gnosis-review-history--next nil
+              gnosis-review-history--previous nil
+              gnosis-review-history--records nil)
+      (unless (equal gnosis-review-history--authority authority)
+        (signal 'gnosis-core-authorization-error
+                '("Gnosis authenticated authority changed"))))
     (setq gnosis-review-history--status 'loading)
     (gnosis-review-history--render)
     (condition-case nil
@@ -1110,23 +1106,28 @@ Return `installed', `terminal', or `error'."
                (page (gnosis-core-review-history cursor 100))
                (items (plist-get page :items))
                (next (plist-get page :next)))
-          (if (and cursor (= (length items) 0))
-              (progn
-                (setq gnosis-review-history--next gnosis-core--json-null
-                      gnosis-review-history--status 'end)
-                (gnosis-review-history--render)
-                'terminal)
+          (cond
+           ((not (equal gnosis-review-history--authority authority))
+            'stale)
+           ((and cursor (= (length items) 0))
+            (setq gnosis-review-history--next gnosis-core--json-null
+                  gnosis-review-history--status 'end)
+            (gnosis-review-history--render)
+            'terminal)
+           (t
             (setq gnosis-review-history--cursor cursor
                   gnosis-review-history--next next
                   gnosis-review-history--records (append items nil)
                   gnosis-review-history--status
                   (if (= (length items) 0) 'empty nil))
             (gnosis-review-history--render)
-            'installed))
+            'installed)))
       (gnosis-core-error
-       (setq gnosis-review-history--status 'error)
-       (gnosis-review-history--render)
-       'error))))
+       (if (not (equal gnosis-review-history--authority authority))
+           'stale
+         (setq gnosis-review-history--status 'error)
+         (gnosis-review-history--render)
+         'error)))))
 
 (defun gnosis-review-history-refresh ()
   "Refresh the current bounded review history page."
@@ -1136,7 +1137,6 @@ Return `installed', `terminal', or `error'."
 (defun gnosis-review-history-next ()
   "Show the next bounded review history page."
   (interactive)
-  (gnosis-review-history--ensure-authority)
   (when (or (null gnosis-review-history--next)
             (eq gnosis-review-history--next gnosis-core--json-null))
     (user-error "No later review history page"))
@@ -1148,7 +1148,6 @@ Return `installed', `terminal', or `error'."
 (defun gnosis-review-history-previous ()
   "Show the previous bounded review history page."
   (interactive)
-  (gnosis-review-history--ensure-authority)
   (unless gnosis-review-history--previous
     (user-error "No earlier review history page"))
   (when (eq 'installed
@@ -1196,18 +1195,11 @@ Return `installed', `terminal', or `error'."
 (defun gnosis-review-history ()
   "Open bounded server-authoritative review history."
   (interactive)
-  (let* ((buffer (get-buffer-create gnosis-review-history-buffer-name))
-         (authority (gnosis-review-history--current-authority)))
+  (let ((buffer (get-buffer-create gnosis-review-history-buffer-name)))
     (pop-to-buffer-same-window buffer)
     (unless (derived-mode-p 'gnosis-review-history-mode)
       (gnosis-review-history-mode))
-    (unless (equal authority gnosis-review-history--authority)
-      (setq gnosis-review-history--authority authority
-            gnosis-review-history--cursor nil
-            gnosis-review-history--next nil
-            gnosis-review-history--previous nil
-            gnosis-review-history--records nil))
-    (gnosis-review-history--load nil)
+    (gnosis-review-history--load nil t)
     (goto-char (point-min))
     (keymap-popup gnosis-review-history-mode-map)))
 
