@@ -10,10 +10,11 @@ history, authoring rules, and persistence.
 
 ** Current scope
 
-Run =M-x gnosis= for the server-projected dashboard; =r= starts or resumes
-review, =T= starts topic review, =R= opens active review controls, =n= opens
-nodes and documents, =t= opens the thema management list, =g= refreshes, =?=
-shows actions, and =q= closes it.  Run
+Run =M-x gnosis= for the server-projected overview; its home page shows current
+statistics.  Press =n= for node views and search, =t= for thema views and
+search, =h= for daemon health, =H= for review history, =r= to start or resume
+review, =T= for topic review, =R= for active review controls, =g= to refresh,
+=?= to show actions, and =q= to close it.  Run
 =M-x gnosis-review= for due review.  For an
 offline-editable Org working tree, customize =gnosis-nodes-dir= and run
 =M-x gnosis-nodes-bootstrap=.  Edit Org files normally; each save durably queues
@@ -95,9 +96,9 @@ compatibility entry point.
 Server-backed node pages are available through =gnosis-nodes-search=,
 =gnosis-nodes-search-content=, =gnosis-nodes-find-tag=,
 =gnosis-nodes-inbound=, and =gnosis-nodes-outbound=.  The themata dashboard
-supports text/review/tag filters, create/edit, archive, suspension, and confirmed
-tag-page suspension.  The daemon remains authoritative for all projections and
-mutations.
+supports text/review/tag filters, create/edit, deletion, suspension, and confirmed
+tag-page suspension.  Mark rows and press =d= to delete them; deleted themata are
+hidden.  The daemon remains authoritative for all projections and mutations.
 
 Thema creation, dashboard editing, and review editing share one type-aware text
 buffer.  Basic themata expose question, hint, and answer sections.  Choice

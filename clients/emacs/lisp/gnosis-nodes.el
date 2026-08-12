@@ -22,6 +22,9 @@
 (require 'keymap-popup)
 (require 'gnosis-core)
 
+(declare-function gnosis-dashboard "gnosis-dashboard")
+(declare-function gnosis-review-topic "gnosis-review")
+
 (defgroup gnosis-nodes nil
   "Offline-editable Gnosis Org files."
   :group 'gnosis)
@@ -129,6 +132,7 @@ When nil, use private `gnosis/sync/state.json' below `user-emacs-directory'."
 (defvar-local gnosis-nodes-page--next nil)
 (defvar-local gnosis-nodes-page--history nil)
 (defvar-local gnosis-nodes-page--records nil)
+(defvar-local gnosis-nodes-page--authority nil)
 
 (defconst gnosis-nodes--catalog-page-limit 5000)
 (defconst gnosis-nodes--catalog-max-nodes 100000)
@@ -1174,19 +1178,79 @@ With prefix argument REFRESH, rebuild the node catalog first."
                   '("Gnosis authority changed during node lookup")))
         (gnosis-nodes--visit-node node)))))
 
-(keymap-popup-define gnosis-nodes-page-mode-map
-  "Keymap for server-backed Gnosis node pages."
+(defun gnosis-nodes-page--node-id ()
+  "Return the node identity represented at point."
+  (let ((record (gethash (tabulated-list-get-id) gnosis-nodes-page--records)))
+    (or (plist-get record :node_id)
+        (let ((id (plist-get record :file_node_id)))
+          (unless (eq id gnosis-core--json-null) id))
+        (user-error "No Gnosis node at point"))))
+
+(defun gnosis-nodes-page-outbound ()
+  "Show outbound links for the node at point."
+  (interactive)
+  (gnosis-nodes-page--with-authority
+   (lambda () (gnosis-nodes-outbound (gnosis-nodes-page--node-id)))))
+
+(defun gnosis-nodes-page-inbound ()
+  "Show backlinks for the node at point."
+  (interactive)
+  (gnosis-nodes-page--with-authority
+   (lambda () (gnosis-nodes-inbound (gnosis-nodes-page--node-id)))))
+
+(defun gnosis-nodes-page-review ()
+  "Review the topic represented by the node at point."
+  (interactive)
+  (gnosis-nodes-page--with-authority
+   (lambda () (gnosis-review-topic (gnosis-nodes-page--node-id)))))
+
+(defun gnosis-nodes-page-sort (column)
+  "Sort the current node page by COLUMN."
+  (setq tabulated-list-sort-key (cons column nil))
+  (tabulated-list-init-header)
+  (tabulated-list-print t)
+  (goto-char (point-min)))
+
+(keymap-popup-define gnosis-node-search-map
+  "Search Nodes"
+  :description "Search Nodes"
+  :group "Search All Nodes"
+  "C-t" ("By title" gnosis-nodes-search)
+  "c" ("By content" gnosis-nodes-search-content)
+  "t" ("By tag" gnosis-nodes-find-by-tag))
+
+(keymap-popup-define gnosis-node-sort-map
+  "Sort Nodes"
+  :description "Sort Nodes"
+  :group "Sort By"
+  "C-t" ("Title" (lambda () (interactive) (gnosis-nodes-page-sort "Title")))
+  "p" ("Path" (lambda () (interactive) (gnosis-nodes-page-sort "Path")))
+  "t" ("Tags" (lambda () (interactive) (gnosis-nodes-page-sort "Tags"))))
+
+(keymap-popup-define gnosis-node-page-map
+  "Gnosis Nodes"
   :parent tabulated-list-mode-map
   :popup-key "?"
   :exit-key "C-g"
   :description "Gnosis Nodes"
-  :group "Open"
+  :group "Navigate"
   "RET" ("Visit node" gnosis-nodes-page-visit)
+  "q" ("Back" gnosis-dashboard)
+  "g" ("Refresh" gnosis-nodes-page-refresh :stay-open t)
+  :group "Search/Sort"
+  "SPC" ("Search all" :keymap gnosis-node-search-map)
+  "s" ("Sort" :keymap gnosis-node-sort-map)
+  :group "View"
+  "f" ("Show links" gnosis-nodes-page-outbound)
+  "b" ("Show backlinks" gnosis-nodes-page-inbound)
+  :group "Review"
+  "r" ("Review topic" gnosis-nodes-page-review)
   :group "Page"
   "n" ("Next page" gnosis-nodes-page-next)
-  "p" ("Previous page" gnosis-nodes-page-previous)
-  "g" ("Refresh page" gnosis-nodes-page-refresh :stay-open t)
-  "q" ("Quit" quit-window))
+  "p" ("Previous page" gnosis-nodes-page-previous))
+
+(defvar-keymap gnosis-nodes-page-mode-map
+  :parent gnosis-node-page-map)
 
 (define-derived-mode gnosis-nodes-page-mode tabulated-list-mode "Gnosis Nodes"
   "Major mode for one page of server-backed node results."
@@ -1225,22 +1289,53 @@ With prefix argument REFRESH, rebuild the node catalog first."
     (tabulated-list-print t)
     (goto-char (point-min))))
 
+(defun gnosis-nodes-page--with-authority (function)
+  "Call FUNCTION under this page's authenticated authority."
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (gnosis-core--token))
+         (authority (list base-url (secure-hash 'sha256 token))))
+    (unless gnosis-nodes-page--authority
+      (signal 'gnosis-nodes-error
+              '("Gnosis node page has no authenticated authority")))
+    (unless (equal gnosis-nodes-page--authority authority)
+      (signal 'gnosis-nodes-error
+              '("Gnosis authenticated authority changed for node page")))
+    (let ((gnosis-core--base-url-override base-url)
+          (gnosis-core--token-override token))
+      (funcall function))))
+
+(defun gnosis-nodes-page--fetch-page (cursor)
+  "Fetch CURSOR while preserving this page's authenticated authority."
+  (gnosis-nodes-page--with-authority
+   (lambda () (funcall gnosis-nodes-page--fetch cursor))))
+
 (defun gnosis-nodes-page--load (cursor)
   "Load CURSOR through the current page fetcher."
   (unless gnosis-nodes-page--fetch
     (user-error "No Gnosis page source"))
   (gnosis-nodes-page--install
-   (funcall gnosis-nodes-page--fetch cursor) cursor))
+   (gnosis-nodes-page--fetch-page cursor) cursor))
 
 (defun gnosis-nodes-page-open (title fetch)
   "Open a node page named TITLE using single-argument FETCH."
-  (let ((buffer (get-buffer-create (format "*Gnosis Nodes: %s*" title))))
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (gnosis-core--token))
+         (authority (list base-url (secure-hash 'sha256 token)))
+         (buffer (get-buffer-create (format "*Gnosis Nodes: %s*" title))))
     (pop-to-buffer-same-window buffer)
     (gnosis-nodes-page-mode)
+    (setq-local tabulated-list-entries nil
+                gnosis-nodes-page--cursor nil
+                gnosis-nodes-page--next gnosis-core--json-null
+                gnosis-nodes-page--records (make-hash-table :test #'equal))
+    (tabulated-list-print t)
     (setq-local gnosis-nodes-page--fetch fetch
-                gnosis-nodes-page--history nil)
-    (gnosis-nodes-page--load nil)
-    (keymap-popup gnosis-nodes-page-mode-map)))
+                gnosis-nodes-page--history nil
+                gnosis-nodes-page--authority authority)
+    (let ((gnosis-core--base-url-override base-url)
+          (gnosis-core--token-override token))
+      (gnosis-nodes-page--load nil))
+    (keymap-popup gnosis-node-page-map)))
 
 (defun gnosis-nodes-page-next ()
   "Open the next server result page."
@@ -1248,7 +1343,7 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (when (eq gnosis-nodes-page--next gnosis-core--json-null)
     (user-error "No next Gnosis node page"))
   (let* ((cursor gnosis-nodes-page--next)
-         (page (funcall gnosis-nodes-page--fetch cursor))
+         (page (gnosis-nodes-page--fetch-page cursor))
          (previous gnosis-nodes-page--cursor))
     (gnosis-nodes-page--install page cursor)
     (push previous gnosis-nodes-page--history)))
@@ -1259,7 +1354,7 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (unless gnosis-nodes-page--history
     (user-error "No previous Gnosis node page"))
   (let* ((cursor (car gnosis-nodes-page--history))
-         (page (funcall gnosis-nodes-page--fetch cursor)))
+         (page (gnosis-nodes-page--fetch-page cursor)))
     (gnosis-nodes-page--install page cursor)
     (pop gnosis-nodes-page--history)))
 
@@ -1271,19 +1366,21 @@ With prefix argument REFRESH, rebuild the node catalog first."
 (defun gnosis-nodes-page-visit ()
   "Visit the node or content-hit document at point."
   (interactive)
-  (let* ((record (gethash (tabulated-list-get-id) gnosis-nodes-page--records))
-         (node-id (or (plist-get record :node_id)
-                      (let ((id (plist-get record :file_node_id)))
-                        (unless (eq id gnosis-core--json-null) id)))))
-    (if node-id
-        (gnosis-nodes--visit-node (gnosis-core-node node-id))
-      (let* ((node (list :document_id (plist-get record :document_id)
-                         :document_revision (plist-get record :revision)
-                         :content_sha256 (plist-get record :content_digest)
-                         :logical_path (plist-get record :logical_path)))
-             (source (gnosis-nodes--document-source node)))
-        (pop-to-buffer-same-window (plist-get source :buffer))
-        (goto-char (point-min))))))
+  (gnosis-nodes-page--with-authority
+   (lambda ()
+     (let* ((record (gethash (tabulated-list-get-id) gnosis-nodes-page--records))
+            (node-id (or (plist-get record :node_id)
+                         (let ((id (plist-get record :file_node_id)))
+                           (unless (eq id gnosis-core--json-null) id)))))
+       (if node-id
+           (gnosis-nodes--visit-node (gnosis-core-node node-id))
+         (let* ((node (list :document_id (plist-get record :document_id)
+                            :document_revision (plist-get record :revision)
+                            :content_sha256 (plist-get record :content_digest)
+                            :logical_path (plist-get record :logical_path)))
+                (source (gnosis-nodes--document-source node)))
+           (pop-to-buffer-same-window (plist-get source :buffer))
+           (goto-char (point-min))))))))
 
 ;;;###autoload
 (defun gnosis-nodes-search (query)

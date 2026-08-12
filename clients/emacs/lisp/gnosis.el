@@ -103,6 +103,9 @@
 (defvar gnosis-dashboard-buffer-name "*Gnosis Dashboard*"
   "Gnosis dashboard buffer name.")
 
+(defvar gnosis-dashboard-themata-buffer-name "*Gnosis Themata*"
+  "Gnosis thema collection buffer name.")
+
 (defvar-local gnosis-center-content t
   "Non-nil means center content in the current Gnosis buffer.")
 
@@ -234,14 +237,11 @@
 
 (defun gnosis--dashboard-content-text (content)
   "Return the dashboard summary for CONTENT."
-  (format "%s %s, %s, %s, %s"
+  (format "%s %s, %s, %s"
           (gnosis--dashboard-style "Content:" 'shadow)
           (gnosis--dashboard-style
            (format "%d themata" (plist-get content :active_themata))
            'font-lock-type-face)
-          (gnosis--dashboard-style
-           (format "%d archived" (plist-get content :archived_themata))
-           'shadow)
           (gnosis--dashboard-style
            (format "%d documents" (plist-get content :active_documents))
            'font-lock-type-face)

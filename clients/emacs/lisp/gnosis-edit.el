@@ -1046,7 +1046,7 @@ Call AFTER-SAVE with the validated projection after a successful save."
                 (gnosis-core--token-override token))
             (gnosis-core-thema thema-id))))
     (when (eq t (plist-get projection :archived))
-      (user-error "Archived Thema cannot be edited; unarchive it first"))
+      (user-error "Deleted thema cannot be edited"))
     (let ((request (gnosis-core-thema-write-view projection)))
       (gnosis-edit--open gnosis-edit-buffer-name request thema-id
                          (plist-get projection :revision)

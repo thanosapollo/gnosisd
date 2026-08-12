@@ -104,7 +104,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
   "Evaluate BODY with CATALOG-FUNCTION and deterministic client boundaries."
   (declare (indent 1) (debug (form body)))
   `(let (jobs)
-     (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+     (when-let* ((buffer (get-buffer gnosis-dashboard-themata-buffer-name)))
        (kill-buffer buffer))
      (unwind-protect
          (cl-letf (((symbol-function 'gnosis-core-dashboard)
@@ -128,7 +128,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                    ((symbol-function 'pop-to-buffer-same-window)
                     (lambda (buffer &rest _) (set-buffer buffer))))
            ,@body)
-       (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+       (when-let* ((buffer (get-buffer gnosis-dashboard-themata-buffer-name)))
          (kill-buffer buffer)))))
 
 (defmacro gnosis-test-ewoc-dashboard--with-records (total &rest body)
@@ -136,22 +136,22 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
   (declare (indent 1) (debug (form body)))
   `(let ((pages (gnosis-test-ewoc-dashboard--pages ,total)))
      (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-       (gnosis-dashboard)
+       (gnosis-dashboard-themata)
        (gnosis-test-ewoc-dashboard--drain 'jobs)
        ,@body)))
 
-(ert-deftest gnosis-dashboard-default-journey-is-summary-plus-ewoc-catalog ()
+(ert-deftest gnosis-dashboard-dedicated-themata-journey-loads-complete-catalog ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 2 "thema-000001")
                      (gnosis-test-ewoc-dashboard--page 2 1))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
-      (with-current-buffer gnosis-dashboard-buffer-name
-        (should (derived-mode-p 'gnosis-dashboard-mode))
+      (gnosis-dashboard-themata)
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
+        (should (derived-mode-p 'gnosis-dashboard-themata-mode))
         (should (ewoc-p gnosis-themata--ewoc))
-        (should (string-search "Gnosis Dashboard" (buffer-string)))
+        (should (string-search "Gnosis Themata" (buffer-string)))
         (should (string-search "Loading complete thema catalog" (buffer-string))))
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (string-search "Question 0" (buffer-string)))
         (should (string-search "Question 2" (buffer-string)))
         (should (= 3 (hash-table-count gnosis-themata--nodes)))
@@ -159,6 +159,40 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should
          (< (line-number-at-pos (ewoc-location (ewoc-nth gnosis-themata--ewoc 0)))
             (line-number-at-pos (ewoc-location (ewoc-nth gnosis-themata--ewoc 1)))))))))
+
+(ert-deftest gnosis-dashboard-view-all-clears-rendered-filters ()
+  (gnosis-test-ewoc-dashboard--with-records 3
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
+      (gnosis-themata-filter-search "Question 1")
+      (gnosis-themata-filter-review-state :suspended)
+      (gnosis-themata-filter-max-reviews 0)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (should-not (string-search "Question 0" (buffer-string)))
+      (should-not (string-search "Question 1" (buffer-string))))
+    (gnosis-dashboard-themata)
+    (gnosis-test-ewoc-dashboard--drain 'jobs)
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
+      (should-not gnosis-themata--search-filter)
+      (should (eq gnosis-themata--review-filter :all))
+      (should-not gnosis-themata--tag-filter)
+      (should-not gnosis-themata--max-reviews)
+      (should (string-search "Question 0" (buffer-string)))
+      (should (string-search "Question 1" (buffer-string)))
+      (should (string-search "Question 2" (buffer-string))))))
+
+(ert-deftest gnosis-dashboard-hides-deleted-themata-and-archived-column ()
+  (let* ((active (gnosis-test-ewoc-dashboard--record 0))
+         (deleted (plist-put (gnosis-test-ewoc-dashboard--record 1) :archived t))
+         (pages (list `(:generation "g1" :items [,active ,deleted]
+                        :next ,gnosis-core--json-null))))
+    (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
+      (gnosis-dashboard-themata)
+      (gnosis-test-ewoc-dashboard--drain 'jobs)
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
+        (should (string-search "Question 0" (buffer-string)))
+        (should-not (string-search "Question 1" (buffer-string)))
+        (should-not (string-search "Archived" (buffer-string)))
+        (should (= 6 (length (gnosis-themata--columns active))))))))
 
 (ert-deftest gnosis-dashboard-authority-change-replaces-catalog ()
   (let ((token (make-string 40 ?a))
@@ -173,13 +207,13 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                  (lambda (&optional supplied-token)
                    (vector "https://test.example"
                            (secure-hash 'sha256 (or supplied-token token))))))
-        (gnosis-dashboard)
+        (gnosis-dashboard-themata)
         (gnosis-test-ewoc-dashboard--drain 'jobs)
         (setq token (make-string 40 ?b)
               pages (list (gnosis-test-ewoc-dashboard--page 100 1)))
-        (gnosis-dashboard)
+        (gnosis-dashboard-themata)
         (gnosis-test-ewoc-dashboard--drain 'jobs))
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (= 2 catalog-calls))
         (should-not (string-search "Question 0" (buffer-string)))
         (should (string-search "Question 100" (buffer-string)))
@@ -188,9 +222,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-ewoc-data-owns-complete-records ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 2))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should-not (boundp 'gnosis-themata--records))
         (should-not (boundp 'gnosis-themata--order))
         (let* ((node (ewoc-nth gnosis-themata--ewoc 0))
@@ -223,9 +257,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
          (pages (list `(:generation "g1" :items [,first ,second ,third]
                         :next ,gnosis-core--json-null))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (gnosis-themata-filter-search "Question")
         (gnosis-test-ewoc-dashboard--drain 'jobs)
         (gnosis-themata-sort 0)
@@ -259,9 +293,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
          (pages (list `(:generation "g1" :items [,first ,second]
                         :next ,gnosis-core--json-null))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (equal '("thema-000001" "thema-000000")
                        (gnosis-test-ewoc-dashboard--ids)))
         (should (equal '(0 1)
@@ -280,9 +314,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-progressive-render-restores-unchanged-context ()
   (let ((pages (gnosis-test-ewoc-dashboard--pages 501)))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (gnosis-themata--goto-id "thema-000042"))
         (move-to-column 7)
         (let ((column (current-column)))
@@ -295,9 +329,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-progressive-render-preserves-intervening-movement ()
   (let ((pages (gnosis-test-ewoc-dashboard--pages 501)))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (gnosis-themata--goto-id "thema-000000"))
         (move-to-column 5)
         (gnosis-themata-sort 0)
@@ -312,7 +346,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-progressive-render-drops-only-moved-selection ()
   (gnosis-test-ewoc-dashboard--with-records 1001
     (save-window-excursion
-      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+      (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
             (window (selected-window)))
         (set-window-buffer window buffer)
         (with-current-buffer buffer
@@ -330,7 +364,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-progressive-render-drops-only-moved-viewport ()
   (gnosis-test-ewoc-dashboard--with-records 1001
     (save-window-excursion
-      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+      (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
             (window (selected-window)))
         (set-window-buffer window buffer)
         (with-current-buffer buffer
@@ -355,7 +389,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
   (gnosis-test-ewoc-dashboard--with-records 1001
     (save-window-excursion
       (delete-other-windows)
-      (let* ((buffer (get-buffer gnosis-dashboard-buffer-name))
+      (let* ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
              (target (selected-window))
              (other (split-window-right))
              (scratch (get-buffer-create " *gnosis-window-owner-test*")))
@@ -387,7 +421,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
   (gnosis-test-ewoc-dashboard--with-records 1001
     (save-window-excursion
       (delete-other-windows)
-      (let* ((buffer (get-buffer gnosis-dashboard-buffer-name))
+      (let* ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
              (other (selected-window))
              (target (split-window-right))
              (scratch (get-buffer-create " *gnosis-deleted-window-test*")))
@@ -408,7 +442,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-progressive-render-needs-no-visible-window ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (let ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+    (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name)))
       (should-not (get-buffer-window buffer))
       (with-current-buffer buffer
         (should (gnosis-themata--goto-id "thema-000042"))
@@ -419,7 +453,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-sort-replacement-retains-pending-records ()
   (gnosis-test-ewoc-dashboard--with-records 1001
     (save-window-excursion
-      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+      (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
             (window (selected-window)))
         (set-window-buffer window buffer)
         (with-current-buffer buffer
@@ -443,7 +477,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-filter-replacement-retains-pending-records ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (gnosis-themata-sort 0)
       (let ((stale (pop jobs)))
         (gnosis-themata-filter-search "Question 1")
@@ -453,7 +487,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-layout-replacement-retains-pending-records ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (gnosis-themata-sort 0)
       (let ((stale (pop jobs)))
         (gnosis-themata--apply-layout
@@ -465,7 +499,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-mutation-replaces-pending-record-during-render ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (setq gnosis-themata--search-filter "Question")
       (should (gnosis-themata--goto-id "thema-000042"))
       (gnosis-themata-sort 0)
@@ -491,7 +525,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-render-run-replacement-rejects-stale-callback ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (gnosis-themata-sort 0)
       (let ((stale (pop jobs))
             (count (hash-table-count gnosis-themata--nodes)))
@@ -501,7 +535,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-render-incarnation-replacement-rejects-stale-callback ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (gnosis-themata-sort 0)
       (let ((stale (pop jobs))
             (count (hash-table-count gnosis-themata--nodes)))
@@ -511,7 +545,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-render-authority-replacement-rejects-stale-callback ()
   (gnosis-test-ewoc-dashboard--with-records 1001
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (gnosis-themata-sort 0)
       (let ((stale (pop jobs))
             (count (hash-table-count gnosis-themata--nodes)))
@@ -535,9 +569,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
             (cl-incf next-index count)
             (setq max-page-size (max max-page-size count))
             (gnosis-test-ewoc-dashboard--page start count next)))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (let ((records (ewoc-collect gnosis-themata--ewoc #'identity)))
           (should (= 1001 (length records)))
           (should (equal "thema-001000"
@@ -563,7 +597,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                  (lambda (data)
                    (cl-incf pretty-printer-calls)
                    (gnosis-themata--pretty-print-default data))))
-        (gnosis-dashboard)
+        (gnosis-dashboard-themata)
         (while jobs
           (setq pretty-printer-calls 0)
           (let ((job (pop jobs)))
@@ -587,9 +621,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
               `(:generation "g1"
                 :items [,(gnosis-test-ewoc-dashboard--record 1)]
                 :next "same")))
-        (gnosis-dashboard)
+        (gnosis-dashboard-themata)
         (gnosis-test-ewoc-dashboard--drain 'jobs)
-        (with-current-buffer gnosis-dashboard-buffer-name
+        (with-current-buffer gnosis-dashboard-themata-buffer-name
           (should (string-search "catalog unavailable" (buffer-string)))
           (should-not gnosis-themata--loading-p))))))
 
@@ -601,9 +635,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
             :items [,(gnosis-test-ewoc-dashboard--record 0)]
             :next ,gnosis-core--json-null))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (= 1 (hash-table-count gnosis-themata--nodes)))
         (should (string-search "catalog unavailable" (buffer-string)))))))
 
@@ -612,9 +646,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
          (list (gnosis-test-ewoc-dashboard--page 0 1 "thema-000000" "g1")
                (gnosis-test-ewoc-dashboard--page 1 1 nil "g2"))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (= 1 (hash-table-count gnosis-themata--nodes)))
         (should (string-search "catalog changed during refresh" (buffer-string)))
         (should-not gnosis-themata--loading-p)))))
@@ -622,12 +656,12 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-reopen-error-retains-live-ewoc ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 1))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
       (cl-letf (((symbol-function 'gnosis-core-dashboard)
                  (lambda () (signal 'gnosis-core-unavailable '("private")))))
-        (gnosis-dashboard))
-      (with-current-buffer gnosis-dashboard-buffer-name
+        (gnosis-dashboard-themata))
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (= 1 (hash-table-count gnosis-themata--nodes)))
         (should (string-search "Question 0" (buffer-string)))
         (should (string-search "gnosisd unavailable" (buffer-string)))))))
@@ -635,28 +669,28 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-restart-cancels-stale-page-callback ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 1))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (let ((stale (pop jobs)))
-        (with-current-buffer gnosis-dashboard-buffer-name
+        (with-current-buffer gnosis-dashboard-themata-buffer-name
           (gnosis-themata-refresh))
         (apply (car stale) (cdr stale)))
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (= 1 (hash-table-count gnosis-themata--nodes)))
         (should-not gnosis-themata--loading-p)))))
 
 (ert-deftest gnosis-dashboard-explicit-empty-and-empty-filter-states ()
   (gnosis-test-ewoc-dashboard--with-client
       (lambda (&rest _) (gnosis-test-ewoc-dashboard--page 0 0))
-    (gnosis-dashboard)
+    (gnosis-dashboard-themata)
     (gnosis-test-ewoc-dashboard--drain 'jobs)
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (should (string-search "No themata yet. Press a to add one." (buffer-string)))))
   (gnosis-test-ewoc-dashboard--with-client
       (lambda (&rest _) (gnosis-test-ewoc-dashboard--page 0 1))
-    (gnosis-dashboard)
+    (gnosis-dashboard-themata)
     (gnosis-test-ewoc-dashboard--drain 'jobs)
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (gnosis-themata-filter-search "does not exist")
       (gnosis-test-ewoc-dashboard--drain 'jobs)
       (should (string-search "No themata match current filters." (buffer-string))))))
@@ -664,10 +698,10 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-refresh-preserves-ewoc-selection-column-and-window ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
       (save-window-excursion
-        (let ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+        (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name)))
           (set-window-buffer (selected-window) buffer)
           (with-current-buffer buffer
             (should (gnosis-themata--goto-id "thema-000000"))
@@ -690,7 +724,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-refresh-preserves-selection-moved-after-dispatch ()
   (gnosis-test-ewoc-dashboard--with-records 501
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (should (gnosis-themata--goto-id "thema-000042"))
       (setq pages (gnosis-test-ewoc-dashboard--pages 501))
       (gnosis-themata-refresh)
@@ -705,7 +739,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-refresh-preserves-viewport-moved-after-dispatch ()
   (gnosis-test-ewoc-dashboard--with-records 501
     (save-window-excursion
-      (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+      (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
             (window (selected-window)))
         (set-window-buffer window buffer)
         (with-current-buffer buffer
@@ -724,9 +758,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-refresh-missing-selected-row-falls-back-only-while-owned ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (gnosis-themata--goto-id "thema-000001"))
         (setq pages (list (gnosis-test-ewoc-dashboard--page 100 3)))
         (gnosis-themata-refresh)
@@ -734,9 +768,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should (equal "thema-000100" (gnosis-themata--current-id))))))
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (should (gnosis-themata--goto-id "thema-000001"))
         (setq pages (list (gnosis-test-ewoc-dashboard--page 100 3)))
         (gnosis-themata-refresh)
@@ -747,10 +781,10 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-refresh-missing-start-row-has-no-viewport-fallback ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
       (save-window-excursion
-        (let ((buffer (get-buffer gnosis-dashboard-buffer-name))
+        (let ((buffer (get-buffer gnosis-dashboard-themata-buffer-name))
               (window (selected-window)))
           (set-window-buffer window buffer)
           (with-current-buffer buffer
@@ -769,9 +803,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-surgical-ewoc-update-preserves-selected-id ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 3))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (gnosis-themata--goto-id "thema-000002")
         (let ((updated (copy-tree
                         (ewoc-data (gethash "thema-000001"
@@ -784,9 +818,9 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 (ert-deftest gnosis-dashboard-authoritative-mutations-update-ewoc-surgically ()
   (let ((pages (list (gnosis-test-ewoc-dashboard--page 0 2))))
     (gnosis-test-ewoc-dashboard--with-client (lambda (&rest _) (pop pages))
-      (gnosis-dashboard)
+      (gnosis-dashboard-themata)
       (gnosis-test-ewoc-dashboard--drain 'jobs)
-      (with-current-buffer gnosis-dashboard-buffer-name
+      (with-current-buffer gnosis-dashboard-themata-buffer-name
         (gnosis-themata--goto-id "thema-000001")
         (let ((ordinal (plist-get
                         (ewoc-data (gethash "thema-000001"
@@ -807,6 +841,14 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                                           gnosis-themata--nodes))
                       :catalog-ordinal))))
         (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
+                  ((symbol-function 'gnosis-core-thema-set-suspended)
+                   (lambda (_id _revision desired)
+                     `(:state (:state_revision 3 :suspended ,desired)))))
+          (gnosis-themata-toggle-suspension))
+        (should (eq t (plist-get
+                       (ewoc-data (gethash "thema-000001" gnosis-themata--nodes))
+                       :suspended)))
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                   ((symbol-function 'gnosis-core-thema-set-archived)
                    (lambda (id _revision desired)
                      `(:thema_id ,id :revision 3 :kind "basic"
@@ -816,14 +858,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should (eq t (plist-get
                        (ewoc-data (gethash "thema-000001" gnosis-themata--nodes))
                        :archived)))
-        (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _) t))
-                  ((symbol-function 'gnosis-core-thema-set-suspended)
-                   (lambda (_id _revision desired)
-                     `(:state (:state_revision 3 :suspended ,desired)))))
-          (gnosis-themata-toggle-suspension))
-        (should (eq t (plist-get
-                       (ewoc-data (gethash "thema-000001" gnosis-themata--nodes))
-                       :suspended)))
+        (should-not (string-search "Edited" (buffer-string)))
         (cl-letf (((symbol-function 'gnosis-edit-read-kind) (lambda () "basic"))
                   ((symbol-function 'gnosis-add-thema)
                    (lambda (callback _kind)
@@ -837,11 +872,11 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should (= 2 (plist-get
                       (ewoc-data (gethash "thema-new" gnosis-themata--nodes))
                       :catalog-ordinal)))
-        (should (equal "thema-000001" (gnosis-themata--current-id)))))))
+        (should (equal "thema-000000" (gnosis-themata--current-id)))))))
 
 (ert-deftest gnosis-dashboard-marks-complete-filtered-projection-across-pages ()
   (gnosis-test-ewoc-dashboard--with-records 501
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (setq gnosis-themata--search-filter "Question 5")
       (gnosis-themata-mark-all)
       (should (= 12 (hash-table-count gnosis-themata--marked)))
@@ -853,7 +888,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-bulk-500-uses-one-request ()
   (gnosis-test-ewoc-dashboard--with-records 500
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (let ((operation 0)
             calls)
         (gnosis-themata-mark-all)
@@ -869,9 +904,29 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
         (should (= 1 (length calls)))
         (should (= 500 (length (car calls))))))))
 
+(ert-deftest gnosis-dashboard-bulk-prompts-with-user-facing-actions ()
+  (gnosis-test-ewoc-dashboard--with-records 1
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
+      (let (prompts)
+        (cl-letf (((symbol-function 'yes-or-no-p)
+                   (lambda (prompt) (push prompt prompts) nil))
+                  ((symbol-function 'gnosis-themata--selected-records)
+                   (lambda ()
+                     '((:thema_id "thema-000000"
+                        :thema_revision 1 :state_revision 1)))))
+          (gnosis-themata-bulk-archive)
+          (gnosis-themata-bulk-archive t)
+          (gnosis-themata-bulk-suspension)
+          (gnosis-themata-bulk-suspension t))
+        (should (equal '("Delete 1 selected thema? "
+                         "Restore 1 selected thema? "
+                         "Suspend 1 selected thema? "
+                         "Unsuspend 1 selected thema? ")
+                       (nreverse prompts)))))))
+
 (ert-deftest gnosis-dashboard-bulk-501-is-ordered-and-publishes-once ()
   (gnosis-test-ewoc-dashboard--with-records 501
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (let ((operation 0)
             calls
             (renders 0)
@@ -903,7 +958,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-bulk-cancel-keeps-unsent-marked ()
   (gnosis-test-ewoc-dashboard--with-records 501
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (let ((operation 0)
             calls)
         (gnosis-themata-mark-all)
@@ -925,7 +980,7 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
 
 (ert-deftest gnosis-dashboard-bulk-rejection-and-uncertainty-retain-retry-state ()
   (gnosis-test-ewoc-dashboard--with-records 2
-    (with-current-buffer gnosis-dashboard-buffer-name
+    (with-current-buffer gnosis-dashboard-themata-buffer-name
       (let ((operation 0)
             calls)
         (gnosis-themata-mark-all)

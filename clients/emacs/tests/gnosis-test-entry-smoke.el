@@ -28,8 +28,8 @@
                    (fset 'gnosis-edit--request-context
                          (lambda () '(:authority test))))
                  (let ((gnosis-themata--authority 'test))
-                   (cl-letf (((symbol-function 'gnosis-themata--ensure-authority)
-                              #'ignore)
+                   (cl-letf (((symbol-function 'gnosis-themata--call-with-authority)
+                              (lambda (function) (funcall function)))
                              ((symbol-function 'completing-read)
                               (lambda (&rest _) \"basic\")))
                      (gnosis-themata-add)
@@ -54,7 +54,7 @@
         (unless (= status 0)
           (ert-fail (buffer-string)))))))
 
-(ert-deftest gnosis-entry-and-dashboard-review-bindings-dispatch ()
+(ert-deftest gnosis-entry-and-dashboard-review-binding-dispatches ()
   (let ((gnosis-dashboard--projection
          (list :active_session (list :session_id "session-1")))
         called)
@@ -62,18 +62,14 @@
                (lambda (&optional _) (interactive) (push 'due called)))
               ((symbol-function 'gnosis-dashboard)
                (lambda () (interactive) (push 'dashboard called)))
-              ((symbol-function 'gnosis-dashboard-themata)
-               (lambda () (interactive) (push 'themata called)))
               ((symbol-function 'gnosis-review-topic)
                (lambda () (interactive) (push 'topic called)))
               ((symbol-function 'gnosis-review-resume)
-               (lambda () (interactive) (push 'resume called)))
-              ((symbol-function 'gnosis-nodes-find)
-               (lambda () (interactive) (push 'nodes called))))
+               (lambda () (interactive) (push 'resume called))))
       (call-interactively #'gnosis)
-      (dolist (key '("r" "T" "R" "n" "t"))
+      (dolist (key '("r" "T" "R"))
         (call-interactively (keymap-lookup gnosis-dashboard-mode-map key)))
-      (should (equal '(themata nodes resume topic due dashboard) called)))))
+      (should (equal '(resume topic due dashboard) called)))))
 
 (provide 'gnosis-test-entry-smoke)
 ;;; gnosis-test-entry-smoke.el ends here

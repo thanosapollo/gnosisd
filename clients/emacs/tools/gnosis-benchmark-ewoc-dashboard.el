@@ -96,18 +96,18 @@
                (lambda (record)
                  (cl-incf pretty-calls)
                  (gnosis-themata--pretty-print-default record))))
-      (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+      (when-let* ((buffer (get-buffer gnosis-dashboard-themata-buffer-name)))
         (kill-buffer buffer))
       (unwind-protect
           (progn
-            (gnosis-dashboard)
+            (gnosis-dashboard-themata)
             (while jobs
               (setq pretty-calls 0)
               (let ((job (pop jobs)))
                 (cl-incf callback-calls)
                 (apply (car job) (cdr job)))
               (setq max-pretty-calls (max max-pretty-calls pretty-calls)))
-            (with-current-buffer gnosis-dashboard-buffer-name
+            (with-current-buffer gnosis-dashboard-themata-buffer-name
               (let* ((records (ewoc-collect gnosis-themata--ewoc #'identity))
                      (rows (length records))
                      (last-id (plist-get (car (last records)) :thema_id))
@@ -130,7 +130,7 @@
                           "rendered_chars=%d elapsed_seconds=%.3f\n")
                   rows catalog-calls callback-calls max-pretty-calls
                   rendered-chars elapsed)))))
-        (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+        (when-let* ((buffer (get-buffer gnosis-dashboard-themata-buffer-name)))
           (kill-buffer buffer))))))
 
 (gnosis-benchmark-ewoc-dashboard-run)

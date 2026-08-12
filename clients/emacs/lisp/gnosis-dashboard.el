@@ -39,7 +39,9 @@
 
 (defvar gnosis-dashboard--projection)
 (defvar gnosis-dashboard-buffer-name)
+(defvar gnosis-dashboard-themata-buffer-name)
 (defvar gnosis-dashboard-mode-map)
+(defvar gnosis-dashboard-themata-mode-map)
 
 (defvar gnosis-review-history-buffer-name "*Gnosis Review History*"
   "Name of the bounded review history buffer.")
@@ -100,13 +102,12 @@
 (defun gnosis-themata--column-format (width)
   "Return thema column widths proportioned for window WIDTH."
   (let ((available (max 56 (- width 8))))
-    (vector (max 10 (/ (* available 28) 100))
-            (max 8 (/ (* available 16) 100))
-            (max 8 (/ (* available 16) 100))
-            (max 8 (/ (* available 18) 100))
+    (vector (max 10 (/ (* available 30) 100))
+            (max 8 (/ (* available 17) 100))
+            (max 8 (/ (* available 17) 100))
+            (max 8 (/ (* available 19) 100))
             (max 5 (/ (* available 10) 100))
-            (max 5 (/ (* available 6) 100))
-            (max 5 (/ (* available 6) 100)))))
+            (max 5 (/ (* available 7) 100)))))
 
 (defun gnosis-themata--display-list (values)
   "Return one-line comma-separated text for vector VALUES."
@@ -134,7 +135,6 @@
     (gnosis-themata--display-list (plist-get record :answer)))
    (gnosis-themata--display-list (plist-get record :tags))
    (plist-get record :kind)
-   (gnosis-themata--yes-no (plist-get record :archived))
    (gnosis-themata--yes-no (plist-get record :suspended))))
 
 (defun gnosis-themata--column-text (text width index face)
@@ -148,11 +148,9 @@
   "Return one propertized dashboard row for RECORD."
   (let* ((columns (gnosis-themata--columns record))
          (widths gnosis-themata--column-widths)
-         (archived (eq t (plist-get record :archived)))
          (suspended (eq t (plist-get record :suspended)))
          (faces (vector 'default 'default 'default 'font-lock-constant-face
                         'font-lock-type-face
-                        (if archived 'warning 'shadow)
                         (if suspended 'warning 'shadow)))
          (parts
           (cl-loop for index below (length columns)
@@ -177,7 +175,7 @@
 
 (defun gnosis-themata--header-line ()
   "Return current thema column header."
-  (let ((names ["Question" "Hypothesis" "Answer" "Tags" "Kind" "Archived" "Suspended"])
+  (let ((names ["Question" "Hypothesis" "Answer" "Tags" "Kind" "Suspended"])
         (widths gnosis-themata--column-widths))
     (concat
      (propertize "Themata" 'face 'gnosis-face-dashboard-header)
@@ -193,14 +191,13 @@
       'face 'shadow)
      "\n")))
 
-(defun gnosis-themata--dashboard-header (projection)
-  "Return summary and collection header for dashboard PROJECTION."
+(defun gnosis-themata--dashboard-header (_projection)
+  "Return the dedicated thema collection header."
   (concat
-   (propertize (gnosis--center-text "Gnosis Dashboard")
+   (propertize (gnosis--center-text "Gnosis Themata")
                'face 'gnosis-face-dashboard-header)
    "\n" (gnosis--separator) "\n\n"
-   (gnosis--center-text (gnosis--dashboard-text projection))
-   "\n\n" (gnosis-themata--header-line)))
+   (gnosis-themata--header-line)))
 
 (defun gnosis-themata--status-text (kind &optional detail)
   "Return public status footer for KIND and optional DETAIL."
@@ -275,12 +272,11 @@
 
 (defun gnosis-themata--matches-review-filter-p (record)
   "Return non-nil when RECORD matches current review filter."
-  (pcase gnosis-themata--review-filter
-    (:active (and (not (eq t (plist-get record :archived)))
-                  (not (eq t (plist-get record :suspended)))))
-    (:archived (eq t (plist-get record :archived)))
-    (:suspended (eq t (plist-get record :suspended)))
-    (_ t)))
+  (and (not (eq t (plist-get record :archived)))
+       (pcase gnosis-themata--review-filter
+         (:active (not (eq t (plist-get record :suspended))))
+         (:suspended (eq t (plist-get record :suspended)))
+         (_ t))))
 
 (defun gnosis-themata--matches-tag-filter-p (record)
   "Return non-nil when RECORD matches current exact tag filter."
@@ -351,7 +347,7 @@ When RECORDS is nil, use materialized and pending EWOC records."
   "Return non-nil when CONTEXT still owns the current dashboard."
   (and context
        (eq (current-buffer) (plist-get context :buffer))
-       (derived-mode-p 'gnosis-dashboard-mode)
+       (derived-mode-p 'gnosis-dashboard-themata-mode)
        (equal gnosis-themata--incarnation (plist-get context :incarnation))
        (equal gnosis-themata--authority (plist-get context :authority))
        (condition-case nil
@@ -489,7 +485,7 @@ When RECORDS is nil, use materialized and pending EWOC records."
   "Render one bounded projection chunk for BUFFER and RUN."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (derived-mode-p 'gnosis-dashboard-mode)
+      (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
                  (equal run gnosis-themata--render-run)
                  gnosis-themata--render-state
                  (gnosis-themata--context-owner-p
@@ -608,7 +604,7 @@ When RECORDS is nil, use materialized and pending EWOC records."
   "Return non-nil when BUFFER owns RUN, INCARNATION, and AUTHORITY."
   (and (buffer-live-p buffer)
        (with-current-buffer buffer
-         (and (derived-mode-p 'gnosis-dashboard-mode)
+         (and (derived-mode-p 'gnosis-dashboard-themata-mode)
               (equal run gnosis-themata--refresh-run)
               (equal incarnation gnosis-themata--incarnation)
               (equal authority gnosis-themata--authority)
@@ -641,7 +637,7 @@ When RECORDS is nil, use materialized and pending EWOC records."
   "Fetch and publish one bounded catalog page for BUFFER and RUN."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (derived-mode-p 'gnosis-dashboard-mode)
+      (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
                  (equal run gnosis-themata--refresh-run)
                  gnosis-themata--refresh-state)
         (let* ((incarnation gnosis-themata--incarnation)
@@ -727,7 +723,7 @@ When FRESH is non-nil, publish each accepted page progressively."
 (defun gnosis-themata-refresh ()
   "Restart complete terminal catalog traversal without discarding live rows."
   (interactive)
-  (unless (derived-mode-p 'gnosis-dashboard-mode)
+  (unless (derived-mode-p 'gnosis-dashboard-themata-mode)
     (user-error "Not in the Gnosis dashboard"))
   (gnosis-themata--ensure-authority)
   (gnosis-themata--start-bootstrap (gnosis-themata--current-id) nil))
@@ -742,9 +738,9 @@ When FRESH is non-nil, publish each accepted page progressively."
   "Filter authoritative themata by review STATE."
   (interactive
    (list (intern (concat ":" (completing-read
-                              "State: " '("all" "active" "suspended" "archived")
+                              "State: " '("all" "active" "suspended")
                               nil t nil nil "all")))))
-  (unless (memq state '(:all :active :suspended :archived))
+  (unless (memq state '(:all :active :suspended))
     (user-error "Unknown Gnosis thema state filter"))
   (setq gnosis-themata--review-filter state)
   (gnosis-themata--render (gnosis-themata--current-id)))
@@ -774,7 +770,7 @@ With numeric prefix -1, restore authoritative catalog order."
     (if (equal column -1)
         (setq gnosis-themata--sort-key nil)
       (let ((column (or column (gnosis-themata--column-at-point))))
-        (unless (and (integerp column) (<= 0 column 6))
+        (unless (and (integerp column) (<= 0 column 5))
           (user-error "Invalid column number"))
         (if (equal column (car-safe gnosis-themata--sort-key))
             (setcdr gnosis-themata--sort-key
@@ -800,7 +796,7 @@ With numeric prefix -1, restore authoritative catalog order."
   "Apply WIDTH to BUFFER when INCARNATION still owns it."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (derived-mode-p 'gnosis-dashboard-mode)
+      (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
                  (equal incarnation gnosis-themata--incarnation))
         (setq gnosis-themata--layout-timer nil
               gnosis-themata--layout-width width
@@ -903,7 +899,7 @@ With numeric prefix -1, restore authoritative catalog order."
   "Update BUFFER from PROJECTION when AUTHORITY and INCARNATION still own it."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (derived-mode-p 'gnosis-dashboard-mode)
+      (when (and (derived-mode-p 'gnosis-dashboard-themata-mode)
                  (equal authority gnosis-themata--authority)
                  (equal authority (gnosis-themata--current-authority))
                  (equal incarnation gnosis-themata--incarnation))
@@ -918,26 +914,29 @@ With numeric prefix -1, restore authoritative catalog order."
 (defun gnosis-themata-edit ()
   "Open shared editor for thema at point."
   (interactive)
-  (let ((buffer (current-buffer))
-        (authority gnosis-themata--authority)
-        (incarnation gnosis-themata--incarnation)
-        (id (plist-get (gnosis-themata--record-at-point) :thema_id)))
-    (gnosis-edit-thema
-     id (lambda (projection)
-          (gnosis-themata--edited buffer authority incarnation projection)))))
+  (gnosis-themata--call-with-authority
+   (lambda ()
+     (let ((buffer (current-buffer))
+           (authority gnosis-themata--authority)
+           (incarnation gnosis-themata--incarnation)
+           (id (plist-get (gnosis-themata--record-at-point) :thema_id)))
+       (gnosis-edit-thema
+        id (lambda (projection)
+             (gnosis-themata--edited buffer authority incarnation projection)))))))
 
 (defun gnosis-themata-add ()
   "Open shared editor for a new thema."
   (interactive)
-  (gnosis-themata--ensure-authority)
-  (let ((buffer (current-buffer))
-        (authority gnosis-themata--authority)
-        (incarnation gnosis-themata--incarnation)
-        (kind (gnosis-edit-read-kind)))
-    (gnosis-add-thema
-     (lambda (projection)
-       (gnosis-themata--edited buffer authority incarnation projection))
-     kind)))
+  (let ((kind (gnosis-edit-read-kind)))
+    (gnosis-themata--call-with-authority
+     (lambda ()
+       (let ((buffer (current-buffer))
+             (authority gnosis-themata--authority)
+             (incarnation gnosis-themata--incarnation))
+         (gnosis-add-thema
+          (lambda (projection)
+            (gnosis-themata--edited buffer authority incarnation projection))
+          kind))))))
 
 (defalias 'gnosis-themata-new #'gnosis-themata-add)
 
@@ -1129,10 +1128,12 @@ With numeric prefix -1, restore authoritative catalog order."
                 (plist-get pending :items))
             (gnosis-themata--bulk-items
              (gnosis-themata--selected-records) kind)))
-         (action (if desired "set" "clear")))
-    (when (yes-or-no-p (format "%s %s on %d themata? "
-                               (capitalize action) (symbol-name kind)
-                               (length items)))
+         (count (length items))
+         (action (if (eq kind :suspension)
+                     (if desired "Suspend" "Unsuspend")
+                   (if desired "Delete" "Restore"))))
+    (when (yes-or-no-p (format "%s %d selected %s? "
+                               action count (if (= count 1) "thema" "themata")))
       (let ((run (cl-incf gnosis-themata--sequence)))
         (setq gnosis-themata--pending-bulk nil
               gnosis-themata--active-bulk
@@ -1154,7 +1155,7 @@ With numeric prefix -1, restore authoritative catalog order."
   (gnosis-themata--start-bulk :suspension (not unsuspend)))
 
 (defun gnosis-themata-bulk-archive (&optional unarchive)
-  "Archive selected themata, or UNARCHIVE them with a prefix argument."
+  "Delete selected themata, or restore them when UNARCHIVE is non-nil."
   (interactive "P")
   (gnosis-themata--start-bulk :archive (not unarchive)))
 
@@ -1189,12 +1190,12 @@ With numeric prefix -1, restore authoritative catalog order."
            (gnosis-themata--replace-record updated)))))))
 
 (defun gnosis-themata-toggle-archive ()
-  "Archive or unarchive thema at point after confirmation."
+  "Delete or restore thema at point after confirmation."
   (interactive)
   (let* ((record (gnosis-themata--record-at-point))
          (id (plist-get record :thema_id))
          (desired (not (eq t (plist-get record :archived))))
-         (action (if desired "Archive" "Unarchive")))
+         (action (if desired "Delete" "Restore")))
     (when (y-or-n-p (format "%s thema at point? " action))
       (gnosis-themata--call-with-authority
        (lambda ()
@@ -1401,8 +1402,8 @@ Return `installed', `terminal', `error', or `stale'."
     (goto-char (point-min))
     (keymap-popup gnosis-review-history-mode-map)))
 
-(defun gnosis-dashboard--load-ewoc (&optional initial)
-  "Load summary into EWOC dashboard.
+(defun gnosis-themata--load (&optional initial)
+  "Load the dedicated thema collection.
 Start fresh catalog traversal when INITIAL is non-nil."
   (let ((projection (gnosis-core-dashboard)))
     (if (ewoc-p gnosis-themata--ewoc)
@@ -1414,27 +1415,49 @@ Start fresh catalog traversal when INITIAL is non-nil."
       (gnosis-themata--start-bootstrap nil t))))
 
 (defun gnosis-dashboard-refresh ()
-  "Refresh summary and complete thema projection from server."
+  "Refresh the server-projected dashboard summary."
   (interactive)
   (unless (derived-mode-p 'gnosis-dashboard-mode)
-    (user-error "Not in a Gnosis dashboard"))
+    (user-error "Not in the Gnosis dashboard"))
   (condition-case condition
-      (progn
-        (gnosis-dashboard--load-ewoc nil)
-        (gnosis-themata-refresh))
+      (let ((projection (gnosis-core-dashboard)))
+        (setq gnosis-dashboard--projection projection)
+        (gnosis--render-dashboard projection))
     (gnosis-core-error
      (user-error "%s" (gnosis-dashboard--failure-message condition)))))
 
 ;;;###autoload
 (defun gnosis-dashboard ()
-  "Open summary and complete server-owned thema dashboard."
+  "Open the server-projected Gnosis overview."
   (interactive)
-  (let* ((buffer (get-buffer-create gnosis-dashboard-buffer-name))
+  (let ((buffer (get-buffer-create gnosis-dashboard-buffer-name)))
+    (pop-to-buffer-same-window buffer)
+    (unless (derived-mode-p 'gnosis-dashboard-mode)
+      (gnosis-dashboard-mode))
+    (condition-case condition
+        (let ((projection (gnosis-core-dashboard)))
+          (setq gnosis-dashboard--projection projection)
+          (gnosis--render-dashboard projection t))
+      (gnosis-core-error
+       (setq gnosis-dashboard--projection nil)
+       (let ((inhibit-read-only t))
+         (erase-buffer)
+         (insert (propertize (gnosis-dashboard--failure-message condition)
+                             'face 'error)))))
+    (goto-char (point-min))
+    (keymap-popup gnosis-dashboard-mode-map)))
+
+;;;###autoload
+(defun gnosis-dashboard-themata (&optional query tag max-reviews)
+  "Open the complete server-owned thema collection.
+QUERY, TAG, and MAX-REVIEWS select an initial server-owned projection."
+  (interactive)
+  (let* ((buffer (get-buffer-create gnosis-dashboard-themata-buffer-name))
          (initial (not (with-current-buffer buffer
-                         (and (derived-mode-p 'gnosis-dashboard-mode)
+                         (and (derived-mode-p 'gnosis-dashboard-themata-mode)
                               (ewoc-p gnosis-themata--ewoc))))))
     (pop-to-buffer-same-window buffer)
-    (when initial (gnosis-dashboard-mode))
+    (when initial (gnosis-dashboard-themata-mode))
     (condition-case condition
         (let* ((authority (gnosis-themata--current-authority))
                (authority-changed
@@ -1443,7 +1466,18 @@ Start fresh catalog traversal when INITIAL is non-nil."
           (when authority-changed
             (gnosis-themata--reset-authority-state))
           (setq gnosis-themata--authority authority)
-          (gnosis-dashboard--load-ewoc (or initial authority-changed)))
+          (let ((filters-changed
+                 (or (not (equal gnosis-themata--search-filter query))
+                     (not (eq gnosis-themata--review-filter :all))
+                     (not (equal gnosis-themata--tag-filter tag))
+                     (not (equal gnosis-themata--max-reviews max-reviews)))))
+            (gnosis-themata--load (or initial authority-changed))
+            (setq gnosis-themata--search-filter query
+                  gnosis-themata--review-filter :all
+                  gnosis-themata--tag-filter tag
+                  gnosis-themata--max-reviews max-reviews)
+            (when (and (ewoc-p gnosis-themata--ewoc) filters-changed)
+              (gnosis-themata--render nil))))
       (gnosis-core-error
        (let ((message (gnosis-dashboard--failure-message condition)))
          (if (ewoc-p gnosis-themata--ewoc)
@@ -1453,71 +1487,154 @@ Start fresh catalog traversal when INITIAL is non-nil."
              (erase-buffer)
              (insert (propertize message 'face 'error)))))))
     (goto-char (point-min))
-    (keymap-popup gnosis-dashboard-mode-map)))
+    (keymap-popup gnosis-dashboard-themata-mode-map)))
 
-;;;###autoload
-(defun gnosis-dashboard-themata ()
-  "Open dashboard and move to first visible thema when available."
-  (interactive)
-  (gnosis-dashboard)
-  (when-let* ((node (and (ewoc-p gnosis-themata--ewoc)
-                         (ewoc-nth gnosis-themata--ewoc 0))))
-    (ewoc-goto-node gnosis-themata--ewoc node)))
+(defun gnosis-dashboard-search-themata (query)
+  "Open the thema collection filtered by literal QUERY."
+  (interactive "sThema search: ")
+  (gnosis-dashboard-themata (unless (string-empty-p query) query)))
 
-(defun gnosis-dashboard-themata-mode ()
-  "Compatibility entry selecting `gnosis-dashboard-mode'."
+(defun gnosis-dashboard-themata-by-tag (tag)
+  "Open the thema collection filtered by exact TAG."
+  (interactive "sThema tag: ")
+  (gnosis-dashboard-themata nil (unless (string-empty-p tag) tag)))
+
+(defun gnosis-dashboard-themata-new (&optional maximum)
+  "Open themata reviewed at most MAXIMUM times.
+Without a prefix argument, show only never-reviewed themata."
+  (interactive
+   (list (if current-prefix-arg
+             (read-number "Maximum reviews: " 0)
+           0)))
+  (setq maximum (or maximum 0))
+  (unless (natnump maximum)
+    (user-error "Maximum reviews must be non-negative"))
+  (gnosis-dashboard-themata nil nil maximum))
+
+(defun gnosis-dashboard-add-thema ()
+  "Add a thema from the overview and refresh its server projection."
   (interactive)
-  (gnosis-dashboard-mode))
+  (let ((buffer (current-buffer))
+        (kind (gnosis-edit-read-kind)))
+    (gnosis-add-thema
+     (lambda (_projection)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when (derived-mode-p 'gnosis-dashboard-mode)
+             (gnosis-dashboard-refresh)))))
+     kind)))
+
+(defun gnosis-dashboard-nodes ()
+  "Open all server-backed nodes."
+  (interactive)
+  (gnosis-nodes-page-open
+   "All" (lambda (after) (gnosis-core-nodes nil after 100))))
+
+(defun gnosis-dashboard-health ()
+  "Check gnosisd health and show authenticated content totals."
+  (interactive)
+  (condition-case condition
+      (let* ((_status (gnosis-core-status))
+             (projection (gnosis-core-dashboard))
+             (content (plist-get projection :content)))
+        (message "gnosisd ready — %d themata, %d documents, %d nodes"
+                 (plist-get content :active_themata)
+                 (plist-get content :active_documents)
+                 (plist-get content :active_nodes)))
+    (gnosis-core-error
+     (user-error "%s" (gnosis-dashboard--failure-message condition)))))
+
+(keymap-popup-define gnosis-nodes-map
+  "Nodes"
+  :description "Nodes"
+  :group "Nodes"
+  "a" ("View all nodes" gnosis-dashboard-nodes)
+  "t" ("View nodes by tag" gnosis-nodes-find-by-tag)
+  "SPC" ("Search node titles" gnosis-nodes-search)
+  "c" ("Search document content" gnosis-nodes-search-content))
+
+(keymap-popup-define gnosis-themata-map
+  "Themata"
+  :description "Themata"
+  :group "Themata"
+  "a" ("View all themata" gnosis-dashboard-themata)
+  "SPC" ("Search themata" gnosis-dashboard-search-themata)
+  "t" ("View by tag" gnosis-dashboard-themata-by-tag)
+  "n" ("New or low reviews" gnosis-dashboard-themata-new))
 
 (keymap-popup-define gnosis-dashboard-mode-map
-  "Keymap for `gnosis-dashboard-mode'."
+  "Gnosis Dashboard"
   :parent special-mode-map
   :popup-key "?"
   :exit-key "C-g"
   :description #'gnosis-dashboard--popup-description
+  :group "Navigate"
+  "n" ("Nodes" :keymap gnosis-nodes-map)
+  "t" ("Themata" :keymap gnosis-themata-map)
+  "h" ("Health" gnosis-dashboard-health :stay-open t)
+  "H" ("Review history" gnosis-review-history)
   :group "Review"
   "r" (#'gnosis-dashboard--review-description gnosis-dashboard-review)
   "T" ("Review topic" gnosis-review-topic)
   "R" ("Active review controls" gnosis-review-resume
        :if #'gnosis-dashboard--active-session-p)
-  :group "Browse"
-  "n" ("Nodes / documents" gnosis-nodes-find)
-  "h" ("Review history" gnosis-review-history)
-  "t" ("Show themata" gnosis-dashboard-themata)
-  "g" ("Refresh dashboard" gnosis-dashboard-refresh :stay-open t)
-  :group "Thema"
+  :group "Actions"
+  "a" ("Add thema" gnosis-dashboard-add-thema)
+  "SPC" ("Search themata" gnosis-dashboard-search-themata)
+  "g" ("Refresh overview" gnosis-dashboard-refresh :stay-open t)
+  :group "Window"
+  "q" ("Quit" quit-window))
+
+(keymap-popup-define gnosis-dashboard-themata-mode-map
+  "Keymap for `gnosis-dashboard-themata-mode'."
+  :parent special-mode-map
+  :popup-key "?"
+  :exit-key "C-g"
+  :description "Gnosis Themata"
+  :group "Navigate"
+  "q" ("Back" gnosis-dashboard)
+  "SPC" ("Search" gnosis-themata-filter-search)
+  "n" ("New or low reviews" gnosis-themata-filter-max-reviews)
   "RET" ("Edit at point" gnosis-themata-edit)
-  "e" ("Edit at point" gnosis-themata-edit)
+  :group "Edit"
+  "e" ("Edit thema" gnosis-themata-edit)
   "a" ("Add thema" gnosis-themata-add)
-  :group "Mutate"
   "s" ("Suspend or unsuspend" gnosis-themata-toggle-suspension)
-  "S" ("Suspend selected (prefix: unsuspend)" gnosis-themata-bulk-suspension)
-  "A" ("Archive selected (prefix: unarchive)" gnosis-themata-bulk-archive)
-  "x" ("Cancel bulk mutation" gnosis-themata-cancel-bulk
-       :if (lambda () gnosis-themata--active-bulk))
+  "d" ("Delete selected" gnosis-themata-bulk-archive)
   :group "Selection"
   "*" ("Mark current" gnosis-themata-mark :stay-open t)
   "u" ("Unmark current" gnosis-themata-unmark :stay-open t)
   "M" ("Mark all visible" gnosis-themata-mark-all :stay-open t)
   "U" ("Unmark all" gnosis-themata-unmark-all :stay-open t)
+  :group "Mutate"
+  "S" ("Suspend selected (prefix: unsuspend)" gnosis-themata-bulk-suspension)
+  "x" ("Cancel bulk mutation" gnosis-themata-cancel-bulk
+       :if (lambda () gnosis-themata--active-bulk))
   :group "Filter"
-  "v" ("Show tag" gnosis-themata-find-tag)
-  "/" ("Search themata" gnosis-themata-filter-search)
+  "t" ("Show tag at point" gnosis-themata-find-tag)
+  "/" ("Search" gnosis-themata-filter-search)
   "f" ("Review state" gnosis-themata-filter-review-state)
   "m" ("Maximum reviews" gnosis-themata-filter-max-reviews)
   :group "Layout"
   "o" ("Sort at point" gnosis-themata-sort)
   ">" ("Widen column" gnosis-themata-widen-current-column)
   "<" ("Narrow column" gnosis-themata-narrow-current-column)
-  :group "System"
-  "q" ("Quit" quit-window))
+  "g" ("Refresh" gnosis-themata-refresh :stay-open t))
 
-(define-derived-mode gnosis-dashboard-mode special-mode "Gnosis"
-  "Major mode for the Gnosis summary and complete thema projection."
+(define-derived-mode gnosis-dashboard-mode special-mode "Gnosis Dashboard"
+  "Major mode for the server-projected Gnosis overview."
   (display-line-numbers-mode -1)
   (setq-local truncate-lines nil
               revert-buffer-function
-              (lambda (&rest _) (gnosis-dashboard-refresh)))
+              (lambda (&rest _) (gnosis-dashboard-refresh))))
+
+(define-derived-mode gnosis-dashboard-themata-mode
+    special-mode "Gnosis Themata"
+  "Major mode for the complete server-owned thema collection."
+  (display-line-numbers-mode -1)
+  (setq-local truncate-lines nil
+              revert-buffer-function
+              (lambda (&rest _) (gnosis-themata-refresh)))
   (setq gnosis-themata--incarnation (cl-incf gnosis-themata--sequence)
         gnosis-themata--marked (make-hash-table :test #'equal))
   (add-hook 'kill-buffer-hook #'gnosis-themata--cancel-timers nil t)

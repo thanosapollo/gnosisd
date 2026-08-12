@@ -35,6 +35,14 @@
 (defvar gnosis-nodes-max-local-scan-per-pass)
 (defvar gnosis-nodes-dir)
 (defvar gnosis-nodes-timestring)
+(defvar gnosis-node-page-map)
+(defvar gnosis-node-search-map)
+(defvar gnosis-node-sort-map)
+(defvar gnosis-nodes-page--authority)
+
+(declare-function gnosis-nodes-page-inbound "gnosis-nodes")
+(declare-function gnosis-nodes-page-outbound "gnosis-nodes")
+(declare-function gnosis-nodes-page-review "gnosis-nodes")
 
 (defun gnosis-test-nodes--catalog-node (node-id &rest overrides)
   "Return a valid catalog node for NODE-ID with OVERRIDES."
@@ -2289,12 +2297,17 @@
     (should (equal '((:all nil) (:all (4))) (nreverse calls)))))
 
 (ert-deftest gnosis-node-page-next-preserves-server-cursor-and-selection ()
-  (let ((first (gnosis-test-nodes--catalog-node "node-a" :title "Alpha"))
+  (let* ((token (make-string 40 ?a))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (first (gnosis-test-nodes--catalog-node "node-a" :title "Alpha"))
         (second (gnosis-test-nodes--catalog-node "node-b" :title "Beta"))
         calls)
     (with-temp-buffer
       (gnosis-nodes-page-mode)
-      (setq-local gnosis-nodes-page--fetch
+      (setq-local gnosis-nodes-page--authority
+                  (list gnosis-core--base-url-override (secure-hash 'sha256 token))
+                  gnosis-nodes-page--fetch
                   (lambda (cursor)
                     (push cursor calls)
                     (if cursor
@@ -2306,10 +2319,15 @@
       (should (equal "node-b" (tabulated-list-get-id))))))
 
 (ert-deftest gnosis-node-page-fetch-failures-preserve-all-page-state ()
-  (let ((node (gnosis-test-nodes--catalog-node "node-a" :title "Alpha")))
+  (let* ((token (make-string 40 ?a))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (node (gnosis-test-nodes--catalog-node "node-a" :title "Alpha")))
     (with-temp-buffer
       (gnosis-nodes-page-mode)
-      (setq-local gnosis-nodes-page--fetch
+      (setq-local gnosis-nodes-page--authority
+                  (list gnosis-core--base-url-override (secure-hash 'sha256 token))
+                  gnosis-nodes-page--fetch
                   (lambda (cursor)
                     (if (equal cursor "bad")
                         (signal 'gnosis-core-transport-error '("failed"))
@@ -2356,6 +2374,100 @@
                         ("node-a" :outbound nil 100)))
       (should (member expected calls)))))
 
+(ert-deftest gnosis-node-page-mode-restores-archived-direct-actions ()
+  (with-temp-buffer
+    (gnosis-nodes-page-mode)
+    (let ((map (current-local-map)))
+      (dolist (binding `(("RET" . gnosis-nodes-page-visit)
+                         ("q" . gnosis-dashboard)
+                         ("g" . gnosis-nodes-page-refresh)
+                         ("SPC" . gnosis-node-page-map--enter-gnosis-node-search-map)
+                         ("s" . gnosis-node-page-map--enter-gnosis-node-sort-map)
+                         ("f" . gnosis-nodes-page-outbound)
+                         ("b" . gnosis-nodes-page-inbound)
+                         ("r" . gnosis-nodes-page-review)
+                         ("?" . gnosis-node-page-map-popup)))
+        (should (eq (keymap-lookup map (car binding)) (cdr binding)))))))
+
+(ert-deftest gnosis-node-page-pins-function-credential-for-complete-action ()
+  (let* ((gnosis-core-base-url "https://test.example")
+         (token-a (make-string 40 ?a))
+         (token-b (make-string 40 ?b))
+         (secret-calls 0)
+         observed-token)
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _)
+                 (list (list :secret
+                             (lambda ()
+                               (cl-incf secret-calls)
+                               (if (= secret-calls 1) token-a token-b))))))
+              ((symbol-function 'gnosis-review-topic)
+               (lambda (_node-id)
+                 (setq observed-token (gnosis-core--token)))))
+      (with-temp-buffer
+        (gnosis-nodes-page-mode)
+        (setq-local gnosis-nodes-page--authority
+                    (list gnosis-core-base-url (secure-hash 'sha256 token-a))
+                    gnosis-nodes-page--records (make-hash-table :test #'equal)
+                    tabulated-list-entries '(("node-a" ["Alpha" "" ""])))
+        (puthash "node-a" '(:node_id "node-a") gnosis-nodes-page--records)
+        (tabulated-list-print t)
+        (goto-char (point-min))
+        (gnosis-nodes-page-review)
+        (should (equal token-a observed-token))
+        (should (= 1 secret-calls))))))
+
+(ert-deftest gnosis-node-page-open-pins-function-credential-for-initial-fetch ()
+  (let* ((gnosis-core-base-url "https://test.example")
+         (token-a (make-string 40 ?a))
+         (token-b (make-string 40 ?b))
+         (secret-calls 0)
+         observed-token)
+    (cl-letf (((symbol-function 'auth-source-search)
+               (lambda (&rest _)
+                 (list (list :secret
+                             (lambda ()
+                               (cl-incf secret-calls)
+                               (if (= secret-calls 1) token-a token-b))))))
+              ((symbol-function 'pop-to-buffer-same-window)
+               (lambda (buffer &rest _) (set-buffer buffer)))
+              ((symbol-function 'keymap-popup) #'ignore))
+      (unwind-protect
+          (progn
+            (gnosis-nodes-page-open
+             "Initial"
+             (lambda (_cursor)
+               (setq observed-token (gnosis-core--token))
+               `(:items [] :next ,gnosis-core--json-null)))
+            (should (equal token-a observed-token))
+            (should (= 1 secret-calls)))
+        (when-let* ((buffer (get-buffer "*Gnosis Nodes: Initial*")))
+          (kill-buffer buffer))))))
+
+(ert-deftest gnosis-node-page-open-clears-prior-authority-before-failed-fetch ()
+  (let* ((gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override (make-string 40 ?b))
+         (buffer-name "*Gnosis Nodes: Reused*"))
+    (unwind-protect
+        (with-current-buffer (get-buffer-create buffer-name)
+          (gnosis-nodes-page-mode)
+          (setq-local tabulated-list-entries '(("node-a" ["Authority A" "" ""])))
+          (tabulated-list-print t)
+          (cl-letf (((symbol-function 'pop-to-buffer-same-window)
+                     (lambda (buffer &rest _) (set-buffer buffer)))
+                    ((symbol-function 'keymap-popup) #'ignore))
+            (should-error
+             (gnosis-nodes-page-open
+              "Reused"
+              (lambda (_cursor)
+                (signal 'gnosis-core-transport-error '("failed"))))
+             :type 'gnosis-core-transport-error))
+          (should-not (string-search "Authority A" (buffer-string)))
+          (should (hash-table-p gnosis-nodes-page--records))
+          (should (= 0 (hash-table-count gnosis-nodes-page--records))))
+      (when-let* ((buffer (get-buffer buffer-name)))
+        (kill-buffer buffer)))))
+
 (ert-deftest gnosis-node-compatibility-wrappers-prompt-and-dispatch ()
   (let (tag node-id)
     (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "topic"))
@@ -2369,11 +2481,16 @@
       (should-not node-id))))
 
 (ert-deftest gnosis-node-page-content-hit-falls-back-to-authoritative-path ()
-  (let ((target (generate-new-buffer " *gnosis-content-hit*")) visited)
+  (let* ((token (make-string 40 ?a))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (target (generate-new-buffer " *gnosis-content-hit*")) visited)
     (unwind-protect
         (with-temp-buffer
           (gnosis-nodes-page-mode)
-          (setq-local gnosis-nodes-page--records (make-hash-table :test #'equal)
+          (setq-local gnosis-nodes-page--authority
+                      (list gnosis-core--base-url-override (secure-hash 'sha256 token))
+                      gnosis-nodes-page--records (make-hash-table :test #'equal)
                       tabulated-list-entries
                       '(("document-a" ["Match" "notes/a.org" ""])))
           (puthash "document-a"

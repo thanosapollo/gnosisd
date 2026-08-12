@@ -88,14 +88,15 @@ Set authinfo file permissions to 0600.  Change the lookup user when required:
 
 * Dashboard
 
-Run =M-x gnosis= for the server-projected dashboard.  It shows review, queue,
-content, activity, and active-session state without deriving domain data
-locally.  Press =r= to start or resume review, =T= for topic review, =R= for
-active review controls, =n= to open nodes and documents, =t= for the paginated
-thema management list, =g= to refresh, =?= for actions, and =q= to close the
-buffer.  In the thema list, =RET= or =e=
+Run =M-x gnosis= for the server-projected overview.  Its home page shows current
+review, queue, content, activity, and active-session statistics without deriving
+domain data locally.  Press =n= for node views and search, =t= for thema views
+and search, =h= for daemon health, =H= for review history, =r= to start or resume
+review, =T= for topic review, =R= for active review controls, =g= to refresh,
+=?= for actions, and =q= to close the buffer.  In the thema list, =RET= or =e=
 opens the shared editor and =s= suspends or unsuspends the row through
-=gnosisd=.  Run =M-x gnosis-review= for due review.
+=gnosisd=.  Mark rows and press =d= to delete them; deleted themata are hidden
+from the list and overview.  Run =M-x gnosis-review= for due review.
 
 * Review
 

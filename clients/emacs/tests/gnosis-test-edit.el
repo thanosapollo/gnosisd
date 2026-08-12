@@ -456,7 +456,9 @@
              (lambda (_)
                (append '(:thema_id "archived" :revision 7 :archived t)
                        gnosis-test-edit--request))))
-    (should-error (gnosis-edit-thema "archived") :type 'user-error)
+    (let ((error (should-error (gnosis-edit-thema "archived")
+                               :type 'user-error)))
+      (should (equal "Deleted thema cannot be edited" (cadr error))))
     (should-not (get-buffer gnosis-edit-buffer-name))))
 
 (ert-deftest gnosis-edit-thema-fetches-before-opening-buffer ()

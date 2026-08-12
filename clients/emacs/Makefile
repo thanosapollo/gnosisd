@@ -131,8 +131,10 @@ do-lint:
 load:
 	rm -f $(LISP_DIR)/*.elc
 	@emacsclient --eval "(dolist (symbol \
-	    '(gnosis-dashboard-mode-map gnosis-edit-mode-map \
-	      gnosis-review-mode-map)) \
+	    '(gnosis-dashboard-mode-map gnosis-dashboard-themata-mode-map \
+	      gnosis-nodes-map gnosis-themata-map gnosis-node-search-map \
+	      gnosis-node-sort-map gnosis-node-page-map gnosis-nodes-page-mode-map \
+	      gnosis-edit-mode-map gnosis-review-mode-map)) \
 	  (when (boundp symbol) (makunbound symbol)))" > /dev/null
 	@set -e; for file in $(EL_FILES); do \
 		emacsclient -e "(load-file \"$(shell pwd)/$(LISP_DIR)/$$file\")" > /dev/null; \
@@ -141,6 +143,9 @@ load:
 	  (with-current-buffer buffer \
 	    (pcase major-mode \
 	      ('gnosis-dashboard-mode (use-local-map gnosis-dashboard-mode-map)) \
+	      ('gnosis-dashboard-themata-mode \
+	       (use-local-map gnosis-dashboard-themata-mode-map)) \
+	      ('gnosis-nodes-page-mode (use-local-map gnosis-nodes-page-mode-map)) \
 	      ('gnosis-edit-mode (use-local-map gnosis-edit-mode-map)) \
 	      ('gnosis-review-mode (use-local-map gnosis-review-mode-map)) \
 	      )))" > /dev/null
