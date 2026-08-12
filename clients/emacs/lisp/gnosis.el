@@ -283,9 +283,11 @@
   "Return server-projected current streak DAYS."
   (format "%s %s"
           (gnosis--dashboard-style "Current streak:" 'shadow)
-          (gnosis--dashboard-style
-           (format "%d %s" days (if (= days 1) "day" "days"))
-           (if (> days 0) 'success 'shadow))))
+          (if (numberp days)
+              (gnosis--dashboard-style
+               (format "%d %s" days (if (= days 1) "day" "days"))
+               (if (> days 0) 'success 'shadow))
+            (gnosis--dashboard-style "unavailable" 'shadow))))
 
 (defun gnosis--dashboard-session-text (session)
   "Return a warning when server-projected SESSION is active."

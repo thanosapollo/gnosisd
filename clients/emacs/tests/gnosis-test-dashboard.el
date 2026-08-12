@@ -330,6 +330,12 @@
     (should (string-match-p
              "success rate unavailable" (gnosis--dashboard-text state)))))
 
+(ert-deftest gnosis-dashboard-summary-renders-missing-streak ()
+  (let ((state (copy-tree (gnosis-test-dashboard--projection))))
+    (cl-remf state :current_streak_days)
+    (should (string-match-p
+             "Current streak: unavailable" (gnosis--dashboard-text state)))))
+
 (ert-deftest gnosis-dashboard-keymap-restores-archived-navigation-hierarchy ()
   (dolist (binding '(("g" . gnosis-dashboard-refresh)
                      ("r" . gnosis-dashboard-review)
