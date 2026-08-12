@@ -1958,6 +1958,136 @@ Use optional OPERATION-ID and return the authoritative review-state projection."
     (gnosis-core--thema-suspension-result
      result thema-id operation-id state-revision suspended)))
 
+(defun gnosis-core--bulk-thema-items (items require-positive-revision)
+  "Validate and encode bulk thema ITEMS.
+When REQUIRE-POSITIVE-REVISION is non-nil, reject revision zero."
+  (unless (and (listp items) (<= 1 (length items) 500))
+    (signal 'gnosis-core-validation-error
+            '("Gnosis bulk thema item count must be between 1 and 500")))
+  (let ((operation-ids (make-hash-table :test #'equal))
+        (thema-ids (make-hash-table :test #'equal)))
+    (vconcat
+     (mapcar
+      (lambda (item)
+        (let ((operation-id (plist-get item :operation_id))
+              (thema-id (plist-get item :thema_id))
+              (revision (plist-get item :expected_revision)))
+          (unless (and (gnosis-core--operation-id-p operation-id)
+                       (gnosis-core--opaque-id-p thema-id)
+                       (natnump revision)
+                       (<= revision 9223372036854775807)
+                       (or (not require-positive-revision) (> revision 0))
+                       (not (gethash operation-id operation-ids))
+                       (not (gethash thema-id thema-ids)))
+            (signal 'gnosis-core-validation-error
+                    '("Invalid or duplicate Gnosis bulk thema item")))
+          (puthash operation-id t operation-ids)
+          (puthash thema-id t thema-ids)
+          (list :operation_id operation-id :thema_id thema-id
+                :expected_revision revision)))
+      items))))
+
+(defun gnosis-core--thema-archive-state-result
+    (result thema-id operation-id revision desired)
+  "Validate compact archive RESULT for THEMA-ID and OPERATION-ID.
+REVISION and DESIRED identify the requested state."
+  (if (equal "rejected" (plist-get result :status))
+      (gnosis-core--thema-mutation-result result operation-id thema-id revision)
+    (let* ((changed (plist-get result :changed))
+           (cursor (plist-get result :cursor))
+           (authoritative (plist-get result :authoritative))
+           (projection (plist-get authoritative :value))
+           (result-revision (plist-get projection :revision)))
+      (unless (and (gnosis-core--json-object-p result)
+                   (equal "applied" (plist-get result :status))
+                   (equal 1 (plist-get result :format_version))
+                   (equal operation-id (plist-get result :operation_id))
+                   (memq changed (list t gnosis-core--json-false))
+                   (stringp cursor) (not (string-empty-p cursor))
+                   (gnosis-core--json-object-p authoritative)
+                   (equal "thema_archive_state" (plist-get authoritative :kind))
+                   (gnosis-core--json-object-p projection)
+                   (equal thema-id (plist-get projection :thema_id))
+                   (integerp result-revision)
+                   (= result-revision (if (eq changed t) (1+ revision) revision))
+                   (eq desired (eq t (plist-get projection :archived))))
+        (signal 'gnosis-core-mutation-uncertain
+                '("Gnosis bulk archive projection is invalid")))
+      projection)))
+
+(defun gnosis-core--bulk-thema-result (result item desired suspension-p)
+  "Validate bulk RESULT for ITEM and DESIRED state.
+When SUSPENSION-P is non-nil, validate a review-state projection."
+  (let ((operation-id (plist-get item :operation_id))
+        (thema-id (plist-get item :thema_id))
+        (revision (plist-get item :expected_revision)))
+    (unless (and (gnosis-core--json-object-p result)
+                 (equal operation-id (plist-get result :operation_id)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis bulk mutation result is not correlated")))
+    (pcase (plist-get result :status)
+      ("applied"
+       (list :status :applied :thema_id thema-id
+             :projection
+             (if suspension-p
+                 (gnosis-core--thema-suspension-result
+                  result thema-id operation-id revision desired)
+               (gnosis-core--thema-archive-state-result
+                result thema-id operation-id revision desired))))
+      ("rejected"
+       (condition-case nil
+           (progn
+             (if suspension-p
+                 (gnosis-core--thema-suspension-result
+                  result thema-id operation-id revision desired)
+               (gnosis-core--thema-mutation-result
+                result operation-id thema-id revision))
+             (signal 'gnosis-core-mutation-uncertain
+                     '("Gnosis rejected bulk result was accepted")))
+         ((gnosis-core-conflict gnosis-core-not-found gnosis-core-validation-error)
+          (list :status :rejected :thema_id thema-id
+                :reason (plist-get (plist-get result :rejection) :reason)
+                :current_revision
+                (plist-get (plist-get result :rejection) :current_revision)))))
+      (_ (signal 'gnosis-core-mutation-uncertain
+                 '("Gnosis bulk mutation status is invalid"))))))
+
+(defun gnosis-core--bulk-thema-request (identity items desired suspension-p)
+  "Send one bulk thema request by IDENTITY for ITEMS and DESIRED state.
+SUSPENSION-P selects review-state rather than archive validation."
+  (let* ((wire-items (gnosis-core--bulk-thema-items items (not suspension-p)))
+         (wire-desired (if desired t gnosis-core--json-false))
+         (key (if suspension-p :suspended :archived))
+         (envelope (gnosis-core--typed-request
+                    identity nil nil
+                    (list :version 1 key wire-desired :items wire-items)))
+         (results (plist-get envelope :results)))
+    (unless (and (gnosis-core--json-object-p envelope)
+                 (equal 1 (plist-get envelope :version))
+                 (vectorp results) (= (length results) (length items)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis bulk mutation envelope is invalid")))
+    (cl-mapcar (lambda (result item)
+                 (gnosis-core--bulk-thema-result
+                  result item desired suspension-p))
+               (append results nil) items)))
+
+(defun gnosis-core-themata-set-suspended (items suspended)
+  "Set all themata ITEMS to SUSPENDED in one bounded request.
+Each item contains stable operation, thema, and expected-revision fields."
+  (unless (memq suspended '(nil t))
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis suspension state")))
+  (gnosis-core--bulk-thema-request
+   "put_themata_bulk_suspension" items suspended t))
+
+(defun gnosis-core-themata-set-archived (items archived)
+  "Set all themata ITEMS to ARCHIVED in one bounded request.
+Each item contains stable operation, thema, and expected-revision fields."
+  (unless (memq archived '(nil t))
+    (signal 'gnosis-core-validation-error '("Invalid Gnosis archive state")))
+  (gnosis-core--bulk-thema-request
+   "post_themata_bulk_archive" items archived nil))
+
 (defun gnosis-core--review-id-valid-p (value)
   "Return non-nil when VALUE is a valid review identity."
   (and (stringp value)

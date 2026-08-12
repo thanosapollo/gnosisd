@@ -978,6 +978,67 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
      (gnosis-core-thema-set-suspended "thema-a" 0 nil "suspend:1")
      :type 'gnosis-core-mutation-uncertain)))
 
+(ert-deftest gnosis-core-bulk-thema-mutations-correlate-ordered-results ()
+  (let ((items '((:operation_id "bulk:1" :thema_id "thema-a"
+                  :expected_revision 2)
+                 (:operation_id "bulk:2" :thema_id "thema-b"
+                  :expected_revision 4)))
+        calls)
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest arguments)
+                 (push arguments calls)
+                 `(:version 1
+                   :results
+                   [(:status "applied" :format_version 1
+                     :operation_id "bulk:1" :changed t
+                     :authoritative
+                     (:kind "review_state"
+                      :value (:thema_id "thema-a"
+                              :state (:state_revision 3 :suspended t)))
+                     :cursor "feed-1")
+                    (:status "rejected" :format_version 1
+                     :operation_id "bulk:2"
+                     :rejection (:reason "revision_conflict"
+                                 :expected_revision 4 :current_revision 5)
+                     :cursor "feed-2")]))))
+      (should
+       (equal
+        '((:status :applied :thema_id "thema-a"
+           :projection (:thema_id "thema-a"
+                        :state (:state_revision 3 :suspended t)))
+          (:status :rejected :thema_id "thema-b"
+           :reason "revision_conflict" :current_revision 5))
+        (gnosis-core-themata-set-suspended items t))))
+    (should
+     (equal
+      '("put_themata_bulk_suspension" nil nil)
+      (seq-take (car calls) 3)))
+    (should
+     (equal
+      [(:operation_id "bulk:1" :thema_id "thema-a" :expected_revision 2)
+       (:operation_id "bulk:2" :thema_id "thema-b" :expected_revision 4)]
+      (plist-get (nth 3 (car calls)) :items)))))
+
+(ert-deftest gnosis-core-bulk-archive-accepts-compact-authority ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               '(:version 1
+                 :results
+                 [(:status "applied" :format_version 1
+                   :operation_id "archive:1" :changed t
+                   :authoritative
+                   (:kind "thema_archive_state"
+                    :value (:thema_id "thema-a" :revision 8 :archived t))
+                   :cursor "feed-1")]))))
+    (should
+     (equal
+      '((:status :applied :thema_id "thema-a"
+         :projection (:thema_id "thema-a" :revision 8 :archived t)))
+      (gnosis-core-themata-set-archived
+       '((:operation_id "archive:1" :thema_id "thema-a"
+          :expected_revision 7))
+       t)))))
+
 (ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
         (created '(:thema_id "created" :revision 1))

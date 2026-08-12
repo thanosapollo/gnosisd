@@ -253,6 +253,21 @@ impl ServiceHandle {
         .await?
     }
 
+    pub(crate) async fn apply_device_thema_mutations(
+        &self,
+        operations: Vec<PreparedDeviceDesiredStateMutation>,
+        created_at_us: i64,
+    ) -> Result<Vec<DeviceMutationExecution>, ServiceError> {
+        request(&self.sender, |response| {
+            StoreCommand::ApplyDeviceThemaMutations {
+                operations,
+                created_at_us,
+                response,
+            }
+        })
+        .await?
+    }
+
     pub(crate) async fn note(
         &self,
         document_id: DocumentId,
@@ -1579,6 +1594,11 @@ enum StoreCommand {
         created_at_us: i64,
         response: oneshot::Sender<Result<DeviceMutationExecution, ServiceError>>,
     },
+    ApplyDeviceThemaMutations {
+        operations: Vec<PreparedDeviceDesiredStateMutation>,
+        created_at_us: i64,
+        response: oneshot::Sender<Result<Vec<DeviceMutationExecution>, ServiceError>>,
+    },
     DocumentHead {
         document_id: DocumentId,
         response: oneshot::Sender<StoreResult<Option<DocumentHead>>>,
@@ -2459,6 +2479,16 @@ fn run_store_command(
                 asset_bytes.as_deref(),
                 created_at_us,
             ),
+        ),
+        StoreCommand::ApplyDeviceThemaMutations {
+            operations,
+            created_at_us,
+            response,
+        } => send(
+            response,
+            store
+                .apply_device_thema_mutations(&operations, created_at_us)
+                .map_err(ServiceError::Store),
         ),
         StoreCommand::DocumentHead {
             document_id,

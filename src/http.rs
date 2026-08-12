@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     convert::Infallible,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +51,7 @@ use crate::{
         http_v1::{
             ActiveReviewPackEnvelopeV2, ActiveReviewSessionV1, ApiErrorBodyV1, ApiErrorCodeV1,
             ApiErrorMetaV1, ApiErrorResponseV1, AssetCapabilitiesV1, AssetHeadV1,
+            BulkThemaArchiveRequestV1, BulkThemaMutationResponseV1, BulkThemaSuspensionRequestV1,
             ContentCapabilitiesV1, ContentChangePageV1, ContentSearchPageV1, DashboardV1,
             DesiredStateMutationResultV1, DeviceIdentityV1, DocumentHeadV1,
             DocumentImportRequestV1, DocumentMutationResultV1, DocumentRevisionPageV1,
@@ -81,6 +83,7 @@ const MAX_BODY: usize = MAX_OFFLINE_ASSET_BYTES as usize;
 const MAX_PAGE: u16 = 500;
 const MAX_NODE_CATALOG_PAGE: u16 = 5000;
 const MAX_REPLICA_PAGE: u16 = 32;
+const MAX_BULK_THEMATA_BODY: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct HttpState {
@@ -245,6 +248,14 @@ fn data_router() -> Router<HttpState> {
         .route("/v1/themata/{id}/suspension", put(set_thema_suspension))
         .route("/v1/themata/{id}/archive", post(archive_thema))
         .route("/v1/themata/{id}/unarchive", post(unarchive_thema))
+        .route(
+            "/v1/themata/bulk/suspension",
+            put(bulk_thema_suspension).layer(DefaultBodyLimit::max(MAX_BULK_THEMATA_BODY)),
+        )
+        .route(
+            "/v1/themata/bulk/archive",
+            post(bulk_thema_archive).layer(DefaultBodyLimit::max(MAX_BULK_THEMATA_BODY)),
+        )
         .route("/v1/nodes", get(search_nodes))
         .route("/v1/nodes/catalog", get(node_catalog))
         .route("/v1/nodes/content-search", get(search_document_content))
@@ -1403,6 +1414,158 @@ async fn unarchive_thema(
     headers: HeaderMap,
 ) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     set_archive(state, principal, path, headers, false).await
+}
+
+async fn bulk_thema_suspension(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(request): ApiJson<BulkThemaSuspensionRequestV1>,
+) -> Result<Json<BulkThemaMutationResponseV1>, ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    apply_bulk_thema_mutations(
+        &state,
+        principal,
+        request.version,
+        request
+            .items
+            .into_iter()
+            .map(|item| BulkThemaMutationItem {
+                operation_id: item.operation_id,
+                thema_id: item.thema_id,
+                expected_revision: item.expected_revision,
+            })
+            .collect(),
+        BulkThemaDesiredState::Suspended(request.suspended),
+    )
+    .await
+}
+
+async fn bulk_thema_archive(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    ApiJson(request): ApiJson<BulkThemaArchiveRequestV1>,
+) -> Result<Json<BulkThemaMutationResponseV1>, ApiError> {
+    require(&principal, DeviceScope::ContentWrite)?;
+    apply_bulk_thema_mutations(
+        &state,
+        principal,
+        request.version,
+        request
+            .items
+            .into_iter()
+            .map(|item| BulkThemaMutationItem {
+                operation_id: item.operation_id,
+                thema_id: item.thema_id,
+                expected_revision: item.expected_revision,
+            })
+            .collect(),
+        BulkThemaDesiredState::Archived(request.archived),
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum BulkThemaDesiredState {
+    Archived(bool),
+    Suspended(bool),
+}
+
+struct BulkThemaMutationItem {
+    operation_id: String,
+    thema_id: String,
+    expected_revision: u64,
+}
+
+fn valid_bulk_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphanumeric())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        && value.len() <= 128
+}
+
+async fn apply_bulk_thema_mutations(
+    state: &HttpState,
+    principal: DevicePrincipal,
+    version: u32,
+    items: Vec<BulkThemaMutationItem>,
+    desired: BulkThemaDesiredState,
+) -> Result<Json<BulkThemaMutationResponseV1>, ApiError> {
+    if version != 1 || !(1..=crate::application::MAX_BULK_THEMATA_ITEMS).contains(&items.len()) {
+        return Err(ApiError::bad_request("invalid bulk thema mutation"));
+    }
+    let mut operation_ids = HashSet::with_capacity(items.len());
+    let mut thema_ids = HashSet::with_capacity(items.len());
+    let mut operations = Vec::with_capacity(items.len());
+    for item in items {
+        if item.expected_revision > i64::MAX as u64
+            || (matches!(desired, BulkThemaDesiredState::Archived(_))
+                && item.expected_revision == 0)
+            || !valid_bulk_id(&item.operation_id)
+            || !operation_ids.insert(item.operation_id.clone())
+            || !thema_ids.insert(item.thema_id.clone())
+        {
+            return Err(ApiError::bad_request(
+                "duplicate or invalid bulk thema item",
+            ));
+        }
+        let thema_id =
+            ThemaId::new(item.thema_id).map_err(|_| ApiError::bad_request("invalid thema ID"))?;
+        let mutation = match desired {
+            BulkThemaDesiredState::Archived(archived) => {
+                DeviceDesiredStateMutation::SetThemaArchived {
+                    thema_id,
+                    expected_revision: item.expected_revision,
+                    archived,
+                }
+            }
+            BulkThemaDesiredState::Suspended(suspended) => {
+                DeviceDesiredStateMutation::SetThemaSuspended {
+                    thema_id,
+                    expected_state_revision: item.expected_revision,
+                    suspended,
+                }
+            }
+        };
+        operations.push(
+            prepare_device_desired_state_mutation(
+                1,
+                item.operation_id,
+                principal.device_id.clone(),
+                mutation,
+            )
+            .map_err(|_| ApiError::bad_request("invalid device mutation"))?,
+        );
+    }
+    let request_sha256 = operations
+        .iter()
+        .map(|operation| operation.identity.request_sha256.clone())
+        .collect::<Vec<_>>();
+    let executions = state
+        .service
+        .apply_device_thema_mutations(operations, now_us_i64()?)
+        .await
+        .map_err(ApiError::service)?;
+    if executions.len() != request_sha256.len() {
+        return Err(ApiError::internal());
+    }
+    if executions
+        .iter()
+        .any(|execution| !execution.replayed && execution.result.changed())
+    {
+        announce(state).await;
+    }
+    let results = executions
+        .iter()
+        .zip(request_sha256)
+        .map(|(execution, request_sha256)| {
+            DesiredStateMutationResultV1::from_application(&execution.result, &request_sha256)
+                .map_err(|_| ApiError::internal())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(BulkThemaMutationResponseV1 {
+        version: 1,
+        results,
+    }))
 }
 
 async fn get_thema_review_state(
@@ -2820,6 +2983,20 @@ fn openapi_content_operation(path: &str, method: &str) -> Option<Value> {
     if path == "/v1/review/due" {
         operation["x-gnosis-required-scopes"] = json!(["read", "review"]);
     }
+    if matches!(
+        path,
+        "/v1/themata/bulk/suspension" | "/v1/themata/bulk/archive"
+    ) {
+        operation["x-gnosis-bulk-semantics"] = json!({
+            "maximumItems":crate::application::MAX_BULK_THEMATA_ITEMS,
+            "maximumBodyBytes":MAX_BULK_THEMATA_BODY,
+            "maximumResponseBytes":MAX_BODY,
+            "resultOrder":"request",
+            "commit":"single_transaction",
+            "conflicts":"per_item_rejection",
+            "unknownDelivery":"replay_identical_operation_ids"
+        });
+    }
     if let Some(body) = content_request_body(path, method, contract.request) {
         operation["requestBody"] = body;
     }
@@ -3018,6 +3195,20 @@ fn content_json_contract(path: &str, method: &str) -> Option<ContentJsonContract
             &[
                 "400", "401", "403", "408", "409", "413", "422", "500", "503",
             ],
+        )),
+        ("/v1/themata/bulk/suspension", "put") => Some(json_contract(
+            "review",
+            Some("BulkThemaSuspensionRequestV1"),
+            "200",
+            "BulkThemaMutationResponseV1",
+            &["400", "401", "403", "408", "413", "422", "500", "503"],
+        )),
+        ("/v1/themata/bulk/archive", "post") => Some(json_contract(
+            "content:write",
+            Some("BulkThemaArchiveRequestV1"),
+            "200",
+            "BulkThemaMutationResponseV1",
+            &["400", "401", "403", "408", "413", "422", "500", "503"],
         )),
         ("/v1/themata/{id}", "get") => Some(json_contract(
             "read",
@@ -3633,6 +3824,7 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     generator.subschema_for::<ThemaPageV1>();
     generator.subschema_for::<ThemaCatalogPageV1>();
     generator.subschema_for::<ThemaV1>();
+    generator.subschema_for::<BulkThemaMutationResponseV1>();
     generator.subschema_for::<NodeCatalogPageV1>();
     generator.subschema_for::<NodePageV1>();
     generator.subschema_for::<ContentSearchPageV1>();
@@ -3677,6 +3869,8 @@ fn http_v1_schemas() -> serde_json::Map<String, Value> {
     requests.subschema_for::<SetAcceptedSuccessRequestV1>();
     requests.subschema_for::<SetSuspensionRequestV1>();
     requests.subschema_for::<SetThemaSuspensionRequestV1>();
+    requests.subschema_for::<BulkThemaSuspensionRequestV1>();
+    requests.subschema_for::<BulkThemaArchiveRequestV1>();
     requests.subschema_for::<OfflineReviewOperationEnvelopeV1>();
     requests.subschema_for::<OfflineContentOperationEnvelopeV1>();
     requests.subschema_for::<OfflineAssetOperationEnvelopeV1>();
@@ -3780,6 +3974,8 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/themata", "get"),
     ("/v1/themata", "post"),
     ("/v1/themata/catalog", "get"),
+    ("/v1/themata/bulk/suspension", "put"),
+    ("/v1/themata/bulk/archive", "post"),
     ("/v1/themata/{id}", "get"),
     ("/v1/themata/{id}", "put"),
     ("/v1/themata/{id}/review-state", "get"),
@@ -4043,6 +4239,45 @@ mod tests {
             let operation = &api["paths"][path][method];
             assert!(operation["responses"].is_object(), "{method} {path}");
             assert_eq!(operation["security"][0]["bearerAuth"], json!([]));
+        }
+    }
+
+    #[test]
+    fn openapi_exposes_bounded_ordered_bulk_thema_contracts() {
+        let api = openapi_document();
+        for (path, method, request, scope) in [
+            (
+                "/v1/themata/bulk/suspension",
+                "put",
+                "BulkThemaSuspensionRequestV1",
+                "review",
+            ),
+            (
+                "/v1/themata/bulk/archive",
+                "post",
+                "BulkThemaArchiveRequestV1",
+                "content:write",
+            ),
+        ] {
+            let operation = &api["paths"][path][method];
+            assert_eq!(operation["x-gnosis-required-scopes"], json!([scope]));
+            assert_eq!(
+                operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                format!("#/components/schemas/{request}")
+            );
+            assert_eq!(
+                operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/BulkThemaMutationResponseV1"
+            );
+            assert_eq!(operation["x-gnosis-bulk-semantics"]["maximumItems"], 500);
+            assert_eq!(
+                operation["x-gnosis-bulk-semantics"]["resultOrder"],
+                "request"
+            );
+            assert_eq!(
+                operation["x-gnosis-bulk-semantics"]["unknownDelivery"],
+                "replay_identical_operation_ids"
+            );
         }
     }
 
@@ -6556,6 +6791,107 @@ mod tests {
                 "not_found"
             );
         }
+
+        drop(app);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_thema_routes_return_ordered_partial_results_and_exact_replays() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let device = generate_device(
+            "bulk-manager".into(),
+            vec!["read".into(), "review".into(), "content:write".into()],
+        )
+        .unwrap();
+        let token = device.token.clone();
+        service.create_device(device, 1).await.unwrap();
+        for id in ["bulk-one", "bulk-two"] {
+            put_custom_review_thema(
+                &service,
+                id,
+                "basic",
+                "Question",
+                vec![None],
+                vec!["Answer".into()],
+                None,
+            )
+            .await;
+        }
+        let app = router(service.clone());
+        let suspension_body = serde_json::to_vec(&json!({
+            "version": 1,
+            "suspended": true,
+            "items": [
+                {"operation_id": "bulk-suspend-one", "thema_id": "bulk-one",
+                 "expected_revision": 0},
+                {"operation_id": "bulk-suspend-two", "thema_id": "bulk-two",
+                 "expected_revision": 1}
+            ]
+        }))
+        .unwrap();
+        let suspension_request = || {
+            authorized(
+                "PUT",
+                "/v1/themata/bulk/suspension",
+                &token,
+                Body::from(suspension_body.clone()),
+            )
+        };
+        let response = app.clone().oneshot(suspension_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let suspension = response_json(response).await;
+        assert_eq!(suspension["results"][0]["operation_id"], "bulk-suspend-one");
+        assert_eq!(suspension["results"][0]["status"], "applied");
+        assert_eq!(suspension["results"][1]["operation_id"], "bulk-suspend-two");
+        assert_eq!(suspension["results"][1]["status"], "rejected");
+        assert_eq!(
+            response_json(app.clone().oneshot(suspension_request()).await.unwrap()).await,
+            suspension
+        );
+
+        let archive_body = serde_json::to_vec(&json!({
+            "version": 1,
+            "archived": true,
+            "items": [
+                {"operation_id": "bulk-archive-one", "thema_id": "bulk-one",
+                 "expected_revision": 1},
+                {"operation_id": "bulk-archive-two", "thema_id": "bulk-two",
+                 "expected_revision": 2}
+            ]
+        }))
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/themata/bulk/archive",
+                &token,
+                Body::from(archive_body),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let archive = response_json(response).await;
+        assert_eq!(archive["results"][0]["status"], "applied");
+        assert_eq!(
+            archive["results"][0]["authoritative"]["kind"],
+            "thema_archive_state"
+        );
+        assert_eq!(
+            archive["results"][0]["authoritative"]["value"],
+            json!({"thema_id": "bulk-one", "revision": 2, "archived": true})
+        );
+        assert_eq!(archive["results"][1]["status"], "rejected");
 
         drop(app);
         drop(service);

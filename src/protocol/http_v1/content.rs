@@ -219,6 +219,11 @@ impl DocumentMutationResultV1 {
 pub enum DesiredStateMutationProjectionV1 {
     Asset(AssetHeadV1),
     Thema(ThemaV1),
+    ThemaArchiveState {
+        thema_id: String,
+        revision: u64,
+        archived: bool,
+    },
     ReviewState {
         thema_id: String,
         state: ReviewStateV1,
@@ -307,6 +312,15 @@ fn desired_state_projection(
         DeviceMutationProjection::Thema(thema) => Ok(DesiredStateMutationProjectionV1::Thema(
             ThemaV1::from_mutation_projection(thema)?,
         )),
+        DeviceMutationProjection::ThemaArchiveState {
+            thema_id,
+            revision,
+            archived,
+        } => Ok(DesiredStateMutationProjectionV1::ThemaArchiveState {
+            thema_id: thema_id.clone(),
+            revision: *revision,
+            archived: *archived,
+        }),
         DeviceMutationProjection::ReviewState { thema_id, state } => {
             Ok(DesiredStateMutationProjectionV1::ReviewState {
                 thema_id: thema_id.clone(),

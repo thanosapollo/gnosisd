@@ -914,6 +914,63 @@ pub struct SetThemaSuspensionRequestV1 {
     pub suspended: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkThemaSuspensionItemV1 {
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    )]
+    pub operation_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub thema_id: String,
+    #[schemars(range(max = 9223372036854775807_u64))]
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkThemaArchiveItemV1 {
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    )]
+    pub operation_id: String,
+    #[schemars(length(min = 1, max = 128))]
+    pub thema_id: String,
+    #[schemars(range(min = 1, max = 9223372036854775807_u64))]
+    pub expected_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkThemaSuspensionRequestV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub suspended: bool,
+    #[schemars(length(min = 1, max = 500))]
+    pub items: Vec<BulkThemaSuspensionItemV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkThemaArchiveRequestV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    pub archived: bool,
+    #[schemars(length(min = 1, max = 500))]
+    pub items: Vec<BulkThemaArchiveItemV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BulkThemaMutationResponseV1 {
+    #[schemars(extend("const" = 1))]
+    pub version: u32,
+    #[schemars(length(min = 1, max = 500))]
+    pub results: Vec<DesiredStateMutationResultV1>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewAttemptOperationResponseV1 {

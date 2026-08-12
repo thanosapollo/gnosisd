@@ -255,6 +255,11 @@ pub(crate) enum DeviceMutationProjection {
     Document(super::DocumentHead),
     Asset(AssetHead),
     Thema(ThemaMutationProjection),
+    ThemaArchiveState {
+        thema_id: String,
+        revision: u64,
+        archived: bool,
+    },
     ReviewState {
         thema_id: String,
         state: ReviewStateSnapshot,
@@ -434,6 +439,10 @@ impl DeviceMutationResult {
                     .target_id
                     .as_deref()
                     .is_some_and(|target| target == thema.thema_id),
+                DeviceMutationProjection::ThemaArchiveState { thema_id, .. } => identity
+                    .target_id
+                    .as_deref()
+                    .is_some_and(|target| target == thema_id),
                 DeviceMutationProjection::ReviewState { thema_id, .. } => identity
                     .target_id
                     .as_deref()

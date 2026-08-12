@@ -54,6 +54,9 @@
 (defconst gnosis-themata--render-chunk-size 500
   "Maximum EWOC rows formatted by one timer callback.")
 
+(defconst gnosis-themata--bulk-chunk-size 500
+  "Maximum selected themata sent in one mutation request.")
+
 (defvar-local gnosis-themata--ewoc nil
   "EWOC rendering the complete thema projection in this dashboard.")
 (defvar-local gnosis-themata--nodes nil
@@ -76,6 +79,10 @@
 (defvar-local gnosis-themata--loading-p nil)
 (defvar-local gnosis-themata--authority nil)
 (defvar-local gnosis-themata--incarnation nil)
+(defvar-local gnosis-themata--marked nil)
+(defvar-local gnosis-themata--bulk-timer nil)
+(defvar-local gnosis-themata--active-bulk nil)
+(defvar-local gnosis-themata--pending-bulk nil)
 (defvar gnosis-themata--sequence 0)
 
 (defun gnosis-themata--current-authority ()
@@ -153,7 +160,10 @@
                             (aref columns index) (aref widths index) index
                             (aref faces index))))
          (id (plist-get record :thema_id)))
-    (propertize (concat "  " (string-join parts " "))
+    (propertize (concat (if (gethash id gnosis-themata--marked)
+                            (propertize "* " 'face 'font-lock-constant-face)
+                          "  ")
+                        (string-join parts " "))
                 'gnosis-thema-id id 'mouse-face 'highlight)))
 
 (defun gnosis-themata--pretty-print-default (record)
@@ -812,11 +822,15 @@ With numeric prefix -1, restore authoritative catalog order."
 (defun gnosis-themata--cancel-timers ()
   "Cancel dashboard rendering and catalog traversal timers."
   (gnosis-themata--cancel-render)
-  (dolist (timer (list gnosis-themata--layout-timer gnosis-themata--refresh-timer))
+  (dolist (timer (list gnosis-themata--layout-timer gnosis-themata--refresh-timer
+                       gnosis-themata--bulk-timer))
     (when (timerp timer) (cancel-timer timer)))
   (setq gnosis-themata--layout-timer nil
         gnosis-themata--refresh-timer nil
         gnosis-themata--refresh-state nil
+        gnosis-themata--bulk-timer nil
+        gnosis-themata--active-bulk nil
+        gnosis-themata--pending-bulk nil
         gnosis-themata--loading-p nil
         gnosis-themata--refresh-run (cl-incf gnosis-themata--sequence)))
 
@@ -940,6 +954,220 @@ With numeric prefix -1, restore authoritative catalog order."
           (gnosis-core--token-override token))
       (funcall function))))
 
+(defun gnosis-themata--set-mark (marked)
+  "Set mark on thema at point to MARKED."
+  (let* ((record (gnosis-themata--record-at-point))
+         (id (plist-get record :thema_id))
+         (node (gethash id gnosis-themata--nodes)))
+    (if marked
+        (puthash id t gnosis-themata--marked)
+      (remhash id gnosis-themata--marked))
+    (ewoc-invalidate gnosis-themata--ewoc node)))
+
+(defun gnosis-themata-mark ()
+  "Mark thema at point for a selected-item mutation."
+  (interactive)
+  (gnosis-themata--set-mark t))
+
+(defun gnosis-themata-unmark ()
+  "Unmark thema at point."
+  (interactive)
+  (gnosis-themata--set-mark nil))
+
+(defun gnosis-themata-mark-all ()
+  "Mark every thema in the complete current projection."
+  (interactive)
+  (when (or gnosis-themata--loading-p gnosis-themata--render-state)
+    (user-error "Wait for the complete Gnosis projection"))
+  (let ((context (gnosis-themata--capture-context)))
+    (dolist (record (gnosis-themata--complete-records))
+      (when (gnosis-themata--visible-p record)
+        (puthash (plist-get record :thema_id) t gnosis-themata--marked)))
+    (ewoc-refresh gnosis-themata--ewoc)
+    (gnosis-themata--restore-context
+     (gnosis-themata--observe-context context))))
+
+(defun gnosis-themata-unmark-all ()
+  "Unmark every thema."
+  (interactive)
+  (let ((context (gnosis-themata--capture-context)))
+    (clrhash gnosis-themata--marked)
+    (ewoc-refresh gnosis-themata--ewoc)
+    (gnosis-themata--restore-context
+     (gnosis-themata--observe-context context))))
+
+(defun gnosis-themata--selected-records ()
+  "Return marked records, or the current record when none are marked."
+  (let ((records
+         (cl-loop for record in (gnosis-themata--complete-records)
+                  when (gethash (plist-get record :thema_id)
+                                gnosis-themata--marked)
+                  collect record)))
+    (sort (or records (list (gnosis-themata--record-at-point)))
+          (lambda (left right)
+            (string-lessp (plist-get left :thema_id)
+                          (plist-get right :thema_id))))))
+
+(defun gnosis-themata--bulk-items (records kind)
+  "Return stable mutation items for RECORDS and mutation KIND."
+  (mapcar
+   (lambda (record)
+     (list :operation_id (gnosis-core-operation-id)
+           :thema_id (plist-get record :thema_id)
+           :expected_revision
+           (plist-get record (if (eq kind :suspension)
+                                 :state_revision
+                               :thema_revision))))
+   records))
+
+(defun gnosis-themata--bulk-update-record (record kind result)
+  "Return RECORD updated from accepted bulk RESULT for KIND."
+  (let ((updated (copy-tree record))
+        (projection (plist-get result :projection)))
+    (if (eq kind :suspension)
+        (let ((state (plist-get projection :state)))
+          (setq updated (plist-put updated :state_revision
+                                   (plist-get state :state_revision))
+                updated (plist-put updated :suspended
+                                   (plist-get state :suspended))))
+      (setq updated (plist-put updated :thema_revision
+                               (plist-get projection :revision))
+            updated (plist-put updated :archived
+                               (plist-get projection :archived))))
+    updated))
+
+(defun gnosis-themata--publish-bulk (state)
+  "Publish accepted authority from terminal bulk STATE once."
+  (let ((kind (plist-get state :kind))
+        (accepted (plist-get state :accepted))
+        (context (plist-get state :context)))
+    (when accepted
+      (dolist (result accepted)
+        (let* ((id (plist-get result :thema_id))
+               (node (gethash id gnosis-themata--nodes)))
+          (when node
+            (ewoc-set-data
+             node (gnosis-themata--bulk-update-record
+                   (ewoc-data node) kind result)))
+          (remhash id gnosis-themata--marked)))
+      (gnosis-themata--start-render
+       (gnosis-themata--ordered-records)
+       (gnosis-themata--observe-context context)))))
+
+(defun gnosis-themata--finish-bulk (status pending)
+  "Finish active bulk run with STATUS and retained PENDING items."
+  (let* ((state gnosis-themata--active-bulk)
+         (accepted (length (plist-get state :accepted)))
+         (rejected (plist-get state :rejected)))
+    (setq gnosis-themata--bulk-timer nil
+          gnosis-themata--pending-bulk
+          (and pending
+               (list :kind (plist-get state :kind)
+                     :desired (plist-get state :desired)
+                     :items pending)))
+    (gnosis-themata--publish-bulk state)
+    (setq gnosis-themata--active-bulk nil)
+    (message "Gnosis bulk %s: %d accepted, %d rejected, %d pending"
+             status accepted rejected (length pending))))
+
+(defun gnosis-themata--bulk-step (buffer run)
+  "Execute one bounded selected-item request for BUFFER and RUN."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and gnosis-themata--active-bulk
+                 (equal run (plist-get gnosis-themata--active-bulk :run)))
+        (setq gnosis-themata--bulk-timer nil)
+        (let* ((state gnosis-themata--active-bulk)
+               (items (plist-get state :items))
+               (chunk (seq-take items gnosis-themata--bulk-chunk-size))
+               (remaining (nthcdr (length chunk) items))
+               (kind (plist-get state :kind))
+               (desired (plist-get state :desired)))
+          (condition-case nil
+              (let* ((results
+                      (gnosis-themata--call-with-authority
+                       (lambda ()
+                         (if (eq kind :suspension)
+                             (gnosis-core-themata-set-suspended chunk desired)
+                           (gnosis-core-themata-set-archived chunk desired)))))
+                     (accepted
+                      (cl-remove-if-not
+                       (lambda (result) (eq :applied (plist-get result :status)))
+                       results))
+                     (rejected (- (length results) (length accepted))))
+                (setq state (plist-put state :items remaining)
+                      state (plist-put state :accepted
+                                       (append (plist-get state :accepted) accepted))
+                      state (plist-put state :rejected
+                                       (+ (plist-get state :rejected) rejected))
+                      gnosis-themata--active-bulk state)
+                (if remaining
+                    (progn
+                      (message "Gnosis bulk progress: %d/%d"
+                               (- (plist-get state :total) (length remaining))
+                               (plist-get state :total))
+                      (setq gnosis-themata--bulk-timer
+                            (run-at-time 0 nil #'gnosis-themata--bulk-step
+                                         buffer run)))
+                  (gnosis-themata--finish-bulk 'complete nil)))
+            (gnosis-core-error
+             (gnosis-themata--finish-bulk 'uncertain (append chunk remaining)))))))))
+
+(defun gnosis-themata--start-bulk (kind desired)
+  "Start selected-item bulk KIND to DESIRED state."
+  (when gnosis-themata--active-bulk
+    (user-error "A Gnosis bulk mutation is already active"))
+  (when (or gnosis-themata--loading-p gnosis-themata--render-state)
+    (user-error "Wait for the complete Gnosis projection"))
+  (let* ((pending gnosis-themata--pending-bulk)
+         (items
+          (if pending
+              (progn
+                (unless (and (eq kind (plist-get pending :kind))
+                             (eq desired (plist-get pending :desired)))
+                  (user-error "Retry the pending Gnosis bulk mutation first"))
+                (plist-get pending :items))
+            (gnosis-themata--bulk-items
+             (gnosis-themata--selected-records) kind)))
+         (action (if desired "set" "clear")))
+    (when (yes-or-no-p (format "%s %s on %d themata? "
+                               (capitalize action) (symbol-name kind)
+                               (length items)))
+      (let ((run (cl-incf gnosis-themata--sequence)))
+        (setq gnosis-themata--pending-bulk nil
+              gnosis-themata--active-bulk
+              (list :run run :kind kind :desired desired :items items
+                    :total (length items) :accepted nil :rejected 0
+                    :context (gnosis-themata--capture-context))
+              gnosis-themata--bulk-timer
+              (run-at-time 0 nil #'gnosis-themata--bulk-step
+                           (current-buffer) run))
+        (set-transient-map
+         (let ((map (make-sparse-keymap)))
+           (define-key map (kbd "C-g") #'gnosis-themata-cancel-bulk)
+           map)
+         (lambda () gnosis-themata--active-bulk))))))
+
+(defun gnosis-themata-bulk-suspension (&optional unsuspend)
+  "Suspend selected themata, or UNSUSPEND them with a prefix argument."
+  (interactive "P")
+  (gnosis-themata--start-bulk :suspension (not unsuspend)))
+
+(defun gnosis-themata-bulk-archive (&optional unarchive)
+  "Archive selected themata, or UNARCHIVE them with a prefix argument."
+  (interactive "P")
+  (gnosis-themata--start-bulk :archive (not unarchive)))
+
+(defun gnosis-themata-cancel-bulk ()
+  "Cancel unsent chunks while preserving accepted server authority."
+  (interactive)
+  (unless gnosis-themata--active-bulk
+    (user-error "No Gnosis bulk mutation is active"))
+  (when (timerp gnosis-themata--bulk-timer)
+    (cancel-timer gnosis-themata--bulk-timer))
+  (gnosis-themata--finish-bulk
+   'cancelled (plist-get gnosis-themata--active-bulk :items)))
+
 (defun gnosis-themata-toggle-suspension ()
   "Suspend or unsuspend thema at point."
   (interactive)
@@ -985,38 +1213,6 @@ With numeric prefix -1, restore authoritative catalog order."
   (setq gnosis-themata--tag-filter tag)
   (gnosis-themata--render (gnosis-themata--current-id)))
 
-(defun gnosis-themata-suspend-tag ()
-  "Suspend each unsuspended thema in visible exact-tag set."
-  (interactive)
-  (gnosis-themata--ensure-authority)
-  (unless gnosis-themata--tag-filter
-    (user-error "Select a Gnosis tag filter first"))
-  (let ((records
-         (sort
-          (cl-loop for record in (ewoc-collect gnosis-themata--ewoc #'identity)
-                   when (and (gnosis-themata--visible-p record)
-                             (not (eq t (plist-get record :suspended))))
-                   collect (copy-tree record))
-          (lambda (left right)
-            (string-lessp (plist-get left :thema_id)
-                          (plist-get right :thema_id))))))
-    (if (null records)
-        (message "No unsuspended themata in this tag set")
-      (when (yes-or-no-p (format "Suspend %d tagged themata? " (length records)))
-        (gnosis-themata--call-with-authority
-         (lambda ()
-           (dolist (record records)
-             (let* ((projection
-                     (gnosis-core-thema-set-suspended
-                      (plist-get record :thema_id)
-                      (plist-get record :state_revision) t))
-                    (state (plist-get projection :state))
-                    (updated (copy-tree record)))
-               (setq updated (plist-put updated :state_revision
-                                        (plist-get state :state_revision))
-                     updated (plist-put updated :suspended
-                                        (plist-get state :suspended)))
-               (gnosis-themata--replace-record updated)))))))))
 
 (defun gnosis-themata--reset-authority-state ()
   "Discard all dashboard state owned by the previous authority."
@@ -1031,7 +1227,9 @@ With numeric prefix -1, restore authoritative catalog order."
         gnosis-themata--review-filter :all
         gnosis-themata--tag-filter nil
         gnosis-themata--max-reviews nil
-        gnosis-themata--sort-key nil))
+        gnosis-themata--sort-key nil
+        gnosis-themata--marked (make-hash-table :test #'equal)
+        gnosis-themata--pending-bulk nil))
 
 (defun gnosis-review-history--date (review-day)
   "Return readable date for numeric REVIEW-DAY."
@@ -1293,8 +1491,15 @@ Start fresh catalog traversal when INITIAL is non-nil."
   "a" ("Add thema" gnosis-themata-add)
   :group "Mutate"
   "s" ("Suspend or unsuspend" gnosis-themata-toggle-suspension)
-  "A" ("Archive or unarchive" gnosis-themata-toggle-archive)
-  "S" ("Suspend visible tag set" gnosis-themata-suspend-tag)
+  "S" ("Suspend selected (prefix: unsuspend)" gnosis-themata-bulk-suspension)
+  "A" ("Archive selected (prefix: unarchive)" gnosis-themata-bulk-archive)
+  "x" ("Cancel bulk mutation" gnosis-themata-cancel-bulk
+       :if (lambda () gnosis-themata--active-bulk))
+  :group "Selection"
+  "*" ("Mark current" gnosis-themata-mark :stay-open t)
+  "u" ("Unmark current" gnosis-themata-unmark :stay-open t)
+  "M" ("Mark all visible" gnosis-themata-mark-all :stay-open t)
+  "U" ("Unmark all" gnosis-themata-unmark-all :stay-open t)
   :group "Filter"
   "v" ("Show tag" gnosis-themata-find-tag)
   "/" ("Search themata" gnosis-themata-filter-search)
@@ -1313,7 +1518,8 @@ Start fresh catalog traversal when INITIAL is non-nil."
   (setq-local truncate-lines nil
               revert-buffer-function
               (lambda (&rest _) (gnosis-dashboard-refresh)))
-  (setq gnosis-themata--incarnation (cl-incf gnosis-themata--sequence))
+  (setq gnosis-themata--incarnation (cl-incf gnosis-themata--sequence)
+        gnosis-themata--marked (make-hash-table :test #'equal))
   (add-hook 'kill-buffer-hook #'gnosis-themata--cancel-timers nil t)
   (add-hook 'change-major-mode-hook #'gnosis-themata--cancel-timers nil t)
   (add-hook 'window-size-change-functions

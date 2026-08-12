@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
@@ -97,50 +99,35 @@ impl SqliteStore {
         operation: &PreparedDeviceDesiredStateMutation,
         created_at_us: i64,
     ) -> Result<DeviceMutationExecution, StoreError> {
-        operation.validate().map_err(|_| StoreError::CorruptData {
-            field: "device desired-state mutation",
-        })?;
+        validate_desired_state_operation(operation)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::storage)?;
-        if let Some(replay) = replayed_device_mutation(&transaction, &operation.identity)? {
-            transaction.commit().map_err(StoreError::storage)?;
-            return Ok(replay);
-        }
-        transaction
-            .execute_batch("SAVEPOINT device_mutation_apply")
-            .map_err(StoreError::storage)?;
-        let result = match apply_desired_state_mutation(&transaction, operation, created_at_us) {
-            Ok((changed, authoritative)) => {
-                transaction
-                    .execute_batch("RELEASE device_mutation_apply")
-                    .map_err(StoreError::storage)?;
-                DeviceMutationResult::applied(
-                    &operation.identity,
-                    changed,
-                    authoritative,
-                    mutation_cursor(&transaction)?,
-                )
-            }
-            Err(error) => {
-                let Some(rejection) = desired_state_rejection(&error) else {
-                    return Err(error);
-                };
-                transaction
-                    .execute_batch(
-                        "ROLLBACK TO device_mutation_apply; RELEASE device_mutation_apply",
-                    )
-                    .map_err(StoreError::storage)?;
-                rejected_result(&transaction, &operation.identity, rejection)?
-            }
-        };
-        insert_receipt(&transaction, &operation.identity, &result, created_at_us)?;
+        let execution =
+            apply_device_desired_state_mutation_in(&transaction, operation, created_at_us, false)?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(DeviceMutationExecution {
-            result,
-            replayed: false,
-        })
+        Ok(execution)
+    }
+
+    pub(crate) fn apply_device_thema_mutations(
+        &mut self,
+        operations: &[PreparedDeviceDesiredStateMutation],
+        created_at_us: i64,
+    ) -> Result<Vec<DeviceMutationExecution>, StoreError> {
+        validate_bulk_thema_operations(operations)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::storage)?;
+        let executions = operations
+            .iter()
+            .map(|operation| {
+                apply_device_desired_state_mutation_in(&transaction, operation, created_at_us, true)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit().map_err(StoreError::storage)?;
+        Ok(executions)
     }
 
     pub(crate) fn device_desired_state_mutation_needs_blob(
@@ -174,6 +161,100 @@ impl SqliteStore {
             Err(error) if desired_state_rejection(&error).is_some() => Ok(false),
             Err(error) => Err(error),
         }
+    }
+}
+
+fn validate_desired_state_operation(
+    operation: &PreparedDeviceDesiredStateMutation,
+) -> Result<(), StoreError> {
+    operation.validate().map_err(|_| StoreError::CorruptData {
+        field: "device desired-state mutation",
+    })
+}
+
+fn validate_bulk_thema_operations(
+    operations: &[PreparedDeviceDesiredStateMutation],
+) -> Result<(), StoreError> {
+    if !(1..=crate::application::MAX_BULK_THEMATA_ITEMS).contains(&operations.len()) {
+        return Err(StoreError::CorruptData {
+            field: "bulk thema mutations",
+        });
+    }
+    let mut operation_ids = HashSet::with_capacity(operations.len());
+    let mut targets = HashSet::with_capacity(operations.len());
+    for operation in operations {
+        validate_desired_state_operation(operation)?;
+        if !matches!(
+            operation.mutation,
+            DeviceDesiredStateMutation::SetThemaArchived { .. }
+                | DeviceDesiredStateMutation::SetThemaSuspended { .. }
+        ) || !operation_ids.insert(operation.identity.operation_id.as_str())
+            || !targets.insert(operation.identity.target_id.as_deref())
+        {
+            return Err(StoreError::CorruptData {
+                field: "bulk thema mutations",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_device_desired_state_mutation_in(
+    transaction: &Transaction<'_>,
+    operation: &PreparedDeviceDesiredStateMutation,
+    created_at_us: i64,
+    compact_thema: bool,
+) -> Result<DeviceMutationExecution, StoreError> {
+    if let Some(mut replay) = replayed_device_mutation(transaction, &operation.identity)? {
+        if compact_thema {
+            compact_thema_projection(&mut replay.result);
+        }
+        return Ok(replay);
+    }
+    transaction
+        .execute_batch("SAVEPOINT device_mutation_apply")
+        .map_err(StoreError::storage)?;
+    let mut result = match apply_desired_state_mutation(transaction, operation, created_at_us) {
+        Ok((changed, authoritative)) => {
+            transaction
+                .execute_batch("RELEASE device_mutation_apply")
+                .map_err(StoreError::storage)?;
+            DeviceMutationResult::applied(
+                &operation.identity,
+                changed,
+                authoritative,
+                mutation_cursor(transaction)?,
+            )
+        }
+        Err(error) => {
+            let Some(rejection) = desired_state_rejection(&error) else {
+                return Err(error);
+            };
+            transaction
+                .execute_batch("ROLLBACK TO device_mutation_apply; RELEASE device_mutation_apply")
+                .map_err(StoreError::storage)?;
+            rejected_result(transaction, &operation.identity, rejection)?
+        }
+    };
+    insert_receipt(transaction, &operation.identity, &result, created_at_us)?;
+    if compact_thema {
+        compact_thema_projection(&mut result);
+    }
+    Ok(DeviceMutationExecution {
+        result,
+        replayed: false,
+    })
+}
+
+fn compact_thema_projection(result: &mut DeviceMutationResult) {
+    if let DeviceMutationResult::Applied { authoritative, .. } = result
+        && let DeviceMutationProjection::Thema(thema) = authoritative
+    {
+        *authoritative = DeviceMutationProjection::ThemaArchiveState {
+            thema_id: thema.thema_id.clone(),
+            revision: thema.revision,
+            archived: thema.archived,
+        };
     }
 }
 
@@ -950,6 +1031,89 @@ mod tests {
             ));
         }
         assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+    }
+
+    #[test]
+    fn bulk_thema_mutations_commit_valid_siblings_and_replay_rejections() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "bulk-themata");
+        for thema_id in ["one", "two"] {
+            let thema = prepare_thema(
+                Some(thema_id.into()),
+                thema_content(
+                    "basic",
+                    format!("Question {thema_id}"),
+                    vec![],
+                    vec!["Answer".into()],
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+                vec![],
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
+            store.put_thema(&thema, 20260719, 1, None).unwrap();
+        }
+        let operation = |operation_id: &str, thema_id: &str, expected_revision| {
+            prepare_device_desired_state_mutation(
+                1,
+                operation_id.into(),
+                device.clone(),
+                DeviceDesiredStateMutation::SetThemaArchived {
+                    thema_id: ThemaId::new(thema_id).unwrap(),
+                    expected_revision,
+                    archived: true,
+                },
+            )
+            .unwrap()
+        };
+        let operations = vec![
+            operation("archive-one", "one", 1),
+            operation("archive-two-stale", "two", 2),
+        ];
+
+        let first = store.apply_device_thema_mutations(&operations, 3).unwrap();
+
+        assert!(matches!(
+            &first[0].result,
+            DeviceMutationResult::Applied {
+                authoritative: DeviceMutationProjection::ThemaArchiveState {
+                    thema_id,
+                    revision: 2,
+                    archived: true,
+                },
+                ..
+            } if thema_id == "one"
+        ));
+        assert!(matches!(
+            first[1].result,
+            DeviceMutationResult::Rejected {
+                rejection: DeviceMutationRejection::RevisionConflict {
+                    expected: Some(2),
+                    actual: Some(1),
+                },
+                ..
+            }
+        ));
+        assert!(store.get_thema("one").unwrap().unwrap().archived);
+        assert!(!store.get_thema("two").unwrap().unwrap().archived);
+
+        let replay = store.apply_device_thema_mutations(&operations, 4).unwrap();
+        assert!(replay.iter().all(|execution| execution.replayed));
+        assert_eq!(
+            replay
+                .iter()
+                .map(|execution| &execution.result)
+                .collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|execution| &execution.result)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

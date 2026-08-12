@@ -11,10 +11,16 @@
 (defvar gnosis-themata--ewoc)
 (defvar gnosis-themata--loading-p)
 (defvar gnosis-themata--max-reviews)
+(defvar gnosis-themata--marked)
+(defvar gnosis-themata--pending-bulk)
 
 (declare-function gnosis-themata--current-id "gnosis-dashboard")
 (declare-function gnosis-themata--pretty-print "gnosis-dashboard")
 (declare-function gnosis-themata--pretty-print-default "gnosis-dashboard")
+(declare-function gnosis-themata-bulk-suspension "gnosis-dashboard")
+(declare-function gnosis-themata-cancel-bulk "gnosis-dashboard")
+(declare-function gnosis-themata-mark-all "gnosis-dashboard")
+(declare-function gnosis-themata-unmark-all "gnosis-dashboard")
 
 (defun gnosis-test-ewoc-dashboard--record (index)
   "Return valid compact thema record for INDEX."
@@ -42,6 +48,17 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                           (format "cursor-%06d" (+ start count))
                         gnosis-core--json-null)
            collect (gnosis-test-ewoc-dashboard--page start count next)))
+
+(defun gnosis-test-ewoc-dashboard--bulk-suspension-results (items)
+  "Return applied suspension results corresponding to ITEMS."
+  (mapcar
+   (lambda (item)
+     (let ((thema-id (plist-get item :thema_id))
+           (revision (plist-get item :expected_revision)))
+       `(:status :applied :thema_id ,thema-id
+         :projection (:thema_id ,thema-id
+                      :state (:state_revision ,(1+ revision) :suspended t)))))
+   items))
 
 (defun gnosis-test-ewoc-dashboard--ids ()
   "Return thema identities in current EWOC order."
@@ -821,6 +838,122 @@ NEXT defaults to the JSON null terminal marker.  GENERATION defaults to g1."
                       (ewoc-data (gethash "thema-new" gnosis-themata--nodes))
                       :catalog-ordinal)))
         (should (equal "thema-000001" (gnosis-themata--current-id)))))))
+
+(ert-deftest gnosis-dashboard-marks-complete-filtered-projection-across-pages ()
+  (gnosis-test-ewoc-dashboard--with-records 501
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (setq gnosis-themata--search-filter "Question 5")
+      (gnosis-themata-mark-all)
+      (should (= 12 (hash-table-count gnosis-themata--marked)))
+      (should (gethash "thema-000005" gnosis-themata--marked))
+      (should (gethash "thema-000500" gnosis-themata--marked))
+      (should-not (gethash "thema-000004" gnosis-themata--marked))
+      (gnosis-themata-unmark-all)
+      (should (= 0 (hash-table-count gnosis-themata--marked))))))
+
+(ert-deftest gnosis-dashboard-bulk-500-uses-one-request ()
+  (gnosis-test-ewoc-dashboard--with-records 500
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (let ((operation 0)
+            calls)
+        (gnosis-themata-mark-all)
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                  ((symbol-function 'gnosis-core-operation-id)
+                   (lambda () (format "bulk:%d" (cl-incf operation))))
+                  ((symbol-function 'gnosis-core-themata-set-suspended)
+                   (lambda (items _desired)
+                     (push items calls)
+                     (gnosis-test-ewoc-dashboard--bulk-suspension-results items))))
+          (gnosis-themata-bulk-suspension)
+          (gnosis-test-ewoc-dashboard--drain 'jobs))
+        (should (= 1 (length calls)))
+        (should (= 500 (length (car calls))))))))
+
+(ert-deftest gnosis-dashboard-bulk-501-is-ordered-and-publishes-once ()
+  (gnosis-test-ewoc-dashboard--with-records 501
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (let ((operation 0)
+            calls
+            (renders 0)
+            (render-function (symbol-function 'gnosis-themata--start-render)))
+        (should (gnosis-themata--goto-id "thema-000042"))
+        (move-to-column 7)
+        (let ((column (current-column)))
+          (gnosis-themata-mark-all)
+          (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                    ((symbol-function 'gnosis-core-operation-id)
+                     (lambda () (format "bulk:%d" (cl-incf operation))))
+                    ((symbol-function 'gnosis-core-themata-set-suspended)
+                     (lambda (items _desired)
+                       (setq calls (append calls (list items)))
+                       (gnosis-test-ewoc-dashboard--bulk-suspension-results items)))
+                    ((symbol-function 'gnosis-themata--start-render)
+                     (lambda (&rest arguments)
+                       (cl-incf renders)
+                       (apply render-function arguments))))
+            (gnosis-themata-bulk-suspension)
+            (gnosis-test-ewoc-dashboard--drain 'jobs))
+          (should (equal '(500 1) (mapcar #'length calls)))
+          (should (equal "thema-000000" (plist-get (car (car calls)) :thema_id)))
+          (should (equal "thema-000500" (plist-get (car (cadr calls)) :thema_id)))
+          (should (= 1 renders))
+          (should (equal "thema-000042" (gnosis-themata--current-id)))
+          (should (= column (current-column)))
+          (should (= 0 (hash-table-count gnosis-themata--marked))))))))
+
+(ert-deftest gnosis-dashboard-bulk-cancel-keeps-unsent-marked ()
+  (gnosis-test-ewoc-dashboard--with-records 501
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (let ((operation 0)
+            calls)
+        (gnosis-themata-mark-all)
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                  ((symbol-function 'gnosis-core-operation-id)
+                   (lambda () (format "bulk:%d" (cl-incf operation))))
+                  ((symbol-function 'cancel-timer) #'ignore)
+                  ((symbol-function 'gnosis-core-themata-set-suspended)
+                   (lambda (items _desired)
+                     (push items calls)
+                     (gnosis-test-ewoc-dashboard--bulk-suspension-results items))))
+          (gnosis-themata-bulk-suspension)
+          (let ((job (pop jobs))) (apply (car job) (cdr job)))
+          (gnosis-themata-cancel-bulk))
+        (should (= 1 (length calls)))
+        (should-not (gethash "thema-000000" gnosis-themata--marked))
+        (should (gethash "thema-000500" gnosis-themata--marked))
+        (should (= 1 (length (plist-get gnosis-themata--pending-bulk :items))))))))
+
+(ert-deftest gnosis-dashboard-bulk-rejection-and-uncertainty-retain-retry-state ()
+  (gnosis-test-ewoc-dashboard--with-records 2
+    (with-current-buffer gnosis-dashboard-buffer-name
+      (let ((operation 0)
+            calls)
+        (gnosis-themata-mark-all)
+        (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                  ((symbol-function 'gnosis-core-operation-id)
+                   (lambda () (format "bulk:%d" (cl-incf operation))))
+                  ((symbol-function 'gnosis-core-themata-set-suspended)
+                   (lambda (items _desired)
+                     (push items calls)
+                     (if (= 1 (length calls))
+                         (signal 'gnosis-core-mutation-uncertain '("lost"))
+                       (cons
+                        '(:status :rejected :thema_id "thema-000000"
+                          :reason "revision_conflict" :current_revision 1)
+                        (gnosis-test-ewoc-dashboard--bulk-suspension-results
+                         (cdr items)))))))
+          (gnosis-themata-bulk-suspension)
+          (gnosis-test-ewoc-dashboard--drain 'jobs)
+          (let ((first-ids (mapcar (lambda (item) (plist-get item :operation_id))
+                                   (car calls))))
+            (gnosis-themata-bulk-suspension)
+            (gnosis-test-ewoc-dashboard--drain 'jobs)
+            (should (equal first-ids
+                           (mapcar (lambda (item) (plist-get item :operation_id))
+                                   (car calls))))))
+        (should (gethash "thema-000000" gnosis-themata--marked))
+        (should-not (gethash "thema-000001" gnosis-themata--marked))
+        (should-not gnosis-themata--pending-bulk)))))
 
 (provide 'gnosis-test-ewoc-dashboard)
 ;;; gnosis-test-ewoc-dashboard.el ends here
