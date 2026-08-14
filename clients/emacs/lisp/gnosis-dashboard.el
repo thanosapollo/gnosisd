@@ -765,6 +765,8 @@ Without a prefix argument, show only never-reviewed themata."
   "Sort by COLUMN and progressively rebuild complete projection.
 With numeric prefix -1, restore authoritative catalog order."
   (interactive "P")
+  (when gnosis-themata--loading-p
+    (user-error "Wait for the complete Gnosis projection"))
   (let ((selected (gnosis-themata--current-id)))
     (if (equal column -1)
         (setq gnosis-themata--sort-key nil)

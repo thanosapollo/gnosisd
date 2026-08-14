@@ -408,6 +408,15 @@
     (should (eq (keymap-lookup gnosis-dashboard-themata-mode-map (car binding))
                 (cdr binding)))))
 
+(ert-deftest gnosis-themata-sort-rejects-incomplete-projection ()
+  (with-temp-buffer
+    (setq-local gnosis-themata--loading-p t)
+    (setq-local gnosis-themata--sort-key nil)
+    (cl-letf (((symbol-function 'gnosis-themata--current-id) #'ignore)
+              ((symbol-function 'gnosis-themata--render) #'ignore))
+      (should-error (gnosis-themata-sort 0) :type 'user-error))
+    (should-not gnosis-themata--sort-key)))
+
 (ert-deftest gnosis-dashboard-new-themata-route-applies-zero-review-filter ()
   (let (arguments)
     (cl-letf (((symbol-function 'gnosis-dashboard-themata)
