@@ -28,7 +28,6 @@
 (declare-function gnosis-dashboard--popup-description "gnosis")
 (declare-function gnosis-dashboard--review-description "gnosis")
 (declare-function gnosis-dashboard--active-session-p "gnosis")
-(declare-function gnosis-dashboard-review "gnosis")
 (declare-function gnosis-review "gnosis-review")
 (declare-function gnosis-review-resume "gnosis-review")
 (declare-function gnosis-review-topic "gnosis-review")
@@ -1574,7 +1573,7 @@ Without a prefix argument, show only never-reviewed themata."
   "h" ("Health" gnosis-dashboard-health :stay-open t)
   "H" ("Review history" gnosis-review-history)
   :group "Review"
-  "r" (#'gnosis-dashboard--review-description gnosis-dashboard-review)
+  "r" (#'gnosis-dashboard--review-description gnosis-review)
   "T" ("Review topic" gnosis-review-topic)
   "R" ("Active review controls" gnosis-review-resume
        :if #'gnosis-dashboard--active-session-p)

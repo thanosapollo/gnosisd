@@ -128,11 +128,6 @@
   "Return the review action appropriate for the dashboard projection."
   (if (gnosis-dashboard--active-session-p) "Resume review" "Start review"))
 
-(defun gnosis-dashboard-review ()
-  "Start or resume the server-owned due review flow."
-  (interactive)
-  (gnosis-review nil))
-
 (defun gnosis--display-link-descriptions (string)
   "Return STRING with bracket links replaced by their descriptions."
   (replace-regexp-in-string

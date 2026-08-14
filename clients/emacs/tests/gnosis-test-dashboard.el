@@ -338,7 +338,7 @@
 
 (ert-deftest gnosis-dashboard-keymap-restores-archived-navigation-hierarchy ()
   (dolist (binding '(("g" . gnosis-dashboard-refresh)
-                     ("r" . gnosis-dashboard-review)
+                     ("r" . gnosis-review)
                      ("a" . gnosis-dashboard-add-thema)
                      ("SPC" . gnosis-dashboard-search-themata)
                      ("h" . gnosis-dashboard-health)
@@ -527,13 +527,6 @@
    (equal (gnosis-dashboard--failure-message
            '(gnosis-core-authorization-error "secret server detail"))
           "Gnosis access denied. Check gnosisd token scopes.")))
-
-(ert-deftest gnosis-dashboard-primary-review-action-dispatches-existing-journey ()
-  (let (arguments)
-    (cl-letf (((symbol-function 'gnosis-review)
-               (lambda (&rest value) (setq arguments value))))
-      (gnosis-dashboard-review))
-    (should (equal arguments '(nil)))))
 
 (provide 'gnosis-test-dashboard)
 ;;; gnosis-test-dashboard.el ends here
