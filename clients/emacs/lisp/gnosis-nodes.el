@@ -1207,10 +1207,11 @@ With prefix argument REFRESH, rebuild the node catalog first."
 
 (defun gnosis-nodes-page-sort (column)
   "Sort the current node page by COLUMN."
-  (setq tabulated-list-sort-key (cons column nil))
-  (tabulated-list-init-header)
-  (tabulated-list-print t)
-  (goto-char (point-min)))
+  (let ((selected-id (tabulated-list-get-id)))
+    (setq tabulated-list-sort-key (cons column nil))
+    (tabulated-list-init-header)
+    (tabulated-list-print t)
+    (gnosis-nodes-page--restore-selection selected-id)))
 
 (keymap-popup-define gnosis-node-search-map
   "Search Nodes"

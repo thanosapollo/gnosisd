@@ -2346,6 +2346,25 @@
       (gnosis-nodes-page-refresh)
       (should (equal "node-a" (tabulated-list-get-id))))))
 
+(ert-deftest gnosis-node-page-sort-preserves-stable-selection ()
+  (let* ((first (gnosis-test-nodes--catalog-node
+                 "node-a" :title "Alpha" :logical_path "notes/z.org"))
+         (second (gnosis-test-nodes--catalog-node
+                  "node-b" :title "Beta" :logical_path "notes/m.org"))
+         (third (gnosis-test-nodes--catalog-node
+                 "node-c" :title "Gamma" :logical_path "notes/a.org")))
+    (with-temp-buffer
+      (gnosis-nodes-page-mode)
+      (gnosis-nodes-page--install
+       `(:items [,first ,second ,third] :next ,gnosis-core--json-null) nil)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (gnosis-nodes-page-sort "Path")
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (goto-char (point-min))
+      (should (equal "node-c" (tabulated-list-get-id))))))
+
 (ert-deftest gnosis-node-page-fetch-failures-preserve-all-page-state ()
   (let* ((token (make-string 40 ?a))
          (gnosis-core--base-url-override "https://test.example")
