@@ -41,9 +41,15 @@
     :tags ["geography"] :concepts [] :asset_paths [])
   "Multiple-choice request used by editor tests.")
 
+(defun gnosis-test-edit--render-request (request)
+  "Install REQUEST through the real editor lifecycle."
+  (unless (derived-mode-p 'gnosis-edit-mode)
+    (gnosis-edit-mode))
+  (gnosis-edit--replace-request request))
+
 (ert-deftest gnosis-edit-basic-authoring-round-trip-is-lossless ()
   (with-temp-buffer
-    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (gnosis-test-edit--render-request gnosis-test-edit--request)
     (let ((text (buffer-string)))
       (should (string-prefix-p "* Thema [basic]\n\n** Question\n" text))
       (should (string-match-p (regexp-quote "\n** Hint\n") text))
@@ -55,7 +61,7 @@
 
 (ert-deftest gnosis-edit-cloze-authoring-derives-answers-and-hints ()
   (with-temp-buffer
-    (insert (gnosis-edit--render gnosis-test-edit--cloze-request))
+    (gnosis-test-edit--render-request gnosis-test-edit--cloze-request)
     (let ((text (buffer-string)))
       (should (string-prefix-p "* Thema [cloze]\n\n** Text\n" text))
       (should (string-match-p
@@ -134,7 +140,7 @@
            :review_image ,gnosis-core--json-null
            :tags [] :concepts [] :asset_paths [])))
     (with-temp-buffer
-      (insert (gnosis-edit--render request))
+      (gnosis-test-edit--render-request request)
       (should (string-match-p (regexp-quote "\\{{braces}}")
                               (buffer-string)))
       (should (equal request (gnosis-edit--parse))))))
@@ -176,7 +182,7 @@
 
 (ert-deftest gnosis-edit-cloze-authoring-compiles-edited-markers ()
   (with-temp-buffer
-    (insert (gnosis-edit--render gnosis-test-edit--cloze-request))
+    (gnosis-test-edit--render-request gnosis-test-edit--cloze-request)
     (goto-char (point-min))
     (search-forward "{{Greece :: country}}")
     (replace-match "{{Hellas :: nation}}" t t)
@@ -190,7 +196,7 @@
 
 (ert-deftest gnosis-edit-choice-authoring-selects-answer-in-place ()
   (with-temp-buffer
-    (insert (gnosis-edit--render gnosis-test-edit--choice-request))
+    (gnosis-test-edit--render-request gnosis-test-edit--choice-request)
     (let ((text (buffer-string)))
       (should (string-prefix-p "* Thema [mcq]\n\n** Question\n" text))
       (should (string-match-p (regexp-quote "- [x] Athens") text))
@@ -204,7 +210,7 @@
                    :answer ["Answer"]
                    :concepts [(:node_id "node/id" :relation "primary")])))
     (with-temp-buffer
-      (insert (gnosis-edit--render request))
+      (gnosis-test-edit--render-request request)
       (should (string-match-p "^\\*\\* Tags \\[omitted\\]$"
                               (buffer-string)))
       (should (equal request (gnosis-edit--parse))))))
@@ -234,8 +240,7 @@
   (let ((request '(:kind "basic" :keimenon "Question" :answer ["Answer"]))
         sent)
     (with-temp-buffer
-      (gnosis-edit-mode)
-      (insert (gnosis-edit--render request))
+      (gnosis-test-edit--render-request request)
       (cl-letf (((symbol-function 'gnosis-core-operation-id)
                  (lambda () "op:absent"))
                 ((symbol-function 'gnosis-edit--send-authorized)
@@ -269,7 +274,7 @@
                         :review_image gnosis-core--json-null
                         :tags ["logic"] :concepts [] :asset_paths [])))
     (with-temp-buffer
-      (insert (gnosis-edit--render request))
+      (gnosis-test-edit--render-request request)
       (should (string-match-p "^\\\\\\*\\*\\* Hidden$" (buffer-string)))
       (should (equal request (gnosis-edit--parse))))
     (with-temp-buffer
@@ -390,20 +395,54 @@
 (ert-deftest gnosis-edit-activate-makes-null-field-editable ()
   (with-temp-buffer
     (gnosis-edit-mode)
-    (gnosis-edit--replace-request gnosis-test-edit--request)
+    (gnosis-edit--replace-request gnosis-test-edit--choice-request)
     (goto-char (point-min))
-    (re-search-forward "^\\*\\* Source GUID \\[none\\]$")
+    (re-search-forward "^\\*\\* Review image \\[none\\]$")
     (beginning-of-line)
     (cl-letf (((symbol-function 'completing-read)
                (lambda (&rest _) "value")))
       (gnosis-edit-activate))
     (should-not (get-text-property (point) 'read-only))
-    (should (equal "** Source GUID"
+    (should (equal "** Review image"
                    (buffer-substring-no-properties
                     (line-beginning-position 0) (line-end-position 0))))
-    (insert "source-guid")
-    (should (equal "source-guid"
-                   (plist-get (gnosis-edit--parse) :source_guid)))))
+    (insert "image.png")
+    (should (equal "image.png"
+                   (plist-get (gnosis-edit--parse) :review_image)))))
+
+(ert-deftest gnosis-edit-source-guid-is-hidden-and-preserved ()
+  (let ((request (copy-tree gnosis-test-edit--request t)) sent)
+    (plist-put request :source_guid "source-guid")
+    (with-temp-buffer
+      (gnosis-test-edit--render-request request)
+      (should-not (string-match-p "Source GUID\\|source-guid"
+                                  (buffer-string)))
+      (goto-char (point-min))
+      (re-search-forward "^\\*\\* Question$")
+      (forward-line 1)
+      (insert "edited ")
+      (cl-letf (((symbol-function 'gnosis-core-operation-id)
+                 (lambda () "op:source-guid"))
+                ((symbol-function 'gnosis-edit--send-authorized)
+                 (lambda (_operation-id payload _thema-id _revision)
+                   (setq sent payload)
+                   'projection))
+                ((symbol-function 'gnosis-edit--accept) #'identity))
+        (gnosis-edit-save))
+      (should (equal "source-guid" (plist-get sent :source_guid))))))
+
+(ert-deftest gnosis-edit-rejects-invalid-source-guid-before-opening ()
+  (let ((name " *gnosis-edit-invalid-source-guid*")
+        (request (copy-tree gnosis-test-edit--request t)))
+    (plist-put request :source_guid ["not" "a" "guid"])
+    (unwind-protect
+        (progn
+          (should-error
+           (gnosis-edit--open name request nil nil 'authority nil)
+           :type 'user-error)
+          (should-not (get-buffer name)))
+      (when-let* ((buffer (get-buffer name)))
+        (kill-buffer buffer)))))
 
 (ert-deftest gnosis-edit-activate-selects-choice-at-point ()
   (with-temp-buffer
@@ -755,7 +794,7 @@
       (setq-local gnosis-edit--authority 'test-authority)
       (setq-local gnosis-edit--after-save
                   (lambda (projection) (setq callback projection)))
-      (insert (gnosis-edit--render gnosis-test-edit--request))
+      (gnosis-test-edit--render-request gnosis-test-edit--request)
       (cl-letf (((symbol-function 'gnosis-core-operation-id)
                  (lambda ()
                    (cl-incf operation-calls)
@@ -803,7 +842,7 @@
       (setq-local gnosis-edit--authority 'opening-authority)
       (setq-local gnosis-edit--after-save
                   (lambda (_) (signal 'error '("callback failed"))))
-      (insert (gnosis-edit--render gnosis-test-edit--request))
+      (gnosis-test-edit--render-request gnosis-test-edit--request)
       (let ((projection
              `(:thema_id "thema-a" :revision 8
                :kind "basic" :keimenon "Question" :hypothesis ["guess"]
@@ -830,8 +869,7 @@
 
 (ert-deftest gnosis-edit-save-rejects-missing-opening-authority ()
   (with-temp-buffer
-    (gnosis-edit-mode)
-    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (gnosis-test-edit--render-request gnosis-test-edit--request)
     (let ((mutations 0))
       (cl-letf (((symbol-function 'gnosis-core-thema-create)
                  (lambda (&rest _) (cl-incf mutations))))
@@ -843,7 +881,11 @@
   (with-temp-buffer
     (gnosis-edit-mode)
     (setq-local gnosis-edit--authority 'opening-authority)
-    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (gnosis-test-edit--render-request gnosis-test-edit--request)
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Question$")
+    (forward-line 1)
+    (insert "edited ")
     (let ((mutations 0))
       (cl-letf (((symbol-function 'gnosis-core--token) (lambda () "live-token"))
                 ((symbol-function 'gnosis-core--authenticated-authority)
@@ -862,7 +904,7 @@
     (setq-local gnosis-edit--authority 'test-authority)
     (setq-local gnosis-edit--thema-id "opaque/thema")
     (setq-local gnosis-edit--revision 7)
-    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (gnosis-test-edit--render-request gnosis-test-edit--request)
     (let ((before (buffer-string))
           calls)
       (cl-letf (((symbol-function 'gnosis-core-operation-id)
@@ -887,7 +929,7 @@
   (with-temp-buffer
     (gnosis-edit-mode)
     (setq-local gnosis-edit--authority 'test-authority)
-    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (gnosis-test-edit--render-request gnosis-test-edit--request)
     (let ((calls 0)
           operation-ids)
       (cl-letf (((symbol-function 'gnosis-core-operation-id)
@@ -921,15 +963,16 @@
     (setq-local gnosis-edit--thema-id "changed-target")
     (setq-local gnosis-edit--revision 99)
     (setq-local gnosis-edit--authority 'test-authority)
-    (insert (gnosis-edit--render gnosis-test-edit--request))
+    (gnosis-test-edit--render-request gnosis-test-edit--request)
     (let ((retained (copy-tree gnosis-test-edit--request t))
           arguments)
       (setq-local gnosis-edit--recovery
                   (list :operation-id "op:uncertain"
                         :thema-id "original-target" :revision 7
                         :request retained))
-      (erase-buffer)
-      (insert "{\"kind\":\"changed\"}")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "{\"kind\":\"changed\"}"))
       (cl-letf (((symbol-function 'gnosis-core--token)
                  (lambda () "test-token"))
                 ((symbol-function 'gnosis-core--authenticated-authority)
