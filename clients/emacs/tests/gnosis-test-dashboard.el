@@ -52,7 +52,7 @@
   (let ((text (gnosis--dashboard-text (gnosis-test-dashboard--projection))))
     (dolist (value '("Connection: Ready"
                      "Reviewed today: 8 (New: 2)"
-                     "Due themata: 4 (Overdue: 1)"
+                     "Due: 4 (New: 3 Overdue: 1)"
                      "Content: 12 themata, 2 documents, 7 nodes"
                      "Last 30 days: 20 reviews, success rate 0.75"
                      "Activity: 4 active days; 0.67/calendar day, 5.00/active day"
@@ -529,8 +529,13 @@
     (gnosis--render-dashboard (gnosis-test-dashboard--projection))
     (dolist (pair '(("Connection:" . shadow)
                     ("Ready" . success)
+                    ("Reviewed today: 8" . success)
+                    ("New: 2" . font-lock-keyword-face)
                     ("6 successful" . success)
                     ("2 failed" . error)
+                    ("Due: 4" . error)
+                    ("New: 3" . font-lock-keyword-face)
+                    ("Overdue: 1" . warning)
                     ("4 active days" . font-lock-type-face)
                     ("3 days" . success)))
       (goto-char (point-min))
