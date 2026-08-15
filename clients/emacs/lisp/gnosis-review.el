@@ -598,6 +598,8 @@ When a review is active, prompt to resume it, replace it, or cancel."
   (interactive
    (list (read-string "Topic node ID: ")
          (when current-prefix-arg (read-number "Target count: " 20))))
+  (unless (and (stringp topic-node-id) (not (string-empty-p topic-node-id)))
+    (user-error "Topic node ID must be a non-empty string"))
   (setq target-count (gnosis-review--normalize-target-count target-count))
   (let ((source (gnosis-review--source "topic")))
     (setq source (plist-put source :topic_node_id topic-node-id))

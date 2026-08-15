@@ -1382,6 +1382,16 @@
         (should-error (gnosis-review-topic "topic" invalid) :type 'user-error)
         (should-not events)))))
 
+(ert-deftest gnosis-review-topic-id-validation-precedes-authority ()
+  (let (events)
+    (cl-letf (((symbol-function 'gnosis-review--call-with-current-authority)
+               (lambda (_) (push 'authority events)))
+              ((symbol-function 'gnosis-review--start)
+               (lambda (&rest _) (push 'start events))))
+      (dolist (invalid '(nil 1 ""))
+        (should-error (gnosis-review-topic invalid) :type 'user-error)
+        (should-not events)))))
+
 (ert-deftest gnosis-review-public-target-boundaries-preserve-defaults ()
   (let (started)
     (cl-letf (((symbol-function 'gnosis-review--call-with-current-authority)
