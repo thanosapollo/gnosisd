@@ -637,6 +637,58 @@
                        (gnosis-review--read-answer)))
         (should (= reads 1))))))
 
+(ert-deftest gnosis-review-cancelled-progressive-cloze-restores-presentation ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--attempt
+          (gnosis-test-review--attempt
+           "pending" (list :kind "texts"
+                           :input_scripts
+                           (vector gnosis-core--json-null
+                                   gnosis-core--json-null)))
+          gnosis-review--answer-locked-p nil)
+    (let* ((presentation (plist-get gnosis-review--attempt :presentation))
+           (original-question "(...) and (...)")
+           (original-spans
+            [(:start_byte 0 :end_byte 5 :state "concealed")
+             (:start_byte 10 :end_byte 15 :state "concealed")])
+           (reads 0)
+           answer-sent)
+      (setf (plist-get presentation :question) original-question
+            (plist-get presentation :cloze_spans) original-spans)
+      (cl-letf (((symbol-function 'gnosis-review--read-string)
+                 (lambda (&rest _)
+                   (cl-incf reads)
+                   (if (= reads 1) "alpha" (signal 'quit nil))))
+                ((symbol-function 'gnosis-core-review-attempt-check-cloze)
+                 (lambda (&rest _)
+                   `(:matches [t] :all_entered_correct t :complete nil
+                     :question "alpha and (...)"
+                     :cloze_spans
+                     [(:start_byte 0 :end_byte 5 :state "correct")
+                      (:start_byte 10 :end_byte 15 :state "concealed")]
+                     :next_input_script ,gnosis-core--json-null)))
+                ((symbol-function 'gnosis-core-review-attempt-answer)
+                 (lambda (&rest _) (setq answer-sent t)))
+                ((symbol-function 'gnosis-review--render) #'ignore))
+        (should
+         (eq 'quit
+             (condition-case nil
+                 (progn (gnosis-review--answer-current) 'returned)
+               (quit 'quit)))))
+      (should (= reads 2))
+      (should-not answer-sent)
+      (should-not gnosis-review--answer-locked-p)
+      (should (equal "pending" (plist-get gnosis-review--attempt :status)))
+      (should (equal original-question
+                     (plist-get
+                      (plist-get gnosis-review--attempt :presentation)
+                      :question)))
+      (should (equal original-spans
+                     (plist-get
+                      (plist-get gnosis-review--attempt :presentation)
+                      :cloze_spans))))))
+
 (ert-deftest gnosis-review-render-never-grades-or-discloses-pending-answer ()
   (with-temp-buffer
     (gnosis-review-mode)

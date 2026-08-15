@@ -572,12 +572,26 @@ When a review is active, prompt to resume it, replace it, or cancel."
   "Return non-nil when CONDITION reports a stale review attempt."
   (equal "stale_attempt" (nth 2 condition)))
 
+(defun gnosis-review--read-complete-answer ()
+  "Read one answer, restoring its presentation after a nonlocal exit."
+  (let ((presentation
+         (copy-tree (plist-get gnosis-review--attempt :presentation)))
+        (complete nil)
+        answer)
+    (unwind-protect
+        (setq answer (gnosis-review--read-answer)
+              complete t)
+      (unless complete
+        (setf (plist-get gnosis-review--attempt :presentation) presentation)
+        (gnosis-review--render)))
+    answer))
+
 (defun gnosis-review--answer-current (&optional show-popup)
   "Submit one response and show actions when SHOW-POPUP is non-nil."
   (unless (gnosis-review--answerable-p)
     (user-error "Attempt cannot be answered; refresh authoritative state"))
   (let* ((attempt-id (plist-get gnosis-review--attempt :attempt_id))
-         (answer (gnosis-review--read-answer))
+         (answer (gnosis-review--read-complete-answer))
          answered-attempt
          uncertain
          state)
