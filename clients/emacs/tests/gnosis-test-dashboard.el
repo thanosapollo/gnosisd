@@ -550,10 +550,12 @@
     (should-not display-line-numbers)
     (should (functionp revert-buffer-function))))
 
-(ert-deftest gnosis-dashboard-refresh-preserves-buffer-on-summary-failure ()
+(ert-deftest gnosis-dashboard-refresh-failure-clears-stale-ready-state ()
   (with-temp-buffer
     (gnosis-dashboard-mode)
-    (let ((inhibit-read-only t)) (insert "existing projection"))
+    (setq gnosis-dashboard--projection
+          (gnosis-test-dashboard--projection '(:session_id "stale")))
+    (gnosis--render-dashboard gnosis-dashboard--projection)
     (cl-letf (((symbol-function 'gnosis-core-dashboard)
                (lambda (&rest _) (signal 'gnosis-core-unavailable '("down")))))
       (let ((condition (should-error (gnosis-dashboard-refresh)
@@ -561,7 +563,11 @@
         (should
          (equal (cadr condition)
                 "gnosisd unavailable. Check service and gnosis-core-base-url.")))
-      (should (equal "existing projection" (buffer-string))))))
+      (should-not gnosis-dashboard--projection)
+      (should (equal "Start review" (gnosis-dashboard--review-description)))
+      (should (string-match-p "gnosisd unavailable" (buffer-string)))
+      (should-not (string-match-p "Connection:.*Ready" (buffer-string)))
+      (should-not (string-match-p "Due themata:" (buffer-string))))))
 
 (ert-deftest gnosis-dashboard-failure-messages-are-public-safe ()
   (should

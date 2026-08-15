@@ -22,6 +22,7 @@
 (require 'tabulated-list)
 
 (declare-function gnosis--dashboard-text "gnosis")
+(declare-function gnosis--render-dashboard-failure "gnosis")
 (declare-function gnosis--separator "gnosis")
 (declare-function gnosis--center-text "gnosis")
 (declare-function gnosis-dashboard--failure-message "gnosis")
@@ -1453,6 +1454,8 @@ Start fresh catalog traversal when INITIAL is non-nil."
         (setq gnosis-dashboard--projection projection)
         (gnosis--render-dashboard projection))
     (gnosis-core-error
+     (setq gnosis-dashboard--projection nil)
+     (gnosis--render-dashboard-failure condition)
      (user-error "%s" (gnosis-dashboard--failure-message condition)))))
 
 ;;;###autoload
