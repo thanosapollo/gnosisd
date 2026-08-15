@@ -1273,8 +1273,18 @@ With prefix argument REFRESH, rebuild the node catalog first."
                              (append (or (plist-get record :tags) []) nil)
                              ", ")))))
 
-(defun gnosis-nodes-page--install (page cursor)
-  "Install fetched PAGE for CURSOR in the current result buffer."
+(defun gnosis-nodes-page--restore-selection (selected-id)
+  "Restore SELECTED-ID in the current page, falling back to its first row."
+  (goto-char (point-min))
+  (when selected-id
+    (while (and (not (eobp))
+                (not (equal selected-id (tabulated-list-get-id))))
+      (forward-line 1))
+    (unless (equal selected-id (tabulated-list-get-id))
+      (goto-char (point-min)))))
+
+(defun gnosis-nodes-page--install (page cursor &optional selected-id)
+  "Install fetched PAGE for CURSOR, restoring optional SELECTED-ID."
   (let* ((items (plist-get page :items))
          (records (make-hash-table :test #'equal)))
     (cl-loop for record across items
@@ -1288,7 +1298,7 @@ With prefix argument REFRESH, rebuild the node catalog first."
           (cl-loop for record across items
                    collect (gnosis-nodes-page--entry record)))
     (tabulated-list-print t)
-    (goto-char (point-min))))
+    (gnosis-nodes-page--restore-selection selected-id)))
 
 (defun gnosis-nodes-page--with-authority (function)
   "Call FUNCTION under this page's authenticated authority."
@@ -1310,12 +1320,12 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (gnosis-nodes-page--with-authority
    (lambda () (funcall gnosis-nodes-page--fetch cursor))))
 
-(defun gnosis-nodes-page--load (cursor)
-  "Load CURSOR through the current page fetcher."
+(defun gnosis-nodes-page--load (cursor &optional selected-id)
+  "Load CURSOR through the page fetcher, restoring optional SELECTED-ID."
   (unless gnosis-nodes-page--fetch
     (user-error "No Gnosis page source"))
   (gnosis-nodes-page--install
-   (gnosis-nodes-page--fetch-page cursor) cursor))
+   (gnosis-nodes-page--fetch-page cursor) cursor selected-id))
 
 (defun gnosis-nodes-page-open (title fetch)
   "Open a node page named TITLE using single-argument FETCH."
@@ -1362,7 +1372,8 @@ With prefix argument REFRESH, rebuild the node catalog first."
 (defun gnosis-nodes-page-refresh ()
   "Refresh the current result page."
   (interactive)
-  (gnosis-nodes-page--load gnosis-nodes-page--cursor))
+  (gnosis-nodes-page--load gnosis-nodes-page--cursor
+                           (tabulated-list-get-id)))
 
 (defun gnosis-nodes-page-visit ()
   "Visit the node or content-hit document at point."

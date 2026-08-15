@@ -2322,6 +2322,30 @@
       (should (equal '(nil "node-a") (nreverse calls)))
       (should (equal "node-b" (tabulated-list-get-id))))))
 
+(ert-deftest gnosis-node-page-refresh-preserves-stable-selection ()
+  (let* ((token (make-string 40 ?a))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (first (gnosis-test-nodes--catalog-node "node-a" :title "Alpha"))
+         (second (gnosis-test-nodes--catalog-node "node-b" :title "Beta"))
+         (items (vector first second)))
+    (with-temp-buffer
+      (gnosis-nodes-page-mode)
+      (setq-local gnosis-nodes-page--authority
+                  (list gnosis-core--base-url-override (secure-hash 'sha256 token))
+                  gnosis-nodes-page--fetch
+                  (lambda (_cursor)
+                    `(:items ,items :next ,gnosis-core--json-null)))
+      (gnosis-nodes-page--load nil)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (gnosis-nodes-page-refresh)
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (setq items (vector first))
+      (gnosis-nodes-page-refresh)
+      (should (equal "node-a" (tabulated-list-get-id))))))
+
 (ert-deftest gnosis-node-page-fetch-failures-preserve-all-page-state ()
   (let* ((token (make-string 40 ?a))
          (gnosis-core--base-url-override "https://test.example")
