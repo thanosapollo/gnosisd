@@ -550,7 +550,7 @@
                  "logos")))
       (should (equal '(:kind "text" :value "logos")
                      (gnosis-review--read-answer)))
-      (should (equal '("Answer: " "Greek") arguments))))
+      (should (equal '("Answer (Greek): " "Greek") arguments))))
   (let ((gnosis-review--attempt
           (gnosis-test-review--attempt
           "pending" (list :kind "texts"
@@ -576,7 +576,7 @@
                        :cloze_spans
                        [(:start_byte 0 :end_byte 5 :state "concealed")
                         (:start_byte 10 :end_byte 14 :state "correct")]
-                       :next_input_script nil)
+                       :next_input_script "Greek")
                    `(:matches [t t] :all_entered_correct t :complete t
                      :question "alpha and beta"
                      :cloze_spans
@@ -593,8 +593,9 @@
        (equal '(:kind "texts" :value ["beta" "alpha"])
               (gnosis-review--read-answer)))
       (should (equal '(["beta"] ["beta" "alpha"]) (nreverse checks)))
-      (should (equal '("Answer: " "Answer: ") (nreverse prompts)))
-      (should (equal (list gnosis-core--json-null nil)
+      (should (equal '("Answer 1: " "Answer 2 (Greek): ")
+                     (nreverse prompts)))
+      (should (equal (list gnosis-core--json-null "Greek")
                      (nreverse scripts)))
       (should (equal '("(...) and beta" "alpha and beta")
                      (nreverse questions)))))
