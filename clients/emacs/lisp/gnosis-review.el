@@ -87,11 +87,29 @@
   "Return non-nil when the current attempt can be mutated."
   (equal "graded" (plist-get gnosis-review--attempt :status)))
 
+(defun gnosis-review--session-progress (session)
+  "Return one-based SESSION progress as (POSITION . LENGTH), or nil."
+  (let ((position (plist-get session :current_position))
+        (length (plist-get session :queue_length)))
+    (and (natnump position) (natnump length) (cons (1+ position) length))))
+
 (defun gnosis-review--session-label ()
   "Return a compact progress label for the current session."
-  (format "Review %d/%d"
-          (1+ (plist-get gnosis-review--session :current_position))
-          (plist-get gnosis-review--session :queue_length)))
+  (if-let* ((progress (gnosis-review--session-progress gnosis-review--session)))
+      (format "Review %d/%d" (car progress) (cdr progress))
+    "Review"))
+
+(defun gnosis-review--header-line ()
+  "Return semantic one-based review progress for the header line."
+  (if-let* ((progress (gnosis-review--session-progress gnosis-review--session)))
+      (gnosis-center-string
+       (concat "Review "
+               (propertize (number-to-string (car progress))
+                           'face 'font-lock-type-face)
+               (propertize "/" 'face 'shadow)
+               (propertize (number-to-string (cdr progress))
+                           'face 'font-lock-type-face)))
+    ""))
 
 (defun gnosis-review--popup-description ()
   "Return public-safe context text for review popup help."
@@ -143,19 +161,6 @@
         :topic_forward_depth gnosis-core--json-null
         :topic_backward_depth gnosis-core--json-null
         :manual_ids []))
-
-(defun gnosis-review--header-line ()
-  "Return semantic one-based review progress for the header line."
-  (gnosis-center-string
-   (concat "Review "
-           (propertize
-            (number-to-string
-             (1+ (plist-get gnosis-review--session :current_position)))
-            'face 'font-lock-type-face)
-           (propertize "/" 'face 'shadow)
-           (propertize
-            (number-to-string (plist-get gnosis-review--session :queue_length))
-            'face 'font-lock-type-face))))
 
 (defun gnosis-review--session-complete-p (session)
   "Return non-nil when SESSION has no remaining review item."

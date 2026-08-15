@@ -171,6 +171,21 @@
      (string-prefix-p
       "Review 2/2" (string-trim-left (gnosis-review--header-line))))))
 
+(ert-deftest gnosis-review-complete-does-not-crash-header-after-clearing-session ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt))
+    (cl-letf (((symbol-function 'message)
+               (lambda (&rest _)
+                 (gnosis-review--header-line)
+                 (gnosis-review--popup-description)))
+              ((symbol-function 'kill-buffer) #'ignore))
+      (gnosis-review--complete)
+      (should-not gnosis-review--session)
+      (should (equal "" (gnosis-review--header-line)))
+      (should (string-prefix-p "Review" (gnosis-review--popup-description))))))
+
 (ert-deftest gnosis-review-source-is-closed-due-view ()
   (let ((source (gnosis-review--source "due")))
     (should (equal "due" (plist-get source :kind)))
