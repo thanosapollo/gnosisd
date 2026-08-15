@@ -269,6 +269,7 @@ fn data_router() -> Router<HttpState> {
         )
         .route("/v1/review/sessions/active", get(active_session))
         .route("/v1/review/sessions/{id}", get(review_session))
+        .route("/v1/review/sessions/{id}/replace", post(replace_session))
         .route("/v1/review/sessions/{id}/resume", post(resume_session))
         .route("/v1/review/sessions/{id}/quit", post(quit_session))
         .route("/v1/review/sessions/{id}/abort", post(abort_session))
@@ -1998,6 +1999,31 @@ async fn create_session(
         Json(ReviewSessionV1::from_application(&session).map_err(|_| ApiError::internal())?),
     ))
 }
+async fn replace_session(
+    State(state): State<HttpState>,
+    Extension(principal): Extension<DevicePrincipal>,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<ReviewSessionRequestV1>,
+) -> Result<(StatusCode, Json<ReviewSessionV1>), ApiError> {
+    require(&principal, DeviceScope::Review)?;
+    let (source, target_count) = input.into_application();
+    let session = state
+        .service
+        .replace_review_session(
+            id,
+            source,
+            target_count,
+            online_review_actor(),
+            Some(principal.device_id),
+            now_us()?,
+        )
+        .await
+        .map_err(ApiError::service)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ReviewSessionV1::from_application(&session).map_err(|_| ApiError::internal())?),
+    ))
+}
 async fn active_session(
     State(state): State<HttpState>,
     Extension(principal): Extension<DevicePrincipal>,
@@ -3581,6 +3607,15 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
             "ReviewSessionSummaryV1",
             &["401", "403", "404", "408", "500", "503"],
         )),
+        ("/v1/review/sessions/{id}/replace", "post") => Some(json_contract(
+            "review",
+            Some("ReviewSessionRequestV1"),
+            "201",
+            "ReviewSessionV1",
+            &[
+                "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
+        )),
         ("/v1/review/sessions/{id}/resume", "post") => Some(json_contract(
             "review",
             None,
@@ -3993,6 +4028,7 @@ const OPENAPI_OPERATIONS: &[(&str, &str)] = &[
     ("/v1/review/sessions", "post"),
     ("/v1/review/sessions/active", "get"),
     ("/v1/review/sessions/{id}", "get"),
+    ("/v1/review/sessions/{id}/replace", "post"),
     ("/v1/review/sessions/{id}/resume", "post"),
     ("/v1/review/sessions/{id}/quit", "post"),
     ("/v1/review/sessions/{id}/abort", "post"),
@@ -4866,6 +4902,9 @@ mod tests {
             "200",
             "ReviewSessionSummaryV1",
         );
+        let replace = &paths["/v1/review/sessions/{id}/replace"]["post"];
+        assert_schema_ref(replace, "requestBody", "ReviewSessionRequestV1");
+        assert_response_schema(replace, "201", "ReviewSessionV1");
         let history = &paths["/v1/review/history"]["get"];
         assert_response_schema(history, "200", "ReviewHistoryPageV1");
         assert_eq!(
@@ -4939,6 +4978,12 @@ mod tests {
         assert_response_statuses(
             &paths["/v1/review/sessions/active"]["get"],
             &["200", "401", "403", "408", "500", "503"],
+        );
+        assert_response_statuses(
+            &paths["/v1/review/sessions/{id}/replace"]["post"],
+            &[
+                "201", "400", "401", "403", "404", "408", "409", "413", "422", "500", "503",
+            ],
         );
         assert_response_statuses(
             &paths["/v1/review/sessions/{id}/resume"]["post"],
@@ -7330,6 +7375,119 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stale_override.status(), StatusCode::NOT_FOUND);
+        drop(service);
+        runtime.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn online_review_replacement_is_atomic_across_devices() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServiceRuntime::start(
+            directory.path().join("gnosis.sqlite"),
+            directory.path().join("blobs"),
+            8,
+        )
+        .await
+        .unwrap();
+        let service = runtime.handle();
+        let first = generate_device("first".into(), vec!["review".into()]).unwrap();
+        let first_token = first.token.clone();
+        service.create_device(first, 1).await.unwrap();
+        let second = generate_device("second".into(), vec!["review".into()]).unwrap();
+        let second_token = second.token.clone();
+        let second_id = second.device_id.clone();
+        service.create_device(second, 2).await.unwrap();
+        for (id, question) in [("first", "First"), ("second", "Second"), ("third", "Third")] {
+            put_custom_review_thema(
+                &service,
+                id,
+                "basic",
+                question,
+                vec![None],
+                vec!["answer".into()],
+                None,
+            )
+            .await;
+        }
+        let app = router(service.clone());
+        let created = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                "/v1/review/sessions",
+                &first_token,
+                Body::from(review_session_body("first")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let first_session_id = response_json(created).await["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let empty = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/sessions/{first_session_id}/replace"),
+                &second_token,
+                Body::from(review_session_body("missing")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            authenticated_json(&app, &first_token, "/v1/review/sessions/active").await["session"]["session_id"],
+            first_session_id
+        );
+
+        let replaced = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/sessions/{first_session_id}/replace"),
+                &second_token,
+                Body::from(review_session_body("second")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), StatusCode::CREATED);
+        let replacement = response_json(replaced).await;
+        let replacement_id = replacement["session_id"].as_str().unwrap().to_owned();
+        assert_ne!(replacement_id, first_session_id);
+        assert_eq!(replacement["owner_device_id"], second_id);
+
+        let stale_empty = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/sessions/{first_session_id}/replace"),
+                &first_token,
+                Body::from(review_session_body("missing")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale_empty.status(), StatusCode::CONFLICT);
+
+        let stale = app
+            .clone()
+            .oneshot(authorized(
+                "POST",
+                &format!("/v1/review/sessions/{first_session_id}/replace"),
+                &first_token,
+                Body::from(review_session_body("third")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            authenticated_json(&app, &second_token, "/v1/review/sessions/active").await["session"]
+                ["session_id"],
+            replacement_id
+        );
+
+        drop(app);
         drop(service);
         runtime.finish().await.unwrap();
     }

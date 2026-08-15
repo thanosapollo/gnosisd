@@ -22,13 +22,13 @@
 (require 'tabulated-list)
 
 (declare-function gnosis--dashboard-text "gnosis")
+(declare-function gnosis--render-dashboard-failure "gnosis")
 (declare-function gnosis--separator "gnosis")
 (declare-function gnosis--center-text "gnosis")
 (declare-function gnosis-dashboard--failure-message "gnosis")
 (declare-function gnosis-dashboard--popup-description "gnosis")
 (declare-function gnosis-dashboard--review-description "gnosis")
 (declare-function gnosis-dashboard--active-session-p "gnosis")
-(declare-function gnosis-dashboard-review "gnosis")
 (declare-function gnosis-review "gnosis-review")
 (declare-function gnosis-review-resume "gnosis-review")
 (declare-function gnosis-review-topic "gnosis-review")
@@ -102,12 +102,13 @@
 (defun gnosis-themata--column-format (width)
   "Return thema column widths proportioned for window WIDTH."
   (let ((available (max 56 (- width 8))))
-    (vector (max 10 (/ (* available 30) 100))
+    (vector (max 10 (/ (* available 27) 100))
+            (max 8 (/ (* available 16) 100))
+            (max 8 (/ (* available 16) 100))
             (max 8 (/ (* available 17) 100))
-            (max 8 (/ (* available 17) 100))
-            (max 8 (/ (* available 19) 100))
-            (max 5 (/ (* available 10) 100))
-            (max 5 (/ (* available 7) 100)))))
+            (max 5 (/ (* available 9) 100))
+            (max 5 (/ (* available 7) 100))
+            (max 5 (/ (* available 8) 100)))))
 
 (defun gnosis-themata--display-list (values)
   "Return one-line comma-separated text for vector VALUES."
@@ -135,6 +136,7 @@
     (gnosis-themata--display-list (plist-get record :answer)))
    (gnosis-themata--display-list (plist-get record :tags))
    (plist-get record :kind)
+   (gnosis-themata--yes-no (plist-get record :archived))
    (gnosis-themata--yes-no (plist-get record :suspended))))
 
 (defun gnosis-themata--column-text (text width index face)
@@ -148,9 +150,11 @@
   "Return one propertized dashboard row for RECORD."
   (let* ((columns (gnosis-themata--columns record))
          (widths gnosis-themata--column-widths)
+         (archived (eq t (plist-get record :archived)))
          (suspended (eq t (plist-get record :suspended)))
          (faces (vector 'default 'default 'default 'font-lock-constant-face
                         'font-lock-type-face
+                        (if archived 'warning 'shadow)
                         (if suspended 'warning 'shadow)))
          (parts
           (cl-loop for index below (length columns)
@@ -175,7 +179,8 @@
 
 (defun gnosis-themata--header-line ()
   "Return current thema column header."
-  (let ((names ["Question" "Hypothesis" "Answer" "Tags" "Kind" "Suspended"])
+  (let ((names ["Question" "Hypothesis" "Answer" "Tags" "Kind"
+                "Archived" "Suspended"])
         (widths gnosis-themata--column-widths))
     (concat
      (propertize "Themata" 'face 'gnosis-face-dashboard-header)
@@ -251,6 +256,28 @@
   "Return visible EWOC node at point, or nil."
   (gethash (gnosis-themata--current-id) gnosis-themata--nodes))
 
+(defun gnosis-themata--move-row (step)
+  "Move with EWOC STEP to a visible row, clamping at collection bounds."
+  (when-let* ((node (gnosis-themata--current-node)))
+    (let ((column (current-column))
+          (next (funcall step gnosis-themata--ewoc node)))
+      (while (and next
+                  (not (gnosis-themata--visible-p (ewoc-data next))))
+        (setq next (funcall step gnosis-themata--ewoc next)))
+      (when next
+        (ewoc-goto-node gnosis-themata--ewoc next)
+        (move-to-column column)))))
+
+(defun gnosis-themata-next-row ()
+  "Move to the next visible thema, clamping at the final row."
+  (interactive)
+  (gnosis-themata--move-row #'ewoc-next))
+
+(defun gnosis-themata-previous-row ()
+  "Move to the previous visible thema, clamping at the first row."
+  (interactive)
+  (gnosis-themata--move-row #'ewoc-prev))
+
 (defun gnosis-themata--goto-id (thema-id)
   "Move point to visible THEMA-ID and return non-nil when found."
   (when-let* ((node (and thema-id (gethash thema-id gnosis-themata--nodes)))
@@ -272,11 +299,12 @@
 
 (defun gnosis-themata--matches-review-filter-p (record)
   "Return non-nil when RECORD matches current review filter."
-  (and (not (eq t (plist-get record :archived)))
-       (pcase gnosis-themata--review-filter
-         (:active (not (eq t (plist-get record :suspended))))
-         (:suspended (eq t (plist-get record :suspended)))
-         (_ t))))
+  (let ((archived (eq t (plist-get record :archived)))
+        (suspended (eq t (plist-get record :suspended))))
+    (pcase gnosis-themata--review-filter
+      (:active (and (not archived) (not suspended)))
+      (:suspended (and (not archived) suspended))
+      (_ t))))
 
 (defun gnosis-themata--matches-tag-filter-p (record)
   "Return non-nil when RECORD matches current exact tag filter."
@@ -766,11 +794,13 @@ Without a prefix argument, show only never-reviewed themata."
   "Sort by COLUMN and progressively rebuild complete projection.
 With numeric prefix -1, restore authoritative catalog order."
   (interactive "P")
+  (when gnosis-themata--loading-p
+    (user-error "Wait for the complete Gnosis projection"))
   (let ((selected (gnosis-themata--current-id)))
     (if (equal column -1)
         (setq gnosis-themata--sort-key nil)
       (let ((column (or column (gnosis-themata--column-at-point))))
-        (unless (and (integerp column) (<= 0 column 5))
+        (unless (and (integerp column) (<= 0 column 6))
           (user-error "Invalid column number"))
         (if (equal column (car-safe gnosis-themata--sort-key))
             (setcdr gnosis-themata--sort-key
@@ -1424,6 +1454,8 @@ Start fresh catalog traversal when INITIAL is non-nil."
         (setq gnosis-dashboard--projection projection)
         (gnosis--render-dashboard projection))
     (gnosis-core-error
+     (setq gnosis-dashboard--projection nil)
+     (gnosis--render-dashboard-failure condition)
      (user-error "%s" (gnosis-dashboard--failure-message condition)))))
 
 ;;;###autoload
@@ -1574,7 +1606,7 @@ Without a prefix argument, show only never-reviewed themata."
   "h" ("Health" gnosis-dashboard-health :stay-open t)
   "H" ("Review history" gnosis-review-history)
   :group "Review"
-  "r" (#'gnosis-dashboard--review-description gnosis-dashboard-review)
+  "r" (#'gnosis-dashboard--review-description gnosis-review)
   "T" ("Review topic" gnosis-review-topic)
   "R" ("Active review controls" gnosis-review-resume
        :if #'gnosis-dashboard--active-session-p)
@@ -1593,14 +1625,17 @@ Without a prefix argument, show only never-reviewed themata."
   :description "Gnosis Themata"
   :group "Navigate"
   "q" ("Back" gnosis-dashboard)
-  "SPC" ("Search" gnosis-themata-filter-search)
-  "n" ("New or low reviews" gnosis-themata-filter-max-reviews)
+  "n" ("Next row" gnosis-themata-next-row :stay-open t)
+  "p" ("Previous row" gnosis-themata-previous-row :stay-open t)
   "RET" ("Edit at point" gnosis-themata-edit)
+  :group "Quick views"
+  "SPC" ("Search" gnosis-themata-filter-search)
+  "N" ("New or low reviews" gnosis-themata-filter-max-reviews)
   :group "Edit"
   "e" ("Edit thema" gnosis-themata-edit)
   "a" ("Add thema" gnosis-themata-add)
   "s" ("Suspend or unsuspend" gnosis-themata-toggle-suspension)
-  "d" ("Delete selected" gnosis-themata-bulk-archive)
+  "d" ("Delete selected (prefix: restore)" gnosis-themata-bulk-archive)
   :group "Selection"
   "*" ("Mark current" gnosis-themata-mark :stay-open t)
   "u" ("Unmark current" gnosis-themata-unmark :stay-open t)

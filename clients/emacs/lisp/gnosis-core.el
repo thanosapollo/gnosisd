@@ -642,14 +642,82 @@ EXPECTED-ETAG requires an exact successful response ETag."
        (string-match-p
         "\\`application/\\(?:problem\\+\\)?json\\(?:;\\|\\'\\)" value)))
 
+(defconst gnosis-core--api-error-codes
+  '("unauthorized" "forbidden" "not_found" "invalid_request"
+    "precondition_required" "internal" "invalid_content"
+    "request_too_large" "invalid_body" "request_timeout"
+    "catalog_changed" "invalid_server_state"
+    "unsupported_offline_review_version" "invalid_offline_review_operation"
+    "unsupported_offline_content_version" "invalid_offline_content_operation"
+    "unsupported_offline_asset_version" "invalid_offline_asset_operation"
+    "replica_projection_too_large" "snapshot_required" "revision_conflict"
+    "busy" "active_session" "stale_attempt" "review_state_conflict"
+    "idempotency_conflict" "device_sequence_gap" "blob_required"
+    "blob_metadata_conflict" "rename_required" "path_conflict"
+    "node_id_conflict" "invalid_blob_metadata")
+  "Closed set of typed Gnosis API error codes.")
+
+(defun gnosis-core--json-object-p (value)
+  "Return non-nil when VALUE has decoded JSON object shape."
+  (and (proper-list-p value)
+       (cl-evenp (length value))
+       (let ((keys (cl-loop for (key _item) on value by #'cddr
+                            collect key)))
+         (and (cl-every #'keywordp keys)
+              (= (length keys)
+                 (length (delete-dups (copy-sequence keys))))))))
+
+(defun gnosis-core--closed-json-object-p (value keys)
+  "Return non-nil when VALUE is a JSON object with exactly KEYS."
+  (and (gnosis-core--json-object-p value)
+       (= (length value) (* 2 (length keys)))
+       (cl-every (lambda (key) (plist-member value key)) keys)))
+
+(defun gnosis-core--uint64-or-null-p (value)
+  "Return non-nil when VALUE is JSON null or a Rust `u64'."
+  (or (eq value gnosis-core--json-null)
+      (and (integerp value) (<= 0 value #xffffffffffffffff))))
+
+(defun gnosis-core--api-error-meta-p (code meta)
+  "Return non-nil when META has the typed shape required by CODE."
+  (pcase code
+    ("snapshot_required"
+     (and (gnosis-core--closed-json-object-p meta '(:snapshot_url))
+          (equal "/v1/sync/snapshot" (plist-get meta :snapshot_url))))
+    ("revision_conflict"
+     (and (gnosis-core--closed-json-object-p
+           meta '(:expected_revision :current_revision))
+          (gnosis-core--uint64-or-null-p
+           (plist-get meta :expected_revision))
+          (gnosis-core--uint64-or-null-p
+           (plist-get meta :current_revision))))
+    ("device_sequence_gap"
+     (and (gnosis-core--closed-json-object-p meta '(:expected_sequence))
+          (let ((sequence (plist-get meta :expected_sequence)))
+            (and (integerp sequence) (<= 0 sequence #xffffffffffffffff)))))
+    ("blob_required"
+     (let ((digest (and (gnosis-core--closed-json-object-p
+                         meta '(:content_sha256 :upload_url))
+                        (plist-get meta :content_sha256))))
+       (and (stringp digest)
+            (let ((case-fold-search nil))
+              (string-match-p "\\`[0-9a-f]\\{64\\}\\'" digest))
+            (equal (format "/v1/sync/blobs/%s" digest)
+                   (plist-get meta :upload_url)))))
+    (_ (eq meta gnosis-core--json-null))))
+
 (defun gnosis-core--api-error-view (body)
-  "Return bounded message and code from generic error BODY."
-  (let* ((view (and (proper-list-p body) (plist-get body :error)))
-         (code (and (proper-list-p view) (plist-get view :code)))
-         (message (and (proper-list-p view) (plist-get view :message))))
-    (unless (and (stringp code) (<= 1 (length code) 64)
-                 (string-match-p "\\`[a-z][a-z0-9_]*\\'" code)
-                 (stringp message) (<= 1 (length message) 512))
+  "Return bounded message and code from typed error BODY."
+  (let* ((view (and (gnosis-core--closed-json-object-p body '(:error))
+                    (plist-get body :error)))
+         (code (and (gnosis-core--closed-json-object-p
+                     view '(:code :message :meta))
+                    (plist-get view :code)))
+         (message (and code (plist-get view :message)))
+         (meta (and code (plist-get view :meta))))
+    (unless (and (member code gnosis-core--api-error-codes)
+                 (stringp message) (<= 1 (length message) 512)
+                 (gnosis-core--api-error-meta-p code meta))
       (gnosis-core--invalid "Invalid Gnosis error response"))
     (list message code)))
 
@@ -698,16 +766,6 @@ EXPECTED-ETAG requires an exact successful response ETag."
 (defun gnosis-core--json-key (name)
   "Return plist keyword for JSON object key NAME."
   (intern (concat ":" name)))
-
-(defun gnosis-core--json-object-p (value)
-  "Return non-nil when VALUE has decoded JSON object shape."
-  (and (proper-list-p value)
-       (cl-evenp (length value))
-       (let ((keys (cl-loop for (key _item) on value by #'cddr
-                            collect key)))
-         (and (cl-every #'keywordp keys)
-              (= (length keys)
-                 (length (delete-dups (copy-sequence keys))))))))
 
 (defun gnosis-core--schema-ref (contract reference)
   "Resolve schema REFERENCE in CONTRACT or return nil."
@@ -1112,29 +1170,29 @@ the remaining declared request inputs."
              body (cdr success) contract)
       (gnosis-core--invalid
        "Gnosis request cannot satisfy its response contract"))
-    (let ((value
-           (condition-case condition
-               (gnosis-core--request
-                method
-                (gnosis-core--operation-path template path-values query)
-                body (car success) nil (equal method "GET") t headers)
-             ((gnosis-core-transport-error gnosis-core-protocol-error)
+    (let ((path (gnosis-core--operation-path template path-values query)))
+      (condition-case condition
+          (let ((value
+                 (gnosis-core--request
+                  method path body (car success) nil
+                  (equal method "GET") t headers)))
+            (unless (or (and (cdr success)
+                             (gnosis-core--schema-valid-p
+                              value (cdr success) contract))
+                        (and cached
+                             (not (equal method "GET"))
+                             (gnosis-core--refreshed-response-valid-p
+                              identity method template success value)))
               (if (equal method "GET")
-                  (signal (car condition) (cdr condition))
+                  (gnosis-core--invalid "Invalid Gnosis operation response")
                 (signal 'gnosis-core-mutation-uncertain
-                        '("Gnosis mutation outcome is uncertain")))))))
-      (unless (or (and (cdr success)
-                       (gnosis-core--schema-valid-p
-                        value (cdr success) contract))
-                  (and cached
-                       (not (equal method "GET"))
-                       (gnosis-core--refreshed-response-valid-p
-                        identity method template success value)))
-        (if (equal method "GET")
-            (gnosis-core--invalid "Invalid Gnosis operation response")
-          (signal 'gnosis-core-mutation-uncertain
-                  '("Gnosis mutation response is invalid"))))
-      value)))
+                        '("Gnosis mutation response is invalid"))))
+            value)
+        ((gnosis-core-transport-error gnosis-core-protocol-error quit)
+         (if (equal method "GET")
+             (signal (car condition) (cdr condition))
+           (signal 'gnosis-core-mutation-uncertain
+                   '("Gnosis mutation outcome is uncertain"))))))))
 
 (defun gnosis-core--typed-read-request
     (identity &optional path-values query)
@@ -2128,6 +2186,27 @@ Each item contains stable operation, thema, and expected-revision fields."
                         (plist-get session :target_count)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review session response is not correlated")))
+    session))
+
+(defun gnosis-core-review-session-replace
+    (replaced-session-id source &optional target-count)
+  "Atomically replace REPLACED-SESSION-ID with a review from SOURCE.
+TARGET-COUNT is optional."
+  (let ((session
+         (gnosis-core--typed-request
+          "post_review_sessions__id__replace"
+          (list (cons "id" replaced-session-id)) nil
+          (list :source source
+                :target_count (or target-count gnosis-core--json-null)))))
+    (unless (and (gnosis-core--review-session-valid-p session "active")
+                 (not (equal replaced-session-id
+                             (plist-get session :session_id)))
+                 (equal source (plist-get session :source))
+                 (equal (or target-count
+                            gnosis-core--default-online-review-target-count)
+                        (plist-get session :target_count)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis replacement review response is not correlated")))
     session))
 
 (defun gnosis-core-review-session-active ()

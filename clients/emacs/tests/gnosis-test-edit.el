@@ -41,6 +41,19 @@
     :tags ["geography"] :concepts [] :asset_paths [])
   "Multiple-choice request used by editor tests.")
 
+(defun gnosis-test-edit--large-cloze-request (count)
+  "Return a cloze request with COUNT distinct answers."
+  (let ((answers (vconcat
+                  (cl-loop for index below count
+                           collect (format "answer-%03d" index)))))
+    `(:kind "cloze"
+      :keimenon ,(mapconcat #'identity (append answers nil) " ")
+      :hypothesis [] :answer ,answers
+      :source_guid ,gnosis-core--json-null
+      :parathema ,gnosis-core--json-null
+      :review_image ,gnosis-core--json-null
+      :tags [] :concepts [] :asset_paths [])))
+
 (ert-deftest gnosis-edit-basic-authoring-round-trip-is-lossless ()
   (with-temp-buffer
     (insert (gnosis-edit--render gnosis-test-edit--request))
@@ -71,6 +84,69 @@
     (setf (aref (plist-get request :answer) 1) "France")
     (should-error (gnosis-edit--render request) :type 'user-error)))
 
+(ert-deftest gnosis-edit-cloze-authoring-bounds-review-inputs ()
+  (with-temp-buffer
+    (insert (gnosis-edit--render (gnosis-test-edit--large-cloze-request 500)))
+    (should (= 500 (length (plist-get (gnosis-edit--parse) :answer)))))
+  (with-temp-buffer
+    (insert (gnosis-edit--render (gnosis-test-edit--large-cloze-request 501)))
+    (should-error (gnosis-edit--parse) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-visible-answer-occurrence ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) "secret and secret"
+          (plist-get request :hypothesis) []
+          (plist-get request :answer) ["secret"])
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-daemon-overlap-mismatch ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) "aaa"
+          (plist-get request :hypothesis) []
+          (plist-get request :answer) ["a" "aa"])
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-trimmed-visible-answer ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) " secret and secret"
+          (plist-get request :hypothesis) []
+          (plist-get request :answer) ["\" secret \""])
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-unicode-trimmed-answer ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) " secret  and secret"
+          (plist-get request :hypothesis) []
+          (plist-get request :answer) [" secret "])
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-answer-bearing-hint ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) "secret"
+          (plist-get request :hypothesis) ["secret"]
+          (plist-get request :answer) ["secret"])
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-rejects-answer-bearing-placeholder ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) "..."
+          (plist-get request :hypothesis) []
+          (plist-get request :answer) ["..."])
+    (should-error (gnosis-edit--render request) :type 'user-error)))
+
+(ert-deftest gnosis-edit-cloze-authoring-accepts-covered-answer-occurrences ()
+  (let ((request (copy-tree gnosis-test-edit--cloze-request t)))
+    (setf (plist-get request :keimenon) "secret and secret"
+          (plist-get request :hypothesis) []
+          (plist-get request :answer) ["secret" "secret"])
+    (with-temp-buffer
+      (insert (gnosis-edit--render request))
+      (goto-char (point-min))
+      (should (= 2 (how-many (regexp-quote "{{secret}}"))))
+      (let ((parsed (gnosis-edit--parse)))
+        (should (equal "secret and secret" (plist-get parsed :keimenon)))
+        (should (equal ["secret" "secret"] (plist-get parsed :answer)))))))
+
 (ert-deftest gnosis-edit-cloze-authoring-preserves-daemon-answer-spelling ()
   (let ((request
          `(:kind "cloze" :keimenon "athens and Greece"
@@ -91,7 +167,7 @@
 (ert-deftest gnosis-edit-cloze-authoring-preserves-daemon-answer-order ()
   (let ((request
          `(:kind "cloze" :keimenon "A then B"
-           :hypothesis ["hint-b" "hint-a"] :answer ["B" "A"]
+           :hypothesis ["second-hint" "first-hint"] :answer ["B" "A"]
            :source_guid ,gnosis-core--json-null
            :parathema ,gnosis-core--json-null
            :review_image ,gnosis-core--json-null
@@ -102,9 +178,9 @@
       (gnosis-edit--replace-request request)
       (should (equal request (gnosis-edit--parse)))
       (goto-char (point-min))
-      (search-forward "{{A :: hint-a}}")
+      (search-forward "{{A :: first-hint}}")
       (replace-match "{{Alpha :: new-a}}" t t)
-      (search-forward "{{B :: hint-b}}")
+      (search-forward "{{B :: second-hint}}")
       (replace-match "{{Beta :: new-b}}" t t)
       (should (equal `(:kind "cloze" :keimenon "Alpha then Beta"
                         :hypothesis ["new-b" "new-a"] :answer ["Beta" "Alpha"]

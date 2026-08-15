@@ -187,7 +187,7 @@
         (cl-letf (((symbol-function 'kill-buffer)
                    (lambda (&rest _) (setq killed t)))
                   ((symbol-function 'message) #'ignore))
-          (gnosis-review--next)
+          (gnosis-review--next-current)
           (should killed)
           (should-not gnosis-review--session))))))
 
@@ -262,7 +262,8 @@
                        (lambda (target &rest _) (set-buffer target)))
                       ((symbol-function 'keymap-popup) #'ignore)
                       ((symbol-function 'display-images-p) (lambda () nil)))
-              (gnosis-review--open session)
+              (gnosis-review--call-with-current-authority
+               (lambda () (gnosis-review--open session)))
               (with-current-buffer buffer
                 (should (equal "graded"
                                (plist-get gnosis-review--attempt :status)))
@@ -277,7 +278,7 @@
                   (should (eq gnosis-core--json-false
                               (plist-get (plist-get state :attempt)
                                          :accepted_success))))
-                (cl-letf (((symbol-function 'gnosis-review--next)
+                (cl-letf (((symbol-function 'gnosis-review--next-current)
                            (lambda () (setq advanced t))))
                   (gnosis-review--commit-next))
                 (should advanced)

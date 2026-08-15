@@ -128,11 +128,6 @@
   "Return the review action appropriate for the dashboard projection."
   (if (gnosis-dashboard--active-session-p) "Resume review" "Start review"))
 
-(defun gnosis-dashboard-review ()
-  "Start or resume the server-owned due review flow."
-  (interactive)
-  (gnosis-review nil))
-
 (defun gnosis--display-link-descriptions (string)
   "Return STRING with bracket links replaced by their descriptions."
   (replace-regexp-in-string
@@ -213,10 +208,10 @@
           (gnosis--dashboard-style "Reviewed today:" 'shadow)
           (gnosis--dashboard-style
            (number-to-string (plist-get today :review_count))
-           'font-lock-type-face)
+           'success)
           (gnosis--dashboard-style
            (number-to-string (plist-get today :new_count))
-           'font-lock-type-face)
+           'font-lock-keyword-face)
           (gnosis--dashboard-style
            (format "%d successful" (plist-get today :success_count))
            'success)
@@ -227,13 +222,16 @@
 (defun gnosis--dashboard-queue-text (queue)
   "Return review availability text for server-projected QUEUE."
   (let ((due (plist-get queue :due_count))
+        (new (plist-get queue :new_count))
         (overdue (plist-get queue :overdue_count)))
-    (format "%s %s (Overdue: %s)"
-            (gnosis--dashboard-style "Due themata:" 'shadow)
+    (format "%s %s (New: %s Overdue: %s)"
+            (gnosis--dashboard-style "Due:" 'shadow)
             (gnosis--dashboard-style
-             (number-to-string due) (if (> due 0) 'warning 'success))
+             (number-to-string due) 'error)
             (gnosis--dashboard-style
-             (number-to-string overdue) (if (> overdue 0) 'error 'success)))))
+             (number-to-string new) 'font-lock-keyword-face)
+            (gnosis--dashboard-style
+             (number-to-string overdue) 'warning))))
 
 (defun gnosis--dashboard-content-text (content)
   "Return the dashboard summary for CONTENT."

@@ -1267,6 +1267,77 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
        :type 'gnosis-core-mutation-uncertain))
     (should (= calls 1))))
 
+(ert-deftest gnosis-core-mutation-quit-after-dispatch-is-uncertain ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0)
+        outcome)
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf calls)
+                 (signal 'quit nil))))
+      (setq outcome
+            (condition-case condition
+                (progn
+                  (gnosis-core--typed-request
+                   "put_widget" '(("id" . "widget")) nil '(:value "text")
+                   '(("If-Match" . "\"3\"")))
+                  'returned)
+              (gnosis-core-mutation-uncertain (car condition))
+              (quit 'quit))))
+    (should (eq outcome 'gnosis-core-mutation-uncertain))
+    (should (= calls 1))))
+
+(ert-deftest gnosis-core-mutation-quit-before-dispatch-remains-local ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0)
+        outcome)
+    (cl-letf (((symbol-function 'gnosis-core--operation-path)
+               (lambda (&rest _) (signal 'quit nil)))
+              ((symbol-function 'gnosis-core--request)
+               (lambda (&rest _) (cl-incf calls))))
+      (setq outcome
+            (condition-case nil
+                (progn
+                  (gnosis-core--typed-request
+                   "put_widget" '(("id" . "widget")) nil '(:value "text")
+                   '(("If-Match" . "\"3\"")))
+                  'returned)
+              (gnosis-core-mutation-uncertain 'uncertain)
+              (quit 'quit))))
+    (should (eq outcome 'quit))
+    (should (= calls 0))))
+
+(ert-deftest gnosis-core-mutation-quit-during-response-check-is-uncertain ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0)
+        outcome)
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf calls)
+                 '(:id "widget" :value "text")))
+              ((symbol-function 'gnosis-core--schema-valid-p)
+               (lambda (value &rest _)
+                 (if (plist-get value :id)
+                     (signal 'quit nil)
+                   t))))
+      (setq outcome
+            (condition-case nil
+                (progn
+                  (gnosis-core--typed-request
+                   "put_widget" '(("id" . "widget")) nil '(:value "text")
+                   '(("If-Match" . "\"3\"")))
+                  'returned)
+              (gnosis-core-mutation-uncertain 'uncertain)
+              (quit 'quit))))
+    (should (eq outcome 'uncertain))
+    (should (= calls 1))))
+
 (ert-deftest gnosis-core-openapi-request-is-public-and-retryable ()
   (let (calls)
     (cl-letf (((symbol-function 'gnosis-core--request)
@@ -1305,18 +1376,48 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                (lambda (&rest _)
                  (gnosis-test-core--http-buffer
                   status
-                  "{\"error\":{\"code\":\"future_error\",\"message\":\"bad request\",\"meta\":{\"new\":true}}}"))))
+                  "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad request\",\"meta\":null}}"))))
       (let ((condition
              (should-error
               (gnosis-core--perform-request "GET" "/v1/test" nil 200 nil t)
               :type 'gnosis-core-validation-error)))
         (should (eq 'gnosis-core-http-rejection (car condition)))
-        (should (equal '("bad request" "future_error") (cdr condition)))))))
+        (should (equal '("bad request" "invalid_request") (cdr condition)))))))
+
+(ert-deftest gnosis-core-accepts-code-correlated-error-metadata ()
+  (let ((digest (make-string 64 ?a)))
+    (dolist
+        (entry
+         `(("snapshot_required" (:snapshot_url "/v1/sync/snapshot"))
+           ("revision_conflict"
+            (:expected_revision :gnosis-json-null
+             :current_revision #xffffffffffffffff))
+           ("device_sequence_gap" (:expected_sequence #xffffffffffffffff))
+           ("blob_required"
+            (:content_sha256 ,digest
+             :upload_url ,(format "/v1/sync/blobs/%s" digest)))))
+      (should
+       (equal
+        (list "typed" (car entry))
+        (gnosis-core--api-error-view
+         (list :error
+               (list :code (car entry) :message "typed" :meta (cadr entry)))))))))
 
 (ert-deftest gnosis-core-rejects-unbounded-or-malformed-error-envelope ()
   (dolist (body
            (list "{}"
                  "{\"error\":{\"code\":7,\"message\":\"bad\"}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\",\"meta\":null},\"error\":{\"code\":\"internal\",\"message\":\"other\",\"meta\":null}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\",\"meta\":null},\"extra\":true}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"code\":\"internal\",\"message\":\"bad\",\"meta\":null}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\",\"meta\":null,\"extra\":true}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\"}}"
+                 "{\"error\":{\"code\":\"future_error\",\"message\":\"bad\",\"meta\":null}}"
+                 "{\"error\":{\"code\":\"stale_attempt\",\"message\":\"changed\",\"meta\":{\"expected_revision\":1,\"current_revision\":2}}}"
+                 (let ((digest (make-string 64 ?A)))
+                   (format
+                    "{\"error\":{\"code\":\"blob_required\",\"message\":\"bad\",\"meta\":{\"content_sha256\":\"%s\",\"upload_url\":\"/v1/sync/blobs/%s\"}}}"
+                    digest digest))
                  (format "{\"error\":{\"code\":\"bad\",\"message\":\"%s\"}}"
                          (make-string 513 ?x))))
     (cl-letf (((symbol-function 'gnosis-core--token)
@@ -1719,6 +1820,10 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                     `(:session_id "session" :mode "online" :status "active"
                       :source ,source :target_count 12
                       :current_position 0 :queue_length 1 :started_at_us 1))
+                   ("post_review_sessions__id__replace"
+                    `(:session_id "replacement" :mode "online" :status "active"
+                      :source ,source :target_count 12
+                      :current_position 0 :queue_length 1 :started_at_us 2))
                    ("post_review_sessions__id__quit"
                     `(:session_id "session" :mode "online" :status "quit"
                       :source ,source :target_count 12
@@ -1754,6 +1859,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                    ("post_review_attempts__id__commit"
                     '(:attempt_id "attempt" :event_id "event"))))))
       (gnosis-core-review-session-create source 12)
+      (gnosis-core-review-session-replace "session" source 12)
       (gnosis-core-review-session-active)
       (gnosis-core-review-session-resume "session")
       (gnosis-core-review-session-quit "session")
@@ -1767,6 +1873,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
     (should
      (equal
       `(("post_review_sessions" nil nil
+         (:source ,source :target_count 12))
+        ("post_review_sessions__id__replace" (("id" . "session")) nil
          (:source ,source :target_count 12))
         ("get_review_sessions_active")
         ("post_review_sessions__id__resume" (("id" . "session")))

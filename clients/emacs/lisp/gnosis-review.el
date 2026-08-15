@@ -28,10 +28,17 @@
 (defvar gnosis-review-buffer-name "*gnosis*"
   "Buffer name reserved for Gnosis review.")
 
+(defconst gnosis-review--max-target-count 500
+  "Maximum online review target count accepted by gnosisd.")
+
 (defvar-local gnosis-review--session nil)
 (defvar-local gnosis-review--attempt nil)
 (defvar-local gnosis-review--attempt-revision nil)
 (defvar-local gnosis-review--answer-locked-p nil)
+(defvar-local gnosis-review--authority nil)
+
+(defvar gnosis-review--opening-authority nil
+  "Dynamically pinned authority for one review-opening chain.")
 
 (defcustom gnosis-review-input-method-alist
   '(("greek" . "greek")
@@ -39,6 +46,33 @@
   "Map server input-script names to Emacs input methods."
   :type '(alist :key-type string :value-type string)
   :group 'gnosis)
+
+(defun gnosis-review--call-with-current-authority (function)
+  "Call FUNCTION with the current authenticated authority pinned."
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (gnosis-core--token))
+         (authority (let ((gnosis-core--base-url-override base-url))
+                      (gnosis-core--authenticated-authority token))))
+    (let ((gnosis-core--base-url-override base-url)
+          (gnosis-core--token-override token)
+          (gnosis-review--opening-authority authority))
+      (funcall function))))
+
+(defun gnosis-review--call-with-authority (function)
+  "Call FUNCTION only under this buffer's authenticated authority."
+  (unless gnosis-review--authority
+    (signal 'gnosis-core-authorization-error
+            '("Gnosis review authority is unavailable")))
+  (let* ((base-url (gnosis-core--validated-base-url))
+         (token (gnosis-core--token))
+         (authority (let ((gnosis-core--base-url-override base-url))
+                      (gnosis-core--authenticated-authority token))))
+    (unless (equal authority gnosis-review--authority)
+      (signal 'gnosis-core-authorization-error
+              '("Gnosis authenticated authority changed")))
+    (let ((gnosis-core--base-url-override base-url)
+          (gnosis-core--token-override token))
+      (funcall function))))
 
 (defun gnosis-review--pending-p ()
   "Return non-nil when the current attempt awaits an answer."
@@ -329,7 +363,11 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
       ("text"
        (let ((script (plist-get prompt :input_script)))
          (list :kind "text" :value
-               (gnosis-review--read-string "Answer: " script))))
+               (gnosis-review--read-string
+                (if (eq script gnosis-core--json-null)
+                    "Answer: "
+                  (format "Answer (%s): " (capitalize script)))
+                script))))
       ("texts"
        (gnosis-review--read-cloze-answer prompt))
       ("choice"
@@ -346,7 +384,12 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
         continue)
     (setq continue t)
     (while continue
-      (let* ((input (gnosis-review--read-string "Answer: " script))
+      (let* ((index (1+ (length inputs)))
+             (input (gnosis-review--read-string
+                     (if (eq script gnosis-core--json-null)
+                         (format "Answer %d: " index)
+                       (format "Answer %d (%s): " index (capitalize script)))
+                     script))
              (next-inputs (vconcat inputs (vector input)))
              (check (gnosis-core-review-attempt-check-cloze
                      attempt-id next-inputs))
@@ -435,11 +478,12 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
   "Clear the current review and close its buffer."
   (setq gnosis-review--session nil
         gnosis-review--attempt nil
-        gnosis-review--attempt-revision nil)
+        gnosis-review--attempt-revision nil
+        gnosis-review--authority nil)
   (message "Gnosis review complete")
   (kill-buffer (current-buffer)))
 
-(defun gnosis-review--next ()
+(defun gnosis-review--next-current ()
   "Advance to the next server attempt or close a completed session."
   (let* ((session-id (plist-get gnosis-review--session :session_id))
          (session (gnosis-review--active-session)))
@@ -459,6 +503,10 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
                 gnosis-review--answer-locked-p nil)
           (gnosis-review--present t))))))
 
+(defun gnosis-review--next ()
+  "Advance under the review buffer's authenticated authority."
+  (gnosis-review--call-with-authority #'gnosis-review--next-current))
+
 (defun gnosis-review--open (session)
   "Open a review buffer for active SESSION."
   (if (gnosis-review--session-complete-p session)
@@ -477,26 +525,40 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
           (setq gnosis-review--session next-session
                 gnosis-review--attempt attempt
                 gnosis-review--attempt-revision nil
-                gnosis-review--answer-locked-p nil)
+                gnosis-review--answer-locked-p nil
+                gnosis-review--authority gnosis-review--opening-authority)
           (gnosis-review--present t))))))
 
-(defun gnosis-review--create (source target-count)
-  "Create and open a review for SOURCE and optional TARGET-COUNT."
+(defun gnosis-review--create (source target-count &optional replaced-session-id)
+  "Create and open a review for SOURCE and optional TARGET-COUNT.
+Atomically replace REPLACED-SESSION-ID when non-nil.  Return nil when SOURCE
+has no review items."
   (condition-case condition
-      (gnosis-review--open
-       (gnosis-core-review-session-create source target-count))
+      (progn
+        (gnosis-review--open
+         (if replaced-session-id
+             (gnosis-core-review-session-replace
+              replaced-session-id source target-count)
+           (gnosis-core-review-session-create source target-count)))
+        t)
     (gnosis-core-not-found
-     (message "No Gnosis review items are available"))
+     (message "No Gnosis review items are available")
+     nil)
     (gnosis-core-mutation-uncertain
      (let ((session (gnosis-review--active-session))
            (expected-count target-count))
        (if (and session
+                (or (null replaced-session-id)
+                    (not (equal replaced-session-id
+                                (plist-get session :session_id))))
                 (equal source (plist-get session :source))
                 (let ((effective (plist-get session :target_count)))
                   (equal effective
                          (or expected-count
                              gnosis-core--default-online-review-target-count))))
-           (gnosis-review--open session)
+           (progn
+             (gnosis-review--open session)
+             t)
          (signal (car condition) (cdr condition)))))))
 
 (defun gnosis-review--read-active-session-action ()
@@ -506,8 +568,19 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
    '("Resume session" "Start new" "Cancel")
    nil t nil nil "Resume session"))
 
+(defun gnosis-review--normalize-target-count (target-count)
+  "Return canonical TARGET-COUNT, using nil for the server default."
+  (cond
+   ((or (null target-count) (equal target-count 0)) nil)
+   ((and (integerp target-count)
+         (<= 1 target-count gnosis-review--max-target-count))
+    target-count)
+   (t (user-error "Target count must be between 1 and %d"
+                  gnosis-review--max-target-count))))
+
 (defun gnosis-review--start (source target-count)
   "Start or resume a review for SOURCE and optional TARGET-COUNT."
+  (setq target-count (gnosis-review--normalize-target-count target-count))
   (gnosis-core-status)
   (if-let* ((session (gnosis-review--active-session)))
       (pcase (gnosis-review--read-active-session-action)
@@ -516,8 +589,8 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
           (gnosis-review--resume-session
            (plist-get session :session_id))))
         ("Start new"
-         (gnosis-review--quit-session (plist-get session :session_id))
-         (gnosis-review--create source target-count))
+         (gnosis-review--create
+          source target-count (plist-get session :session_id)))
         ("Cancel" (message "Gnosis review unchanged")))
     (gnosis-review--create source target-count)))
 
@@ -525,10 +598,11 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
 (defun gnosis-review (&optional target-count)
   "Start a server-owned due review of optional TARGET-COUNT.
 When a review is active, prompt to resume it, replace it, or cancel."
-  (interactive
-   (list (let ((count (read-number "Target count (0 for server default): " 0)))
-           (and (> count 0) count))))
-  (gnosis-review--start (gnosis-review--source "due") target-count))
+  (interactive (list (read-number "Target count (0 for server default): " 0)))
+  (setq target-count (gnosis-review--normalize-target-count target-count))
+  (gnosis-review--call-with-current-authority
+   (lambda ()
+     (gnosis-review--start (gnosis-review--source "due") target-count))))
 
 ;;;###autoload
 (defun gnosis-review-topic (topic-node-id &optional target-count)
@@ -537,38 +611,58 @@ When a review is active, prompt to resume it, replace it, or cancel."
   (interactive
    (list (read-string "Topic node ID: ")
          (when current-prefix-arg (read-number "Target count: " 20))))
+  (unless (and (stringp topic-node-id) (not (string-empty-p topic-node-id)))
+    (user-error "Topic node ID must be a non-empty string"))
+  (setq target-count (gnosis-review--normalize-target-count target-count))
   (let ((source (gnosis-review--source "topic")))
     (setq source (plist-put source :topic_node_id topic-node-id))
     (setq source (plist-put source :topic_forward_depth 0))
     (setq source (plist-put source :topic_backward_depth 0))
-    (gnosis-review--start source target-count)))
+    (gnosis-review--call-with-current-authority
+     (lambda () (gnosis-review--start source target-count)))))
 
 ;;;###autoload
 (defun gnosis-review-resume ()
   "Resume, abort, or leave unchanged the active server review."
   (interactive)
-  (if-let* ((session (gnosis-review--active-session)))
-      (pcase (read-char-choice
-              "Active review: [r]esume [a]bort [c]ancel " '(?r ?a ?c))
-        (?r (gnosis-review--open
-             (gnosis-review--resume-session
-              (plist-get session :session_id))))
-        (?a (gnosis-review--abort-session
-             (plist-get session :session_id))
-            (message "Gnosis review aborted"))
-        (?c (message "Gnosis review unchanged")))
-    (user-error "No active Gnosis review session")))
+  (gnosis-review--call-with-current-authority
+   (lambda ()
+     (if-let* ((session (gnosis-review--active-session)))
+         (pcase (read-char-choice
+                 "Active review: [r]esume [a]bort [c]ancel " '(?r ?a ?c))
+           (?r (gnosis-review--open
+                (gnosis-review--resume-session
+                 (plist-get session :session_id))))
+           (?a (gnosis-review--abort-session
+                (plist-get session :session_id))
+               (message "Gnosis review aborted"))
+           (?c (message "Gnosis review unchanged")))
+       (user-error "No active Gnosis review session")))))
 
 (defun gnosis-review--stale-condition-p (condition)
   "Return non-nil when CONDITION reports a stale review attempt."
   (equal "stale_attempt" (nth 2 condition)))
+
+(defun gnosis-review--read-complete-answer ()
+  "Read one answer, restoring its presentation after a nonlocal exit."
+  (let ((presentation
+         (copy-tree (plist-get gnosis-review--attempt :presentation)))
+        (complete nil)
+        answer)
+    (unwind-protect
+        (setq answer (gnosis-review--read-answer)
+              complete t)
+      (unless complete
+        (setf (plist-get gnosis-review--attempt :presentation) presentation)
+        (gnosis-review--render)))
+    answer))
 
 (defun gnosis-review--answer-current (&optional show-popup)
   "Submit one response and show actions when SHOW-POPUP is non-nil."
   (unless (gnosis-review--answerable-p)
     (user-error "Attempt cannot be answered; refresh authoritative state"))
   (let* ((attempt-id (plist-get gnosis-review--attempt :attempt_id))
-         (answer (gnosis-review--read-answer))
+         (answer (gnosis-review--read-complete-answer))
          answered-attempt
          uncertain
          state)
@@ -602,9 +696,8 @@ When a review is active, prompt to resume it, replace it, or cancel."
   (when show-popup
     (keymap-popup gnosis-review-mode-map)))
 
-(defun gnosis-review--answer (&optional show-popup)
+(defun gnosis-review--answer-authorized (&optional show-popup)
   "Submit one response and show actions when SHOW-POPUP is non-nil."
-  (interactive '(t))
   (condition-case condition
       (gnosis-review--answer-current show-popup)
     (gnosis-core-conflict
@@ -612,8 +705,15 @@ When a review is active, prompt to resume it, replace it, or cancel."
          (progn
            (setq gnosis-review--answer-locked-p nil)
            (message "Review item changed; continuing")
-           (gnosis-review--next))
+           (gnosis-review--next-current))
        (signal (car condition) (cdr condition))))))
+
+(defun gnosis-review--answer (&optional show-popup)
+  "Submit one response under the review buffer's authority.
+Show actions when SHOW-POPUP is non-nil."
+  (interactive '(t))
+  (gnosis-review--call-with-authority
+   (lambda () (gnosis-review--answer-authorized show-popup))))
 
 (defun gnosis-review--finish-current (accepted-success)
   "Set ACCEPTED-SUCCESS, commit the current attempt, and continue."
@@ -637,9 +737,9 @@ When a review is active, prompt to resume it, replace it, or cancel."
      (unless (equal "committed" (plist-get gnosis-review--attempt :status))
        (gnosis-review--render)
        (signal (car condition) (cdr condition)))))
-  (gnosis-review--next))
+  (gnosis-review--next-current))
 
-(defun gnosis-review--finish (accepted-success)
+(defun gnosis-review--finish-authorized (accepted-success)
   "Set ACCEPTED-SUCCESS, commit the current attempt, and continue."
   (condition-case condition
       (gnosis-review--finish-current accepted-success)
@@ -647,8 +747,13 @@ When a review is active, prompt to resume it, replace it, or cancel."
      (if (gnosis-review--stale-condition-p condition)
          (progn
            (message "Review item changed; continuing")
-           (gnosis-review--next))
+           (gnosis-review--next-current))
        (signal (car condition) (cdr condition))))))
+
+(defun gnosis-review--finish (accepted-success)
+  "Finish with ACCEPTED-SUCCESS under the review buffer's authority."
+  (gnosis-review--call-with-authority
+   (lambda () (gnosis-review--finish-authorized accepted-success))))
 
 (defun gnosis-review--commit-next ()
   "Commit the current accepted result and continue."
@@ -656,9 +761,8 @@ When a review is active, prompt to resume it, replace it, or cancel."
   (gnosis-review--finish
    (plist-get gnosis-review--attempt :accepted_success)))
 
-(defun gnosis-review--override ()
+(defun gnosis-review--override-current ()
   "Invert the current accepted result without committing the attempt."
-  (interactive)
   (unless (gnosis-review--graded-p)
     (user-error "Current attempt is not graded"))
   (unless gnosis-review--attempt-revision (gnosis-review--load-revision))
@@ -678,9 +782,13 @@ When a review is active, prompt to resume it, replace it, or cancel."
     (gnosis-review--render)
     (message "Gnosis result overridden")))
 
-(defun gnosis-review--toggle-suspension ()
-  "Toggle desired suspension for the current graded attempt."
+(defun gnosis-review--override ()
+  "Override the result under the review buffer's authority."
   (interactive)
+  (gnosis-review--call-with-authority #'gnosis-review--override-current))
+
+(defun gnosis-review--toggle-suspension-current ()
+  "Toggle desired suspension for the current graded attempt."
   (unless (gnosis-review--graded-p)
     (user-error "Current attempt is not graded"))
   (unless gnosis-review--attempt-revision (gnosis-review--load-revision))
@@ -699,11 +807,16 @@ When a review is active, prompt to resume it, replace it, or cancel."
     (gnosis-review--render)
     (message "Gnosis suspension %s" (if (eq desired t) "enabled" "disabled"))))
 
-(defun gnosis-review--refresh ()
-  "Refresh the current attempt from gnosisd."
+(defun gnosis-review--toggle-suspension ()
+  "Toggle suspension under the review buffer's authority."
   (interactive)
+  (gnosis-review--call-with-authority
+   #'gnosis-review--toggle-suspension-current))
+
+(defun gnosis-review--refresh-current ()
+  "Refresh the current attempt from gnosisd."
   (if (equal "committed" (plist-get gnosis-review--attempt :status))
-      (gnosis-review--next)
+      (gnosis-review--next-current)
     (let ((attempt-id (plist-get gnosis-review--attempt :attempt_id))
           (answer-locked-p gnosis-review--answer-locked-p))
       (gnosis-review--load-revision)
@@ -717,24 +830,50 @@ When a review is active, prompt to resume it, replace it, or cancel."
             (keymap-popup gnosis-review-mode-map))
         (gnosis-review--present)))))
 
-(defun gnosis-review--edited (buffer _projection)
-  "Return to review BUFFER and reconcile it after a saved edit."
-  (when (buffer-live-p buffer)
-    (pop-to-buffer-same-window buffer)
-    (with-current-buffer buffer
-      (when (derived-mode-p 'gnosis-review-mode)
-        (gnosis-review--next)))))
-
-(defun gnosis-review--edit ()
-  "Edit the current review thema through the shared editor."
+(defun gnosis-review--refresh ()
+  "Refresh under the review buffer's authenticated authority."
   (interactive)
+  (gnosis-review--call-with-authority #'gnosis-review--refresh-current))
+
+(defun gnosis-review--edited
+    (buffer authority session-id attempt-id _projection)
+  "Reconcile live review BUFFER after a saved edit.
+AUTHORITY, SESSION-ID, and ATTEMPT-ID identify the state that opened the editor."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (derived-mode-p 'gnosis-review-mode)
+                 authority
+                 (equal authority gnosis-review--authority)
+                 (equal session-id
+                        (plist-get gnosis-review--session :session_id))
+                 (equal attempt-id
+                        (plist-get gnosis-review--attempt :attempt_id)))
+        (gnosis-review--call-with-authority
+         (lambda ()
+           (pop-to-buffer-same-window buffer)
+           (gnosis-review--next-current)))))))
+
+(defun gnosis-review--edit-current ()
+  "Edit the current review thema through the shared editor."
   (let ((buffer (current-buffer))
+        (authority gnosis-review--authority)
+        (session-id (plist-get gnosis-review--session :session_id))
+        (attempt-id (plist-get gnosis-review--attempt :attempt_id))
         (thema-id (plist-get gnosis-review--attempt :thema_id)))
-    (unless (and (stringp thema-id) (not (string-empty-p thema-id)))
-      (user-error "Current review attempt has no thema identity"))
+    (unless (and authority
+                 (stringp session-id) (not (string-empty-p session-id))
+                 (stringp attempt-id) (not (string-empty-p attempt-id))
+                 (stringp thema-id) (not (string-empty-p thema-id)))
+      (user-error "Current review attempt has incomplete identity"))
     (gnosis-edit-thema
      thema-id (lambda (projection)
-                (gnosis-review--edited buffer projection)))))
+                (gnosis-review--edited
+                 buffer authority session-id attempt-id projection)))))
+
+(defun gnosis-review--edit ()
+  "Edit under the review buffer's authenticated authority."
+  (interactive)
+  (gnosis-review--call-with-authority #'gnosis-review--edit-current))
 
 (defun gnosis-review--quit ()
   "Close the local review buffer without mutating its durable session."

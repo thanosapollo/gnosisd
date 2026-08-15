@@ -52,7 +52,7 @@
   (let ((text (gnosis--dashboard-text (gnosis-test-dashboard--projection))))
     (dolist (value '("Connection: Ready"
                      "Reviewed today: 8 (New: 2)"
-                     "Due themata: 4 (Overdue: 1)"
+                     "Due: 4 (New: 3 Overdue: 1)"
                      "Content: 12 themata, 2 documents, 7 nodes"
                      "Last 30 days: 20 reviews, success rate 0.75"
                      "Activity: 4 active days; 0.67/calendar day, 5.00/active day"
@@ -338,7 +338,7 @@
 
 (ert-deftest gnosis-dashboard-keymap-restores-archived-navigation-hierarchy ()
   (dolist (binding '(("g" . gnosis-dashboard-refresh)
-                     ("r" . gnosis-dashboard-review)
+                     ("r" . gnosis-review)
                      ("a" . gnosis-dashboard-add-thema)
                      ("SPC" . gnosis-dashboard-search-themata)
                      ("h" . gnosis-dashboard-health)
@@ -390,7 +390,9 @@
 (ert-deftest gnosis-dashboard-themata-mode-restores-archived-view-actions ()
   (dolist (binding '(("q" . gnosis-dashboard)
                      ("SPC" . gnosis-themata-filter-search)
-                     ("n" . gnosis-themata-filter-max-reviews)
+                     ("n" . gnosis-themata-next-row)
+                     ("p" . gnosis-themata-previous-row)
+                     ("N" . gnosis-themata-filter-max-reviews)
                      ("RET" . gnosis-themata-edit)
                      ("e" . gnosis-themata-edit)
                      ("a" . gnosis-themata-add)
@@ -407,6 +409,49 @@
                      ("g" . gnosis-themata-refresh)))
     (should (eq (keymap-lookup gnosis-dashboard-themata-mode-map (car binding))
                 (cdr binding)))))
+
+(ert-deftest gnosis-dashboard-themata-row-navigation-clamps-to-visible-records ()
+  (let ((first '(:thema_id "id-1" :keimenon "First" :hypothesis []
+                 :answer [] :tags [] :kind "basic"))
+        (hidden '(:thema_id "id-hidden" :keimenon "Hidden" :hypothesis []
+                  :answer [] :tags [] :kind "basic" :archived t))
+        (last '(:thema_id "id-2" :keimenon "Last" :hypothesis []
+                :answer [] :tags [] :kind "basic")))
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (setq-local gnosis-themata--review-filter :active)
+      (gnosis-themata--setup-ewoc nil)
+      (let ((inhibit-read-only t))
+        (gnosis-themata--enter-last first)
+        (gnosis-themata--enter-last hidden)
+        (gnosis-themata--enter-last last))
+      (gnosis-themata--goto-id "id-1")
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "p"))
+      (should (equal "id-1" (gnosis-themata--current-id)))
+      (gnosis-themata-mark)
+      (should (gethash "id-1" gnosis-themata--marked))
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "n"))
+      (should (equal "id-2" (gnosis-themata--current-id)))
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "p"))
+      (should (equal "id-1" (gnosis-themata--current-id)))
+      (gnosis-themata--goto-id "id-2")
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "n"))
+      (should (equal "id-2" (gnosis-themata--current-id)))
+      (gnosis-themata-mark)
+      (should (gethash "id-2" gnosis-themata--marked)))))
+
+(ert-deftest gnosis-themata-sort-rejects-incomplete-projection ()
+  (with-temp-buffer
+    (setq-local gnosis-themata--loading-p t)
+    (setq-local gnosis-themata--sort-key nil)
+    (cl-letf (((symbol-function 'gnosis-themata--current-id) #'ignore)
+              ((symbol-function 'gnosis-themata--render) #'ignore))
+      (should-error (gnosis-themata-sort 0) :type 'user-error))
+    (should-not gnosis-themata--sort-key)))
 
 (ert-deftest gnosis-dashboard-new-themata-route-applies-zero-review-filter ()
   (let (arguments)
@@ -484,8 +529,13 @@
     (gnosis--render-dashboard (gnosis-test-dashboard--projection))
     (dolist (pair '(("Connection:" . shadow)
                     ("Ready" . success)
+                    ("Reviewed today: 8" . success)
+                    ("New: 2" . font-lock-keyword-face)
                     ("6 successful" . success)
                     ("2 failed" . error)
+                    ("Due: 4" . error)
+                    ("New: 3" . font-lock-keyword-face)
+                    ("Overdue: 1" . warning)
                     ("4 active days" . font-lock-type-face)
                     ("3 days" . success)))
       (goto-char (point-min))
@@ -505,10 +555,12 @@
     (should-not display-line-numbers)
     (should (functionp revert-buffer-function))))
 
-(ert-deftest gnosis-dashboard-refresh-preserves-buffer-on-summary-failure ()
+(ert-deftest gnosis-dashboard-refresh-failure-clears-stale-ready-state ()
   (with-temp-buffer
     (gnosis-dashboard-mode)
-    (let ((inhibit-read-only t)) (insert "existing projection"))
+    (setq gnosis-dashboard--projection
+          (gnosis-test-dashboard--projection '(:session_id "stale")))
+    (gnosis--render-dashboard gnosis-dashboard--projection)
     (cl-letf (((symbol-function 'gnosis-core-dashboard)
                (lambda (&rest _) (signal 'gnosis-core-unavailable '("down")))))
       (let ((condition (should-error (gnosis-dashboard-refresh)
@@ -516,7 +568,11 @@
         (should
          (equal (cadr condition)
                 "gnosisd unavailable. Check service and gnosis-core-base-url.")))
-      (should (equal "existing projection" (buffer-string))))))
+      (should-not gnosis-dashboard--projection)
+      (should (equal "Start review" (gnosis-dashboard--review-description)))
+      (should (string-match-p "gnosisd unavailable" (buffer-string)))
+      (should-not (string-match-p "Connection:.*Ready" (buffer-string)))
+      (should-not (string-match-p "Due themata:" (buffer-string))))))
 
 (ert-deftest gnosis-dashboard-failure-messages-are-public-safe ()
   (should
@@ -527,13 +583,6 @@
    (equal (gnosis-dashboard--failure-message
            '(gnosis-core-authorization-error "secret server detail"))
           "Gnosis access denied. Check gnosisd token scopes.")))
-
-(ert-deftest gnosis-dashboard-primary-review-action-dispatches-existing-journey ()
-  (let (arguments)
-    (cl-letf (((symbol-function 'gnosis-review)
-               (lambda (&rest value) (setq arguments value))))
-      (gnosis-dashboard-review))
-    (should (equal arguments '(nil)))))
 
 (provide 'gnosis-test-dashboard)
 ;;; gnosis-test-dashboard.el ends here

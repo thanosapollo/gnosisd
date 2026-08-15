@@ -1995,7 +1995,7 @@
                (lambda (query)
                  (should (equal title query))
                  (if created
-                     (vector '(:node_id "journal-id"
+                     (vector '(:node_id "journal-id" :active t
                                :logical_path "journal/2026-08-03.org"))
                    [])))
               ((symbol-function 'gnosis-nodes--create-journal-entry)
@@ -2044,20 +2044,24 @@
 
 (ert-deftest gnosis-journal-matches-only-file-nodes-and-today-exact-path ()
   (let* ((root '(:node_id "root" :title "2026-08-03" :level 0
-                 :logical_path "journal/2026-08-03.org"))
+                 :logical_path "journal/2026-08-03.org" :active t))
+         (retired `(:node_id "retired" :title "2026-08-03" :level 0
+                    :logical_path "journal/2026-08-03.org"
+                    :active ,gnosis-core--json-false))
          (child '(:node_id "child" :title "2026-08-03 notes" :level 1
-                  :logical_path "journal/2026-08-03.org"))
+                  :logical_path "journal/2026-08-03.org" :active t))
          (other '(:node_id "other" :title "2026-08-03" :level 0
-                  :logical_path "journal/other.org"))
+                  :logical_path "journal/other.org" :active t))
          visited)
     (cl-letf (((symbol-function 'gnosis-core-nodes)
                (lambda (&rest _)
-                 `(:items [,root ,child ,other] :next ,gnosis-core--json-null)))
+                 `(:items [,root ,retired ,child ,other]
+                   :next ,gnosis-core--json-null)))
               ((symbol-function 'format-time-string)
                (lambda (&rest _) "2026-08-03"))
               ((symbol-function 'gnosis-nodes--visit-node)
                (lambda (node) (setq visited node))))
-      (should (equal '("root" "other")
+      (should (equal '("root" "retired" "other")
                      (mapcar (lambda (node) (plist-get node :node_id))
                              (append (gnosis-nodes--journal-matches
                                       "2026-08-03") nil))))
@@ -2317,6 +2321,85 @@
       (gnosis-nodes-page-next)
       (should (equal '(nil "node-a") (nreverse calls)))
       (should (equal "node-b" (tabulated-list-get-id))))))
+
+(ert-deftest gnosis-node-page-next-preserves-terminal-page ()
+  (let* ((token (make-string 40 ?a))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (first (gnosis-test-nodes--catalog-node "node-a" :title "Alpha"))
+         (second (gnosis-test-nodes--catalog-node "node-b" :title "Beta"))
+         calls)
+    (with-temp-buffer
+      (gnosis-nodes-page-mode)
+      (setq-local gnosis-nodes-page--authority
+                  (list gnosis-core--base-url-override (secure-hash 'sha256 token))
+                  gnosis-nodes-page--fetch
+                  (lambda (cursor)
+                    (push cursor calls)
+                    (if cursor
+                        `(:items [] :next ,gnosis-core--json-null)
+                      `(:items [,first ,second] :next "node-b"))))
+      (gnosis-nodes-page--load nil)
+      (goto-char (point-min))
+      (forward-line 1)
+      (let ((cursor gnosis-nodes-page--cursor)
+            (history gnosis-nodes-page--history)
+            (records gnosis-nodes-page--records)
+            (entries tabulated-list-entries)
+            (selected (tabulated-list-get-id)))
+        (gnosis-nodes-page-next)
+        (should (equal '(nil "node-b") (reverse calls)))
+        (should (eq gnosis-core--json-null gnosis-nodes-page--next))
+        (should (equal cursor gnosis-nodes-page--cursor))
+        (should (equal history gnosis-nodes-page--history))
+        (should (eq records gnosis-nodes-page--records))
+        (should (equal entries tabulated-list-entries))
+        (should (equal selected (tabulated-list-get-id)))
+        (should-error (gnosis-nodes-page-next) :type 'user-error)
+        (should (= 2 (length calls)))))))
+
+(ert-deftest gnosis-node-page-refresh-preserves-stable-selection ()
+  (let* ((token (make-string 40 ?a))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (first (gnosis-test-nodes--catalog-node "node-a" :title "Alpha"))
+         (second (gnosis-test-nodes--catalog-node "node-b" :title "Beta"))
+         (items (vector first second)))
+    (with-temp-buffer
+      (gnosis-nodes-page-mode)
+      (setq-local gnosis-nodes-page--authority
+                  (list gnosis-core--base-url-override (secure-hash 'sha256 token))
+                  gnosis-nodes-page--fetch
+                  (lambda (_cursor)
+                    `(:items ,items :next ,gnosis-core--json-null)))
+      (gnosis-nodes-page--load nil)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (gnosis-nodes-page-refresh)
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (setq items (vector first))
+      (gnosis-nodes-page-refresh)
+      (should (equal "node-a" (tabulated-list-get-id))))))
+
+(ert-deftest gnosis-node-page-sort-preserves-stable-selection ()
+  (let* ((first (gnosis-test-nodes--catalog-node
+                 "node-a" :title "Alpha" :logical_path "notes/z.org"))
+         (second (gnosis-test-nodes--catalog-node
+                  "node-b" :title "Beta" :logical_path "notes/m.org"))
+         (third (gnosis-test-nodes--catalog-node
+                 "node-c" :title "Gamma" :logical_path "notes/a.org")))
+    (with-temp-buffer
+      (gnosis-nodes-page-mode)
+      (gnosis-nodes-page--install
+       `(:items [,first ,second ,third] :next ,gnosis-core--json-null) nil)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (gnosis-nodes-page-sort "Path")
+      (should (equal "node-b" (tabulated-list-get-id)))
+      (goto-char (point-min))
+      (should (equal "node-c" (tabulated-list-get-id))))))
 
 (ert-deftest gnosis-node-page-fetch-failures-preserve-all-page-state ()
   (let* ((token (make-string 40 ?a))

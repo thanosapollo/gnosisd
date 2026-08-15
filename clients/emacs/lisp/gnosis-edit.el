@@ -24,6 +24,9 @@
 (defconst gnosis-edit--kinds '("basic" "cloze" "mcq" "mc-cloze")
   "Thema kinds supported by the authoring mode.")
 
+(defconst gnosis-edit--max-review-cloze-inputs 500
+  "Maximum cloze inputs accepted by the daemon.")
+
 (defconst gnosis-edit--metadata-fields
   '((:source_guid "Source GUID" optional)
     (:parathema "Parathema" optional)
@@ -423,6 +426,25 @@
                  value)))
     (if (string-prefix-p "\"" value) (substring value 1) value)))
 
+(defun gnosis-edit--unicode-whitespace-p (character)
+  "Return non-nil when CHARACTER is whitespace according to Rust."
+  (or (and (<= #x9 character) (<= character #xd))
+      (memq character
+            '(#x20 #x85 #xa0 #x1680 #x2028 #x2029 #x202f #x205f #x3000))
+      (and (<= #x2000 character) (<= character #x200a))))
+
+(defun gnosis-edit--unicode-trim-bounds (value)
+  "Return Rust-compatible Unicode trim bounds for VALUE."
+  (let ((start 0)
+        (end (length value)))
+    (while (and (< start end)
+                (gnosis-edit--unicode-whitespace-p (aref value start)))
+      (setq start (1+ start)))
+    (while (and (> end start)
+                (gnosis-edit--unicode-whitespace-p (aref value (1- end))))
+      (setq end (1- end)))
+    (cons start end)))
+
 (defun gnosis-edit--answer-range (text answer spans)
   "Return the first unused folded ANSWER range in TEXT outside SPANS."
   (let ((start 0) found (case-fold-search t))
@@ -430,7 +452,7 @@
                 (string-match (regexp-quote answer) text start))
       (let ((begin (match-beginning 0)) (end (match-end 0)))
         (if (gnosis-edit--range-overlap-p begin end spans)
-            (setq start (1+ begin))
+            (setq start end)
           (setq found (list begin end)))))
     found))
 
@@ -443,11 +465,13 @@
              for index from 0
              for matched = (and (stringp answer)
                                 (gnosis-edit--trim-outer-quotes answer))
+             for trim-bounds = (and matched
+                                    (gnosis-edit--unicode-trim-bounds matched))
              for range = (and matched
-                              (not (string-empty-p (string-trim matched)))
+                              (< (car trim-bounds) (cdr trim-bounds))
                               (gnosis-edit--answer-range text matched spans))
              unless (and matched
-                         (not (string-empty-p (string-trim matched))))
+                         (< (car trim-bounds) (cdr trim-bounds)))
              do (user-error "Cloze answers cannot be empty")
              unless range
              do (user-error "Cloze answer is not text in the question: %s"
@@ -495,6 +519,48 @@
       (concat " :: " (gnosis-edit--escape-cloze-value (aref hints index))))
      (t (user-error "Invalid cloze hint")))))
 
+(defun gnosis-edit--review-cloze-hint (request index)
+  "Return daemon-equivalent concealed hint for REQUEST answer INDEX."
+  (let* ((hints (plist-get request :hypothesis))
+         (hint (and (vectorp hints) (< index (length hints))
+                    (aref hints index))))
+    (if (and (stringp hint) (not (member hint '("" "nil" "\"\""))))
+        hint
+      "...")))
+
+(defun gnosis-edit--concealed-cloze-text (request spans)
+  "Return daemon-equivalent concealed text for REQUEST using SPANS."
+  (let ((text (plist-get request :keimenon))
+        (answers (plist-get request :answer))
+        (cursor 0)
+        parts)
+    (dolist (span spans)
+      (let* ((answer (gnosis-edit--trim-outer-quotes
+                      (aref answers (nth 2 span))))
+             (trim-bounds (gnosis-edit--unicode-trim-bounds answer)))
+        (push (substring text cursor (car span)) parts)
+        (push (concat (substring answer 0 (car trim-bounds))
+                      "(" (gnosis-edit--review-cloze-hint
+                           request (nth 2 span)) ")"
+                      (substring answer (cdr trim-bounds)))
+              parts))
+      (setq cursor (cadr span)))
+    (push (substring text cursor) parts)
+    (apply #'concat (nreverse parts))))
+
+(defun gnosis-edit--validate-cloze-review-safety (request spans)
+  "Reject REQUEST when concealed text from SPANS exposes an answer."
+  (let ((question (gnosis-edit--concealed-cloze-text request spans))
+        (case-fold-search t))
+    (cl-loop for answer across (plist-get request :answer)
+             for untrimmed = (gnosis-edit--trim-outer-quotes answer)
+             for trim-bounds = (gnosis-edit--unicode-trim-bounds untrimmed)
+             for matched = (substring untrimmed
+                                      (car trim-bounds) (cdr trim-bounds))
+             when (string-match-p (regexp-quote matched) question)
+             do (user-error "Cloze answer remains visible in the question: %s"
+                            answer))))
+
 (defun gnosis-edit--format-cloze-text (request)
   "Return REQUEST question with semantic cloze markers."
   (let* ((text (or (plist-get request :keimenon) ""))
@@ -502,6 +568,8 @@
          (spans (if (= (length answers) 0) nil
                   (gnosis-edit--cloze-spans text answers)))
          (cursor 0) parts)
+    (when spans
+      (gnosis-edit--validate-cloze-review-safety request spans))
     (dolist (span spans)
       (let ((source (substring text (car span) (cadr span)))
             (answer (aref answers (nth 2 span))))
@@ -925,7 +993,9 @@ Deeper outline stars are body text, not structural section boundaries."
                         (and (vectorp hints) (<= (length hints) 1))))
          (user-error "Basic Thema requires one answer and at most one hint")))
       ("cloze"
-       (unless (and (or (null hints)
+       (unless (and (<= (length answers)
+                        gnosis-edit--max-review-cloze-inputs)
+                    (or (null hints)
                         (and (vectorp hints) (<= (length hints) (length answers))))
                     (gnosis-edit--cloze-spans question answers))
          (user-error "Invalid cloze Thema")))

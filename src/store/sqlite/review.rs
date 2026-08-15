@@ -92,6 +92,74 @@ impl SqliteStore {
             .ok_or(StoreError::NotFound)
     }
 
+    pub(crate) fn replace_review_session(
+        &mut self,
+        replaced_session_id: &str,
+        source: &ReviewSource,
+        target_count: Option<u32>,
+        actor_device_id: Option<&str>,
+        owner_device_id: Option<&str>,
+        started_at_us: u64,
+    ) -> Result<ReviewSessionView, StoreError> {
+        source
+            .clone()
+            .validate()
+            .map_err(|_| StoreError::InvalidReviewState)?;
+        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
+        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        {
+            return Err(StoreError::InvalidReviewState);
+        }
+        let transaction = self.write_transaction()?;
+        let replaced_session = require_session_actor(
+            &transaction,
+            replaced_session_id,
+            actor_device_id,
+            ReviewSessionMode::Online,
+        )?;
+        if replaced_session.status != "active" {
+            return Err(StoreError::ActiveReviewSession);
+        }
+        let captured = captured_settings(&transaction)?;
+        let review_day = review_day_at(
+            started_at_us,
+            &captured.timezone,
+            captured.day_boundary_hour,
+        )
+        .map_err(StoreError::storage)?;
+        let queue = select_queue(&transaction, source, review_day, target_count)?;
+        if queue.is_empty() {
+            return Err(StoreError::NotFound);
+        }
+        let session_id = Uuid::now_v7().to_string();
+        let changed = transaction
+            .execute(
+                "UPDATE review_session SET status = 'quit', ended_at_us = ?2
+                 WHERE session_id = ?1 AND status = 'active'",
+                params![
+                    replaced_session_id,
+                    u64_to_i64(started_at_us, "session end")?
+                ],
+            )
+            .map_err(StoreError::storage)?;
+        if changed == 0 {
+            return Err(StoreError::ActiveReviewSession);
+        }
+        insert_session(
+            &transaction,
+            &session_id,
+            source,
+            target_count,
+            &captured,
+            SessionAccess::Online(owner_device_id),
+            started_at_us,
+        )?;
+        insert_session_items(&transaction, &session_id, &queue)?;
+        transaction.commit().map_err(StoreError::storage)?;
+        self.review_session(&session_id)?
+            .ok_or(StoreError::NotFound)
+    }
+
     pub(crate) fn review_session(
         &self,
         session_id: &str,
@@ -1944,7 +2012,7 @@ fn require_session_actor(
     session_id: &str,
     actor_device_id: Option<&str>,
     mode: ReviewSessionMode,
-) -> Result<(), StoreError> {
+) -> Result<ReviewSessionView, StoreError> {
     let session = load_session(connection, session_id)?.ok_or(StoreError::NotFound)?;
     if session.mode != mode {
         return Err(StoreError::InvalidReviewState);
@@ -1952,7 +2020,7 @@ fn require_session_actor(
     if actor_device_id.is_some_and(|actor| session.owner_device_id.as_deref() != Some(actor)) {
         Err(StoreError::ReviewOwnership)
     } else {
-        Ok(())
+        Ok(session)
     }
 }
 
@@ -3980,6 +4048,79 @@ mod tests {
             Some(OfflineConflictReason::CaptureMismatch)
         );
         assert_eq!(result.authoritative_state.review_count, 0);
+    }
+
+    #[test]
+    fn online_replacement_is_atomic_for_empty_and_competing_sources() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "first", "First", None);
+        add_thema(&mut store, "second", "Second", None);
+        add_thema(&mut store, "third", "Third", None);
+        let first = store
+            .create_review_session(&manual_source("first"), Some(1), None, 1)
+            .unwrap();
+
+        assert!(matches!(
+            store.replace_review_session(
+                &first.session_id,
+                &manual_source("missing"),
+                Some(1),
+                None,
+                None,
+                2,
+            ),
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            store.active_review_session(None).unwrap(),
+            Some(first.clone())
+        );
+
+        let second = store
+            .replace_review_session(
+                &first.session_id,
+                &manual_source("second"),
+                Some(1),
+                None,
+                None,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .review_session(&first.session_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "quit"
+        );
+        assert_eq!(
+            store.active_review_session(None).unwrap(),
+            Some(second.clone())
+        );
+        assert!(matches!(
+            store.replace_review_session(
+                &first.session_id,
+                &manual_source("missing"),
+                Some(1),
+                None,
+                None,
+                4,
+            ),
+            Err(StoreError::ActiveReviewSession)
+        ));
+        assert!(matches!(
+            store.replace_review_session(
+                &first.session_id,
+                &manual_source("third"),
+                Some(1),
+                None,
+                None,
+                5,
+            ),
+            Err(StoreError::ActiveReviewSession)
+        ));
+        assert_eq!(store.active_review_session(None).unwrap(), Some(second));
     }
 
     #[test]

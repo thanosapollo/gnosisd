@@ -919,7 +919,8 @@ Without BASE-LEVEL, start one level below the current heading."
           (vconcat
            (seq-filter
             (lambda (node)
-              (equal logical-path (plist-get node :logical_path)))
+              (and (eq t (plist-get node :active))
+                   (equal logical-path (plist-get node :logical_path))))
             (append (gnosis-nodes--journal-matches title) nil)))))
     (pcase (length matches)
       (0 (gnosis-nodes--create-journal-entry title))
@@ -1206,10 +1207,11 @@ With prefix argument REFRESH, rebuild the node catalog first."
 
 (defun gnosis-nodes-page-sort (column)
   "Sort the current node page by COLUMN."
-  (setq tabulated-list-sort-key (cons column nil))
-  (tabulated-list-init-header)
-  (tabulated-list-print t)
-  (goto-char (point-min)))
+  (let ((selected-id (tabulated-list-get-id)))
+    (setq tabulated-list-sort-key (cons column nil))
+    (tabulated-list-init-header)
+    (tabulated-list-print t)
+    (gnosis-nodes-page--restore-selection selected-id)))
 
 (keymap-popup-define gnosis-node-search-map
   "Search Nodes"
@@ -1272,8 +1274,18 @@ With prefix argument REFRESH, rebuild the node catalog first."
                              (append (or (plist-get record :tags) []) nil)
                              ", ")))))
 
-(defun gnosis-nodes-page--install (page cursor)
-  "Install fetched PAGE for CURSOR in the current result buffer."
+(defun gnosis-nodes-page--restore-selection (selected-id)
+  "Restore SELECTED-ID in the current page, falling back to its first row."
+  (goto-char (point-min))
+  (when selected-id
+    (while (and (not (eobp))
+                (not (equal selected-id (tabulated-list-get-id))))
+      (forward-line 1))
+    (unless (equal selected-id (tabulated-list-get-id))
+      (goto-char (point-min)))))
+
+(defun gnosis-nodes-page--install (page cursor &optional selected-id)
+  "Install fetched PAGE for CURSOR, restoring optional SELECTED-ID."
   (let* ((items (plist-get page :items))
          (records (make-hash-table :test #'equal)))
     (cl-loop for record across items
@@ -1287,7 +1299,7 @@ With prefix argument REFRESH, rebuild the node catalog first."
           (cl-loop for record across items
                    collect (gnosis-nodes-page--entry record)))
     (tabulated-list-print t)
-    (goto-char (point-min))))
+    (gnosis-nodes-page--restore-selection selected-id)))
 
 (defun gnosis-nodes-page--with-authority (function)
   "Call FUNCTION under this page's authenticated authority."
@@ -1309,12 +1321,12 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (gnosis-nodes-page--with-authority
    (lambda () (funcall gnosis-nodes-page--fetch cursor))))
 
-(defun gnosis-nodes-page--load (cursor)
-  "Load CURSOR through the current page fetcher."
+(defun gnosis-nodes-page--load (cursor &optional selected-id)
+  "Load CURSOR through the page fetcher, restoring optional SELECTED-ID."
   (unless gnosis-nodes-page--fetch
     (user-error "No Gnosis page source"))
   (gnosis-nodes-page--install
-   (gnosis-nodes-page--fetch-page cursor) cursor))
+   (gnosis-nodes-page--fetch-page cursor) cursor selected-id))
 
 (defun gnosis-nodes-page-open (title fetch)
   "Open a node page named TITLE using single-argument FETCH."
@@ -1345,8 +1357,12 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (let* ((cursor gnosis-nodes-page--next)
          (page (gnosis-nodes-page--fetch-page cursor))
          (previous gnosis-nodes-page--cursor))
-    (gnosis-nodes-page--install page cursor)
-    (push previous gnosis-nodes-page--history)))
+    (if (= (length (plist-get page :items)) 0)
+        (progn
+          (setq gnosis-nodes-page--next gnosis-core--json-null)
+          (message "No more Gnosis node results"))
+      (gnosis-nodes-page--install page cursor)
+      (push previous gnosis-nodes-page--history))))
 
 (defun gnosis-nodes-page-previous ()
   "Return to the previous result page fetched in this buffer."
@@ -1361,7 +1377,8 @@ With prefix argument REFRESH, rebuild the node catalog first."
 (defun gnosis-nodes-page-refresh ()
   "Refresh the current result page."
   (interactive)
-  (gnosis-nodes-page--load gnosis-nodes-page--cursor))
+  (gnosis-nodes-page--load gnosis-nodes-page--cursor
+                           (tabulated-list-get-id)))
 
 (defun gnosis-nodes-page-visit ()
   "Visit the node or content-hit document at point."
