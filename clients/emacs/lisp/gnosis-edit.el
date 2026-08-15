@@ -25,8 +25,7 @@
   "Thema kinds supported by the authoring mode.")
 
 (defconst gnosis-edit--metadata-fields
-  '((:source_guid "Source GUID" optional)
-    (:parathema "Parathema" optional)
+  '((:parathema "Parathema" optional)
     (:review_image "Review image" optional)
     (:tags "Tags" list)
     (:concepts "Concepts" concepts)
@@ -74,7 +73,7 @@
   "Window configuration restored when this editor exits.")
 
 (defvar-local gnosis-edit--original-request nil
-  "Request from which the current authoring buffer was rendered.")
+  "Rendered request and hidden fields preserved by the current editor.")
 
 (defvar-keymap gnosis-edit-mode-map
   "TAB" #'gnosis-edit-tab
@@ -114,7 +113,7 @@
 
 (defun gnosis-edit--stateful-field-p (label)
   "Return non-nil when LABEL supports an explicit value state."
-  (member label '("Hint" "Source GUID" "Parathema" "Review image"
+  (member label '("Hint" "Parathema" "Review image"
                   "Tags" "Concepts" "Asset paths")))
 
 (defun gnosis-edit--collection-field-p (label)
@@ -310,6 +309,11 @@
        "Unsupported live thema fields: %s"
        (mapconcat (lambda (key) (substring (symbol-name key) 1))
                   unknown ", "))))
+  (when (plist-member request :source_guid)
+    (let ((source-guid (plist-get request :source_guid)))
+      (unless (or (eq source-guid gnosis-core--json-null)
+                  (stringp source-guid))
+        (user-error "Invalid Thema source GUID"))))
   (when (plist-member request :concepts)
     (unless (vectorp (plist-get request :concepts))
       (user-error "Invalid thema concepts"))
@@ -952,6 +956,11 @@ When ALLOW-INCOMPLETE is non-nil, return an unfinished new draft."
     (gnosis-edit--validate-section-order kind sections)
     (let ((request (append (list :kind kind)
                            (gnosis-edit--parse-primary kind primary)
+                           (when (plist-member gnosis-edit--original-request
+                                              :source_guid)
+                             (list :source_guid
+                                   (plist-get gnosis-edit--original-request
+                                              :source_guid)))
                            (gnosis-edit--parse-metadata metadata))))
       (gnosis-edit--validate-request-shape request)
       (if allow-incomplete request (gnosis-edit--validate-draft request)))))
