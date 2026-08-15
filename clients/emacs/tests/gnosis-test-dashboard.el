@@ -390,8 +390,8 @@
 (ert-deftest gnosis-dashboard-themata-mode-restores-archived-view-actions ()
   (dolist (binding '(("q" . gnosis-dashboard)
                      ("SPC" . gnosis-themata-filter-search)
-                     ("n" . next-line)
-                     ("p" . previous-line)
+                     ("n" . gnosis-themata-next-row)
+                     ("p" . gnosis-themata-previous-row)
                      ("N" . gnosis-themata-filter-max-reviews)
                      ("RET" . gnosis-themata-edit)
                      ("e" . gnosis-themata-edit)
@@ -409,6 +409,39 @@
                      ("g" . gnosis-themata-refresh)))
     (should (eq (keymap-lookup gnosis-dashboard-themata-mode-map (car binding))
                 (cdr binding)))))
+
+(ert-deftest gnosis-dashboard-themata-row-navigation-clamps-to-visible-records ()
+  (let ((first '(:thema_id "id-1" :keimenon "First" :hypothesis []
+                 :answer [] :tags [] :kind "basic"))
+        (hidden '(:thema_id "id-hidden" :keimenon "Hidden" :hypothesis []
+                  :answer [] :tags [] :kind "basic" :archived t))
+        (last '(:thema_id "id-2" :keimenon "Last" :hypothesis []
+                :answer [] :tags [] :kind "basic")))
+    (with-temp-buffer
+      (gnosis-dashboard-themata-mode)
+      (gnosis-themata--setup-ewoc nil)
+      (let ((inhibit-read-only t))
+        (gnosis-themata--enter-last first)
+        (gnosis-themata--enter-last hidden)
+        (gnosis-themata--enter-last last))
+      (gnosis-themata--goto-id "id-1")
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "p"))
+      (should (equal "id-1" (gnosis-themata--current-id)))
+      (gnosis-themata-mark)
+      (should (gethash "id-1" gnosis-themata--marked))
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "n"))
+      (should (equal "id-2" (gnosis-themata--current-id)))
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "p"))
+      (should (equal "id-1" (gnosis-themata--current-id)))
+      (gnosis-themata--goto-id "id-2")
+      (call-interactively
+       (keymap-lookup gnosis-dashboard-themata-mode-map "n"))
+      (should (equal "id-2" (gnosis-themata--current-id)))
+      (gnosis-themata-mark)
+      (should (gethash "id-2" gnosis-themata--marked)))))
 
 (ert-deftest gnosis-themata-sort-rejects-incomplete-projection ()
   (with-temp-buffer

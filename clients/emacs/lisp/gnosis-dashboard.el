@@ -250,6 +250,28 @@
   "Return visible EWOC node at point, or nil."
   (gethash (gnosis-themata--current-id) gnosis-themata--nodes))
 
+(defun gnosis-themata--move-row (step)
+  "Move with EWOC STEP to a visible row, clamping at collection bounds."
+  (when-let* ((node (gnosis-themata--current-node)))
+    (let ((column (current-column))
+          (next (funcall step gnosis-themata--ewoc node)))
+      (while (and next
+                  (not (gnosis-themata--visible-p (ewoc-data next))))
+        (setq next (funcall step gnosis-themata--ewoc next)))
+      (when next
+        (ewoc-goto-node gnosis-themata--ewoc next)
+        (move-to-column column)))))
+
+(defun gnosis-themata-next-row ()
+  "Move to the next visible thema, clamping at the final row."
+  (interactive)
+  (gnosis-themata--move-row #'ewoc-next))
+
+(defun gnosis-themata-previous-row ()
+  "Move to the previous visible thema, clamping at the first row."
+  (interactive)
+  (gnosis-themata--move-row #'ewoc-prev))
+
 (defun gnosis-themata--goto-id (thema-id)
   "Move point to visible THEMA-ID and return non-nil when found."
   (when-let* ((node (and thema-id (gethash thema-id gnosis-themata--nodes)))
@@ -1594,8 +1616,8 @@ Without a prefix argument, show only never-reviewed themata."
   :description "Gnosis Themata"
   :group "Navigate"
   "q" ("Back" gnosis-dashboard)
-  "n" ("Next row" next-line :stay-open t)
-  "p" ("Previous row" previous-line :stay-open t)
+  "n" ("Next row" gnosis-themata-next-row :stay-open t)
+  "p" ("Previous row" gnosis-themata-previous-row :stay-open t)
   "RET" ("Edit at point" gnosis-themata-edit)
   :group "Quick views"
   "SPC" ("Search" gnosis-themata-filter-search)
