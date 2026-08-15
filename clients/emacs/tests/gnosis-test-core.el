@@ -1376,18 +1376,48 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                (lambda (&rest _)
                  (gnosis-test-core--http-buffer
                   status
-                  "{\"error\":{\"code\":\"future_error\",\"message\":\"bad request\",\"meta\":{\"new\":true}}}"))))
+                  "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad request\",\"meta\":null}}"))))
       (let ((condition
              (should-error
               (gnosis-core--perform-request "GET" "/v1/test" nil 200 nil t)
               :type 'gnosis-core-validation-error)))
         (should (eq 'gnosis-core-http-rejection (car condition)))
-        (should (equal '("bad request" "future_error") (cdr condition)))))))
+        (should (equal '("bad request" "invalid_request") (cdr condition)))))))
+
+(ert-deftest gnosis-core-accepts-code-correlated-error-metadata ()
+  (let ((digest (make-string 64 ?a)))
+    (dolist
+        (entry
+         `(("snapshot_required" (:snapshot_url "/v1/sync/snapshot"))
+           ("revision_conflict"
+            (:expected_revision :gnosis-json-null
+             :current_revision #xffffffffffffffff))
+           ("device_sequence_gap" (:expected_sequence #xffffffffffffffff))
+           ("blob_required"
+            (:content_sha256 ,digest
+             :upload_url ,(format "/v1/sync/blobs/%s" digest)))))
+      (should
+       (equal
+        (list "typed" (car entry))
+        (gnosis-core--api-error-view
+         (list :error
+               (list :code (car entry) :message "typed" :meta (cadr entry)))))))))
 
 (ert-deftest gnosis-core-rejects-unbounded-or-malformed-error-envelope ()
   (dolist (body
            (list "{}"
                  "{\"error\":{\"code\":7,\"message\":\"bad\"}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\",\"meta\":null},\"error\":{\"code\":\"internal\",\"message\":\"other\",\"meta\":null}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\",\"meta\":null},\"extra\":true}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"code\":\"internal\",\"message\":\"bad\",\"meta\":null}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\",\"meta\":null,\"extra\":true}}"
+                 "{\"error\":{\"code\":\"invalid_request\",\"message\":\"bad\"}}"
+                 "{\"error\":{\"code\":\"future_error\",\"message\":\"bad\",\"meta\":null}}"
+                 "{\"error\":{\"code\":\"stale_attempt\",\"message\":\"changed\",\"meta\":{\"expected_revision\":1,\"current_revision\":2}}}"
+                 (let ((digest (make-string 64 ?A)))
+                   (format
+                    "{\"error\":{\"code\":\"blob_required\",\"message\":\"bad\",\"meta\":{\"content_sha256\":\"%s\",\"upload_url\":\"/v1/sync/blobs/%s\"}}}"
+                    digest digest))
                  (format "{\"error\":{\"code\":\"bad\",\"message\":\"%s\"}}"
                          (make-string 513 ?x))))
     (cl-letf (((symbol-function 'gnosis-core--token)

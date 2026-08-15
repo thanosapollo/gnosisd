@@ -475,6 +475,28 @@
                        (plist-get gnosis-review--attempt :attempt_id)))
         (should-not gnosis-review--answer-locked-p)))))
 
+(ert-deftest gnosis-review-malformed-stale-error-does-not-advance ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt (gnosis-test-review--attempt "pending"))
+    (let (advanced)
+      (cl-letf (((symbol-function 'gnosis-review--read-answer)
+                 (lambda () '(:kind "text" :value "answer")))
+                ((symbol-function 'gnosis-core-review-attempt-answer)
+                 (lambda (&rest _)
+                   (gnosis-core--signal-http-error
+                    412
+                    '(:error (:code "stale_attempt" :message "changed"
+                              :meta :gnosis-json-null)
+                      :error (:code "review_state_conflict" :message "other"
+                              :meta :gnosis-json-null)))))
+                ((symbol-function 'gnosis-review--next-current)
+                 (lambda () (setq advanced t))))
+        (should-error (gnosis-review--answer-authorized)
+                      :type 'gnosis-core-protocol-error)
+        (should-not advanced)))))
+
 (ert-deftest gnosis-review-stale-finish-reconciles-without-commit ()
   (with-temp-buffer
     (setq gnosis-review--session (gnosis-test-review--session)
