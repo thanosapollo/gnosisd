@@ -101,12 +101,13 @@
 (defun gnosis-themata--column-format (width)
   "Return thema column widths proportioned for window WIDTH."
   (let ((available (max 56 (- width 8))))
-    (vector (max 10 (/ (* available 30) 100))
+    (vector (max 10 (/ (* available 27) 100))
+            (max 8 (/ (* available 16) 100))
+            (max 8 (/ (* available 16) 100))
             (max 8 (/ (* available 17) 100))
-            (max 8 (/ (* available 17) 100))
-            (max 8 (/ (* available 19) 100))
-            (max 5 (/ (* available 10) 100))
-            (max 5 (/ (* available 7) 100)))))
+            (max 5 (/ (* available 9) 100))
+            (max 5 (/ (* available 7) 100))
+            (max 5 (/ (* available 8) 100)))))
 
 (defun gnosis-themata--display-list (values)
   "Return one-line comma-separated text for vector VALUES."
@@ -134,6 +135,7 @@
     (gnosis-themata--display-list (plist-get record :answer)))
    (gnosis-themata--display-list (plist-get record :tags))
    (plist-get record :kind)
+   (gnosis-themata--yes-no (plist-get record :archived))
    (gnosis-themata--yes-no (plist-get record :suspended))))
 
 (defun gnosis-themata--column-text (text width index face)
@@ -147,9 +149,11 @@
   "Return one propertized dashboard row for RECORD."
   (let* ((columns (gnosis-themata--columns record))
          (widths gnosis-themata--column-widths)
+         (archived (eq t (plist-get record :archived)))
          (suspended (eq t (plist-get record :suspended)))
          (faces (vector 'default 'default 'default 'font-lock-constant-face
                         'font-lock-type-face
+                        (if archived 'warning 'shadow)
                         (if suspended 'warning 'shadow)))
          (parts
           (cl-loop for index below (length columns)
@@ -174,7 +178,8 @@
 
 (defun gnosis-themata--header-line ()
   "Return current thema column header."
-  (let ((names ["Question" "Hypothesis" "Answer" "Tags" "Kind" "Suspended"])
+  (let ((names ["Question" "Hypothesis" "Answer" "Tags" "Kind"
+                "Archived" "Suspended"])
         (widths gnosis-themata--column-widths))
     (concat
      (propertize "Themata" 'face 'gnosis-face-dashboard-header)
@@ -293,11 +298,12 @@
 
 (defun gnosis-themata--matches-review-filter-p (record)
   "Return non-nil when RECORD matches current review filter."
-  (and (not (eq t (plist-get record :archived)))
-       (pcase gnosis-themata--review-filter
-         (:active (not (eq t (plist-get record :suspended))))
-         (:suspended (eq t (plist-get record :suspended)))
-         (_ t))))
+  (let ((archived (eq t (plist-get record :archived)))
+        (suspended (eq t (plist-get record :suspended))))
+    (pcase gnosis-themata--review-filter
+      (:active (and (not archived) (not suspended)))
+      (:suspended (and (not archived) suspended))
+      (_ t))))
 
 (defun gnosis-themata--matches-tag-filter-p (record)
   "Return non-nil when RECORD matches current exact tag filter."
@@ -793,7 +799,7 @@ With numeric prefix -1, restore authoritative catalog order."
     (if (equal column -1)
         (setq gnosis-themata--sort-key nil)
       (let ((column (or column (gnosis-themata--column-at-point))))
-        (unless (and (integerp column) (<= 0 column 5))
+        (unless (and (integerp column) (<= 0 column 6))
           (user-error "Invalid column number"))
         (if (equal column (car-safe gnosis-themata--sort-key))
             (setcdr gnosis-themata--sort-key
@@ -1626,7 +1632,7 @@ Without a prefix argument, show only never-reviewed themata."
   "e" ("Edit thema" gnosis-themata-edit)
   "a" ("Add thema" gnosis-themata-add)
   "s" ("Suspend or unsuspend" gnosis-themata-toggle-suspension)
-  "d" ("Delete selected" gnosis-themata-bulk-archive)
+  "d" ("Delete selected (prefix: restore)" gnosis-themata-bulk-archive)
   :group "Selection"
   "*" ("Mark current" gnosis-themata-mark :stay-open t)
   "u" ("Unmark current" gnosis-themata-unmark :stay-open t)

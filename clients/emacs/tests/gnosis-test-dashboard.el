@@ -419,6 +419,7 @@
                 :answer [] :tags [] :kind "basic")))
     (with-temp-buffer
       (gnosis-dashboard-themata-mode)
+      (setq-local gnosis-themata--review-filter :active)
       (gnosis-themata--setup-ewoc nil)
       (let ((inhibit-read-only t))
         (gnosis-themata--enter-last first)
