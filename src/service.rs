@@ -971,6 +971,36 @@ impl ServiceHandle {
         .map_err(ServiceError::Store)
     }
 
+    pub(crate) async fn replace_review_session(
+        &self,
+        replaced_session_id: String,
+        source: ReviewSource,
+        target_count: Option<u32>,
+        actor_device_id: Option<String>,
+        owner_device_id: Option<String>,
+        started_at_us: u64,
+    ) -> Result<ReviewSessionView, ServiceError> {
+        let source = source.validate().map_err(ServiceError::Review)?;
+        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
+        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        {
+            return Err(ServiceError::Review(ReviewError::Target));
+        }
+        request(&self.sender, |response| {
+            StoreCommand::ReplaceReviewSession {
+                replaced_session_id,
+                source,
+                target_count,
+                actor_device_id,
+                owner_device_id,
+                started_at_us,
+                response,
+            }
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
     pub(crate) async fn active_review_session(
         &self,
         actor_device_id: Option<String>,
@@ -1832,6 +1862,15 @@ enum StoreCommand {
     CreateReviewSession {
         source: ReviewSource,
         target_count: Option<u32>,
+        owner_device_id: Option<String>,
+        started_at_us: u64,
+        response: oneshot::Sender<StoreResult<ReviewSessionView>>,
+    },
+    ReplaceReviewSession {
+        replaced_session_id: String,
+        source: ReviewSource,
+        target_count: Option<u32>,
+        actor_device_id: Option<String>,
         owner_device_id: Option<String>,
         started_at_us: u64,
         response: oneshot::Sender<StoreResult<ReviewSessionView>>,
@@ -2829,6 +2868,25 @@ fn run_store_command(
             store.create_review_session(
                 &source,
                 target_count,
+                owner_device_id.as_deref(),
+                started_at_us,
+            ),
+        ),
+        StoreCommand::ReplaceReviewSession {
+            replaced_session_id,
+            source,
+            target_count,
+            actor_device_id,
+            owner_device_id,
+            started_at_us,
+            response,
+        } => send(
+            response,
+            store.replace_review_session(
+                &replaced_session_id,
+                &source,
+                target_count,
+                actor_device_id.as_deref(),
                 owner_device_id.as_deref(),
                 started_at_us,
             ),

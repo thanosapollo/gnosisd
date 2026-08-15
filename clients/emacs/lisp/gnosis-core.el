@@ -2188,6 +2188,27 @@ Each item contains stable operation, thema, and expected-revision fields."
               '("Gnosis review session response is not correlated")))
     session))
 
+(defun gnosis-core-review-session-replace
+    (replaced-session-id source &optional target-count)
+  "Atomically replace REPLACED-SESSION-ID with a review from SOURCE.
+TARGET-COUNT is optional."
+  (let ((session
+         (gnosis-core--typed-request
+          "post_review_sessions__id__replace"
+          (list (cons "id" replaced-session-id)) nil
+          (list :source source
+                :target_count (or target-count gnosis-core--json-null)))))
+    (unless (and (gnosis-core--review-session-valid-p session "active")
+                 (not (equal replaced-session-id
+                             (plist-get session :session_id)))
+                 (equal source (plist-get session :source))
+                 (equal (or target-count
+                            gnosis-core--default-online-review-target-count)
+                        (plist-get session :target_count)))
+      (signal 'gnosis-core-mutation-uncertain
+              '("Gnosis replacement review response is not correlated")))
+    session))
+
 (defun gnosis-core-review-session-active ()
   "Return the active review-session envelope."
   (let* ((envelope (gnosis-core--typed-request "get_review_sessions_active"))

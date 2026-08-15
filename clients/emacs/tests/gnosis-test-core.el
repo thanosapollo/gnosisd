@@ -1820,6 +1820,10 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                     `(:session_id "session" :mode "online" :status "active"
                       :source ,source :target_count 12
                       :current_position 0 :queue_length 1 :started_at_us 1))
+                   ("post_review_sessions__id__replace"
+                    `(:session_id "replacement" :mode "online" :status "active"
+                      :source ,source :target_count 12
+                      :current_position 0 :queue_length 1 :started_at_us 2))
                    ("post_review_sessions__id__quit"
                     `(:session_id "session" :mode "online" :status "quit"
                       :source ,source :target_count 12
@@ -1855,6 +1859,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                    ("post_review_attempts__id__commit"
                     '(:attempt_id "attempt" :event_id "event"))))))
       (gnosis-core-review-session-create source 12)
+      (gnosis-core-review-session-replace "session" source 12)
       (gnosis-core-review-session-active)
       (gnosis-core-review-session-resume "session")
       (gnosis-core-review-session-quit "session")
@@ -1868,6 +1873,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
     (should
      (equal
       `(("post_review_sessions" nil nil
+         (:source ,source :target_count 12))
+        ("post_review_sessions__id__replace" (("id" . "session")) nil
          (:source ,source :target_count 12))
         ("get_review_sessions_active")
         ("post_review_sessions__id__resume" (("id" . "session")))

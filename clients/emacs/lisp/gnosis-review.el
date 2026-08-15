@@ -529,13 +529,17 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
                 gnosis-review--authority gnosis-review--opening-authority)
           (gnosis-review--present t))))))
 
-(defun gnosis-review--create (source target-count)
+(defun gnosis-review--create (source target-count &optional replaced-session-id)
   "Create and open a review for SOURCE and optional TARGET-COUNT.
-Return nil when SOURCE has no review items."
+Atomically replace REPLACED-SESSION-ID when non-nil.  Return nil when SOURCE
+has no review items."
   (condition-case condition
       (progn
         (gnosis-review--open
-         (gnosis-core-review-session-create source target-count))
+         (if replaced-session-id
+             (gnosis-core-review-session-replace
+              replaced-session-id source target-count)
+           (gnosis-core-review-session-create source target-count)))
         t)
     (gnosis-core-not-found
      (message "No Gnosis review items are available")
@@ -544,6 +548,9 @@ Return nil when SOURCE has no review items."
      (let ((session (gnosis-review--active-session))
            (expected-count target-count))
        (if (and session
+                (or (null replaced-session-id)
+                    (not (equal replaced-session-id
+                                (plist-get session :session_id))))
                 (equal source (plist-get session :source))
                 (let ((effective (plist-get session :target_count)))
                   (equal effective
@@ -552,7 +559,7 @@ Return nil when SOURCE has no review items."
            (progn
              (gnosis-review--open session)
              t)
-           (signal (car condition) (cdr condition)))))))
+         (signal (car condition) (cdr condition)))))))
 
 (defun gnosis-review--read-active-session-action ()
   "Read the action to take when a review session is already active."
@@ -582,11 +589,8 @@ Return nil when SOURCE has no review items."
           (gnosis-review--resume-session
            (plist-get session :session_id))))
         ("Start new"
-         (let ((session-id (plist-get session :session_id)))
-           (gnosis-review--quit-session session-id)
-           (unless (gnosis-review--create source target-count)
-             (gnosis-review--open
-              (gnosis-review--resume-session session-id)))))
+         (gnosis-review--create
+          source target-count (plist-get session :session_id)))
         ("Cancel" (message "Gnosis review unchanged")))
     (gnosis-review--create source target-count)))
 
