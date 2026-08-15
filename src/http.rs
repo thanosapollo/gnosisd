@@ -3548,7 +3548,7 @@ fn openapi_online_review_operation(path: &str, method: &str) -> Option<Value> {
         "operationId":format!("{}_{}", method, path.replace("/v1/", "").replace(['/', '{', '}'], "_")),
         "security":[{"bearerAuth":[]}],
         "x-gnosis-required-scopes":scopes,
-        "parameters":online_review_parameters(path),
+        "parameters":online_review_parameters(path, method),
         "responses":content_json_responses(
             contract.success_status,
             contract.response,
@@ -3683,14 +3683,14 @@ fn online_review_contract(path: &str, method: &str) -> Option<ContentJsonContrac
     }
 }
 
-fn online_review_parameters(path: &str) -> Vec<Value> {
+fn online_review_parameters(path: &str, method: &str) -> Vec<Value> {
     let mut parameters = openapi_path_parameters(path);
-    match path {
-        "/v1/dashboard" => parameters.push(json!({
+    match (path, method) {
+        ("/v1/dashboard", "get") => parameters.push(json!({
             "name":"days", "in":"query", "required":false,
             "schema":{"type":"integer","minimum":1,"maximum":365,"default":30}
         })),
-        "/v1/review/sessions" => {
+        ("/v1/review/sessions", "get") => {
             parameters.extend([
                 json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
                 json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
@@ -3698,7 +3698,7 @@ fn online_review_parameters(path: &str) -> Vec<Value> {
                 json!({"name":"mode","in":"query","required":false,"schema":{"$ref":"#/components/schemas/ReviewSessionModeV1"}}),
             ]);
         }
-        "/v1/review/history" => {
+        ("/v1/review/history", "get") => {
             parameters.extend([
                 json!({"name":"after","in":"query","required":false,"schema":{"type":"string"}}),
                 json!({"name":"limit","in":"query","required":false,"schema":{"type":"integer","minimum":1,"maximum":MAX_PAGE,"default":100}}),
@@ -4959,6 +4959,28 @@ mod tests {
         let event = &api["components"]["schemas"]["ReviewHistoryEventV1"];
         assert!(event["properties"].get("response").is_none());
         assert_local_refs_resolve(&api, &api);
+    }
+
+    #[test]
+    fn openapi_post_review_sessions_omits_list_query_parameters() {
+        let api = openapi_document();
+        let post = &api["paths"]["/v1/review/sessions"]["post"];
+        let parameters = post["parameters"]
+            .as_array()
+            .expect("POST /v1/review/sessions must declare parameters");
+        let query_names: Vec<&str> = parameters
+            .iter()
+            .filter(|parameter| parameter["in"] == "query")
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert!(
+            query_names.is_empty(),
+            "POST /v1/review/sessions leaked list query parameters: {query_names:?}"
+        );
+        let get = &api["paths"]["/v1/review/sessions"]["get"];
+        for name in ["after", "limit", "status", "mode"] {
+            assert_eq!(operation_parameter(get, name)["in"], "query");
+        }
     }
 
     #[test]
