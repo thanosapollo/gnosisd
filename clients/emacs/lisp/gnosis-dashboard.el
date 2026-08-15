@@ -1594,9 +1594,12 @@ Without a prefix argument, show only never-reviewed themata."
   :description "Gnosis Themata"
   :group "Navigate"
   "q" ("Back" gnosis-dashboard)
-  "SPC" ("Search" gnosis-themata-filter-search)
-  "n" ("New or low reviews" gnosis-themata-filter-max-reviews)
+  "n" ("Next row" next-line :stay-open t)
+  "p" ("Previous row" previous-line :stay-open t)
   "RET" ("Edit at point" gnosis-themata-edit)
+  :group "Quick views"
+  "SPC" ("Search" gnosis-themata-filter-search)
+  "N" ("New or low reviews" gnosis-themata-filter-max-reviews)
   :group "Edit"
   "e" ("Edit thema" gnosis-themata-edit)
   "a" ("Add thema" gnosis-themata-add)
