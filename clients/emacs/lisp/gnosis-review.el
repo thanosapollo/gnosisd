@@ -28,6 +28,9 @@
 (defvar gnosis-review-buffer-name "*gnosis*"
   "Buffer name reserved for Gnosis review.")
 
+(defconst gnosis-review--max-target-count 500
+  "Maximum online review target count accepted by gnosisd.")
+
 (defvar-local gnosis-review--session nil)
 (defvar-local gnosis-review--attempt nil)
 (defvar-local gnosis-review--attempt-revision nil)
@@ -552,8 +555,19 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
    '("Resume session" "Start new" "Cancel")
    nil t nil nil "Resume session"))
 
+(defun gnosis-review--normalize-target-count (target-count)
+  "Return canonical TARGET-COUNT, using nil for the server default."
+  (cond
+   ((or (null target-count) (equal target-count 0)) nil)
+   ((and (integerp target-count)
+         (<= 1 target-count gnosis-review--max-target-count))
+    target-count)
+   (t (user-error "Target count must be between 1 and %d"
+                  gnosis-review--max-target-count))))
+
 (defun gnosis-review--start (source target-count)
   "Start or resume a review for SOURCE and optional TARGET-COUNT."
+  (setq target-count (gnosis-review--normalize-target-count target-count))
   (gnosis-core-status)
   (if-let* ((session (gnosis-review--active-session)))
       (pcase (gnosis-review--read-active-session-action)
@@ -571,9 +585,8 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
 (defun gnosis-review (&optional target-count)
   "Start a server-owned due review of optional TARGET-COUNT.
 When a review is active, prompt to resume it, replace it, or cancel."
-  (interactive
-   (list (let ((count (read-number "Target count (0 for server default): " 0)))
-           (and (> count 0) count))))
+  (interactive (list (read-number "Target count (0 for server default): " 0)))
+  (setq target-count (gnosis-review--normalize-target-count target-count))
   (gnosis-review--call-with-current-authority
    (lambda ()
      (gnosis-review--start (gnosis-review--source "due") target-count))))
@@ -585,6 +598,7 @@ When a review is active, prompt to resume it, replace it, or cancel."
   (interactive
    (list (read-string "Topic node ID: ")
          (when current-prefix-arg (read-number "Target count: " 20))))
+  (setq target-count (gnosis-review--normalize-target-count target-count))
   (let ((source (gnosis-review--source "topic")))
     (setq source (plist-put source :topic_node_id topic-node-id))
     (setq source (plist-put source :topic_forward_depth 0))
