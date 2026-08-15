@@ -775,7 +775,14 @@ fn reconcile_new_operation(
         .or_else(|| pack.items.first())
         .ok_or(StoreError::InvalidReviewState)?;
     let state = load_review_state(transaction, &state_item.thema_id)?;
-    let reason = offline_conflict_reason(transaction, operation, pack, &session, &state)?;
+    let reason = offline_conflict_reason(
+        transaction,
+        operation,
+        pack,
+        &session,
+        &state,
+        reconciled_at_us,
+    )?;
     let result = match reason {
         Some(reason) => conflict_result(
             transaction,
@@ -804,6 +811,7 @@ fn offline_conflict_reason(
     pack: &ReviewPackView,
     session: &ReviewSessionView,
     state: &crate::domain::ReviewState,
+    received_at_us: u64,
 ) -> Result<Option<OfflineConflictReason>, StoreError> {
     if pack.status != "active" || session.status != "active" {
         return Ok(Some(OfflineConflictReason::LeaseEnded));
@@ -824,7 +832,9 @@ fn offline_conflict_reason(
     else {
         return Ok(Some(OfflineConflictReason::CaptureMismatch));
     };
-    if !operation_matches_item(operation, item) || !operation_transition_is_valid(operation, pack) {
+    if !operation_matches_item(operation, item)
+        || !operation_transition_is_valid(operation, pack, received_at_us)
+    {
         return Ok(Some(OfflineConflictReason::CaptureMismatch));
     }
     let thema = load_thema(connection, &operation.thema_id)?;
@@ -856,8 +866,9 @@ fn operation_matches_item(operation: &OfflineReviewOperation, item: &ReviewPackI
 fn operation_transition_is_valid(
     operation: &OfflineReviewOperation,
     pack: &ReviewPackView,
+    received_at_us: u64,
 ) -> bool {
-    if operation.answered_at_us < pack.issued_at_us {
+    if operation.answered_at_us < pack.issued_at_us || operation.answered_at_us > received_at_us {
         return false;
     }
     let Ok(review_day) = review_day_at(
@@ -3657,6 +3668,47 @@ mod tests {
                 )
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn future_offline_answer_conflicts_without_changing_canonical_state() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "thema", "Question", None);
+        let device_id = add_device(&mut store, "offline");
+        let pack = store
+            .create_review_pack(
+                1,
+                &manual_source("thema"),
+                Some(1),
+                &device_id,
+                1_752_600_000_000_000,
+            )
+            .unwrap();
+        let operation = offline_answer(&pack, "future-attempt", 1);
+
+        let result = reconcile(
+            &mut store,
+            &operation,
+            &device_id,
+            operation.answered_at_us - 1,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, ReconciliationStatus::Conflict);
+        assert_eq!(
+            result.conflict_reason,
+            Some(OfflineConflictReason::CaptureMismatch)
+        );
+        assert_eq!(result.authoritative_state.review_count, 0);
+        assert_eq!(result.session.current_position, 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM review_event", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
     }
 
