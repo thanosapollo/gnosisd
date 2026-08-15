@@ -820,11 +820,19 @@ Show actions when SHOW-POPUP is non-nil."
   (interactive)
   (gnosis-review--call-with-authority #'gnosis-review--refresh-current))
 
-(defun gnosis-review--edited (buffer _projection)
-  "Return to review BUFFER and reconcile it after a saved edit."
+(defun gnosis-review--edited
+    (buffer authority session-id attempt-id _projection)
+  "Reconcile live review BUFFER after a saved edit.
+AUTHORITY, SESSION-ID, and ATTEMPT-ID identify the state that opened the editor."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (derived-mode-p 'gnosis-review-mode)
+      (when (and (derived-mode-p 'gnosis-review-mode)
+                 authority
+                 (equal authority gnosis-review--authority)
+                 (equal session-id
+                        (plist-get gnosis-review--session :session_id))
+                 (equal attempt-id
+                        (plist-get gnosis-review--attempt :attempt_id)))
         (gnosis-review--call-with-authority
          (lambda ()
            (pop-to-buffer-same-window buffer)
@@ -833,12 +841,19 @@ Show actions when SHOW-POPUP is non-nil."
 (defun gnosis-review--edit-current ()
   "Edit the current review thema through the shared editor."
   (let ((buffer (current-buffer))
+        (authority gnosis-review--authority)
+        (session-id (plist-get gnosis-review--session :session_id))
+        (attempt-id (plist-get gnosis-review--attempt :attempt_id))
         (thema-id (plist-get gnosis-review--attempt :thema_id)))
-    (unless (and (stringp thema-id) (not (string-empty-p thema-id)))
-      (user-error "Current review attempt has no thema identity"))
+    (unless (and authority
+                 (stringp session-id) (not (string-empty-p session-id))
+                 (stringp attempt-id) (not (string-empty-p attempt-id))
+                 (stringp thema-id) (not (string-empty-p thema-id)))
+      (user-error "Current review attempt has incomplete identity"))
     (gnosis-edit-thema
      thema-id (lambda (projection)
-                (gnosis-review--edited buffer projection)))))
+                (gnosis-review--edited
+                 buffer authority session-id attempt-id projection)))))
 
 (defun gnosis-review--edit ()
   "Edit under the review buffer's authenticated authority."

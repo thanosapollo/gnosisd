@@ -395,7 +395,8 @@
               (gnosis-core--token-override token-b))
           (should-error (gnosis-review--answer)
                         :type 'gnosis-core-authorization-error)
-          (should-error (gnosis-review--edited buffer nil)
+          (should-error (gnosis-review--edited
+                         buffer authority-a "session" "attempt" nil)
                         :type 'gnosis-core-authorization-error))
         (should (= reads 0))
         (should (= posts 0))
@@ -436,10 +437,12 @@
                        #'gnosis-review--override
                        #'gnosis-review--toggle-suspension
                        #'gnosis-review--refresh
-                       #'gnosis-review--edit
-                       (lambda () (gnosis-review--edited buffer nil))))
+                       #'gnosis-review--edit))
           (should-error (funcall action)
                         :type 'gnosis-core-authorization-error))
+        (should-not
+         (gnosis-review--edited
+          buffer '(:captured t) "session" "attempt" nil))
         (should (= effects 0))
         (should (= window-effects 0))))))
 
@@ -634,6 +637,85 @@
                            (plist-get gnosis-review--attempt :attempt_id)))
             (should (= 1 (plist-get gnosis-review--session
                                     :current_position)))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest gnosis-review-edit-ignores-callback-for-replacement-state ()
+  (let* ((buffer (generate-new-buffer " *gnosis-review-stale-edit-test*"))
+         (token (make-string 40 ?a))
+         (token-b (make-string 40 ?b))
+         (gnosis-core--base-url-override "https://test.example")
+         (gnosis-core--token-override token)
+         (authority-b
+          (let ((gnosis-core--base-url-override "https://other.example"))
+            (gnosis-core--authenticated-authority token-b)))
+         (session-a (gnosis-test-review--session))
+         (attempt-a (gnosis-test-review--attempt "pending"))
+         (session-b (gnosis-test-review--session))
+         (attempt-a-in-b (gnosis-test-review--attempt "pending"))
+         (attempt-b-in-a (gnosis-test-review--attempt "pending"))
+         (attempt-b (gnosis-test-review--attempt "pending"))
+         callback
+         (base-reads 0)
+         (token-reads 0)
+         (pop-count 0)
+         (next-count 0))
+    (setf (plist-get session-a :session_id) "session-a"
+          (plist-get attempt-a :session_id) "session-a"
+          (plist-get attempt-a :attempt_id) "attempt-a"
+          (plist-get session-b :session_id) "session-b"
+          (plist-get attempt-a-in-b :session_id) "session-b"
+          (plist-get attempt-a-in-b :attempt_id) "attempt-a"
+          (plist-get attempt-b-in-a :session_id) "session-a"
+          (plist-get attempt-b-in-a :attempt_id) "attempt-b"
+          (plist-get attempt-b :session_id) "session-b"
+          (plist-get attempt-b :attempt_id) "attempt-b")
+    (unwind-protect
+        (with-current-buffer buffer
+          (gnosis-review-mode)
+          (setq gnosis-review--session session-a
+                gnosis-review--attempt attempt-a
+                gnosis-review--authority
+                (gnosis-core--authenticated-authority token))
+          (cl-letf (((symbol-function 'gnosis-core--validated-base-url)
+                     (lambda ()
+                       (setq base-reads (1+ base-reads))
+                       gnosis-core--base-url-override))
+                    ((symbol-function 'gnosis-core--token)
+                     (lambda ()
+                       (setq token-reads (1+ token-reads))
+                       gnosis-core--token-override))
+                    ((symbol-function 'gnosis-edit-thema)
+                     (lambda (_thema-id after-save)
+                       (setq callback after-save)))
+                    ((symbol-function 'pop-to-buffer-same-window)
+                     (lambda (&rest _) (setq pop-count (1+ pop-count))))
+                    ((symbol-function 'gnosis-review--next-current)
+                     (lambda () (setq next-count (1+ next-count)))))
+            (gnosis-review--edit)
+            (should (functionp callback))
+            (setq base-reads 0
+                  token-reads 0)
+            (dolist (replacement
+                     (list (list session-b attempt-a-in-b)
+                           (list session-a attempt-b-in-a)
+                           (list session-b attempt-b)))
+              (setq gnosis-review--session (car replacement)
+                    gnosis-review--attempt (cadr replacement))
+              (funcall callback '(:thema_id "thema" :revision 2))
+              (should (= 0 base-reads))
+              (should (= 0 token-reads))
+              (should (= 0 pop-count))
+              (should (= 0 next-count)))
+            (setq gnosis-review--session session-a
+                  gnosis-review--attempt attempt-a
+                  gnosis-review--authority authority-b
+                  gnosis-core--base-url-override "https://other.example"
+                  gnosis-core--token-override token-b)
+            (funcall callback '(:thema_id "thema" :revision 2))
+            (should (= 0 base-reads))
+            (should (= 0 token-reads))
+            (should (= 0 pop-count))
+            (should (= 0 next-count))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
