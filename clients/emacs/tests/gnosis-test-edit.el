@@ -6,7 +6,6 @@
 (require 'ert)
 (require 'gnosis-edit)
 
-(declare-function gnosis-edit-tab "gnosis-edit")
 (declare-function gnosis-edit-activate "gnosis-edit")
 
 (defconst gnosis-test-edit--request
@@ -40,6 +39,53 @@
     :review_image ,gnosis-core--json-null
     :tags ["geography"] :concepts [] :asset_paths [])
   "Multiple-choice request used by editor tests.")
+
+(defun gnosis-test-edit--install-legacy-mode ()
+  "Install the text-derived definitions used before an in-process reload."
+  (makunbound 'gnosis-edit-mode-map)
+  (eval
+   '(progn
+      (defvar-keymap gnosis-edit-mode-map
+        "TAB" #'gnosis-edit-tab
+        "RET" #'gnosis-edit-activate
+        "C-c C-c" #'gnosis-edit-save
+        "C-c C-r" #'gnosis-edit-retry-uncertain
+        "C-c C-k" #'gnosis-edit-cancel)
+      (define-derived-mode gnosis-edit-mode text-mode "Gnosis-Edit"
+        "Legacy major mode fixture for one Gnosis thema."
+        (add-hook 'kill-buffer-query-functions
+                  #'gnosis-edit--allow-kill nil t)
+        (setq-local outline-regexp "\\*+ ")
+        (outline-minor-mode 1))
+      (defun gnosis-edit-tab ()
+        "Fold a legacy heading or indent ordinary authoring text at point."
+        (interactive)
+        (if (save-excursion
+              (beginning-of-line)
+              (looking-at-p outline-regexp))
+            (outline-toggle-children)
+          (indent-for-tab-command))))))
+
+(defun gnosis-test-edit--make-load-finalizer ()
+  "Return the canonical post-load finalizer from the test Makefile."
+  (let ((makefile
+         (expand-file-name
+          "Makefile"
+          (file-name-directory
+           (symbol-file 'gnosis-test-edit--make-load-finalizer 'defun)))))
+    (with-temp-buffer
+      (insert-file-contents makefile)
+      (let (forms)
+        (while (search-forward "@emacsclient --eval \"" nil t)
+          (let ((start (point)))
+            (search-forward "\" > /dev/null")
+            (push (read (replace-regexp-in-string
+                         "\\\\\n[ \t]*" ""
+                         (buffer-substring-no-properties
+                          start (- (point) (length "\" > /dev/null")))))
+                  forms)))
+        (should (= 2 (length forms)))
+        (car forms)))))
 
 (defun gnosis-test-edit--render-request (request)
   "Install REQUEST through the real editor lifecycle."
@@ -371,26 +417,119 @@
     (when-let* ((buffer (get-buffer gnosis-edit-new-buffer-name)))
       (kill-buffer buffer))))
 
-(ert-deftest gnosis-edit-mode-uses-text-mode ()
-  (with-temp-buffer
-    (gnosis-edit-mode)
-    (should (derived-mode-p 'text-mode))
-    (should outline-minor-mode)
-    (should (eq (key-binding (kbd "TAB")) #'gnosis-edit-tab))))
-
-(ert-deftest gnosis-edit-tab-folds-heading-without-indenting-it ()
+(ert-deftest gnosis-edit-mode-uses-org-mode-and-outline ()
   (with-temp-buffer
     (gnosis-edit-mode)
     (gnosis-edit--replace-request gnosis-test-edit--request)
+    (should (derived-mode-p 'org-mode))
+    (should-not outline-minor-mode)
+    (should (eq (key-binding (kbd "TAB")) #'org-cycle))
     (goto-char (point-min))
-    (let (folded indented)
-      (cl-letf (((symbol-function 'outline-toggle-children)
-                 (lambda () (setq folded t)))
-                ((symbol-function 'indent-for-tab-command)
-                 (lambda () (setq indented t))))
-        (gnosis-edit-tab))
-      (should folded)
-      (should-not indented))))
+    (should (org-at-heading-p))
+    (should (= 1 (org-current-level)))
+    (should-not (invisible-p (line-beginning-position 2)))
+    (call-interactively (key-binding (kbd "TAB")))
+    (should (invisible-p (line-beginning-position 2)))
+    (re-search-forward "^\\*\\* Question$")
+    (beginning-of-line)
+    (should (org-at-heading-p))
+    (should (= 2 (org-current-level)))))
+
+(ert-deftest gnosis-edit-tab-survives-text-mode-to-org-mode-reload ()
+  (let ((target-file
+         (concat (file-name-sans-extension
+                  (symbol-file 'gnosis-edit-mode 'defun))
+                 ".el"))
+        (load-finalizer (gnosis-test-edit--make-load-finalizer))
+        (legacy-buffer (generate-new-buffer " *gnosis-edit-legacy*"))
+        (org-buffer (generate-new-buffer " *gnosis-edit-org*"))
+        (request (copy-tree gnosis-test-edit--request t))
+        (authority '(:base_url "https://example.org" :token "token"))
+        (recovery '(:operation_id "op:reload" :request retained))
+        (after-save #'ignore)
+        (window-configuration (current-window-configuration)))
+    (unwind-protect
+        (progn
+          (gnosis-test-edit--install-legacy-mode)
+          (with-current-buffer legacy-buffer
+            (gnosis-edit-mode)
+            (gnosis-edit--replace-request request)
+            (setq gnosis-edit--thema-id "thema"
+                  gnosis-edit--revision 7
+                  gnosis-edit--authority authority
+                  gnosis-edit--recovery recovery
+                  gnosis-edit--after-save after-save
+                  gnosis-edit--window-configuration window-configuration)
+            (goto-char (point-min))
+            (re-search-forward "^\\*\\* Question$")
+            (beginning-of-line)
+            (set-buffer-modified-p t)
+            (let ((content (buffer-string))
+                  (saved-point (point))
+                  (legacy-map (current-local-map))
+                  (original gnosis-edit--original-request))
+              (cl-labels
+                  ((reload ()
+                     (when (boundp 'gnosis-edit-mode-map)
+                       (makunbound 'gnosis-edit-mode-map))
+                     (load target-file nil 'nomessage)
+                     (eval load-finalizer))
+                   (check-legacy ()
+                     (should (equal content (buffer-string)))
+                     (should (= saved-point (point)))
+                     (should (buffer-modified-p))
+                     (should (equal "thema" gnosis-edit--thema-id))
+                     (should (= 7 gnosis-edit--revision))
+                     (should (eq authority gnosis-edit--authority))
+                     (should (eq recovery gnosis-edit--recovery))
+                     (should (eq after-save gnosis-edit--after-save))
+                     (should (eq window-configuration
+                                 gnosis-edit--window-configuration))
+                     (should (eq original gnosis-edit--original-request))
+                     (should (memq #'gnosis-edit--allow-kill
+                                   kill-buffer-query-functions))
+                     (should (eq legacy-map (current-local-map)))
+                     (should (eq (key-binding (kbd "TAB"))
+                                 #'gnosis-edit-tab))))
+                (reload)
+                (check-legacy)
+                (let ((body (line-beginning-position 2)))
+                  (should-not (invisible-p body))
+                  (call-interactively (key-binding (kbd "TAB")))
+                  (should (invisible-p body)))
+                (with-current-buffer org-buffer
+                  (gnosis-edit-mode)
+                  (gnosis-edit--replace-request request)
+                  (should (derived-mode-p 'org-mode))
+                  (should (eq (current-local-map) gnosis-edit-mode-map))
+                  (should (eq (key-binding (kbd "TAB")) #'org-cycle))
+                  (goto-char (point-min))
+                  (let ((body (line-beginning-position 2)))
+                    (should-not (invisible-p body))
+                    (call-interactively (key-binding (kbd "TAB")))
+                    (should (invisible-p body))))
+                (with-current-buffer legacy-buffer
+                  (reload)
+                  (check-legacy)
+                  (let ((body (line-beginning-position 2)))
+                    (call-interactively (key-binding (kbd "TAB")))
+                    (should-not (invisible-p body))))
+                (with-current-buffer org-buffer
+                  (let ((body (line-beginning-position 2)))
+                    (should (eq (current-local-map) gnosis-edit-mode-map))
+                    (should (eq (key-binding (kbd "TAB")) #'org-cycle))
+                    (call-interactively (key-binding (kbd "TAB")))
+                    (should-not (invisible-p body))))))))
+      (when (buffer-live-p legacy-buffer)
+        (with-current-buffer legacy-buffer
+          (setq gnosis-edit--recovery nil)
+          (set-buffer-modified-p nil))
+        (kill-buffer legacy-buffer))
+      (when (buffer-live-p org-buffer)
+        (with-current-buffer org-buffer
+          (set-buffer-modified-p nil))
+        (kill-buffer org-buffer))
+      (load target-file nil 'nomessage))))
 
 (ert-deftest gnosis-edit-activate-makes-null-field-editable ()
   (with-temp-buffer
