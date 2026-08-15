@@ -542,7 +542,7 @@
 (ert-deftest gnosis-review-reads-server-directed-structured-values ()
   (let ((gnosis-review--attempt
          (gnosis-test-review--attempt
-          "pending" '(:kind "text" :input_script "Greek")))
+          "pending" '(:kind "text" :input_script "greek")))
         arguments)
     (cl-letf (((symbol-function 'gnosis-review--read-string)
                (lambda (&rest args)
@@ -550,7 +550,7 @@
                  "logos")))
       (should (equal '(:kind "text" :value "logos")
                      (gnosis-review--read-answer)))
-      (should (equal '("Answer (Greek): " "Greek") arguments))))
+      (should (equal '("Answer (Greek): " "greek") arguments))))
   (let ((gnosis-review--attempt
           (gnosis-test-review--attempt
           "pending" (list :kind "texts"
@@ -576,7 +576,7 @@
                        :cloze_spans
                        [(:start_byte 0 :end_byte 5 :state "concealed")
                         (:start_byte 10 :end_byte 14 :state "correct")]
-                       :next_input_script "Greek")
+                       :next_input_script "greek")
                    `(:matches [t t] :all_entered_correct t :complete t
                      :question "alpha and beta"
                      :cloze_spans
@@ -595,7 +595,7 @@
       (should (equal '(["beta"] ["beta" "alpha"]) (nreverse checks)))
       (should (equal '("Answer 1: " "Answer 2 (Greek): ")
                      (nreverse prompts)))
-      (should (equal (list gnosis-core--json-null "Greek")
+      (should (equal (list gnosis-core--json-null "greek")
                      (nreverse scripts)))
       (should (equal '("(...) and beta" "alpha and beta")
                      (nreverse questions)))))
@@ -615,7 +615,10 @@
     (gnosis-review-mode)
     (setq gnosis-review--attempt
           (gnosis-test-review--attempt
-           "pending" '(:kind "texts" :input_scripts [nil nil])))
+           "pending" (list :kind "texts"
+                           :input_scripts
+                           (vector gnosis-core--json-null
+                                   gnosis-core--json-null))))
     (let ((reads 0))
       (cl-letf (((symbol-function 'gnosis-review--read-string)
                  (lambda (&rest _) (cl-incf reads) "wrong"))

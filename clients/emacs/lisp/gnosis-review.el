@@ -332,7 +332,7 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
                (gnosis-review--read-string
                 (if (eq script gnosis-core--json-null)
                     "Answer: "
-                  (format "Answer (%s): " script))
+                  (format "Answer (%s): " (capitalize script)))
                 script))))
       ("texts"
        (gnosis-review--read-cloze-answer prompt))
@@ -354,7 +354,7 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
              (input (gnosis-review--read-string
                      (if (eq script gnosis-core--json-null)
                          (format "Answer %d: " index)
-                       (format "Answer %d (%s): " index script))
+                       (format "Answer %d (%s): " index (capitalize script)))
                      script))
              (next-inputs (vconcat inputs (vector input)))
              (check (gnosis-core-review-attempt-check-cloze
