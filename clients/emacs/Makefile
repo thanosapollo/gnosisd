@@ -67,7 +67,7 @@ test:
 do-test:
 	@build=$$(mktemp -d "$${TMPDIR:-/tmp}/gnosis-tests.XXXXXX"); \
 	trap 'rm -rf "$$build"' EXIT HUP INT TERM; \
-	cp $(LISP_FILES) $(TOOL_FILES) $(SELECTED_TEST_FILES) "$$build"/; \
+	cp Makefile $(LISP_FILES) $(TOOL_FILES) $(SELECTED_TEST_FILES) "$$build"/; \
 	$(EMACS) --batch -q \
 		--eval "(setq byte-compile-error-on-warn t byte-compile-warnings t)" \
 		-L "$$build" -f batch-byte-compile "$$build"/*.el; \
@@ -146,7 +146,6 @@ load:
 	      ('gnosis-dashboard-themata-mode \
 	       (use-local-map gnosis-dashboard-themata-mode-map)) \
 	      ('gnosis-nodes-page-mode (use-local-map gnosis-nodes-page-mode-map)) \
-	      ('gnosis-edit-mode (use-local-map gnosis-edit-mode-map)) \
 	      ('gnosis-review-mode (use-local-map gnosis-review-mode-map)) \
 	      )))" > /dev/null
 	@echo "Loaded $(words $(EL_FILES)) files."

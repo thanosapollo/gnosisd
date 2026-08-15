@@ -21,6 +21,7 @@
 
 (require 'gnosis-core)
 (require 'gnosis-nodes)
+(require 'ewoc)
 (require 'keymap-popup)
 (require 'org)
 (require 'seq)
@@ -111,6 +112,9 @@
 
 (defvar-local gnosis-dashboard--projection nil
   "Current validated server dashboard projection.")
+
+(defvar-local gnosis-dashboard--ewoc nil
+  "Single EWOC node rendering the dashboard home projection.")
 
 (defun gnosis-dashboard--active-session-p ()
   "Return non-nil when the dashboard has an active review session."
@@ -313,24 +317,49 @@
         (list warning)))
      "\n")))
 
-(defun gnosis--render-dashboard (state &optional start-at-top)
-  "Render dashboard STATE, starting at top when START-AT-TOP."
+(defun gnosis-dashboard--header ()
+  "Return the fixed heading for the dashboard home EWOC."
+  (concat
+   (propertize (gnosis--center-text "Gnosis Dashboard")
+               'face 'gnosis-face-dashboard-header)
+   "\n" (gnosis--separator) "\n"))
+
+(defun gnosis-dashboard--pretty-print (projection)
+  "Insert one home node for dashboard PROJECTION."
+  (insert
+   (gnosis--center-text
+    (if-let* ((failure (plist-get projection :failure)))
+        (propertize (plist-get failure :message) 'face 'error)
+      (gnosis--dashboard-text (plist-get projection :state))))))
+
+(defun gnosis-dashboard--install-node (projection)
+  "Install PROJECTION as the sole dashboard home EWOC node."
   (let ((inhibit-read-only t)
-        (old-point (point))
+        (node (and (ewoc-p gnosis-dashboard--ewoc)
+                   (ewoc-nth gnosis-dashboard--ewoc 0))))
+    (if (and node (null (ewoc-nth gnosis-dashboard--ewoc 1)))
+        (progn
+          (ewoc-set-hf gnosis-dashboard--ewoc
+                       (gnosis-dashboard--header) "")
+          (ewoc-set-data node projection)
+          (ewoc-invalidate gnosis-dashboard--ewoc node))
+      (erase-buffer)
+      (setq gnosis-dashboard--ewoc
+            (ewoc-create #'gnosis-dashboard--pretty-print
+                         (gnosis-dashboard--header) ""))
+      (ewoc-enter-last gnosis-dashboard--ewoc projection))))
+
+(defun gnosis--render-dashboard (state &optional start-at-top)
+  "Render dashboard STATE through one EWOC, optionally START-AT-TOP."
+  (let ((old-point (point))
+        (window (get-buffer-window (current-buffer)))
         (old-window-start
-         (and (eq (window-buffer (selected-window)) (current-buffer))
-              (window-start)))
-        (text
-         (concat
-          (propertize (gnosis--center-text "Gnosis Dashboard")
-                      'face 'gnosis-face-dashboard-header)
-          "\n" (gnosis--separator) "\n\n"
-          (gnosis--center-text (gnosis--dashboard-text state)))))
-    (erase-buffer)
-    (insert text)
+         (when-let* ((window (get-buffer-window (current-buffer))))
+           (window-start window))))
+    (gnosis-dashboard--install-node (list :state state))
     (goto-char (if start-at-top (point-min) (min old-point (point-max))))
-    (when old-window-start
-      (set-window-start (selected-window)
+    (when (and window old-window-start)
+      (set-window-start window
                         (if start-at-top
                             (point-min)
                           (min old-window-start (point-max)))
@@ -350,15 +379,17 @@
 
 (defun gnosis--render-dashboard-failure (condition)
   "Render a safe corrective dashboard for typed CONDITION."
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (insert
-     (propertize (gnosis--center-text "Gnosis Dashboard")
-                 'face 'gnosis-face-dashboard-header)
-     "\n" (gnosis--separator) "\n\n"
-     (gnosis--center-text
-      (propertize (gnosis-dashboard--failure-message condition) 'face 'error)))
-    (goto-char (point-min))))
+  (let ((old-point (point))
+        (window (get-buffer-window (current-buffer)))
+        (old-window-start
+         (when-let* ((window (get-buffer-window (current-buffer))))
+           (window-start window)))
+        (failure (list :type (car condition)
+                       :message (gnosis-dashboard--failure-message condition))))
+    (gnosis-dashboard--install-node (list :failure failure))
+    (goto-char (min old-point (point-max)))
+    (when (and window old-window-start)
+      (set-window-start window (min old-window-start (point-max)) t))))
 
 (autoload 'gnosis-dashboard "gnosis-dashboard" nil t)
 

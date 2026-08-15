@@ -11,14 +11,14 @@
 
 ;;; Commentary:
 
-;; Shared text-first editor for server-validated thema request documents.
+;; Shared Org editor for server-validated thema request documents.
 
 ;;; Code:
 
 (require 'cl-lib)
 (require 'gnosis-core)
 (require 'json)
-(require 'outline)
+(require 'org)
 (require 'subr-x)
 
 (defconst gnosis-edit--kinds '("basic" "cloze" "mcq" "mc-cloze")
@@ -28,8 +28,7 @@
   "Maximum cloze inputs accepted by the daemon.")
 
 (defconst gnosis-edit--metadata-fields
-  '((:source_guid "Source GUID" optional)
-    (:parathema "Parathema" optional)
+  '((:parathema "Parathema" optional)
     (:review_image "Review image" optional)
     (:tags "Tags" list)
     (:concepts "Concepts" concepts)
@@ -43,12 +42,6 @@
 
 (defconst gnosis-edit--markers '("[none]" "[empty]")
   "Reserved readable value markers.")
-
-(defconst gnosis-edit--font-lock-keywords
-  '(("^\\* .*$" . font-lock-type-face)
-    ("^\\*\\* .*$" . font-lock-keyword-face)
-    ("{{\\|}}" . font-lock-builtin-face)
-    ("^- \\[x\\] " . font-lock-constant-face)))
 
 (defvar gnosis-edit-new-buffer-name "*Gnosis New*"
   "Buffer name reserved for adding Gnosis content.")
@@ -77,14 +70,51 @@
   "Window configuration restored when this editor exits.")
 
 (defvar-local gnosis-edit--original-request nil
-  "Request from which the current authoring buffer was rendered.")
+  "Rendered request and hidden fields preserved by the current editor.")
 
-(defvar-keymap gnosis-edit-mode-map
-  "TAB" #'gnosis-edit-tab
-  "RET" #'gnosis-edit-activate
-  "C-c C-c" #'gnosis-edit-save
-  "C-c C-r" #'gnosis-edit-retry-uncertain
-  "C-c C-k" #'gnosis-edit-cancel)
+(defvar-local gnosis-edit--legacy-text-mode nil
+  "Non-nil in an editor opened by the former text-derived mode.")
+
+(defvar gnosis-edit-mode-map nil
+  "Keymap for `gnosis-edit-mode`.")
+
+;; Preserve legacy maps locally, but replace the global map for Org editors.
+(let ((editors
+       (cl-loop for buffer in (buffer-list)
+                when (with-current-buffer buffer
+                       (eq major-mode 'gnosis-edit-mode))
+                collect
+                (with-current-buffer buffer
+                  (list buffer
+                        (or gnosis-edit--legacy-text-mode
+                            (not (derived-mode-p 'org-mode)))
+                        (current-local-map)))))
+      (map (make-sparse-keymap)))
+  (set-keymap-parent map org-mode-map)
+  (keymap-set map "RET" #'gnosis-edit-activate)
+  (keymap-set map "C-c C-c" #'gnosis-edit-save)
+  (keymap-set map "C-c C-r" #'gnosis-edit-retry-uncertain)
+  (keymap-set map "C-c C-k" #'gnosis-edit-cancel)
+  (setq gnosis-edit-mode-map map)
+  (dolist (editor editors)
+    (with-current-buffer (car editor)
+      (if (cadr editor)
+          (progn
+            (setq gnosis-edit--legacy-text-mode t)
+            (use-local-map (nth 2 editor)))
+        (use-local-map map)))))
+
+(defun gnosis-edit-tab ()
+  "Cycle at point in current or live-reloaded legacy editors."
+  (interactive)
+  (if gnosis-edit--legacy-text-mode
+      (if (save-excursion
+            (beginning-of-line)
+            (looking-at-p outline-regexp))
+          (let ((major-mode 'text-mode))
+            (outline-toggle-children))
+        (indent-for-tab-command))
+    (org-cycle)))
 
 (defun gnosis-edit--allow-kill ()
   "Return non-nil unless this editor retains uncertain recovery."
@@ -96,28 +126,16 @@
 
 (put 'gnosis-edit--allow-kill 'permanent-local-hook t)
 
-(define-derived-mode gnosis-edit-mode text-mode "Gnosis-Edit"
-  "Major mode for editing one Gnosis thema as structured text."
+(define-derived-mode gnosis-edit-mode org-mode "Gnosis-Edit"
+  "Major mode for editing one Gnosis thema as an Org document."
   (add-hook 'kill-buffer-query-functions #'gnosis-edit--allow-kill nil t)
-  (setq-local font-lock-defaults '(gnosis-edit--font-lock-keywords)
-              outline-regexp "\\*+ "
-              header-line-format
+  (setq-local header-line-format
               (substitute-command-keys
-               " RET \\[gnosis-edit-activate], fold \\[gnosis-edit-tab], save \\[gnosis-edit-save], cancel \\[gnosis-edit-cancel]"))
-  (outline-minor-mode 1))
-
-(defun gnosis-edit-tab ()
-  "Fold a heading or indent ordinary authoring text at point."
-  (interactive)
-  (if (save-excursion
-        (beginning-of-line)
-        (looking-at-p outline-regexp))
-      (outline-toggle-children)
-    (indent-for-tab-command)))
+               " RET \\[gnosis-edit-activate], TAB fold, save \\[gnosis-edit-save], cancel \\[gnosis-edit-cancel]")))
 
 (defun gnosis-edit--stateful-field-p (label)
   "Return non-nil when LABEL supports an explicit value state."
-  (member label '("Hint" "Source GUID" "Parathema" "Review image"
+  (member label '("Hint" "Parathema" "Review image"
                   "Tags" "Concepts" "Asset paths")))
 
 (defun gnosis-edit--collection-field-p (label)
@@ -313,6 +331,11 @@
        "Unsupported live thema fields: %s"
        (mapconcat (lambda (key) (substring (symbol-name key) 1))
                   unknown ", "))))
+  (when (plist-member request :source_guid)
+    (let ((source-guid (plist-get request :source_guid)))
+      (unless (or (eq source-guid gnosis-core--json-null)
+                  (stringp source-guid))
+        (user-error "Invalid Thema source GUID"))))
   (when (plist-member request :concepts)
     (unless (vectorp (plist-get request :concepts))
       (user-error "Invalid thema concepts"))
@@ -1022,6 +1045,11 @@ When ALLOW-INCOMPLETE is non-nil, return an unfinished new draft."
     (gnosis-edit--validate-section-order kind sections)
     (let ((request (append (list :kind kind)
                            (gnosis-edit--parse-primary kind primary)
+                           (when (plist-member gnosis-edit--original-request
+                                              :source_guid)
+                             (list :source_guid
+                                   (plist-get gnosis-edit--original-request
+                                              :source_guid)))
                            (gnosis-edit--parse-metadata metadata))))
       (gnosis-edit--validate-request-shape request)
       (if allow-incomplete request (gnosis-edit--validate-draft request)))))
