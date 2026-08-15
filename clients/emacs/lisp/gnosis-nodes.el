@@ -1357,8 +1357,12 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (let* ((cursor gnosis-nodes-page--next)
          (page (gnosis-nodes-page--fetch-page cursor))
          (previous gnosis-nodes-page--cursor))
-    (gnosis-nodes-page--install page cursor)
-    (push previous gnosis-nodes-page--history)))
+    (if (= (length (plist-get page :items)) 0)
+        (progn
+          (setq gnosis-nodes-page--next gnosis-core--json-null)
+          (message "No more Gnosis node results"))
+      (gnosis-nodes-page--install page cursor)
+      (push previous gnosis-nodes-page--history))))
 
 (defun gnosis-nodes-page-previous ()
   "Return to the previous result page fetched in this buffer."
