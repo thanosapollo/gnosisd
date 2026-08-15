@@ -1415,7 +1415,7 @@ Start fresh catalog traversal when INITIAL is non-nil."
       (gnosis-themata--start-bootstrap nil t))))
 
 (defun gnosis-dashboard-refresh ()
-  "Refresh the server-projected dashboard summary."
+  "Refresh the server-projected dashboard summary EWOC."
   (interactive)
   (unless (derived-mode-p 'gnosis-dashboard-mode)
     (user-error "Not in the Gnosis dashboard"))
@@ -1424,11 +1424,13 @@ Start fresh catalog traversal when INITIAL is non-nil."
         (setq gnosis-dashboard--projection projection)
         (gnosis--render-dashboard projection))
     (gnosis-core-error
+     (setq gnosis-dashboard--projection nil)
+     (gnosis--render-dashboard-failure condition)
      (user-error "%s" (gnosis-dashboard--failure-message condition)))))
 
 ;;;###autoload
 (defun gnosis-dashboard ()
-  "Open the server-projected Gnosis overview."
+  "Open the one-EWOC server-projected Gnosis overview."
   (interactive)
   (let ((buffer (get-buffer-create gnosis-dashboard-buffer-name)))
     (pop-to-buffer-same-window buffer)
@@ -1440,10 +1442,7 @@ Start fresh catalog traversal when INITIAL is non-nil."
           (gnosis--render-dashboard projection t))
       (gnosis-core-error
        (setq gnosis-dashboard--projection nil)
-       (let ((inhibit-read-only t))
-         (erase-buffer)
-         (insert (propertize (gnosis-dashboard--failure-message condition)
-                             'face 'error)))))
+       (gnosis--render-dashboard-failure condition)))
     (goto-char (point-min))
     (keymap-popup gnosis-dashboard-mode-map)))
 
