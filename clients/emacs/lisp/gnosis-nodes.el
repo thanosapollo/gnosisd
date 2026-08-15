@@ -919,7 +919,8 @@ Without BASE-LEVEL, start one level below the current heading."
           (vconcat
            (seq-filter
             (lambda (node)
-              (equal logical-path (plist-get node :logical_path)))
+              (and (eq t (plist-get node :active))
+                   (equal logical-path (plist-get node :logical_path))))
             (append (gnosis-nodes--journal-matches title) nil)))))
     (pcase (length matches)
       (0 (gnosis-nodes--create-journal-entry title))

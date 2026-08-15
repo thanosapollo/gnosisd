@@ -1995,7 +1995,7 @@
                (lambda (query)
                  (should (equal title query))
                  (if created
-                     (vector '(:node_id "journal-id"
+                     (vector '(:node_id "journal-id" :active t
                                :logical_path "journal/2026-08-03.org"))
                    [])))
               ((symbol-function 'gnosis-nodes--create-journal-entry)
@@ -2044,20 +2044,24 @@
 
 (ert-deftest gnosis-journal-matches-only-file-nodes-and-today-exact-path ()
   (let* ((root '(:node_id "root" :title "2026-08-03" :level 0
-                 :logical_path "journal/2026-08-03.org"))
+                 :logical_path "journal/2026-08-03.org" :active t))
+         (retired `(:node_id "retired" :title "2026-08-03" :level 0
+                    :logical_path "journal/2026-08-03.org"
+                    :active ,gnosis-core--json-false))
          (child '(:node_id "child" :title "2026-08-03 notes" :level 1
-                  :logical_path "journal/2026-08-03.org"))
+                  :logical_path "journal/2026-08-03.org" :active t))
          (other '(:node_id "other" :title "2026-08-03" :level 0
-                  :logical_path "journal/other.org"))
+                  :logical_path "journal/other.org" :active t))
          visited)
     (cl-letf (((symbol-function 'gnosis-core-nodes)
                (lambda (&rest _)
-                 `(:items [,root ,child ,other] :next ,gnosis-core--json-null)))
+                 `(:items [,root ,retired ,child ,other]
+                   :next ,gnosis-core--json-null)))
               ((symbol-function 'format-time-string)
                (lambda (&rest _) "2026-08-03"))
               ((symbol-function 'gnosis-nodes--visit-node)
                (lambda (node) (setq visited node))))
-      (should (equal '("root" "other")
+      (should (equal '("root" "retired" "other")
                      (mapcar (lambda (node) (plist-get node :node_id))
                              (append (gnosis-nodes--journal-matches
                                       "2026-08-03") nil))))
