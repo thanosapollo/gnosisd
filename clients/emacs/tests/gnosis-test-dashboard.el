@@ -381,8 +381,17 @@
             (gnosis-dashboard)
             (with-current-buffer gnosis-dashboard-buffer-name
               (should (derived-mode-p 'gnosis-dashboard-mode))
+              (should-not (derived-mode-p 'tabulated-list-mode))
               (should (string-search "Reviewed today: 8" (buffer-string)))
-              (should-not (bound-and-true-p gnosis-themata--ewoc)))
+              (should (ewoc-p gnosis-dashboard--ewoc))
+              (let ((node (ewoc-nth gnosis-dashboard--ewoc 0)))
+                (should node)
+                (should-not (ewoc-nth gnosis-dashboard--ewoc 1))
+                (should (equal (gnosis-test-dashboard--projection)
+                               (plist-get (ewoc-data node) :state))))
+              (gnosis-dashboard-refresh)
+              (should (ewoc-nth gnosis-dashboard--ewoc 0))
+              (should-not (ewoc-nth gnosis-dashboard--ewoc 1)))
             (should (= 0 catalog-calls)))
         (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
           (kill-buffer buffer))))))
@@ -505,18 +514,80 @@
     (should-not display-line-numbers)
     (should (functionp revert-buffer-function))))
 
-(ert-deftest gnosis-dashboard-refresh-preserves-buffer-on-summary-failure ()
+(ert-deftest gnosis-dashboard-initial-failure-sanitizes-ewoc-data ()
+  (let ((private-detail "private initial detail"))
+    (cl-letf (((symbol-function 'gnosis-core-dashboard)
+               (lambda (&rest _)
+                 (signal 'gnosis-core-authorization-error
+                         (list private-detail))))
+              ((symbol-function 'keymap-popup) #'ignore)
+              ((symbol-function 'pop-to-buffer-same-window)
+               (lambda (buffer &rest _) (set-buffer buffer))))
+      (unwind-protect
+          (progn
+            (gnosis-dashboard)
+            (with-current-buffer gnosis-dashboard-buffer-name
+              (let* ((node (ewoc-nth gnosis-dashboard--ewoc 0))
+                     (data (ewoc-data node))
+                     (failure (plist-get data :failure)))
+                (should-not gnosis-dashboard--projection)
+                (should node)
+                (should-not (ewoc-nth gnosis-dashboard--ewoc 1))
+                (should (eq 'gnosis-core-authorization-error
+                            (plist-get failure :type)))
+                (should
+                 (equal "Gnosis access denied. Check gnosisd token scopes."
+                        (plist-get failure :message)))
+                (should-not
+                 (string-search private-detail (prin1-to-string data)))
+                (should (string-search (plist-get failure :message)
+                                       (buffer-string)))
+                (should-not (string-search private-detail (buffer-string)))
+                (should (equal "Gnosis Dashboard — unavailable"
+                               (gnosis-dashboard--popup-description)))
+                (should (= (point-min) (point))))))
+        (when-let* ((buffer (get-buffer gnosis-dashboard-buffer-name)))
+          (kill-buffer buffer))))))
+
+(ert-deftest gnosis-dashboard-refresh-fails-closed-on-summary-failure ()
   (with-temp-buffer
     (gnosis-dashboard-mode)
-    (let ((inhibit-read-only t)) (insert "existing projection"))
-    (cl-letf (((symbol-function 'gnosis-core-dashboard)
-               (lambda (&rest _) (signal 'gnosis-core-unavailable '("down")))))
-      (let ((condition (should-error (gnosis-dashboard-refresh)
-                                     :type 'user-error)))
+    (setq gnosis-dashboard--projection
+          (gnosis-test-dashboard--projection
+           '(:session_id "stale-session" :status "active")))
+    (gnosis--render-dashboard gnosis-dashboard--projection)
+    (let* ((private-detail "private refresh detail")
+           (ewoc gnosis-dashboard--ewoc)
+           (node (ewoc-nth ewoc 0))
+           (old-point (+ (point-min) 5)))
+      (goto-char old-point)
+      (cl-letf (((symbol-function 'gnosis-core-dashboard)
+                 (lambda (&rest _)
+                   (signal 'gnosis-core-unavailable (list private-detail)))))
+        (let ((condition (should-error (gnosis-dashboard-refresh)
+                                       :type 'user-error)))
+          (should
+           (equal (cadr condition)
+                  "gnosisd unavailable. Check service and gnosis-core-base-url."))))
+      (should-not gnosis-dashboard--projection)
+      (should (eq ewoc gnosis-dashboard--ewoc))
+      (should (eq node (ewoc-nth gnosis-dashboard--ewoc 0)))
+      (should-not (ewoc-nth gnosis-dashboard--ewoc 1))
+      (let* ((data (ewoc-data node))
+             (failure (plist-get data :failure)))
+        (should (eq 'gnosis-core-unavailable (plist-get failure :type)))
         (should
-         (equal (cadr condition)
-                "gnosisd unavailable. Check service and gnosis-core-base-url.")))
-      (should (equal "existing projection" (buffer-string))))))
+         (equal "gnosisd unavailable. Check service and gnosis-core-base-url."
+                (plist-get failure :message)))
+        (should-not (string-search private-detail (prin1-to-string data))))
+      (should (string-search "gnosisd unavailable" (buffer-string)))
+      (should-not (string-match-p
+                   "Ready\\|Active session\\|Reviewed today\\|private refresh detail"
+                   (buffer-string)))
+      (should (equal "Gnosis Dashboard — unavailable"
+                     (gnosis-dashboard--popup-description)))
+      (should-not (gnosis-dashboard--active-session-p))
+      (should (= old-point (point))))))
 
 (ert-deftest gnosis-dashboard-failure-messages-are-public-safe ()
   (should
