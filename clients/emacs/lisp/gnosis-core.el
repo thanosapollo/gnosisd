@@ -1112,29 +1112,29 @@ the remaining declared request inputs."
              body (cdr success) contract)
       (gnosis-core--invalid
        "Gnosis request cannot satisfy its response contract"))
-    (let ((value
-           (condition-case condition
-               (gnosis-core--request
-                method
-                (gnosis-core--operation-path template path-values query)
-                body (car success) nil (equal method "GET") t headers)
-             ((gnosis-core-transport-error gnosis-core-protocol-error)
+    (let ((path (gnosis-core--operation-path template path-values query)))
+      (condition-case condition
+          (let ((value
+                 (gnosis-core--request
+                  method path body (car success) nil
+                  (equal method "GET") t headers)))
+            (unless (or (and (cdr success)
+                             (gnosis-core--schema-valid-p
+                              value (cdr success) contract))
+                        (and cached
+                             (not (equal method "GET"))
+                             (gnosis-core--refreshed-response-valid-p
+                              identity method template success value)))
               (if (equal method "GET")
-                  (signal (car condition) (cdr condition))
+                  (gnosis-core--invalid "Invalid Gnosis operation response")
                 (signal 'gnosis-core-mutation-uncertain
-                        '("Gnosis mutation outcome is uncertain")))))))
-      (unless (or (and (cdr success)
-                       (gnosis-core--schema-valid-p
-                        value (cdr success) contract))
-                  (and cached
-                       (not (equal method "GET"))
-                       (gnosis-core--refreshed-response-valid-p
-                        identity method template success value)))
-        (if (equal method "GET")
-            (gnosis-core--invalid "Invalid Gnosis operation response")
-          (signal 'gnosis-core-mutation-uncertain
-                  '("Gnosis mutation response is invalid"))))
-      value)))
+                        '("Gnosis mutation response is invalid"))))
+            value)
+        ((gnosis-core-transport-error gnosis-core-protocol-error quit)
+         (if (equal method "GET")
+             (signal (car condition) (cdr condition))
+           (signal 'gnosis-core-mutation-uncertain
+                   '("Gnosis mutation outcome is uncertain"))))))))
 
 (defun gnosis-core--typed-read-request
     (identity &optional path-values query)

@@ -1267,6 +1267,77 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
        :type 'gnosis-core-mutation-uncertain))
     (should (= calls 1))))
 
+(ert-deftest gnosis-core-mutation-quit-after-dispatch-is-uncertain ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0)
+        outcome)
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf calls)
+                 (signal 'quit nil))))
+      (setq outcome
+            (condition-case condition
+                (progn
+                  (gnosis-core--typed-request
+                   "put_widget" '(("id" . "widget")) nil '(:value "text")
+                   '(("If-Match" . "\"3\"")))
+                  'returned)
+              (gnosis-core-mutation-uncertain (car condition))
+              (quit 'quit))))
+    (should (eq outcome 'gnosis-core-mutation-uncertain))
+    (should (= calls 1))))
+
+(ert-deftest gnosis-core-mutation-quit-before-dispatch-remains-local ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0)
+        outcome)
+    (cl-letf (((symbol-function 'gnosis-core--operation-path)
+               (lambda (&rest _) (signal 'quit nil)))
+              ((symbol-function 'gnosis-core--request)
+               (lambda (&rest _) (cl-incf calls))))
+      (setq outcome
+            (condition-case nil
+                (progn
+                  (gnosis-core--typed-request
+                   "put_widget" '(("id" . "widget")) nil '(:value "text")
+                   '(("If-Match" . "\"3\"")))
+                  'returned)
+              (gnosis-core-mutation-uncertain 'uncertain)
+              (quit 'quit))))
+    (should (eq outcome 'quit))
+    (should (= calls 0))))
+
+(ert-deftest gnosis-core-mutation-quit-during-response-check-is-uncertain ()
+  (let ((gnosis-core--contract-cache
+         (list :base "http://127.0.0.1:7842"
+               :document (gnosis-test-core--contract)))
+        (calls 0)
+        outcome)
+    (cl-letf (((symbol-function 'gnosis-core--request)
+               (lambda (&rest _)
+                 (cl-incf calls)
+                 '(:id "widget" :value "text")))
+              ((symbol-function 'gnosis-core--schema-valid-p)
+               (lambda (value &rest _)
+                 (if (plist-get value :id)
+                     (signal 'quit nil)
+                   t))))
+      (setq outcome
+            (condition-case nil
+                (progn
+                  (gnosis-core--typed-request
+                   "put_widget" '(("id" . "widget")) nil '(:value "text")
+                   '(("If-Match" . "\"3\"")))
+                  'returned)
+              (gnosis-core-mutation-uncertain 'uncertain)
+              (quit 'quit))))
+    (should (eq outcome 'uncertain))
+    (should (= calls 1))))
+
 (ert-deftest gnosis-core-openapi-request-is-public-and-retryable ()
   (let (calls)
     (cl-letf (((symbol-function 'gnosis-core--request)
