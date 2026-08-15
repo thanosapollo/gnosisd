@@ -119,7 +119,8 @@ cargo tree --depth 1
 ## Git
 
 - Commit completed work in coherent signed commits. Keep behavior and matching
-  tests together.
+  tests together. Keep each review candidate at or below 350 manually maintained
+  changed lines; split larger work unless an explicit exception is approved.
 - Use `module: Change` subjects.
 - Preserve unrelated work. Never commit plans, agent artifacts, generated
   metadata, secrets, or private operational details.
