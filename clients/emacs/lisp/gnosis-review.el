@@ -530,12 +530,16 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
           (gnosis-review--present t))))))
 
 (defun gnosis-review--create (source target-count)
-  "Create and open a review for SOURCE and optional TARGET-COUNT."
+  "Create and open a review for SOURCE and optional TARGET-COUNT.
+Return nil when SOURCE has no review items."
   (condition-case condition
-      (gnosis-review--open
-       (gnosis-core-review-session-create source target-count))
+      (progn
+        (gnosis-review--open
+         (gnosis-core-review-session-create source target-count))
+        t)
     (gnosis-core-not-found
-     (message "No Gnosis review items are available"))
+     (message "No Gnosis review items are available")
+     nil)
     (gnosis-core-mutation-uncertain
      (let ((session (gnosis-review--active-session))
            (expected-count target-count))
@@ -545,8 +549,10 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
                   (equal effective
                          (or expected-count
                              gnosis-core--default-online-review-target-count))))
-           (gnosis-review--open session)
-         (signal (car condition) (cdr condition)))))))
+           (progn
+             (gnosis-review--open session)
+             t)
+           (signal (car condition) (cdr condition)))))))
 
 (defun gnosis-review--read-active-session-action ()
   "Read the action to take when a review session is already active."
@@ -576,8 +582,11 @@ When START-AT-TOP is non-nil, begin the presentation at the top."
           (gnosis-review--resume-session
            (plist-get session :session_id))))
         ("Start new"
-         (gnosis-review--quit-session (plist-get session :session_id))
-         (gnosis-review--create source target-count))
+         (let ((session-id (plist-get session :session_id)))
+           (gnosis-review--quit-session session-id)
+           (unless (gnosis-review--create source target-count)
+             (gnosis-review--open
+              (gnosis-review--resume-session session-id)))))
         ("Cancel" (message "Gnosis review unchanged")))
     (gnosis-review--create source target-count)))
 
