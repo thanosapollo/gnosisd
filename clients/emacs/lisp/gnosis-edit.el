@@ -24,6 +24,9 @@
 (defconst gnosis-edit--kinds '("basic" "cloze" "mcq" "mc-cloze")
   "Thema kinds supported by the authoring mode.")
 
+(defconst gnosis-edit--max-review-cloze-inputs 500
+  "Maximum cloze inputs accepted by the daemon.")
+
 (defconst gnosis-edit--metadata-fields
   '((:source_guid "Source GUID" optional)
     (:parathema "Parathema" optional)
@@ -990,7 +993,9 @@ Deeper outline stars are body text, not structural section boundaries."
                         (and (vectorp hints) (<= (length hints) 1))))
          (user-error "Basic Thema requires one answer and at most one hint")))
       ("cloze"
-       (unless (and (or (null hints)
+       (unless (and (<= (length answers)
+                        gnosis-edit--max-review-cloze-inputs)
+                    (or (null hints)
                         (and (vectorp hints) (<= (length hints) (length answers))))
                     (gnosis-edit--cloze-spans question answers))
          (user-error "Invalid cloze Thema")))
