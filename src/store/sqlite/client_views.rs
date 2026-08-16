@@ -108,11 +108,10 @@ impl SqliteStore {
         let settings = self.settings()?;
         let review_day = review_day_at(now_us, &settings.timezone, settings.day_boundary_hour)
             .map_err(StoreError::storage)?;
-        let matched_count =
-            super::review::select_queue(&self.connection, source, review_day, None)?.len();
+        let matched_count = super::review::count_queue(&self.connection, source, review_day)?;
         Ok(ReviewQueueSummary {
             source: source.clone(),
-            matched_count: u64::try_from(matched_count).map_err(StoreError::storage)?,
+            matched_count,
         })
     }
 
@@ -517,6 +516,39 @@ mod tests {
     }
 
     #[test]
+    fn review_queue_summary_counts_all_due_themata() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        for index in 0..8 {
+            let content = thema_content(
+                "basic",
+                format!("Question {index}"),
+                vec![None],
+                vec!["answer".into()],
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let thema = prepare_thema(
+                Some(format!("thema-{index}")),
+                content,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
+            store.put_thema(&thema, 20260715, 1, None).unwrap();
+        }
+
+        let queue = store
+            .review_queue_summary(&due_source(), REVIEWED_AT_US)
+            .unwrap();
+
+        assert_eq!(queue.matched_count, 8);
+    }
+
+    #[test]
     fn dashboard_projects_current_review_day_streak() {
         let store = store_with_thema();
         store
@@ -667,6 +699,18 @@ mod tests {
             topic_forward_depth: None,
             topic_backward_depth: None,
             manual_ids: vec!["thema".into()],
+        }
+    }
+
+    fn due_source() -> ReviewSource {
+        ReviewSource {
+            kind: ReviewSourceKind::Due,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: vec![],
         }
     }
 

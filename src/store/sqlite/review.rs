@@ -1601,6 +1601,31 @@ pub(super) fn select_queue(
     select_filtered(connection, source, review_day, limit)
 }
 
+pub(super) fn count_queue(
+    connection: &Connection,
+    source: &ReviewSource,
+    review_day: u32,
+) -> Result<u64, StoreError> {
+    if source.kind == ReviewSourceKind::Manual {
+        return u64::try_from(select_manual(connection, &source.manual_ids, None)?.len())
+            .map_err(StoreError::storage);
+    }
+    if source.kind == ReviewSourceKind::Topic {
+        return u64::try_from(
+            select_topic(
+                connection,
+                source.topic_node_id.as_deref().unwrap_or_default(),
+                source.topic_forward_depth.unwrap_or_default(),
+                source.topic_backward_depth.unwrap_or_default(),
+                MAX_TOPIC_TRAVERSAL_ROWS,
+            )?
+            .len(),
+        )
+        .map_err(StoreError::storage);
+    }
+    count_filtered(connection, source, review_day)
+}
+
 fn select_manual(
     connection: &Connection,
     ids: &[String],
@@ -1709,30 +1734,15 @@ fn select_filtered(
     review_day: u32,
     limit: i64,
 ) -> Result<Vec<String>, StoreError> {
-    let day_clause = match source.kind {
-        ReviewSourceKind::Due | ReviewSourceKind::DueTag => "state.next_review_day <= ?1",
-        ReviewSourceKind::Overdue => "state.next_review_day < ?1",
-        ReviewSourceKind::DueWithoutOverdue => "state.next_review_day = ?1",
-        ReviewSourceKind::Tag => "1",
-        _ => return Err(StoreError::InvalidReviewState),
-    };
-    let include = serde_json::to_string(&source.tags).map_err(StoreError::storage)?;
-    let exclude = serde_json::to_string(&source.exclude_tags).map_err(StoreError::storage)?;
     let query = format!(
         "SELECT thema.thema_id FROM thema JOIN review_state AS state USING(thema_id)
-         WHERE thema.archived_at_us IS NULL AND state.suspended = 0
-           AND {day_clause}
-           AND (json_array_length(?2) = 0 OR EXISTS(
-               SELECT 1 FROM thema_tag
-               WHERE thema_id = thema.thema_id AND tag IN (SELECT value FROM json_each(?2))
-           ))
-           AND NOT EXISTS(
-               SELECT 1 FROM thema_tag
-               WHERE thema_id = thema.thema_id AND tag IN (SELECT value FROM json_each(?3))
-           )
+         WHERE {}
          ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id
-         LIMIT ?4"
+         LIMIT ?4",
+        filtered_queue_predicate(&source.kind)?
     );
+    let include = serde_json::to_string(&source.tags).map_err(StoreError::storage)?;
+    let exclude = serde_json::to_string(&source.exclude_tags).map_err(StoreError::storage)?;
     let mut statement = connection.prepare(&query).map_err(StoreError::storage)?;
     statement
         .query_map(
@@ -1742,6 +1752,50 @@ fn select_filtered(
         .map_err(StoreError::storage)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::storage)
+}
+
+fn count_filtered(
+    connection: &Connection,
+    source: &ReviewSource,
+    review_day: u32,
+) -> Result<u64, StoreError> {
+    let query = format!(
+        "SELECT COUNT(*) FROM thema JOIN review_state AS state USING(thema_id)
+         WHERE {}",
+        filtered_queue_predicate(&source.kind)?
+    );
+    let include = serde_json::to_string(&source.tags).map_err(StoreError::storage)?;
+    let exclude = serde_json::to_string(&source.exclude_tags).map_err(StoreError::storage)?;
+    connection
+        .query_row(
+            &query,
+            params![i64::from(review_day), include, exclude],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)
+        .and_then(|count: i64| u64::try_from(count).map_err(StoreError::storage))
+}
+
+fn filtered_queue_predicate(kind: &ReviewSourceKind) -> Result<String, StoreError> {
+    let day_clause = match kind {
+        ReviewSourceKind::Due | ReviewSourceKind::DueTag => "state.next_review_day <= ?1",
+        ReviewSourceKind::Overdue => "state.next_review_day < ?1",
+        ReviewSourceKind::DueWithoutOverdue => "state.next_review_day = ?1",
+        ReviewSourceKind::Tag => "1",
+        _ => return Err(StoreError::InvalidReviewState),
+    };
+    Ok(format!(
+        "thema.archived_at_us IS NULL AND state.suspended = 0
+           AND {day_clause}
+           AND (json_array_length(?2) = 0 OR EXISTS(
+               SELECT 1 FROM thema_tag
+               WHERE thema_id = thema.thema_id AND tag IN (SELECT value FROM json_each(?2))
+           ))
+           AND NOT EXISTS(
+               SELECT 1 FROM thema_tag
+               WHERE thema_id = thema.thema_id AND tag IN (SELECT value FROM json_each(?3))
+           )"
+    ))
 }
 
 enum SessionAccess<'a> {
