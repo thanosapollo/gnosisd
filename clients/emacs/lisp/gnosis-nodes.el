@@ -1205,6 +1205,16 @@ With prefix argument REFRESH, rebuild the node catalog first."
   (gnosis-nodes-page--with-authority
    (lambda () (gnosis-review-topic (gnosis-nodes-page--node-id)))))
 
+(defun gnosis-nodes-page-review-with-depth (forward-depth backward-depth)
+  "Review the node at point with FORWARD-DEPTH and BACKWARD-DEPTH."
+  (interactive
+   (list (read-number "Forward link depth: " 1)
+         (read-number "Backlink depth: " 0)))
+  (gnosis-nodes-page--with-authority
+   (lambda ()
+     (gnosis-review-topic (gnosis-nodes-page--node-id)
+                          forward-depth backward-depth))))
+
 (defun gnosis-nodes-page-sort (column)
   "Sort the current node page by COLUMN."
   (let ((selected-id (tabulated-list-get-id)))
@@ -1247,6 +1257,7 @@ With prefix argument REFRESH, rebuild the node catalog first."
   "b" ("Show backlinks" gnosis-nodes-page-inbound)
   :group "Review"
   "r" ("Review topic" gnosis-nodes-page-review)
+  "R" ("Review with depth" gnosis-nodes-page-review-with-depth)
   :group "Page"
   "n" ("Next page" gnosis-nodes-page-next)
   "p" ("Previous page" gnosis-nodes-page-previous))

@@ -2469,6 +2469,7 @@
                          ("f" . gnosis-nodes-page-outbound)
                          ("b" . gnosis-nodes-page-inbound)
                          ("r" . gnosis-nodes-page-review)
+                         ("R" . gnosis-nodes-page-review-with-depth)
                          ("?" . gnosis-node-page-map-popup)))
         (should (eq (keymap-lookup map (car binding)) (cdr binding)))))))
 

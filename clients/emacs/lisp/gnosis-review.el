@@ -24,9 +24,18 @@
 (require 'subr-x)
 
 (declare-function gnosis-edit-thema "gnosis-edit")
+(declare-function gnosis-nodes--read-catalog-node-id "gnosis-nodes")
+(defvar gnosis-nodes--node-catalog)
 
 (defvar gnosis-review-buffer-name "*gnosis*"
   "Buffer name reserved for Gnosis review.")
+
+(defvar gnosis-review-types '("Due themata"
+                              "Due themata of specified tag(s)"
+                              "Overdue themata"
+                              "Due themata (Without Overdue)"
+                              "All themata of tag(s)")
+  "Archive review-session choices, excluding decks.")
 
 (defconst gnosis-review--max-target-count 500
   "Maximum online review target count accepted by gnosisd.")
@@ -154,13 +163,84 @@
               gnosis-center-content gnosis-center-content-during-review
               header-line-format '(:eval (gnosis-review--header-line))))
 
-(defun gnosis-review--source (kind)
-  "Return a closed review source for KIND."
-  (list :kind kind :tags [] :exclude_tags []
+(defun gnosis-review--source (kind &optional tags)
+  "Return a closed review source for KIND, optionally filtered by TAGS."
+  (list :kind kind
+        :tags (vconcat (or tags []))
+        :exclude_tags []
         :topic_node_id gnosis-core--json-null
         :topic_forward_depth gnosis-core--json-null
         :topic_backward_depth gnosis-core--json-null
         :manual_ids []))
+
+(defun gnosis-review--read-tags ()
+  "Read one or more thema tags, matching the archive tag prompt."
+  (let ((tags (completing-read-multiple "Tags (seperated by ,): " nil)))
+    (setq tags (delete-dups (delete "" tags)))
+    (unless tags
+      (user-error "Select at least one tag"))
+    tags))
+
+(defun gnosis-review--source-for-type (review-type)
+  "Return the server review source for archive REVIEW-TYPE."
+  (pcase review-type
+    ("Due themata" (gnosis-review--source "due"))
+    ("Due themata of specified tag(s)"
+     (gnosis-review--source "due_tag" (gnosis-review--read-tags)))
+    ("Overdue themata" (gnosis-review--source "overdue"))
+    ("Due themata (Without Overdue)"
+     (gnosis-review--source "due_without_overdue"))
+    ("All themata of tag(s)"
+     (gnosis-review--source "tag" (gnosis-review--read-tags)))
+    (_ (user-error "Unknown Gnosis review type"))))
+
+(defun gnosis-review--normalize-depth (depth)
+  "Return DEPTH when it is a valid topic traversal depth."
+  (cond
+   ((null depth) 0)
+   ((and (natnump depth) (<= depth 32)) depth)
+   (t (user-error "Topic depth must be between 0 and 32"))))
+
+(defun gnosis-review--topic-source (node-id forward-depth backward-depth)
+  "Return a topic source for NODE-ID at FORWARD-DEPTH and BACKWARD-DEPTH."
+  (unless (and (stringp node-id) (not (string-empty-p node-id)))
+    (user-error "Topic node ID must be a non-empty string"))
+  (let ((source (gnosis-review--source "topic")))
+    (setq source (plist-put source :topic_node_id node-id))
+    (setq source (plist-put source :topic_forward_depth
+                            (gnosis-review--normalize-depth forward-depth)))
+    (setq source (plist-put source :topic_backward_depth
+                            (gnosis-review--normalize-depth backward-depth)))
+    source))
+
+(defun gnosis-review--topic-label (node-id)
+  "Return a local catalog title for NODE-ID, or NODE-ID."
+  (or (and (boundp 'gnosis-nodes--node-catalog)
+           gnosis-nodes--node-catalog
+           (let ((node (gethash node-id
+                                (plist-get gnosis-nodes--node-catalog :by-id))))
+             (and node (plist-get node :title))))
+      node-id))
+
+(defun gnosis-review--confirm-topic (source title)
+  "Return non-nil when the operator confirms SOURCE themata for TITLE."
+  (let* ((summary (gnosis-core-review-queue-summary source))
+         (count (plist-get summary :matched_count))
+         (forward (plist-get source :topic_forward_depth))
+         (backward (plist-get source :topic_backward_depth))
+         (extra (if (or (> forward 0) (> backward 0))
+                    (format " (fwd:%d back:%d)" forward backward)
+                  "")))
+    (cond
+     ((not (and (integerp count) (> count 0)))
+      (message "No thema found for %s" title)
+      nil)
+     ((y-or-n-p (format "Review %s thema(s) for '%s'%s? "
+                        count title extra))
+      t)
+     (t
+      (message "Gnosis review unchanged")
+      nil))))
 
 (defun gnosis-review--session-complete-p (session)
   "Return non-nil when SESSION has no remaining review item."
@@ -621,31 +701,46 @@ has no review items."
     (gnosis-review--create source target-count)))
 
 ;;;###autoload
-(defun gnosis-review (&optional target-count)
-  "Start a server-owned due review of optional TARGET-COUNT.
-When a review is active, prompt to resume it, replace it, or cancel."
-  (interactive)
+(defun gnosis-review (&optional target-count review-type)
+  "Start an archive-style review session.
+Interactively choose due, overdue, or tag-scoped REVIEW-TYPE.
+Non-interactive calls start due review.  Optional TARGET-COUNT still
+requests a bounded snapshot.  When a review is active, prompt to resume
+it, replace it, or cancel."
+  (interactive
+   (list nil (gnosis-completing-read "Review: " gnosis-review-types t)))
   (setq target-count (gnosis-review--normalize-target-count target-count))
   (gnosis-review--call-with-current-authority
    (lambda ()
-     (gnosis-review--start (gnosis-review--source "due") target-count))))
+     (gnosis-review--start
+      (if review-type
+          (gnosis-review--source-for-type review-type)
+        (gnosis-review--source "due"))
+      target-count))))
 
 ;;;###autoload
-(defun gnosis-review-topic (topic-node-id &optional target-count)
-  "Start a server-owned review for TOPIC-NODE-ID and TARGET-COUNT.
-When a review is active, prompt to resume it, replace it, or cancel."
+(defun gnosis-review-topic (&optional topic-node-id forward-depth backward-depth)
+  "Start a review for TOPIC-NODE-ID.
+FORWARD-DEPTH and BACKWARD-DEPTH default to 0.  With a prefix argument,
+prompt for those depths.  Interactively select the topic by title."
   (interactive
-   (list (read-string "Topic node ID: ")
-         (when current-prefix-arg (read-number "Target count: "))))
-  (unless (and (stringp topic-node-id) (not (string-empty-p topic-node-id)))
-    (user-error "Topic node ID must be a non-empty string"))
-  (setq target-count (gnosis-review--normalize-target-count target-count))
-  (let ((source (gnosis-review--source "topic")))
-    (setq source (plist-put source :topic_node_id topic-node-id))
-    (setq source (plist-put source :topic_forward_depth 0))
-    (setq source (plist-put source :topic_backward_depth 0))
-    (gnosis-review--call-with-current-authority
-     (lambda () (gnosis-review--start source target-count)))))
+   (list nil
+         (when current-prefix-arg (read-number "Forward link depth: " 1))
+         (when current-prefix-arg (read-number "Backlink depth: " 0))))
+  (when topic-node-id
+    (gnosis-review--topic-source topic-node-id forward-depth backward-depth))
+  (gnosis-review--normalize-depth forward-depth)
+  (gnosis-review--normalize-depth backward-depth)
+  (gnosis-review--call-with-current-authority
+   (lambda ()
+     (let* ((topic-node-id
+             (or topic-node-id
+                 (gnosis-nodes--read-catalog-node-id "Select topic: ")))
+            (source (gnosis-review--topic-source
+                     topic-node-id forward-depth backward-depth)))
+       (when (gnosis-review--confirm-topic
+              source (gnosis-review--topic-label topic-node-id))
+         (gnosis-review--start source nil))))))
 
 ;;;###autoload
 (defun gnosis-review-resume ()

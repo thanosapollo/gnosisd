@@ -2172,6 +2172,18 @@ Each item contains stable operation, thema, and expected-revision fields."
            ((or "quit" "aborted") (<= position length))
            (_ nil)))))
 
+(defun gnosis-core-review-queue-summary (source)
+  "Return the server match count for review SOURCE."
+  (let ((summary
+         (gnosis-core--typed-request
+          "post_review_queue_summary" nil nil
+          (list :source source))))
+    (unless (and (equal source (plist-get summary :source))
+                 (integerp (plist-get summary :matched_count))
+                 (>= (plist-get summary :matched_count) 0))
+      (gnosis-core--invalid "Invalid Gnosis review queue summary"))
+    summary))
+
 (defun gnosis-core-review-session-create (source &optional target-count)
   "Create and return a review session from SOURCE and TARGET-COUNT."
   (let ((session
