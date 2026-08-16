@@ -1525,7 +1525,8 @@
               ((symbol-function 'gnosis-review--active-session)
                (lambda ()
                  (append (gnosis-test-review--session)
-                         (list :source source :target_count 100))))
+                         (list :source source
+                               :target_count gnosis-core--json-null))))
               ((symbol-function 'gnosis-review--open)
                (lambda (_) (setq opened t))))
       (should (gnosis-review--create source nil))

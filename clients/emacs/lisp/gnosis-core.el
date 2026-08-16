@@ -2181,8 +2181,7 @@ Each item contains stable operation, thema, and expected-revision fields."
                 :target_count (or target-count gnosis-core--json-null)))))
     (unless (and (gnosis-core--review-session-valid-p session "active")
                  (equal source (plist-get session :source))
-                 (equal (or target-count
-                            gnosis-core--default-online-review-target-count)
+                 (equal (or target-count gnosis-core--json-null)
                         (plist-get session :target_count)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis review session response is not correlated")))
@@ -2202,8 +2201,7 @@ TARGET-COUNT is optional."
                  (not (equal replaced-session-id
                              (plist-get session :session_id)))
                  (equal source (plist-get session :source))
-                 (equal (or target-count
-                            gnosis-core--default-online-review-target-count)
+                 (equal (or target-count gnosis-core--json-null)
                         (plist-get session :target_count)))
       (signal 'gnosis-core-mutation-uncertain
               '("Gnosis replacement review response is not correlated")))

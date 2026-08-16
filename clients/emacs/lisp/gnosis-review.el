@@ -581,8 +581,7 @@ has no review items."
                 (equal source (plist-get session :source))
                 (let ((effective (plist-get session :target_count)))
                   (equal effective
-                         (or expected-count
-                             gnosis-core--default-online-review-target-count))))
+                         (or expected-count gnosis-core--json-null))))
            (progn
              (gnosis-review--open session)
              t)
@@ -625,7 +624,7 @@ has no review items."
 (defun gnosis-review (&optional target-count)
   "Start a server-owned due review of optional TARGET-COUNT.
 When a review is active, prompt to resume it, replace it, or cancel."
-  (interactive (list (read-number "Target count (0 for server default): " 0)))
+  (interactive)
   (setq target-count (gnosis-review--normalize-target-count target-count))
   (gnosis-review--call-with-current-authority
    (lambda ()
@@ -637,7 +636,7 @@ When a review is active, prompt to resume it, replace it, or cancel."
 When a review is active, prompt to resume it, replace it, or cancel."
   (interactive
    (list (read-string "Topic node ID: ")
-         (when current-prefix-arg (read-number "Target count: " 20))))
+         (when current-prefix-arg (read-number "Target count: "))))
   (unless (and (stringp topic-node-id) (not (string-empty-p topic-node-id)))
     (user-error "Topic node ID must be a non-empty string"))
   (setq target-count (gnosis-review--normalize-target-count target-count))
