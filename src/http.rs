@@ -4675,7 +4675,7 @@ mod tests {
             &api["components"]["schemas"]["ReviewSessionRequestV1"]["properties"]["target_count"];
         assert_eq!(target_count["minimum"], 1);
         assert_eq!(target_count["maximum"], 500);
-        assert_eq!(target_count["default"], 100);
+        assert!(target_count.get("default").is_none());
         let source_input = &api["components"]["schemas"]["ReviewSourceInputV1"]["properties"];
         assert_eq!(source_input["topic_forward_depth"]["maximum"], 32);
         assert_eq!(source_input["topic_backward_depth"]["maximum"], 32);
@@ -7957,7 +7957,10 @@ mod tests {
             .await;
         }
 
-        for (target_count, expected) in [(None, 100), (Some(500), 500)] {
+        for (target_count, expected_target, expected_len) in [
+            (None, serde_json::Value::Null, 500),
+            (Some(500), serde_json::json!(500), 500),
+        ] {
             let response = app
                 .clone()
                 .oneshot(authorized(
@@ -7970,8 +7973,8 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::CREATED);
             let session = response_json(response).await;
-            assert_eq!(session["target_count"], expected);
-            assert_eq!(session["queue_length"], expected);
+            assert_eq!(session["target_count"], expected_target);
+            assert_eq!(session["queue_length"], expected_len);
             abort_http_review(&app, &token, session["session_id"].as_str().unwrap()).await;
         }
 

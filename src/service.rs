@@ -37,10 +37,10 @@ use crate::application::{ImportSummary, PreparedServerImport};
 use crate::{
     application::{
         AnswerInput, ApplicationError, AssetHead, ContentChange, ContentSearchGeneration,
-        ContentSearchPage, DEFAULT_ONLINE_REVIEW_TARGET_COUNT, DashboardSummary,
-        DeviceDesiredStateMutation, DeviceMutationResult, DevicePrincipal, DeviceRecord,
-        DocumentHead, DocumentRevision, MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeCatalogPage,
-        NodeRecord, NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
+        ContentSearchPage, DashboardSummary, DeviceDesiredStateMutation, DeviceMutationResult,
+        DevicePrincipal, DeviceRecord, DocumentHead, DocumentRevision,
+        MAX_ONLINE_REVIEW_TARGET_COUNT, NewDevice, NodeCatalogPage, NodeRecord,
+        NodeThemaAssociation, OfflineAssetOperation, OfflineAssetResult,
         OfflineContentConflictReason, OfflineContentOperation, OfflineContentResult,
         OfflineReviewOperation, OfflineReviewResult, PreparedAsset,
         PreparedDeviceDesiredStateMutation, PreparedDeviceDocumentLifecycleMutation,
@@ -955,8 +955,7 @@ impl ServiceHandle {
         started_at_us: u64,
     ) -> Result<ReviewSessionView, ServiceError> {
         let source = source.validate().map_err(ServiceError::Review)?;
-        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
-        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        if target_count.is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
         {
             return Err(ServiceError::Review(ReviewError::Target));
         }
@@ -981,8 +980,7 @@ impl ServiceHandle {
         started_at_us: u64,
     ) -> Result<ReviewSessionView, ServiceError> {
         let source = source.validate().map_err(ServiceError::Review)?;
-        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
-        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
+        if target_count.is_some_and(|count| !(1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
         {
             return Err(ServiceError::Review(ReviewError::Target));
         }

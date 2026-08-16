@@ -10,17 +10,17 @@ use super::{
 };
 use crate::{
     application::{
-        AnswerInput, DEFAULT_ONLINE_REVIEW_TARGET_COUNT, FsrsConfigSnapshot,
-        MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT, MAX_REVIEW_PACK_BYTES,
-        MAX_REVIEW_PACK_ITEMS, OfflineConflictReason, OfflineReviewOperation, OfflineReviewResult,
-        PresentationSnapshot, RecallOutcomeSnapshot, ReconciliationStatus,
-        ReviewAttemptBeginResult, ReviewAttemptMutation, ReviewAttemptOperation,
-        ReviewAttemptOperationResult, ReviewAttemptOperationStatus, ReviewAttemptState,
-        ReviewAttemptView, ReviewClozeCheck, ReviewItemSkipReason, ReviewOperationAuthority,
-        ReviewPackAsset, ReviewPackItem, ReviewPackView, ReviewSessionMode, ReviewSessionView,
-        ReviewSource, ReviewSourceKind, ReviewStateSnapshot, SkippedReviewItem, TransitionSnapshot,
-        presentation_content, progressive_cloze_check, review_day_at, review_question,
-        validate_offline_thema_assets, validate_review_pack_projection,
+        AnswerInput, FsrsConfigSnapshot, MAX_OFFLINE_ASSET_BYTES, MAX_ONLINE_REVIEW_TARGET_COUNT,
+        MAX_REVIEW_PACK_BYTES, MAX_REVIEW_PACK_ITEMS, OfflineConflictReason,
+        OfflineReviewOperation, OfflineReviewResult, PresentationSnapshot, RecallOutcomeSnapshot,
+        ReconciliationStatus, ReviewAttemptBeginResult, ReviewAttemptMutation,
+        ReviewAttemptOperation, ReviewAttemptOperationResult, ReviewAttemptOperationStatus,
+        ReviewAttemptState, ReviewAttemptView, ReviewClozeCheck, ReviewItemSkipReason,
+        ReviewOperationAuthority, ReviewPackAsset, ReviewPackItem, ReviewPackView,
+        ReviewSessionMode, ReviewSessionView, ReviewSource, ReviewSourceKind, ReviewStateSnapshot,
+        SkippedReviewItem, TransitionSnapshot, presentation_content, progressive_cloze_check,
+        review_day_at, review_question, validate_offline_thema_assets,
+        validate_review_pack_projection,
     },
     domain::{
         GradeError, MATCHER_VERSION, MAX_REVIEW_CLOZE_INPUTS, ThemaKind, check_clozes,
@@ -55,11 +55,7 @@ impl SqliteStore {
             .clone()
             .validate()
             .map_err(|_| StoreError::InvalidReviewState)?;
-        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
-        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
-        {
-            return Err(StoreError::InvalidReviewState);
-        }
+        validate_online_target_count(target_count)?;
         require_no_active_session(&self.connection)?;
         let captured = captured_settings(&self.connection)?;
         let review_day = review_day_at(
@@ -68,10 +64,7 @@ impl SqliteStore {
             captured.day_boundary_hour,
         )
         .map_err(StoreError::storage)?;
-        let queue = select_queue(&self.connection, source, review_day, target_count)?;
-        if queue.is_empty() {
-            return Err(StoreError::NotFound);
-        }
+        let queue = online_session_queue(&self.connection, source, review_day, target_count)?;
         let session_id = Uuid::now_v7().to_string();
         let transaction = self
             .connection
@@ -105,11 +98,7 @@ impl SqliteStore {
             .clone()
             .validate()
             .map_err(|_| StoreError::InvalidReviewState)?;
-        let target_count = Some(target_count.unwrap_or(DEFAULT_ONLINE_REVIEW_TARGET_COUNT));
-        if !target_count.is_some_and(|count| (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count))
-        {
-            return Err(StoreError::InvalidReviewState);
-        }
+        validate_online_target_count(target_count)?;
         let transaction = self.write_transaction()?;
         let replaced_session = require_session_actor(
             &transaction,
@@ -127,10 +116,7 @@ impl SqliteStore {
             captured.day_boundary_hour,
         )
         .map_err(StoreError::storage)?;
-        let queue = select_queue(&transaction, source, review_day, target_count)?;
-        if queue.is_empty() {
-            return Err(StoreError::NotFound);
-        }
+        let queue = online_session_queue(&transaction, source, review_day, target_count)?;
         let session_id = Uuid::now_v7().to_string();
         let changed = transaction
             .execute(
@@ -404,15 +390,9 @@ impl SqliteStore {
         let transaction = self.write_transaction()?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::NotFound)?;
         let start_position = session.current_position;
-        let remaining = session
-            .queue_length
-            .checked_sub(session.current_position)
-            .ok_or(StoreError::CorruptData {
-                field: "review session position",
-            })?;
         let mut skipped = Vec::new();
         let mut attempt = None;
-        for _ in 0..remaining {
+        loop {
             if let Some(current) = current_attempt(&transaction, session_id)? {
                 if let Some(reason) = attempt_skip_reason(&transaction, &current)? {
                     skipped.push(skip_current_item(
@@ -426,7 +406,18 @@ impl SqliteStore {
                 attempt = Some(attempt_view(current));
                 break;
             }
-            let (position, thema_id) = current_session_item(&transaction, session_id)?;
+            let item = match current_session_item(&transaction, session_id) {
+                Ok(item) => Some(item),
+                Err(StoreError::InvalidReviewState) => None,
+                Err(error) => return Err(error),
+            };
+            let Some((position, thema_id)) = item else {
+                if enqueue_next_live_item(&transaction, session_id, started_at_us)? {
+                    continue;
+                }
+                complete_idle_session(&transaction, session_id, started_at_us)?;
+                break;
+            };
             let thema = load_thema(&transaction, &thema_id)?.ok_or(StoreError::NotFound)?;
             let state = load_review_state(&transaction, &thema_id)?;
             let presentation = presentation(&thema);
@@ -486,6 +477,16 @@ impl SqliteStore {
         if let Some(attempt) = current_attempt(&self.connection, session_id)? {
             require_safe_review_question(&attempt.presentation, require_safe_question)?;
             return Ok(attempt_view(attempt));
+        }
+        if current_session_item(&self.connection, session_id).is_err() {
+            let transaction = self.write_transaction()?;
+            if enqueue_next_live_item(&transaction, session_id, started_at_us)? {
+                transaction.commit().map_err(StoreError::storage)?;
+            } else {
+                complete_idle_session(&transaction, session_id, started_at_us)?;
+                transaction.commit().map_err(StoreError::storage)?;
+                return Err(StoreError::NotFound);
+            }
         }
         let (position, thema_id) = current_session_item(&self.connection, session_id)?;
         let thema = load_thema(&self.connection, &thema_id)?.ok_or(StoreError::NotFound)?;
@@ -1601,6 +1602,33 @@ pub(super) fn select_queue(
     select_filtered(connection, source, review_day, limit)
 }
 
+fn validate_online_target_count(target_count: Option<u32>) -> Result<(), StoreError> {
+    match target_count {
+        None => Ok(()),
+        Some(count) if (1..=MAX_ONLINE_REVIEW_TARGET_COUNT).contains(&count) => Ok(()),
+        Some(_) => Err(StoreError::InvalidReviewState),
+    }
+}
+
+fn online_session_queue(
+    connection: &Connection,
+    source: &ReviewSource,
+    review_day: u32,
+    target_count: Option<u32>,
+) -> Result<Vec<String>, StoreError> {
+    if target_count.is_none() {
+        if count_queue(connection, source, review_day)? == 0 {
+            return Err(StoreError::NotFound);
+        }
+        return Ok(Vec::new());
+    }
+    let queue = select_queue(connection, source, review_day, target_count)?;
+    if queue.is_empty() {
+        return Err(StoreError::NotFound);
+    }
+    Ok(queue)
+}
+
 pub(super) fn count_queue(
     connection: &Connection,
     source: &ReviewSource,
@@ -1876,7 +1904,7 @@ fn load_session(
         .query_row(
             "SELECT session_id, source_json, target_count, status, current_position,
                 started_at_us, (SELECT count(*) FROM review_session_item WHERE session_id = ?1),
-                owner_device_id, review_mode
+                owner_device_id, review_mode, timezone, day_boundary_hour
          FROM review_session WHERE session_id = ?1",
             [session_id],
             |row| {
@@ -1890,28 +1918,72 @@ fn load_session(
                     row.get::<_, i64>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )
         .optional()
         .map_err(StoreError::storage)?
         .map(|row| {
+            let source: ReviewSource = serde_json::from_str(&row.1).map_err(StoreError::storage)?;
+            let target_count = row
+                .2
+                .map(|value| to_u32(value, "target count"))
+                .transpose()?;
+            let current_position = to_u32(row.4, "session position")?;
+            let started_at_us = to_u64(row.5, "session start")?;
+            let mut queue_length = to_u32(row.6, "queue length")?;
+            if target_count.is_none() && row.3 == "active" {
+                let review_day = review_day_at(
+                    started_at_us,
+                    &row.9,
+                    u8::try_from(row.10).map_err(StoreError::storage)?,
+                )
+                .map_err(StoreError::storage)?;
+                let remaining = count_queue(connection, &source, review_day)?;
+                let relearn =
+                    pending_relearn_count(connection, session_id, current_position, review_day)?;
+                queue_length = current_position
+                    .saturating_add(u32::try_from(remaining).map_err(StoreError::storage)?)
+                    .saturating_add(relearn);
+            }
             Ok(ReviewSessionView {
                 session_id: row.0,
                 owner_device_id: row.7,
                 mode: parse_session_mode(&row.8)?,
-                source: serde_json::from_str(&row.1).map_err(StoreError::storage)?,
-                target_count: row
-                    .2
-                    .map(|value| to_u32(value, "target count"))
-                    .transpose()?,
+                source,
+                target_count,
                 status: row.3,
-                current_position: to_u32(row.4, "session position")?,
-                started_at_us: to_u64(row.5, "session start")?,
-                queue_length: to_u32(row.6, "queue length")?,
+                current_position,
+                started_at_us,
+                queue_length,
             })
         })
         .transpose()
+}
+
+fn pending_relearn_count(
+    connection: &Connection,
+    session_id: &str,
+    current_position: u32,
+    review_day: u32,
+) -> Result<u32, StoreError> {
+    connection
+        .query_row(
+            "SELECT count(*) FROM review_session_item AS item
+             JOIN review_state AS state USING(thema_id)
+             WHERE item.session_id = ?1 AND item.disposition = 'pending'
+               AND item.position >= ?2 AND state.next_review_day > ?3",
+            params![
+                session_id,
+                i64::from(current_position),
+                i64::from(review_day)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::storage)
+        .and_then(|count: i64| to_u32(count, "relearn count"))
 }
 
 fn parse_session_mode(value: &str) -> Result<ReviewSessionMode, StoreError> {
@@ -3032,10 +3104,10 @@ fn advance_review_session(
         .execute(
             "UPDATE review_session SET
              current_position = current_position + 1,
-             status = CASE WHEN current_position + 1 >= (
+             status = CASE WHEN target_count IS NOT NULL AND current_position + 1 >= (
                  SELECT count(*) FROM review_session_item WHERE session_id = ?1
              ) THEN 'completed' ELSE status END,
-             ended_at_us = CASE WHEN current_position + 1 >= (
+             ended_at_us = CASE WHEN target_count IS NOT NULL AND current_position + 1 >= (
                  SELECT count(*) FROM review_session_item WHERE session_id = ?1
              ) THEN ?2 ELSE ended_at_us END
          WHERE session_id = ?1",
@@ -3045,7 +3117,128 @@ fn advance_review_session(
             ],
         )
         .map_err(StoreError::storage)?;
+    complete_live_if_exhausted(transaction, session_id, ended_at_us)
+}
+
+fn complete_live_if_exhausted(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    ended_at_us: u64,
+) -> Result<(), StoreError> {
+    let session = load_session(transaction, session_id)?.ok_or(StoreError::NotFound)?;
+    if session.target_count.is_some() || session.status != "active" {
+        return Ok(());
+    }
+    if current_session_item(transaction, session_id).is_ok() {
+        return Ok(());
+    }
+    let captured = captured_settings(transaction)?;
+    let review_day = review_day_at(ended_at_us, &captured.timezone, captured.day_boundary_hour)
+        .map_err(StoreError::storage)?;
+    if next_unseen_due(transaction, session_id, &session.source, review_day)?.is_some() {
+        return Ok(());
+    }
+    complete_idle_session(transaction, session_id, ended_at_us)
+}
+
+fn complete_idle_session(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    ended_at_us: u64,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "UPDATE review_session SET status = 'completed', ended_at_us = ?2
+             WHERE session_id = ?1 AND status = 'active'
+               AND NOT EXISTS(
+                   SELECT 1 FROM review_attempt
+                   WHERE session_id = ?1 AND status <> 'committed'
+               )",
+            params![session_id, u64_to_i64(ended_at_us, "session end")?],
+        )
+        .map_err(StoreError::storage)?;
     Ok(())
+}
+
+fn enqueue_next_live_item(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    started_at_us: u64,
+) -> Result<bool, StoreError> {
+    let session = load_session(transaction, session_id)?.ok_or(StoreError::NotFound)?;
+    if session.status != "active" || session.target_count.is_some() {
+        return Ok(false);
+    }
+    let captured = captured_settings(transaction)?;
+    let review_day = review_day_at(
+        started_at_us,
+        &captured.timezone,
+        captured.day_boundary_hour,
+    )
+    .map_err(StoreError::storage)?;
+    let Some(thema_id) = next_unseen_due(transaction, session_id, &session.source, review_day)?
+    else {
+        return Ok(false);
+    };
+    append_relearning_item(transaction, session_id, &thema_id)?;
+    Ok(true)
+}
+
+fn next_unseen_due(
+    connection: &Connection,
+    session_id: &str,
+    source: &ReviewSource,
+    review_day: u32,
+) -> Result<Option<String>, StoreError> {
+    match source.kind {
+        ReviewSourceKind::Due
+        | ReviewSourceKind::Overdue
+        | ReviewSourceKind::DueWithoutOverdue
+        | ReviewSourceKind::Tag
+        | ReviewSourceKind::DueTag => {
+            let query = format!(
+                "SELECT thema.thema_id FROM thema JOIN review_state AS state USING(thema_id)
+                 WHERE {}
+                   AND thema.thema_id NOT IN (
+                       SELECT thema_id FROM review_session_item WHERE session_id = ?4
+                   )
+                 ORDER BY (state.review_count > 0), state.next_review_day, thema.thema_id
+                 LIMIT 1",
+                filtered_queue_predicate(&source.kind)?
+            );
+            let include = serde_json::to_string(&source.tags).map_err(StoreError::storage)?;
+            let exclude =
+                serde_json::to_string(&source.exclude_tags).map_err(StoreError::storage)?;
+            connection
+                .query_row(
+                    &query,
+                    params![i64::from(review_day), include, exclude, session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(StoreError::storage)
+        }
+        _ => {
+            let seen = session_thema_ids(connection, session_id)?;
+            Ok(select_queue(connection, source, review_day, None)?
+                .into_iter()
+                .find(|id| !seen.contains(id)))
+        }
+    }
+}
+
+fn session_thema_ids(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<std::collections::HashSet<String>, StoreError> {
+    let mut statement = connection
+        .prepare("SELECT thema_id FROM review_session_item WHERE session_id = ?1")
+        .map_err(StoreError::storage)?;
+    statement
+        .query_map([session_id], |row| row.get(0))
+        .map_err(StoreError::storage)?
+        .collect::<Result<_, _>>()
+        .map_err(StoreError::storage)
 }
 
 fn append_relearning_item(
@@ -3137,6 +3330,18 @@ mod tests {
 
     fn manual_source(id: &str) -> ReviewSource {
         manual_source_many(&[id])
+    }
+
+    fn due_source() -> ReviewSource {
+        ReviewSource {
+            kind: ReviewSourceKind::Due,
+            tags: vec![],
+            exclude_tags: vec![],
+            topic_node_id: None,
+            topic_forward_depth: None,
+            topic_backward_depth: None,
+            manual_ids: vec![],
+        }
     }
 
     fn manual_source_many(ids: &[&str]) -> ReviewSource {
@@ -4867,7 +5072,8 @@ mod tests {
         }
 
         let session = store.create_review_session(&source, None, None, 1).unwrap();
-        assert_eq!(session.target_count, Some(100));
+        assert_eq!(session.target_count, None);
+        assert_eq!(session.queue_length, 1);
 
         for target_count in [Some(0), Some(501)] {
             assert!(matches!(
@@ -4892,6 +5098,64 @@ mod tests {
                 .unwrap()
                 .session_id,
             session.session_id
+        );
+    }
+
+    #[test]
+    fn live_due_session_reviews_every_due_thema() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        add_thema(&mut store, "alpha", "Question", None);
+        add_thema(&mut store, "beta", "Question", None);
+        let started = 1_784_160_000_000_000;
+        let session = store
+            .create_review_session(&due_source(), None, None, started)
+            .unwrap();
+        assert_eq!(session.target_count, None);
+        assert_eq!(session.queue_length, 2);
+
+        let first = store
+            .begin_review_attempt(&session.session_id, None, started + 1)
+            .unwrap();
+        store
+            .grade_review_attempt(
+                &first.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                started + 2,
+            )
+            .unwrap();
+        store
+            .commit_review_attempt(&first.attempt_id, None, started + 3)
+            .unwrap();
+
+        let second = store
+            .begin_review_attempt(&session.session_id, None, started + 4)
+            .unwrap();
+        assert_ne!(first.thema_id, second.thema_id);
+        store
+            .grade_review_attempt(
+                &second.attempt_id,
+                None,
+                &AnswerInput::Text("answer".into()),
+                started + 5,
+            )
+            .unwrap();
+        store
+            .commit_review_attempt(&second.attempt_id, None, started + 6)
+            .unwrap();
+
+        assert!(
+            store
+                .begin_review_attempt(&session.session_id, None, started + 7)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .review_session(&session.session_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "completed"
         );
     }
 
