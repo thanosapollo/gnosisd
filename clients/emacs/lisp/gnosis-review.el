@@ -371,6 +371,12 @@
           (% (/ day 100) 100)
           (% day 100)))
 
+(defun gnosis-review--next-review-face (accepted)
+  "Return face for next-review date after ACCEPTED outcome."
+  (if (eq accepted t)
+      'gnosis-face-correct
+    'gnosis-face-false))
+
 (defun gnosis-review--insert-separator ()
   "Insert spacing and a separator between review sections."
   (insert "\n\n" (gnosis--separator) "\n\n"))
@@ -430,7 +436,7 @@
            (gnosis-review--labeled-text
             "Next review:"
             (gnosis-review--format-next-review-day day)
-            'gnosis-face-next-review)))))
+            (gnosis-review--next-review-face accepted))))))
     (goto-char (if start-at-top (point-min) (min old-point (point-max))))
     (when old-window-start
       (set-window-start

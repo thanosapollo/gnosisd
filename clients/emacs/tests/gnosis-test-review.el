@@ -1744,7 +1744,23 @@
                   'gnosis-face-directions))
       (search-forward "2026/8/20")
       (should (eq (get-text-property (1- (point)) 'face)
-                  'gnosis-face-next-review)))))
+                  'gnosis-face-correct)))))
+
+(ert-deftest gnosis-review-render-uses-false-face-for-failed-next-review ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt
+          (gnosis-test-review--with-next-review
+           (gnosis-test-review--attempt "graded") 20260820))
+    (setf (plist-get gnosis-review--attempt :accepted_success)
+          gnosis-core--json-false)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "2026/8/20")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-false)))))
 
 (ert-deftest gnosis-review-render-updates-next-review-after-override ()
   (with-temp-buffer
@@ -1762,7 +1778,11 @@
             gnosis-core--json-false)
       (gnosis-review--render)
       (should (string-match-p "Next review: 2026/9/3" (buffer-string)))
-      (should-not (string-match-p "2026/8/20" (buffer-string))))))
+      (should-not (string-match-p "2026/8/20" (buffer-string)))
+      (goto-char (point-min))
+      (search-forward "2026/9/3")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-false)))))
 
 (defvar gnosis-review-types)
 
