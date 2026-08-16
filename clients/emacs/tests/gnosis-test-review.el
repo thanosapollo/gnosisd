@@ -32,6 +32,7 @@
         :accepted_success (if (equal status "pending")
                               gnosis-core--json-null t)
         :desired_suspended gnosis-core--json-false
+        :proposed_transition gnosis-core--json-null
         :status (or status "pending")))
 
 (defun gnosis-test-review--begin-result (&optional attempt session)
@@ -1706,6 +1707,59 @@
               ((symbol-function 'message) #'ignore))
       (gnosis-review-resume)
       (should-not mutated))))
+
+(defun gnosis-test-review--with-next-review (attempt day)
+  "Return ATTEMPT with server next-review DAY."
+  (let ((copy (copy-sequence attempt)))
+    (setf (plist-get copy :proposed_transition)
+          (list :after (list :next_review_day day)))
+    copy))
+
+(ert-deftest gnosis-review-render-omits-next-review-while-pending ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt
+          (gnosis-test-review--with-next-review
+           (gnosis-test-review--attempt "pending") 20260820))
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (should-not (string-match-p "Next review:" (buffer-string))))))
+
+(ert-deftest gnosis-review-render-shows-archive-next-review-after-grade ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt
+          (gnosis-test-review--with-next-review
+           (gnosis-test-review--attempt "graded") 20260820))
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (goto-char (point-min))
+      (search-forward "Next review:")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-directions))
+      (search-forward "2026/8/20")
+      (should (eq (get-text-property (1- (point)) 'face)
+                  'gnosis-face-next-review)))))
+
+(ert-deftest gnosis-review-render-updates-next-review-after-override ()
+  (with-temp-buffer
+    (gnosis-review-mode)
+    (setq gnosis-review--session (gnosis-test-review--session)
+          gnosis-review--attempt
+          (gnosis-test-review--with-next-review
+           (gnosis-test-review--attempt "graded") 20260820))
+    (cl-letf (((symbol-function 'display-images-p) (lambda () nil)))
+      (gnosis-review--render)
+      (setq gnosis-review--attempt
+            (gnosis-test-review--with-next-review
+             (gnosis-test-review--attempt "graded") 20260903))
+      (setf (plist-get gnosis-review--attempt :accepted_success)
+            gnosis-core--json-false)
+      (gnosis-review--render)
+      (should (string-match-p "Next review: 2026/9/3" (buffer-string)))
+      (should-not (string-match-p "2026/8/20" (buffer-string))))))
 
 (provide 'gnosis-test-review)
 ;;; gnosis-test-review.el ends here

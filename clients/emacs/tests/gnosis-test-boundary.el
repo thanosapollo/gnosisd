@@ -57,7 +57,7 @@
     (let ((source (gnosis-test-boundary--library-string feature)))
       (should-not
        (string-match-p
-        "node_ids\\|receipt\\|proposed_transition"
+        "node_ids\\|receipt"
         source))))
   (dolist (feature '(gnosis gnosis-edit gnosis-nodes gnosis-review))
     (should-not

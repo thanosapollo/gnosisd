@@ -277,6 +277,20 @@
         (mapconcat (lambda (item) (concat "• " item)) items "\n")
       (or (car items) ""))))
 
+(defun gnosis-review--next-review-day (attempt)
+  "Return server next-review day from ATTEMPT, or nil."
+  (let* ((transition (plist-get attempt :proposed_transition))
+         (after (and (consp transition) (plist-get transition :after)))
+         (day (and (consp after) (plist-get after :next_review_day))))
+    (and (natnump day) (> day 0) day)))
+
+(defun gnosis-review--format-next-review-day (day)
+  "Return archive-style next-review date for numeric DAY."
+  (format "%d/%d/%d"
+          (/ day 10000)
+          (% (/ day 100) 100)
+          (% day 100)))
+
 (defun gnosis-review--insert-separator ()
   "Insert spacing and a separator between review sections."
   (insert "\n\n" (gnosis--separator) "\n\n"))
@@ -328,7 +342,15 @@
             (gnosis-review--insert-separator)
             (insert
              (gnosis-review--content-text
-              parathema 'font-lock-doc-face))))))
+              parathema 'font-lock-doc-face))))
+        (when-let* ((day (gnosis-review--next-review-day
+                          gnosis-review--attempt)))
+          (gnosis-review--insert-separator)
+          (insert
+           (gnosis-review--labeled-text
+            "Next review:"
+            (gnosis-review--format-next-review-day day)
+            'gnosis-face-next-review)))))
     (goto-char (if start-at-top (point-min) (min old-point (point-max))))
     (when old-window-start
       (set-window-start
