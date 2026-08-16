@@ -3414,7 +3414,9 @@ fn add_content_errors(responses: &mut serde_json::Map<String, Value>, statuses: 
 
 fn content_parameters(path: &str, method: &str) -> Vec<Value> {
     let mut parameters = openapi_path_parameters(path);
-    parameters.extend(content_query_parameters(path));
+    if method == "get" {
+        parameters.extend(content_query_parameters(path));
+    }
     if content_requires_if_match(path, method) {
         parameters.push(if_match_parameter(true));
     } else if path == "/v1/assets/{digest}/{name}" && method == "put" {
@@ -4979,6 +4981,29 @@ mod tests {
         );
         let get = &api["paths"]["/v1/review/sessions"]["get"];
         for name in ["after", "limit", "status", "mode"] {
+            assert_eq!(operation_parameter(get, name)["in"], "query");
+        }
+    }
+
+    #[test]
+    fn openapi_post_themata_omits_list_query_parameters() {
+        let api = openapi_document();
+        let post = &api["paths"]["/v1/themata"]["post"];
+        let parameters = post["parameters"]
+            .as_array()
+            .expect("POST /v1/themata must declare parameters");
+        let query_names: Vec<&str> = parameters
+            .iter()
+            .filter(|parameter| parameter["in"] == "query")
+            .filter_map(|parameter| parameter["name"].as_str())
+            .collect();
+        assert!(
+            query_names.is_empty(),
+            "POST /v1/themata leaked list query parameters: {query_names:?}"
+        );
+        assert_eq!(operation_parameter(post, "Idempotency-Key")["in"], "header");
+        let get = &api["paths"]["/v1/themata"]["get"];
+        for name in ["after", "limit", "q"] {
             assert_eq!(operation_parameter(get, name)["in"], "query");
         }
     }
