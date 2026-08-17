@@ -667,5 +667,19 @@
            '(gnosis-core-authorization-error "secret server detail"))
           "Gnosis access denied. Check gnosisd token scopes.")))
 
+(defvar gnosis-test-dashboard--org-hook-ran nil
+  "Non-nil when a test org-mode hook ran.")
+
+(ert-deftest gnosis-org-format-does-not-run-org-mode-hook ()
+  (let ((gnosis-test-dashboard--org-hook-ran nil)
+        (org-mode-hook
+         (list (lambda ()
+                 (setq gnosis-test-dashboard--org-hook-ran t)
+                 (insert "HOOK")))))
+    (should
+     (equal "Hello"
+            (substring-no-properties (gnosis-org-format-string "Hello"))))
+    (should-not gnosis-test-dashboard--org-hook-ran)))
+
 (provide 'gnosis-test-dashboard)
 ;;; gnosis-test-dashboard.el ends here

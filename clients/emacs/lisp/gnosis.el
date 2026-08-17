@@ -148,7 +148,8 @@
 (defun gnosis-org-format-string (string)
   "Return STRING fontified for display like Org content."
   (with-temp-buffer
-    (org-mode)
+    (delay-mode-hooks
+      (org-mode))
     (setq-local org-pretty-entities t)
     (insert (gnosis--display-link-descriptions string))
     (font-lock-ensure)
