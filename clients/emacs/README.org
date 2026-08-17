@@ -109,9 +109,10 @@ Use ={{answer}}= without a hint, ={{answer :: [none]}}= for an explicit null
 hint, and a backslash to quote literal delimiters.  Existing data whose stored
 answer spelling differs from the question uses ={{question text => answer}}=.
 
-Secondary fields retain absent, null, empty, and value states without exposing
-JSON.  Press =RET= on a secondary heading to change its state.  Repeated values
-use =- value= and =  |continuation=; concepts remain
+Secondary collection fields retain omitted versus values without exposing
+JSON.  Press =RET= on Tags, Concepts, or Asset paths to change that state.
+Hint, Parathema, and Review image are the body text: nonempty text is the
+value, and a blank body is null.  Repeated values use =- value= and =  |continuation=; concepts remain
 =- RELATION "NODE-ID"=.  =TAB= folds headings.  Save with =C-c C-c=, cancel with
 =C-c C-k=, or retry a retained uncertain mutation with =C-c C-r=.  Unknown
 live-contract fields stop editing before a mutation can discard them.

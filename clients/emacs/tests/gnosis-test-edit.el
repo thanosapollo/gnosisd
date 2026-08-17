@@ -12,7 +12,7 @@
   `(:kind "basic" :keimenon "  Question  \n\\opening\n** Answer\n"
     :hypothesis ["guess"] :answer ["first"]
     :source_guid ,gnosis-core--json-null
-    :parathema " Context " :review_image ""
+    :parathema " Context " :review_image ,gnosis-core--json-null
     :tags ["logic" "  spaced  "]
     :concepts [(:node_id "primary/κόμβος/雪" :relation "primary")
                (:node_id "reference/node\nquoted" :relation "reference")
@@ -328,8 +328,10 @@
                      (gnosis-edit--parse))))))
 
 (ert-deftest gnosis-edit-text-round-trip-preserves-absent-fields ()
-  (let ((request '(:kind "basic" :keimenon "Question"
-                   :answer ["Answer"]
+  (let ((request `(:kind "basic" :keimenon "Question"
+                   :hypothesis [,gnosis-core--json-null] :answer ["Answer"]
+                   :parathema ,gnosis-core--json-null
+                   :review_image ,gnosis-core--json-null
                    :concepts [(:node_id "node/id" :relation "primary")])))
     (with-temp-buffer
       (gnosis-test-edit--render-request request)
@@ -338,8 +340,10 @@
       (should (equal request (gnosis-edit--parse))))))
 
 (ert-deftest gnosis-edit-cloze-round-trip-preserves-absent-hypothesis ()
-  (let ((request '(:kind "cloze" :keimenon "Athens is ancient"
-                   :answer ["Athens"])))
+  (let ((request `(:kind "cloze" :keimenon "Athens is ancient"
+                   :answer ["Athens"]
+                   :parathema ,gnosis-core--json-null
+                   :review_image ,gnosis-core--json-null)))
     (with-temp-buffer
       (gnosis-edit-mode)
       (gnosis-edit--replace-request request)
@@ -359,7 +363,10 @@
         (kill-buffer buffer)))))
 
 (ert-deftest gnosis-edit-save-preserves-absent-fields-in-payload ()
-  (let ((request '(:kind "basic" :keimenon "Question" :answer ["Answer"]))
+  (let ((request `(:kind "basic" :keimenon "Question"
+                   :hypothesis [,gnosis-core--json-null] :answer ["Answer"]
+                   :parathema ,gnosis-core--json-null
+                   :review_image ,gnosis-core--json-null))
         sent)
     (with-temp-buffer
       (gnosis-test-edit--render-request request)
@@ -390,6 +397,7 @@
 (ert-deftest gnosis-edit-text-parser-preserves-blank-separated-deep-heading ()
   (let* ((question "Lead-in\n\n*** Hidden\n\nTail")
          (request (list :kind "basic" :keimenon question
+                        :hypothesis (vector gnosis-core--json-null)
                         :answer ["Answer"]
                         :source_guid gnosis-core--json-null
                         :parathema gnosis-core--json-null
@@ -607,15 +615,59 @@
         (kill-buffer org-buffer))
       (load target-file nil 'nomessage))))
 
+(ert-deftest gnosis-edit-basic-hint-body-is-value-even-under-none-heading ()
+  (with-temp-buffer
+    (insert "* Thema [basic]\n\n** Question\nQ\n** Hint [none]\n2 words\n** Answer\nA\n\n* Metadata\n\n** Parathema [none]\n\n** Review image [none]\n\n** Tags\n\n** Concepts\n\n** Asset paths\n")
+    (should (equal ["2 words"] (plist-get (gnosis-edit--parse) :hypothesis)))))
+
+(ert-deftest gnosis-edit-basic-empty-optional-text-is-null ()
+  (with-temp-buffer
+    (insert "* Thema [basic]\n\n** Question\nQ\n\n** Hint\n\n** Answer\nA\n\n* Metadata\n\n** Parathema\n\n** Review image\n\n** Tags\n\n** Concepts\n\n** Asset paths\n")
+    (let ((request (gnosis-edit--parse)))
+      (should (equal (vector gnosis-core--json-null)
+                     (plist-get request :hypothesis)))
+      (should (eq gnosis-core--json-null (plist-get request :parathema)))
+      (should (eq gnosis-core--json-null (plist-get request :review_image))))))
+
+(ert-deftest gnosis-edit-basic-null-hint-renders-without-state-marker ()
+  (let ((text (gnosis-edit--render
+               `(:kind "basic" :keimenon "Q"
+                 :hypothesis [,gnosis-core--json-null] :answer ["A"]
+                 :parathema ,gnosis-core--json-null
+                 :review_image ,gnosis-core--json-null
+                 :tags [] :concepts [] :asset_paths []))))
+    (should (string-match-p (regexp-quote "\n** Hint\n\n** Answer\n") text))
+    (should-not (string-match-p "Hint \\[" text))
+    (should-not (string-match-p "Parathema \\[" text))
+    (should-not (string-match-p "Review image \\[" text))))
+
+(ert-deftest gnosis-edit-activate-types-into-hint-without-state-switch ()
+  (with-temp-buffer
+    (gnosis-edit-mode)
+    (gnosis-edit--replace-request
+     `(:kind "basic" :keimenon "Q"
+       :hypothesis [,gnosis-core--json-null] :answer ["A"]
+       :parathema ,gnosis-core--json-null
+       :review_image ,gnosis-core--json-null
+       :tags [] :concepts [] :asset_paths []))
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Hint$")
+    (beginning-of-line)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (error "state switch still live"))))
+      (gnosis-edit-activate))
+    (insert "2 words")
+    (should (equal ["2 words"] (plist-get (gnosis-edit--parse) :hypothesis)))))
+
 (ert-deftest gnosis-edit-activate-makes-null-field-editable ()
   (with-temp-buffer
     (gnosis-edit-mode)
     (gnosis-edit--replace-request gnosis-test-edit--choice-request)
     (goto-char (point-min))
-    (re-search-forward "^\\*\\* Review image \\[none\\]$")
+    (re-search-forward "^\\*\\* Review image$")
     (beginning-of-line)
     (cl-letf (((symbol-function 'completing-read)
-               (lambda (&rest _) "value")))
+               (lambda (&rest _) (error "state switch still live"))))
       (gnosis-edit-activate))
     (should-not (get-text-property (point) 'read-only))
     (should (equal "** Review image"

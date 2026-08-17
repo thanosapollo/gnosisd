@@ -135,8 +135,7 @@
 
 (defun gnosis-edit--stateful-field-p (label)
   "Return non-nil when LABEL supports an explicit value state."
-  (member label '("Hint" "Parathema" "Review image"
-                  "Tags" "Concepts" "Asset paths")))
+  (member label '("Tags" "Concepts" "Asset paths")))
 
 (defun gnosis-edit--collection-field-p (label)
   "Return non-nil when LABEL names a collection field."
@@ -370,19 +369,19 @@
       (format "** %s" label)
     (format "** %s\n%s" label value)))
 
+(defun gnosis-edit--blank-optional-text-p (value)
+  "Return non-nil when optional VALUE has no authoring text."
+  (or (null value)
+      (eq value gnosis-core--json-null)
+      (and (stringp value) (string-empty-p (string-trim value)))))
+
 (defun gnosis-edit--format-optional (request key label)
   "Return optional REQUEST field KEY as a readable LABEL section."
-  (if (not (plist-member request key))
-      (gnosis-edit--format-state-section label 'omitted)
-    (let ((value (plist-get request key)))
-      (cond
-       ((eq value gnosis-core--json-null)
-        (gnosis-edit--format-state-section label 'none))
-       ((and (stringp value) (string-empty-p value))
-        (gnosis-edit--format-state-section label 'empty))
-       ((stringp value)
-        (gnosis-edit--format-state-section label 'value value))
-       (t (user-error "Invalid optional Thema field: %s" label))))))
+  (let ((value (plist-get request key)))
+    (cond
+     ((gnosis-edit--blank-optional-text-p value) (format "** %s" label))
+     ((stringp value) (gnosis-edit--format-state-section label 'value value))
+     (t (user-error "Invalid optional Thema field: %s" label)))))
 
 (defun gnosis-edit--format-collection (request key label formatter)
   "Return collection KEY from REQUEST under LABEL using FORMATTER."
@@ -406,22 +405,16 @@
 
 (defun gnosis-edit--format-hint (request)
   "Return a basic Thema hint section from REQUEST."
-  (if (not (plist-member request :hypothesis))
-      (gnosis-edit--format-state-section "Hint" 'omitted)
-    (let ((values (plist-get request :hypothesis)))
-      (unless (and (vectorp values) (<= (length values) 1))
-        (user-error "Basic Thema accepts at most one hint"))
-      (if (= (length values) 0)
-          "** Hint"
-        (let ((value (aref values 0)))
-          (cond
-           ((eq value gnosis-core--json-null)
-            (gnosis-edit--format-state-section "Hint" 'none))
-           ((and (stringp value) (string-empty-p value))
-            (gnosis-edit--format-state-section "Hint" 'empty))
-           ((stringp value)
-            (gnosis-edit--format-state-section "Hint" 'value value))
-           (t (user-error "Invalid basic Thema hint"))))))))
+  (let ((values (plist-get request :hypothesis)))
+    (unless (or (null values) (and (vectorp values) (<= (length values) 1)))
+      (user-error "Basic Thema accepts at most one hint"))
+    (let ((value (and (vectorp values)
+                      (> (length values) 0)
+                      (aref values 0))))
+      (cond
+       ((gnosis-edit--blank-optional-text-p value) "** Hint")
+       ((stringp value) (gnosis-edit--format-state-section "Hint" 'value value))
+       (t (user-error "Invalid basic Thema hint"))))))
 
 (defun gnosis-edit--format-basic (request)
   "Return primary authoring sections for basic REQUEST."
@@ -680,6 +673,8 @@ Deeper outline stars are body text, not structural section boundaries."
      ((and next (equal segment "\n")) "")
      ((and next (string-suffix-p "\n\n" segment))
       (substring segment 0 -2))
+     ((and next (string-suffix-p "\n" segment))
+      (substring segment 0 -1))
      ((and (not next) (string-empty-p segment)) "")
      ((and (not next) (string-suffix-p "\n" segment))
       (substring segment 0 -1))
@@ -904,14 +899,11 @@ Deeper outline stars are body text, not structural section boundaries."
 
 (defun gnosis-edit--parse-basic-hint (section)
   "Return a hypothesis field list parsed from basic hint SECTION."
-  (let ((state (gnosis-edit--label-state (car section) "Hint")))
-    (pcase state
-      ('omitted nil)
-      ('none (list :hypothesis (vector gnosis-core--json-null)))
-      ('empty (list :hypothesis [""]))
-      (_ (list :hypothesis
-               (if (string-empty-p (cdr section)) []
-                 (vector (gnosis-edit--parse-string (cdr section)))))))))
+  (let ((value (gnosis-edit--parse-string (cdr section))))
+    (list :hypothesis
+          (if (string-empty-p (string-trim value))
+              (vector gnosis-core--json-null)
+            (vector value)))))
 
 (defun gnosis-edit--parse-basic (sections)
   "Return primary request fields parsed from basic SECTIONS."
@@ -970,23 +962,24 @@ Deeper outline stars are body text, not structural section boundaries."
      (append (list :keimenon (gnosis-edit--parse-string (cdar sections)))
              (gnosis-edit--parse-choices (cdr (nth 1 sections)))))))
 
-(defun gnosis-edit--parse-optional (section key label)
-  "Return optional KEY parsed from SECTION named LABEL."
-  (pcase (gnosis-edit--label-state (car section) label)
-    ('omitted nil)
-    ('none (list key gnosis-core--json-null))
-    ('empty (list key ""))
-    (_ (list key (gnosis-edit--parse-string (cdr section))))))
+(defun gnosis-edit--parse-optional (section key)
+  "Return optional KEY parsed from SECTION body text."
+  (let ((value (gnosis-edit--parse-string (cdr section))))
+    (list key (if (string-empty-p (string-trim value))
+                  gnosis-core--json-null
+                value))))
 
 (defun gnosis-edit--parse-metadata-field (section field)
   "Return one metadata FIELD parsed from SECTION."
   (pcase-let ((`(,key ,label ,type) field))
-    (if (eq (gnosis-edit--label-state (car section) label) 'omitted)
-        nil
-      (pcase type
-        ('optional (gnosis-edit--parse-optional section key label))
-        ('list (list key (gnosis-edit--parse-list (cdr section))))
-        ('concepts (list key (gnosis-edit--parse-concepts (cdr section))))))))
+    (pcase type
+      ('optional (gnosis-edit--parse-optional section key))
+      (_ (if (eq (gnosis-edit--label-state (car section) label) 'omitted)
+             nil
+           (pcase type
+             ('list (list key (gnosis-edit--parse-list (cdr section))))
+             ('concepts (list key (gnosis-edit--parse-concepts
+                                   (cdr section))))))))))
 
 (defun gnosis-edit--parse-metadata (sections)
   "Return metadata fields parsed from ordered SECTIONS."
