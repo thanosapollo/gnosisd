@@ -139,10 +139,11 @@ fn insert_content_journal(
     transaction: &Transaction<'_>,
     format_version: u32,
     operation: &OfflineContentOperation,
-    canonical_payload: &str,
+    _canonical_payload: &str,
     digest: &str,
     received_at_us: u64,
 ) -> Result<(), StoreError> {
+    let payload_json = format!(r#"{{"payload_sha256":"{digest}"}}"#);
     insert_device_operation(
         transaction,
         DeviceOperationInsert {
@@ -152,7 +153,7 @@ fn insert_content_journal(
             operation_kind: "content",
             format_version,
             payload_sha256: digest,
-            payload_json: canonical_payload,
+            payload_json: &payload_json,
             received_at_us,
         },
     )?;
@@ -805,6 +806,22 @@ mod tests {
                 .next_device_sequence,
             2
         );
+        let stored_payload: String = store
+            .connection
+            .query_row(
+                "SELECT payload_json FROM device_operation WHERE operation_id = ?1",
+                [super::scoped_operation_id(&device_id, "operation-1")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored_payload.contains("#+title: Note"));
+        assert_eq!(
+            stored_payload,
+            format!(
+                r#"{{"payload_sha256":"{:x}"}}"#,
+                Sha256::digest(b"canonical-operation-1")
+            )
+        );
 
         let replay = store
             .reconcile_content_operation(
@@ -1155,11 +1172,13 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .unwrap();
-        assert_eq!(stored_payload, canonical_payload);
+        assert!(!stored_payload.contains("plain body"));
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&stored_payload).unwrap()["operation"]["mutation"]
-                ["source"],
-            "plain body\n"
+            stored_payload,
+            format!(
+                r#"{{"payload_sha256":"{:x}"}}"#,
+                Sha256::digest(canonical_payload.as_bytes())
+            )
         );
         assert_eq!(
             store
