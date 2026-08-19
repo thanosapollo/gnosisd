@@ -1008,7 +1008,7 @@ mod tests {
                 .iter()
                 .map(|revision| revision.operation.as_str())
                 .collect::<Vec<_>>(),
-            ["create", "rename", "tombstone"]
+            ["tombstone"]
         );
         assert!(!store.document_head(&id).unwrap().unwrap().active);
     }
@@ -1393,7 +1393,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.conflict_reason,
-            Some(OfflineContentConflictReason::BaseChanged)
+            Some(OfflineContentConflictReason::CursorChanged)
         );
         assert_eq!(result.authoritative.unwrap().revision, 2);
         assert_eq!(store.latest_content_cursor().unwrap(), before);
@@ -1481,7 +1481,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result.conflict_reason,
-                Some(OfflineContentConflictReason::BaseChanged)
+                Some(OfflineContentConflictReason::CursorChanged)
             );
         }
         assert_eq!(

@@ -3203,6 +3203,24 @@ fn insert_document_history(
 ) -> Result<(), StoreError> {
     transaction
         .execute(
+            "DELETE FROM document_revision_asset WHERE document_id = ?1",
+            params![document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM document_projection_revision WHERE document_id = ?1",
+            params![document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM document_revision WHERE document_id = ?1",
+            params![document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
             "INSERT INTO document_revision(
                  document_id, revision, logical_path, content_type, blob_sha256, operation,
                  created_at_us, author_device_id
@@ -3645,6 +3663,12 @@ fn insert_thema_history(
     created_at_us: i64,
     author_device_id: Option<&str>,
 ) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM thema_revision WHERE thema_id = ?1",
+            params![record.thema_id],
+        )
+        .map_err(StoreError::storage)?;
     transaction
         .execute(
             "INSERT INTO thema_revision(
@@ -4900,6 +4924,24 @@ fn insert_document_revision(
 ) -> Result<(), StoreError> {
     transaction
         .execute(
+            "DELETE FROM document_revision_asset WHERE document_id = ?1",
+            params![prepared.document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM document_projection_revision WHERE document_id = ?1",
+            params![prepared.document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM document_revision WHERE document_id = ?1",
+            params![prepared.document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
             "INSERT INTO document_revision(
                  document_id, revision, logical_path, content_type, blob_sha256, operation,
                  created_at_us, author_device_id
@@ -4927,6 +4969,14 @@ fn insert_content_change(
     operation: &str,
     created_at_us: i64,
 ) -> Result<(), StoreError> {
+    if matches!(kind, "document" | "thema") {
+        transaction
+            .execute(
+                "DELETE FROM content_change WHERE entity_kind = ?1 AND entity_id = ?2",
+                params![kind, id],
+            )
+            .map_err(StoreError::storage)?;
+    }
     transaction
         .execute(
             "INSERT INTO content_change(entity_kind, entity_id, revision, operation, created_at_us)
@@ -6219,19 +6269,13 @@ mod tests {
             .unwrap();
 
         let retired = reopened.get_node("child").unwrap().unwrap();
-        assert_eq!(retired.document_revision, 1);
-        assert_eq!(retired.content_sha256, prepared.blob_sha256);
-        assert_eq!((retired.start_byte, retired.end_byte), (Some(43), Some(86)));
         assert!(!retired.active);
 
         reopened.tombstone_document(&id, 2, 3, None).unwrap();
         let tombstoned = reopened.get_node("root").unwrap().unwrap();
         assert_eq!(tombstoned.document_revision, 2);
         assert_eq!(tombstoned.content_sha256, replacement.blob_sha256);
-        assert_eq!(
-            (tombstoned.start_byte, tombstoned.end_byte),
-            (Some(0), Some(replacement.source.len()))
-        );
+        assert_eq!((tombstoned.start_byte, tombstoned.end_byte), (None, None));
         assert!(!tombstoned.active);
     }
 
@@ -7133,16 +7177,14 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(documents.len(), 3);
+        assert_eq!(documents.len(), 1);
         assert!(
             documents
                 .iter()
                 .all(|document| { document.revision.content_type == "text/org; charset=utf-8" })
         );
-        assert_eq!(documents[0].projection.as_ref().unwrap().title, "First");
-        assert_eq!(documents[1].projection.as_ref().unwrap().title, "Second");
-        assert_eq!(documents[2].revision.operation, "tombstone");
-        assert!(documents[2].projection.is_none());
+        assert_eq!(documents[0].revision.operation, "tombstone");
+        assert!(documents[0].projection.is_none());
 
         let assets = changes
             .iter()
@@ -7163,9 +7205,8 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(themata.len(), 2);
-        assert_eq!(themata[0].record.content.keimenon, "First");
-        assert_eq!(themata[1].record.content.keimenon, "Second");
+        assert_eq!(themata.len(), 1);
+        assert_eq!(themata[0].record.content.keimenon, "Second");
 
         let review_states = changes
             .iter()
@@ -7332,10 +7373,9 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(revisions.len(), 2);
-        assert_eq!(revisions[0].concepts.len(), 3);
+        assert_eq!(revisions.len(), 1);
         assert_eq!(
-            revisions[1].concepts[0].relation(),
+            revisions[0].concepts[0].relation(),
             ThemaConceptRelation::Reference
         );
 
@@ -7344,7 +7384,7 @@ mod tests {
             ReplicaProjection::Thema(value) => Some(&value.record),
             _ => None,
         });
-        assert_eq!(snapshot_thema.unwrap().concepts, revisions[1].concepts);
+        assert_eq!(snapshot_thema.unwrap().concepts, revisions[0].concepts);
     }
 
     #[test]
@@ -7415,6 +7455,28 @@ mod tests {
             store.get_document(&id).unwrap().unwrap().projection(),
             &third
         );
+    }
+
+    #[test]
+    fn document_puts_keep_one_revision_row() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let id = DocumentId::new("document").unwrap();
+        for (source, at) in [("First", 1), ("Second", 2), ("Third", 3)] {
+            let note = crate::application::prepare_note(
+                Some("document".into()),
+                "note.org".into(),
+                format!("#+title: {source}\n"),
+                None,
+            )
+            .unwrap();
+            let blob = BlobMeta {
+                sha256: note.blob_sha256.clone(),
+                size_bytes: note.source.len() as u64,
+                media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+            };
+            store.replace_note(&note, &blob, at, None).unwrap();
+        }
+        assert_eq!(store.document_revisions(&id, 0, 10).unwrap().len(), 1);
     }
 
     fn note_with_asset_link(
@@ -7505,7 +7567,7 @@ mod tests {
         };
         store.replace_note(&second, &second_blob, 3, None).unwrap();
 
-        let first_assets = retained_asset_paths(&first.content_type, &first.source).unwrap();
+        let _first_assets = retained_asset_paths(&first.content_type, &first.source).unwrap();
         let second_assets = retained_asset_paths(&second.content_type, &second.source).unwrap();
         let document_id = DocumentId::new("document").unwrap();
         store.tombstone_document(&document_id, 2, 4, None).unwrap();
@@ -7583,7 +7645,7 @@ mod tests {
             visited += 1;
             page_cursor = Some((sources[0].document_id.clone(), sources[0].revision));
         }
-        assert_eq!(visited, 3);
+        assert_eq!(visited, 1);
 
         let mut statement = store
             .connection
@@ -7612,12 +7674,7 @@ mod tests {
             .unwrap()
             .map(|row| row.unwrap())
             .collect();
-        let expected_history: Vec<(u64, String)> = [
-            (1_u64, first_assets[0].clone()),
-            (2, second_assets[0].clone()),
-        ]
-        .into_iter()
-        .collect();
+        let expected_history: Vec<(u64, String)> = Vec::new();
         assert_eq!(history_assets, expected_history);
     }
 }

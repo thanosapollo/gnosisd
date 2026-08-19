@@ -8382,7 +8382,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            3
+            1
         );
         drop(service);
         runtime.finish().await.unwrap();
@@ -8503,7 +8503,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            3
+            1
         );
         drop(service);
         runtime.finish().await.unwrap();
