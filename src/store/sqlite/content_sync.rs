@@ -1393,7 +1393,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             result.conflict_reason,
-            Some(OfflineContentConflictReason::CursorChanged)
+            Some(OfflineContentConflictReason::BaseChanged)
         );
         assert_eq!(result.authoritative.unwrap().revision, 2);
         assert_eq!(store.latest_content_cursor().unwrap(), before);
@@ -1481,7 +1481,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 result.conflict_reason,
-                Some(OfflineContentConflictReason::CursorChanged)
+                Some(OfflineContentConflictReason::BaseChanged)
             );
         }
         assert_eq!(

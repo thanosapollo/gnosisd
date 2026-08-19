@@ -913,22 +913,36 @@ impl SqliteStore {
         validate_replica_cursor(&self.connection, expected_server_id, after, after_token)?;
         let latest = current_content_cursor(&self.connection)?;
         let latest_token = replica_cursor_token(&self.connection, latest)?;
-        let changes = self
-            .content_changes(after, limit)?
-            .into_iter()
-            .map(|change| {
-                Ok(ReplicaChange {
-                    cursor: change.cursor,
-                    cursor_token: change.feed_token,
-                    projection: load_replica_projection(
-                        &self.connection,
-                        &change.entity_kind,
-                        &change.entity_id,
-                        change.revision,
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut changes = Vec::new();
+        let mut page_after = after;
+        while changes.len() < usize::from(limit) {
+            let batch = self.content_changes(page_after, limit)?;
+            if batch.is_empty() {
+                break;
+            }
+            for change in batch {
+                page_after = change.cursor;
+                match load_replica_projection(
+                    &self.connection,
+                    &change.entity_kind,
+                    &change.entity_id,
+                    change.revision,
+                ) {
+                    Ok(projection) => {
+                        changes.push(ReplicaChange {
+                            cursor: change.cursor,
+                            cursor_token: change.feed_token,
+                            projection,
+                        });
+                        if changes.len() == usize::from(limit) {
+                            break;
+                        }
+                    }
+                    Err(StoreError::ReplicaCursor) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         Ok((changes, latest, latest_token))
     }
 
@@ -4969,14 +4983,6 @@ fn insert_content_change(
     operation: &str,
     created_at_us: i64,
 ) -> Result<(), StoreError> {
-    if matches!(kind, "document" | "thema") {
-        transaction
-            .execute(
-                "DELETE FROM content_change WHERE entity_kind = ?1 AND entity_id = ?2",
-                params![kind, id],
-            )
-            .map_err(StoreError::storage)?;
-    }
     transaction
         .execute(
             "INSERT INTO content_change(entity_kind, entity_id, revision, operation, created_at_us)
@@ -7217,6 +7223,76 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(review_states.len(), 1);
         assert_eq!(review_states[0].state.state_revision, 0);
+    }
+
+    #[test]
+    fn replica_changes_resume_after_live_head_overwrite() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: First\n".into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store.replace_note(&first, &first_blob, 2, None).unwrap();
+        let after_first = store.replica_state(&device_id).unwrap();
+
+        let second = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Second\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.source.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store.replace_note(&second, &second_blob, 3, None).unwrap();
+
+        let from_mid = store
+            .replica_changes(
+                &after_first.server_id,
+                after_first.cursor,
+                &after_first.cursor_token,
+                10,
+            )
+            .unwrap();
+        assert_eq!(from_mid.1, after_first.cursor + 1);
+        assert_eq!(from_mid.0.len(), 1);
+
+        let (changes, _, _) = store
+            .replica_changes(
+                &initial.server_id,
+                initial.cursor,
+                &initial.cursor_token,
+                1,
+            )
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        let ReplicaProjection::Document(document) = &changes[0].projection else {
+            panic!("expected document change");
+        };
+        assert_eq!(document.revision.revision, 2);
+        assert_eq!(
+            document.revision.blob_sha256.as_deref(),
+            Some(second.blob_sha256.as_str())
+        );
+        assert_ne!(
+            document.revision.blob_sha256.as_deref(),
+            Some(first.blob_sha256.as_str())
+        );
     }
 
     #[test]

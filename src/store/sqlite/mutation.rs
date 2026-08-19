@@ -1762,7 +1762,7 @@ mod tests {
         assert_eq!(rejected_retry.result, rejected_first.result);
         assert_applied_document(&first.result, "document", 2, true);
         assert_eq!(row_count(&store, "document_revision"), 1);
-        assert_eq!(row_count(&store, "content_change"), 1);
+        assert_eq!(row_count(&store, "content_change"), 3);
         assert_eq!(row_count(&store, "device_mutation_receipt"), 4);
     }
 
@@ -1802,7 +1802,7 @@ mod tests {
         assert_eq!(head.revision, 2);
         assert!(!head.active);
         assert_eq!(row_count(&store, "document_revision"), 1);
-        assert_eq!(row_count(&store, "content_change"), 1);
+        assert_eq!(row_count(&store, "content_change"), 2);
     }
 
     #[test]
@@ -1849,7 +1849,7 @@ mod tests {
         };
         assert_eq!(cursor.position, 2);
         assert_eq!(row_count(&store, "document_revision"), 1);
-        assert_eq!(row_count(&store, "content_change"), 1);
+        assert_eq!(row_count(&store, "content_change"), 2);
         assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
     }
 
