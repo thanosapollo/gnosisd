@@ -713,6 +713,22 @@ impl SqliteStore {
             .map_err(StoreError::storage)
     }
 
+    pub(crate) fn document_blob_digests(&self) -> Result<Vec<String>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT head_blob_sha256 FROM document WHERE head_blob_sha256 IS NOT NULL
+                 UNION
+                 SELECT blob_sha256 FROM document_revision WHERE blob_sha256 IS NOT NULL",
+            )
+            .map_err(StoreError::storage)?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .map_err(StoreError::storage)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::storage)
+    }
+
     pub(crate) fn document_revisions(
         &self,
         document_id: &DocumentId,
@@ -7299,12 +7315,7 @@ mod tests {
         assert_eq!(from_mid.0.len(), 1);
 
         let (changes, _, _) = store
-            .replica_changes(
-                &initial.server_id,
-                initial.cursor,
-                &initial.cursor_token,
-                1,
-            )
+            .replica_changes(&initial.server_id, initial.cursor, &initial.cursor_token, 1)
             .unwrap();
         assert_eq!(changes.len(), 1);
         let ReplicaProjection::Document(document) = &changes[0].projection else {

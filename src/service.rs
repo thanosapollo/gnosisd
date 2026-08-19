@@ -145,7 +145,6 @@ impl ServiceHandle {
             response,
         })
         .await?
-        .map_err(ServiceError::Store)
     }
 
     #[cfg(test)]
@@ -1594,7 +1593,7 @@ enum StoreCommand {
         response: oneshot::Sender<StoreResult<RepairSummary>>,
     },
     WipeDisposableNotes {
-        response: oneshot::Sender<StoreResult<NotesWipeSummary>>,
+        response: oneshot::Sender<Result<NotesWipeSummary, ServiceError>>,
     },
     #[cfg(test)]
     Replace {
@@ -2273,14 +2272,44 @@ fn replace_note_command(
     created_at_us: i64,
     author_device_id: Option<&str>,
 ) -> Result<DocumentHead, ServiceError> {
+    let previous = store
+        .document_head(&prepared.document_id)
+        .map_err(ServiceError::Store)?
+        .and_then(|head| head.blob_sha256);
     let blob = blobs.put(prepared.source.as_bytes(), &prepared.content_type)?;
     store
         .replace_note(prepared, &blob, created_at_us, author_device_id)
         .map_err(ServiceError::Store)?;
+    if let Some(digest) = previous {
+        discard_unreferenced_blob_file(store, blobs, &digest)?;
+    }
     store
         .document_head(&prepared.document_id)
         .map_err(ServiceError::Store)?
         .ok_or(ServiceError::Store(StoreError::NotFound))
+}
+
+fn wipe_disposable_notes_command(
+    store: &mut SqliteStore,
+    blobs: &BlobStore,
+) -> Result<NotesWipeSummary, ServiceError> {
+    let candidates = store.document_blob_digests().map_err(ServiceError::Store)?;
+    let summary = store.wipe_disposable_notes().map_err(ServiceError::Store)?;
+    for digest in candidates {
+        discard_unreferenced_blob_file(store, blobs, &digest)?;
+    }
+    Ok(summary)
+}
+
+fn discard_unreferenced_blob_file(
+    store: &SqliteStore,
+    blobs: &BlobStore,
+    digest: &str,
+) -> Result<(), ServiceError> {
+    if !store.has_blob_record(digest).map_err(ServiceError::Store)? {
+        blobs.discard(digest)?;
+    }
+    Ok(())
 }
 
 fn apply_device_document_mutation_command(
@@ -2289,6 +2318,10 @@ fn apply_device_document_mutation_command(
     operation: &PreparedDeviceDocumentMutation,
     created_at_us: i64,
 ) -> Result<DeviceMutationExecution, ServiceError> {
+    let previous = store
+        .document_head(&operation.prepared.document_id)
+        .map_err(ServiceError::Store)?
+        .and_then(|head| head.blob_sha256);
     let needs_blob = store
         .device_document_mutation_needs_blob(operation)
         .map_err(ServiceError::Store)?;
@@ -2323,6 +2356,11 @@ fn apply_device_document_mutation_command(
             .map_err(ServiceError::Store)?
     {
         blobs.discard(&blob.sha256)?;
+    }
+    if let (Ok(execution), Some(digest)) = (&result, previous)
+        && matches!(execution.result, DeviceMutationResult::Applied { .. })
+    {
+        discard_unreferenced_blob_file(store, blobs, &digest)?;
     }
     result
 }
@@ -2466,7 +2504,7 @@ fn run_store_command(
             response,
         } => send(response, repair_canonical_state(store, blobs, batch_size)),
         StoreCommand::WipeDisposableNotes { response } => {
-            send(response, store.wipe_disposable_notes())
+            send(response, wipe_disposable_notes_command(store, blobs))
         }
         #[cfg(test)]
         StoreCommand::Replace {
@@ -3286,8 +3324,9 @@ mod tests {
 
     use super::{
         BackupCommand, BackupError, ServiceError, ServiceHandle, ServiceRuntime, StoreCommand,
-        complete_shutdown_phase, read_blob, repair_canonical_state, sleep_until_next_shutdown_poll,
-        stage_blob_command, store_actor,
+        complete_shutdown_phase, read_blob, repair_canonical_state, replace_note_command,
+        sleep_until_next_shutdown_poll, stage_blob_command, store_actor,
+        wipe_disposable_notes_command,
     };
     use crate::application::{
         AssetReconciliationStatus, ContentBase, ContentReconciliationStatus,
@@ -3805,6 +3844,68 @@ mod tests {
                 .join(&staged.sha256)
                 .exists()
         );
+    }
+
+    fn blob_file(root: &std::path::Path, digest: &str) -> std::path::PathBuf {
+        root.join(&digest[..2]).join(digest)
+    }
+
+    #[test]
+    fn replace_note_discards_unreferenced_previous_blob_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob_path = directory.path().join("blobs");
+        let blobs = BlobStore::open(&blob_path).unwrap();
+        let mut store = SqliteStore::open(directory.path().join("gnosis.sqlite")).unwrap();
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: First\n".into(),
+            None,
+        )
+        .unwrap();
+        replace_note_command(&mut store, &blobs, &first, 1, None).unwrap();
+        assert!(blob_file(&blob_path, &first.blob_sha256).exists());
+
+        let second = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Second\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        replace_note_command(&mut store, &blobs, &second, 2, None).unwrap();
+        assert!(!blob_file(&blob_path, &first.blob_sha256).exists());
+        assert!(blob_file(&blob_path, &second.blob_sha256).exists());
+        assert!(!store.has_blob_record(&first.blob_sha256).unwrap());
+        assert!(store.has_blob_record(&second.blob_sha256).unwrap());
+    }
+
+    #[test]
+    fn wipe_discards_note_blob_file_and_keeps_shared_asset() {
+        let directory = tempfile::tempdir().unwrap();
+        let blob_path = directory.path().join("blobs");
+        let blobs = BlobStore::open(&blob_path).unwrap();
+        let mut store = SqliteStore::open(directory.path().join("gnosis.sqlite")).unwrap();
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Note\n".into(),
+            None,
+        )
+        .unwrap();
+        replace_note_command(&mut store, &blobs, &note, 1, None).unwrap();
+        let asset_blob = blobs
+            .put(b"shared-asset", "application/octet-stream")
+            .unwrap();
+        let asset_path = canonical_asset_path(&asset_blob.sha256, "keep.png").unwrap();
+        let prepared = prepare_asset(asset_path, "keep.png".into(), None).unwrap();
+        store.put_asset(&prepared, &asset_blob, 2, None).unwrap();
+
+        wipe_disposable_notes_command(&mut store, &blobs).unwrap();
+        assert!(!blob_file(&blob_path, &note.blob_sha256).exists());
+        assert!(blob_file(&blob_path, &asset_blob.sha256).exists());
+        assert!(!store.has_blob_record(&note.blob_sha256).unwrap());
+        assert!(store.has_blob_record(&asset_blob.sha256).unwrap());
     }
 
     #[test]
