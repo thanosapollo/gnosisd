@@ -527,11 +527,10 @@ fn expand_compact_thema_result(
     else {
         return Ok(result);
     };
-    let request: StoredThemaRequest = serde_json::from_str(&identity.request_json).map_err(|_| {
-        StoreError::CorruptData {
+    let request: StoredThemaRequest =
+        serde_json::from_str(&identity.request_json).map_err(|_| StoreError::CorruptData {
             field: "device mutation request",
-        }
-    })?;
+        })?;
     let expanded = ThemaMutationProjection {
         thema_id: compact.thema_id,
         revision: compact.revision,
@@ -913,8 +912,8 @@ fn insert_receipt(
     result: &DeviceMutationResult,
     created_at_us: i64,
 ) -> Result<(), StoreError> {
-    let result_json = serde_json::to_string(&compact_receipt_result(result))
-        .map_err(StoreError::storage)?;
+    let result_json =
+        serde_json::to_string(&compact_receipt_result(result)).map_err(StoreError::storage)?;
     transaction
         .execute(
             "INSERT INTO device_mutation_receipt(
@@ -1964,8 +1963,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(head.revision, 3);
-        assert_eq!(head.blob_sha256.as_deref(), Some(update.prepared.blob_sha256.as_str()));
-        assert_ne!(head.blob_sha256.as_deref(), Some(stale.prepared.blob_sha256.as_str()));
+        assert_eq!(
+            head.blob_sha256.as_deref(),
+            Some(update.prepared.blob_sha256.as_str())
+        );
+        assert_ne!(
+            head.blob_sha256.as_deref(),
+            Some(stale.prepared.blob_sha256.as_str())
+        );
         assert_no_retained_body_text(
             &store,
             &["#+title: First", "#+title: Stale", "#+title: Current"],
