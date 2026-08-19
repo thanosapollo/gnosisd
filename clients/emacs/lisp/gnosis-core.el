@@ -1322,8 +1322,10 @@ ACTIVE constrain an applied authoritative head when non-nil."
                       (:create (and (eq changed t)
                                     (= 1 (plist-get head :revision))))
                       ((pred integerp)
-                       (= (+ revision (if (eq changed t) 1 0))
-                          (plist-get head :revision)))
+                       (let ((result-revision (plist-get head :revision)))
+                         (if (eq changed t)
+                             (> result-revision revision)
+                           (= result-revision revision))))
                       (_ t))
                     (or (null logical-path)
                         (equal logical-path (plist-get head :logical_path)))
@@ -1385,8 +1387,9 @@ ACTIVE constrain an applied authoritative head when non-nil."
 
 (defun gnosis-core-document-replace
     (document-id operation-id revision logical-path bytes)
-  "Replace DOCUMENT-ID at REVISION with LOGICAL-PATH and exact Org BYTES.
-Use OPERATION-ID as stable mutation identity."
+  "Replace DOCUMENT-ID with LOGICAL-PATH and exact Org BYTES.
+REVISION is the last known live generation.  Use OPERATION-ID as
+stable mutation identity.  Last successful put wins."
   (let* ((text (gnosis-core--org-string bytes))
          (digest (secure-hash 'sha256 (string-to-unibyte bytes)))
          (result
@@ -1395,7 +1398,7 @@ Use OPERATION-ID as stable mutation identity."
            (list :logical_path logical-path
                  :content_type "text/org; charset=utf-8"
                  :source text)
-           (gnosis-core--document-mutation-headers operation-id revision))))
+           (gnosis-core--document-mutation-headers operation-id))))
     (gnosis-core--document-mutation-result
      result operation-id document-id revision logical-path digest t)))
 
@@ -1826,10 +1829,19 @@ Optionally filter by QUERY, page after AFTER, and request LIMIT items."
   "Return thema write fields derived from server PROJECTION."
   (gnosis-core--operation-request-view "put_themata__id_" projection))
 
+(defun gnosis-core--thema-request-matches-p (request projection)
+  "Return non-nil when PROJECTION confirms every submitted REQUEST field."
+  (condition-case nil
+      (let ((authoritative (gnosis-core-thema-write-view projection)))
+        (cl-loop for (key value) on request by #'cddr
+                 always (and (plist-member authoritative key)
+                             (equal value (plist-get authoritative key)))))
+    (gnosis-core-protocol-error nil)))
+
 (defun gnosis-core--thema-mutation-result
-    (result operation-id &optional thema-id revision)
+    (result operation-id &optional thema-id revision request)
   "Return authoritative thema from mutation RESULT.
-Correlate OPERATION-ID and, when non-nil, THEMA-ID and REVISION."
+Correlate OPERATION-ID and, when non-nil, THEMA-ID, REVISION, and REQUEST."
   (let ((status (plist-get result :status))
         (cursor (plist-get result :cursor)))
     (unless (and (gnosis-core--json-object-p result)
@@ -1855,9 +1867,12 @@ Correlate OPERATION-ID and, when non-nil, THEMA-ID and REVISION."
                   (integerp result-revision)
                   (if thema-id
                       (and (equal thema-id (plist-get projection :thema_id))
-                           (= result-revision
-                              (if (eq changed t) (1+ revision) revision)))
-                    (and (eq changed t) (= result-revision 1))))
+                           (if (eq changed t)
+                               (> result-revision revision)
+                             (= result-revision revision)))
+                    (and (eq changed t) (= result-revision 1)))
+                  (or (null request)
+                      (gnosis-core--thema-request-matches-p request projection)))
            (signal 'gnosis-core-mutation-uncertain
                    '("Gnosis mutation response projection is invalid")))
          projection))
@@ -1897,17 +1912,17 @@ Return its authoritative projection."
    (gnosis-core--typed-request
     "post_themata" nil nil request
     (list (gnosis-core--idempotency-key-header operation-id)))
-   operation-id))
+   operation-id nil nil request))
 
 (defun gnosis-core-thema-update (thema-id operation-id revision request)
-  "Update opaque THEMA-ID at REVISION from REQUEST under OPERATION-ID.
-Do not retry automatically."
+  "Update opaque THEMA-ID from REQUEST under OPERATION-ID.
+REVISION is the last known live generation.  Do not retry
+automatically.  Last successful put wins."
   (gnosis-core--thema-mutation-result
    (gnosis-core--typed-request
     "put_themata__id_" (list (cons "id" thema-id)) nil request
-    (list (gnosis-core--idempotency-key-header operation-id)
-          (gnosis-core--if-match-header revision)))
-   operation-id thema-id revision))
+    (list (gnosis-core--idempotency-key-header operation-id)))
+   operation-id thema-id revision request))
 
 (defun gnosis-core-thema-set-archived
     (thema-id revision archived &optional operation-id)

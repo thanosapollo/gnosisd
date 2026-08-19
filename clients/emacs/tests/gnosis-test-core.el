@@ -142,7 +142,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (:operationId "put_themata__id_"
        :parameters
        [(:in "path" :name "id" :required t :schema (:type "string"))
-        (:in "header" :name "If-Match" :required t :schema (:type "string"))]
+        (:in "header" :name "Idempotency-Key" :required t
+         :schema (:type "string"))]
        :requestBody
        (:required t :content
         (:application/json (:schema (:$ref "#/components/schemas/ThemaWrite"))))
@@ -1041,8 +1042,10 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
 
 (ert-deftest gnosis-core-thema-write-bindings-include-idempotency-headers ()
   (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
-        (created '(:thema_id "created" :revision 1))
-        (updated '(:thema_id "opaque/id" :revision 7))
+        (created '(:thema_id "created" :revision 1
+                   :kind "basic" :keimenon "Q" :answer ["A"]))
+        (updated '(:thema_id "opaque/id" :revision 7
+                   :kind "basic" :keimenon "Q" :answer ["A"]))
         calls)
     (cl-letf (((symbol-function 'gnosis-core--typed-request)
                (lambda (&rest arguments)
@@ -1067,8 +1070,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       `(("post_themata" nil nil ,request
          (("Idempotency-Key" . "op:create")))
         ("put_themata__id_" (("id" . "opaque/id")) nil ,request
-         (("Idempotency-Key" . "op:update")
-          ("If-Match" . "\"7\""))))
+         (("Idempotency-Key" . "op:update"))))
       (nreverse calls)))))
 
 (ert-deftest gnosis-core-thema-bindings-reject-wrong-response-identity ()
@@ -1156,6 +1158,53 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
           "invented")
     (should-error (gnosis-core-thema-write-view projection)
                   :type 'gnosis-core-protocol-error)))
+
+(ert-deftest gnosis-core-thema-update-accepts-last-write-wins-revision-jump ()
+  (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]))
+        (updated '(:thema_id "opaque/id" :revision 9
+                   :kind "basic" :keimenon "Q" :answer ["A"])))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _)
+                 `(:status "applied" :format_version 1
+                   :operation_id "op:update" :changed t
+                   :authoritative (:kind "thema" :value ,updated)
+                   :cursor "cursor:update"))))
+      (should (eq updated
+                  (gnosis-core-thema-update
+                   "opaque/id" "op:update" 7 request))))))
+
+(ert-deftest gnosis-core-thema-update-rejects-regressed-revision ()
+  (cl-letf (((symbol-function 'gnosis-core--typed-request)
+             (lambda (&rest _)
+               '(:status "applied" :format_version 1
+                 :operation_id "op:update" :changed t
+                 :authoritative
+                 (:kind "thema" :value (:thema_id "opaque/id" :revision 6))
+                 :cursor "cursor"))))
+    (should-error
+     (gnosis-core-thema-update
+      "opaque/id" "op:update" 7
+      '(:kind "basic" :keimenon "Q" :answer ["A"]))
+     :type 'gnosis-core-mutation-uncertain)))
+
+(ert-deftest gnosis-core-thema-update-rejects-different-authoritative-body ()
+  (let* ((gnosis-core--contract-cache
+          (list :base "http://127.0.0.1:7842"
+                :document (gnosis-test-core--thema-contract)))
+         (request '(:kind "basic" :keimenon "submitted" :answer ["A"])))
+    (cl-letf (((symbol-function 'gnosis-core--typed-request)
+               (lambda (&rest _)
+                 '(:status "applied" :format_version 1
+                   :operation_id "op:update" :changed t
+                   :authoritative
+                   (:kind "thema"
+                    :value (:thema_id "opaque/id" :revision 9
+                            :kind "basic" :keimenon "different"
+                            :answer ["A"]))
+                   :cursor "cursor"))))
+      (should-error
+       (gnosis-core-thema-update "opaque/id" "op:update" 7 request)
+       :type 'gnosis-core-mutation-uncertain))))
 
 (ert-deftest gnosis-edit-rejects-additional-live-schema-field ()
   (let* ((contract (copy-tree (gnosis-test-core--thema-contract) t))
@@ -1654,7 +1703,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
          (:logical_path "note.org"
           :content_type "text/org; charset=utf-8"
           :source "* Γνῶσις\n")
-         (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\"")))
+         (("Idempotency-Key" . "op:next")))
         ("post_document-mutations__id__rename" (("id" . "doc")) nil
          (:logical_path "moved.org")
          (("Idempotency-Key" . "op:next") ("If-Match" . "\"1\"")))
@@ -1778,6 +1827,16 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
               result "op" "doc" 7 "note.org"
               "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
               t)))))
+    (let ((result `(:status "applied" :format_version 1
+                    :operation_id "op" :changed t
+                    :authoritative ,(copy-tree head) :cursor "hint")))
+      (setf (plist-get (plist-get result :authoritative) :revision) 10)
+      (should
+       (eq result
+           (gnosis-core--document-mutation-result
+            result "op" "doc" 7 "note.org"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            t))))
     (dolist (changed '(nil "true" 1))
       (should-error
        (gnosis-core--document-mutation-result

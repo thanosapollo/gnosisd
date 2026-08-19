@@ -377,11 +377,13 @@
 
 (defun gnosis-edit--format-optional (request key label)
   "Return optional REQUEST field KEY as a readable LABEL section."
-  (let ((value (plist-get request key)))
-    (cond
-     ((gnosis-edit--blank-optional-text-p value) (format "** %s" label))
-     ((stringp value) (gnosis-edit--format-state-section label 'value value))
-     (t (user-error "Invalid optional Thema field: %s" label)))))
+  (if (not (plist-member request key))
+      (gnosis-edit--format-state-section label 'omitted)
+    (let ((value (plist-get request key)))
+      (cond
+       ((gnosis-edit--blank-optional-text-p value) (format "** %s" label))
+       ((stringp value) (gnosis-edit--format-state-section label 'value value))
+       (t (user-error "Invalid optional Thema field: %s" label))))))
 
 (defun gnosis-edit--format-collection (request key label formatter)
   "Return collection KEY from REQUEST under LABEL using FORMATTER."
@@ -405,16 +407,19 @@
 
 (defun gnosis-edit--format-hint (request)
   "Return a basic Thema hint section from REQUEST."
-  (let ((values (plist-get request :hypothesis)))
-    (unless (or (null values) (and (vectorp values) (<= (length values) 1)))
-      (user-error "Basic Thema accepts at most one hint"))
-    (let ((value (and (vectorp values)
-                      (> (length values) 0)
-                      (aref values 0))))
-      (cond
-       ((gnosis-edit--blank-optional-text-p value) "** Hint")
-       ((stringp value) (gnosis-edit--format-state-section "Hint" 'value value))
-       (t (user-error "Invalid basic Thema hint"))))))
+  (if (not (plist-member request :hypothesis))
+      (gnosis-edit--format-state-section "Hint" 'omitted)
+    (let ((values (plist-get request :hypothesis)))
+      (unless (or (null values) (and (vectorp values) (<= (length values) 1)))
+        (user-error "Basic Thema accepts at most one hint"))
+      (let ((value (and (vectorp values)
+                        (> (length values) 0)
+                        (aref values 0))))
+        (cond
+         ((gnosis-edit--blank-optional-text-p value) "** Hint")
+         ((stringp value)
+          (gnosis-edit--format-state-section "Hint" 'value value))
+         (t (user-error "Invalid basic Thema hint")))))))
 
 (defun gnosis-edit--format-basic (request)
   "Return primary authoring sections for basic REQUEST."
@@ -899,11 +904,14 @@ Deeper outline stars are body text, not structural section boundaries."
 
 (defun gnosis-edit--parse-basic-hint (section)
   "Return a hypothesis field list parsed from basic hint SECTION."
-  (let ((value (gnosis-edit--parse-string (cdr section))))
-    (list :hypothesis
-          (if (string-empty-p (string-trim value))
-              (vector gnosis-core--json-null)
-            (vector value)))))
+  (pcase (gnosis-edit--label-state (car section) "Hint")
+    ('omitted nil)
+    (_
+     (let ((value (gnosis-edit--parse-string (cdr section))))
+       (list :hypothesis
+             (if (string-empty-p (string-trim value))
+                 (vector gnosis-core--json-null)
+               (vector value)))))))
 
 (defun gnosis-edit--parse-basic (sections)
   "Return primary request fields parsed from basic SECTIONS."
@@ -973,7 +981,10 @@ Deeper outline stars are body text, not structural section boundaries."
   "Return one metadata FIELD parsed from SECTION."
   (pcase-let ((`(,key ,label ,type) field))
     (pcase type
-      ('optional (gnosis-edit--parse-optional section key))
+      ('optional
+       (if (eq (gnosis-edit--label-state (car section) label) 'omitted)
+           nil
+         (gnosis-edit--parse-optional section key)))
       (_ (if (eq (gnosis-edit--label-state (car section) label) 'omitted)
              nil
            (pcase type

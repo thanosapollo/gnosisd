@@ -339,6 +339,19 @@
                               (buffer-string)))
       (should (equal request (gnosis-edit--parse))))))
 
+(ert-deftest gnosis-edit-basic-round-trip-preserves-absent-optional-fields ()
+  (let ((request '(:kind "basic" :keimenon "Q" :answer ["A"]
+                   :concepts [(:node_id "node/id" :relation "primary")])))
+    (with-temp-buffer
+      (gnosis-test-edit--render-request request)
+      (should (string-match-p "^\\*\\* Hint \\[omitted\\]$"
+                              (buffer-string)))
+      (should (string-match-p "^\\*\\* Parathema \\[omitted\\]$"
+                              (buffer-string)))
+      (should (string-match-p "^\\*\\* Review image \\[omitted\\]$"
+                              (buffer-string)))
+      (should (equal request (gnosis-edit--parse))))))
+
 (ert-deftest gnosis-edit-cloze-round-trip-preserves-absent-hypothesis ()
   (let ((request `(:kind "cloze" :keimenon "Athens is ancient"
                    :answer ["Athens"]
