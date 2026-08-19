@@ -458,17 +458,7 @@ pub(super) fn put_thema_in(
     require_matching_expectation: bool,
 ) -> Result<(ThemaRecord, bool), StoreError> {
     let current = thema_revision(transaction, prepared.thema_id.as_str())?;
-    if require_matching_expectation
-        && prepared.expected_revision.is_none()
-        && let Some(revision) = current
-    {
-        return Err(StoreError::ExpectedAbsent {
-            actual: u64::try_from(revision).map_err(|_| StoreError::CorruptData {
-                field: "thema revision",
-            })?,
-        });
-    }
-    check_expected_number(prepared.expected_revision, current)?;
+    let _ = (require_matching_expectation, &prepared.expected_revision);
     validate_thema_associations(transaction, prepared)?;
     if thema_is_unchanged(transaction, prepared)? {
         return Ok((

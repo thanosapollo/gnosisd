@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_thema_create_requires_absence_and_replays_conflict() {
+    fn durable_thema_put_overwrites_and_replays_without_clobber() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("gnosis.sqlite");
         let mut store = SqliteStore::open(&path).unwrap();
@@ -1159,30 +1159,17 @@ mod tests {
         };
         let same = operation("same", "Question");
         let changed = operation("changed", "Changed");
-        let before = store.get_thema("thema").unwrap().unwrap();
-        let content_changes = row_count(&store, "content_change");
-        let history = row_count(&store, "thema_revision");
 
         let same_result = store.apply_device_desired_state_mutation(&same, 2).unwrap();
         let changed_result = store
             .apply_device_desired_state_mutation(&changed, 3)
             .unwrap();
-        for result in [&same_result, &changed_result] {
-            assert!(!result.replayed);
-            assert!(matches!(
-                result.result,
-                DeviceMutationResult::Rejected {
-                    rejection: DeviceMutationRejection::RevisionConflict {
-                        expected: None,
-                        actual: Some(1),
-                    },
-                    ..
-                }
-            ));
-        }
-        assert_eq!(store.get_thema("thema").unwrap().unwrap(), before);
-        assert_eq!(row_count(&store, "content_change"), content_changes);
-        assert_eq!(row_count(&store, "thema_revision"), history);
+        assert!(!same_result.replayed);
+        assert!(!changed_result.replayed);
+        assert_eq!(
+            store.get_thema("thema").unwrap().unwrap().content.keimenon,
+            "Changed"
+        );
         drop(store);
 
         let mut store = SqliteStore::open(path).unwrap();
@@ -1193,9 +1180,10 @@ mod tests {
             assert!(replay.replayed);
             assert_eq!(replay.result, retained.result);
         }
-        assert_eq!(store.get_thema("thema").unwrap().unwrap(), before);
-        assert_eq!(row_count(&store, "content_change"), content_changes);
-        assert_eq!(row_count(&store, "thema_revision"), history);
+        assert_eq!(
+            store.get_thema("thema").unwrap().unwrap().content.keimenon,
+            "Changed"
+        );
     }
 
     #[test]

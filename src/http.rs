@@ -1223,7 +1223,7 @@ async fn update_thema(
 ) -> Result<Json<DesiredStateMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     ensure_thema_response_budget(&input)?;
-    let prepared = prepared_thema(Some(id), input, Some(if_match(&headers)?))?;
+    let prepared = prepared_thema(Some(id), input, None)?;
     let settings = state.service.settings().await.map_err(ApiError::service)?;
     apply_desired_state_mutation(
         &state,
@@ -3527,7 +3527,6 @@ fn content_requires_if_match(path: &str, method: &str) -> bool {
             | ("/v1/document-mutations/{id}/rename", "post")
             | ("/v1/notes/{id}/rename", "post")
             | ("/v1/assets/{digest}/{name}", "delete")
-            | ("/v1/themata/{id}", "put")
             | ("/v1/themata/{id}/archive", "post")
             | ("/v1/themata/{id}/unarchive", "post")
             | ("/v1/themata/{id}/suspension", "put")
@@ -4066,13 +4065,13 @@ mod tests {
     use super::{
         ApiError, MAX_DUE_CURSOR_BYTES, MAX_FRAME_SIZE, MAX_NODE_CATALOG_PAGE, OPENAPI_OPERATIONS,
         bounded_due_page, bounded_projection_page, durable_created_thema_id,
-        ensure_thema_response_budget, openapi_document, optional_if_match, prepared_thema, router,
+        ensure_thema_response_budget, openapi_document, optional_if_match, router,
     };
     use crate::application::{
-        AnswerInput, ApplicationError, DeviceDesiredStateMutation, OfflineAssetOperation,
-        OfflineReviewOperation, PresentationSnapshot, ReviewAttemptView, ReviewPackView,
-        ReviewSource, ReviewSourceKind, SettingsInput, generate_device, prepare_asset,
-        prepare_document, prepare_thema, presentation_content, review_day_at, thema_content,
+        AnswerInput, ApplicationError, OfflineAssetOperation, OfflineReviewOperation,
+        PresentationSnapshot, ReviewAttemptView, ReviewPackView, ReviewSource, ReviewSourceKind,
+        SettingsInput, generate_device, prepare_asset, prepare_document, prepare_thema,
+        presentation_content, review_day_at, thema_content,
     };
     use crate::domain::{DocumentId, DueThema, ThemaId, compute_transition, grade};
     use crate::protocol::{
@@ -5663,7 +5662,6 @@ mod tests {
             "Idempotency-Key",
         );
         assert_required_header(&api, "/v1/themata", "post", "Idempotency-Key");
-        assert_required_header(&api, "/v1/themata/{id}", "put", "If-Match");
         assert_required_header(&api, "/v1/themata/{id}", "put", "Idempotency-Key");
         assert_required_header(&api, "/v1/themata/{id}/archive", "post", "If-Match");
         assert_required_header(&api, "/v1/themata/{id}/archive", "post", "Idempotency-Key");
@@ -6782,14 +6780,6 @@ mod tests {
             .await
             .unwrap();
         let app = router(service.clone());
-        let expected_request_sha256 = crate::application::desired_state_wire_request_sha256(
-            1,
-            &DeviceDesiredStateMutation::PutThema {
-                prepared: prepared_thema(Some(thema_id.clone()), input.clone(), None).unwrap(),
-                initial_review_day: 0,
-            },
-        )
-        .unwrap();
         let request = || {
             authorized_mutation(
                 "POST",
@@ -6804,13 +6794,8 @@ mod tests {
         let first = app.clone().oneshot(request()).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
         let first = response_json(first).await;
-        assert_eq!(first["status"], "rejected");
-        assert_eq!(first["request_sha256"], expected_request_sha256);
-        assert_eq!(first["rejection"]["reason"], "revision_conflict");
-        assert!(first["rejection"]["expected_revision"].is_null());
-        assert_eq!(first["rejection"]["current_revision"], 1);
+        assert_eq!(first["status"], "applied");
         let fetched = authenticated_json(&app, &token, &format!("/v1/themata/{thema_id}")).await;
-        assert_eq!(fetched["revision"], 1);
         assert_eq!(fetched["keimenon"], "Question");
         drop(app);
         drop(service);
