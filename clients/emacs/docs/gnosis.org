@@ -12,12 +12,12 @@
 Gnosis is the GNU Emacs client for =gnosisd=.  The current 0.13 development
 tree provides the authenticated HTTP, OpenAPI, managed-asset, and presentation
 foundation.  The daemon owns persistence, content rules, grading, scheduling,
-history, session recovery, and mutations.  The client has no SQLite access and
-no local fallback.
+session recovery, and mutations.  It does not keep note or thema-content
+history.  The client has no SQLite access and no local fallback.
 
 Offline-editable Org synchronization uses generated OpenAPI operations only.
-The daemon remains authority for parsing, projections, graph state, revisions,
-and scheduling.
+The daemon remains authority for parsing, projections, graph state, and
+scheduling.  Note and thema bodies are live heads.
 
 * Org synchronization
 
@@ -47,7 +47,7 @@ and deletion; local files remain until the user moves or removes them.
 Conflicts leave local content untouched.  Run =M-x gnosis-nodes-resolve-conflict=
 for three-way Ediff, edit and save Ediff's separate merge buffer, then run
 =M-x gnosis-nodes-accept-conflict=.  Acceptance revalidates the current local
-merge buffer and remote head, then queues a revision-checked replacement.
+merge buffer and remote head, then queues a last-write-wins replacement.
 Use =M-x gnosis-nodes-keep-local-conflict= for explicit rename-back, recreate,
 replace, or tombstone intent.  Use =M-x gnosis-nodes-accept-remote-conflict= to
 accept the remote rename, content, missing-file restore, or tombstone; tombstone

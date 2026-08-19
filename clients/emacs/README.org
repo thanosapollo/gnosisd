@@ -88,7 +88,7 @@ byte-compiles the manifest, then checks health and authenticated transport.
 =gnosis-nodes-insert-template= and =gnosis-nodes-add-tags= edit ordinary Org
 content and save through the synchronization hook.  =gnosis-journal=,
 =gnosis-journal-find=, and =gnosis-journal-insert= provide dated Org entries.
-=gnosis-bulk-link-string= previews and revision-checks authoritative thema
+=gnosis-bulk-link-string= previews and last-write-wins authoritative thema
 updates through =/v1=.  =gnosis-bulk-link-org-files= is the separate
 explicit-file operation.  =gnosis-nodes-db-sync= remains a whole-tree
 compatibility entry point.

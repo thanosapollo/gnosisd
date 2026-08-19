@@ -62,7 +62,7 @@ Mutations are not automatically retried.
 
 The API retains:
 
-- document create/replace/rename/tombstone, exact revisions, digests, and blobs;
+- document create/replace/rename/tombstone, live heads, digests, and blobs;
 - node search/catalog, byte spans, title paths, and inbound/outbound links;
 - thema search/catalog, lifecycle, concepts, and direct review suspension;
 - online review sessions, concealed pending questions, grading, desired-state
@@ -73,10 +73,10 @@ The API retains:
   results;
 - revisioned settings, dashboard projections, health, and OpenAPI.
 
-Public IDs are opaque strings. Existing updates use ~If-Match~. Durable
-mutations use device-scoped ~Idempotency-Key~ or typed operation IDs. Exact
-retries return retained results. Stale revisions, conflicts, and unknown
-delivery remain explicit.
+Public IDs are opaque strings. Note and thema-content puts are last-write-wins
+and send only ~Idempotency-Key~. Rename, tombstone, archive, suspension, and
+settings still use ~If-Match~. Exact retries return retained results. Conflicts
+and unknown delivery remain explicit.
 
 Managed assets use ~assets/<sha256>/<name>~. The server verifies path, digest,
 size, media type, and active state before canonical publication.
@@ -94,7 +94,7 @@ offline operations, retained results, and conflicts. Public IDs never expose
 SQLite row IDs.
 
 Documents and assets use immutable SHA-256 blobs outside SQLite. Accepted Org
-revisions parse and index in the same transaction that moves the document head.
+heads parse and index in the same transaction that replaces the live document.
 Invalid Org cannot change canonical state. Removed nodes remain queryable as
 inactive historical nodes.
 
