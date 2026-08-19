@@ -39,6 +39,8 @@ fn wipe_disposable_notes_in(transaction: &Transaction<'_>) -> Result<NotesWipeSu
             DELETE FROM document;
             DELETE FROM content_change WHERE entity_kind = 'document';
             DELETE FROM thema_revision;
+            DELETE FROM replica_snapshot_item;
+            DELETE FROM replica_snapshot;
             ",
         )
         .map_err(StoreError::storage)?;
@@ -97,6 +99,9 @@ mod tests {
         )
         .unwrap();
         store.put_thema(&thema, 20260715, 3, None).unwrap();
+        store.create_replica_snapshot(&device_id, 4, 16).unwrap();
+        assert_eq!(table_count(&store, "replica_snapshot"), 1);
+        assert!(table_count(&store, "replica_snapshot_item") > 0);
 
         let summary = store.wipe_disposable_notes().unwrap();
         assert_eq!(summary.documents_removed, 1);
@@ -113,5 +118,16 @@ mod tests {
         assert_eq!(stored.concepts[0].concept_id().as_str(), "child");
         store.replica_state(&device_id).unwrap();
         assert_eq!(store.thema_review_state("thema").unwrap().thema_id, "thema");
+        assert_eq!(table_count(&store, "replica_snapshot"), 0);
+        assert_eq!(table_count(&store, "replica_snapshot_item"), 0);
+    }
+
+    fn table_count(store: &SqliteStore, table: &str) -> u64 {
+        store
+            .connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 }
