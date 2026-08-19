@@ -24,6 +24,32 @@ use crate::{
 const REPLAY_SQL: &str = "SELECT request_sha256, request_json, result_kind, result_json
      FROM device_mutation_receipt WHERE device_id = ?1 AND operation_id = ?2";
 
+#[derive(Clone, Debug, serde::Deserialize)]
+struct StoredThemaRequest {
+    kind: String,
+    keimenon: String,
+    #[serde(default)]
+    hypothesis: Vec<Option<String>>,
+    #[serde(default)]
+    answer: Vec<String>,
+    source_guid: Option<String>,
+    parathema: Option<String>,
+    review_image: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    concepts: Vec<StoredThemaConcept>,
+    #[serde(default)]
+    asset_paths: Vec<String>,
+    content_sha256: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct StoredThemaConcept {
+    concept_id: String,
+    relation: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeviceMutationExecution {
     pub(crate) result: DeviceMutationResult,
@@ -315,17 +341,24 @@ fn apply_desired_state_mutation(
             thema_id,
             expected_revision,
             archived,
-        } => Ok((
-            true,
-            DeviceMutationProjection::Thema(thema_projection(set_thema_archived_in(
+        } => {
+            let record = set_thema_archived_in(
                 transaction,
                 thema_id.as_str(),
                 *expected_revision,
                 *archived,
                 created_at_us,
                 author,
-            )?)),
-        )),
+            )?;
+            Ok((
+                true,
+                DeviceMutationProjection::ThemaArchiveState {
+                    thema_id: record.thema_id,
+                    revision: record.revision,
+                    archived: record.archived,
+                },
+            ))
+        }
         DeviceDesiredStateMutation::SetThemaSuspended {
             thema_id,
             expected_state_revision,
@@ -442,13 +475,15 @@ fn verify_replayed_request(
     stored_digest: &str,
     stored_json: &str,
 ) -> Result<(), StoreError> {
-    let actual = format!("{:x}", Sha256::digest(stored_json.as_bytes()));
-    if actual != stored_digest {
+    let compact = stored_json == request_identity_json(stored_digest);
+    let legacy = stored_json == identity.request_json
+        && format!("{:x}", Sha256::digest(stored_json.as_bytes())) == stored_digest;
+    if !compact && !legacy {
         return Err(StoreError::CorruptData {
             field: "device mutation request",
         });
     }
-    if stored_digest == identity.request_sha256 && stored_json == identity.request_json {
+    if stored_digest == identity.request_sha256 {
         Ok(())
     } else {
         Err(StoreError::IdempotencyConflict)
@@ -468,8 +503,95 @@ fn decode_replayed_result(
         Err(StoreError::CorruptData {
             field: "device mutation result",
         })
+    } else if matches!(
+        identity.mutation_kind,
+        DeviceMutationKind::ThemaCreate | DeviceMutationKind::ThemaReplace
+    ) {
+        Ok(expand_compact_thema_result(identity, result)?)
     } else {
         Ok(result)
+    }
+}
+
+fn expand_compact_thema_result(
+    identity: &DeviceMutationIdentity,
+    result: DeviceMutationResult,
+) -> Result<DeviceMutationResult, StoreError> {
+    let DeviceMutationResult::Applied {
+        format_version,
+        operation_id,
+        changed,
+        authoritative: DeviceMutationProjection::Thema(compact),
+        cursor,
+    } = result
+    else {
+        return Ok(result);
+    };
+    let request: StoredThemaRequest = serde_json::from_str(&identity.request_json).map_err(|_| {
+        StoreError::CorruptData {
+            field: "device mutation request",
+        }
+    })?;
+    let expanded = ThemaMutationProjection {
+        thema_id: compact.thema_id,
+        revision: compact.revision,
+        kind: request.kind,
+        keimenon: request.keimenon,
+        hypothesis: request.hypothesis,
+        answer: request.answer,
+        source_guid: request.source_guid,
+        parathema: request.parathema,
+        review_image: request.review_image,
+        tags: request.tags,
+        concepts: request
+            .concepts
+            .into_iter()
+            .map(|concept| (concept.concept_id, concept.relation))
+            .collect(),
+        asset_paths: request.asset_paths,
+        content_sha256: request.content_sha256,
+        archived: compact.archived,
+    };
+    Ok(DeviceMutationResult::Applied {
+        format_version,
+        operation_id,
+        changed,
+        authoritative: DeviceMutationProjection::Thema(expanded),
+        cursor,
+    })
+}
+
+fn compact_receipt_result(result: &DeviceMutationResult) -> DeviceMutationResult {
+    match result {
+        DeviceMutationResult::Applied {
+            format_version,
+            operation_id,
+            changed,
+            authoritative: DeviceMutationProjection::Thema(thema),
+            cursor,
+        } => DeviceMutationResult::Applied {
+            format_version: *format_version,
+            operation_id: operation_id.clone(),
+            changed: *changed,
+            authoritative: DeviceMutationProjection::Thema(ThemaMutationProjection {
+                thema_id: thema.thema_id.clone(),
+                revision: thema.revision,
+                kind: String::new(),
+                keimenon: String::new(),
+                hypothesis: Vec::new(),
+                answer: Vec::new(),
+                source_guid: None,
+                parathema: None,
+                review_image: None,
+                tags: Vec::new(),
+                concepts: Vec::new(),
+                asset_paths: Vec::new(),
+                content_sha256: String::new(),
+                archived: thema.archived,
+            }),
+            cursor: cursor.clone(),
+        },
+        other => other.clone(),
     }
 }
 
@@ -781,13 +903,18 @@ fn mutation_cursor(connection: &Connection) -> Result<DeviceMutationCursor, Stor
     })
 }
 
+fn request_identity_json(digest: &str) -> String {
+    format!(r#"{{"request_sha256":"{digest}"}}"#)
+}
+
 fn insert_receipt(
     transaction: &Transaction<'_>,
     identity: &DeviceMutationIdentity,
     result: &DeviceMutationResult,
     created_at_us: i64,
 ) -> Result<(), StoreError> {
-    let result_json = serde_json::to_string(result).map_err(StoreError::storage)?;
+    let result_json = serde_json::to_string(&compact_receipt_result(result))
+        .map_err(StoreError::storage)?;
     transaction
         .execute(
             "INSERT INTO device_mutation_receipt(
@@ -800,7 +927,7 @@ fn insert_receipt(
                 identity.format_version,
                 identity.mutation_kind.as_str(),
                 identity.request_sha256,
-                identity.request_json,
+                request_identity_json(&identity.request_sha256),
                 result.result_kind(),
                 result_json,
                 created_at_us,
@@ -1031,6 +1158,19 @@ mod tests {
             ));
         }
         assert_eq!(row_count(&store, "device_mutation_receipt"), 3);
+        let retained: bool = store
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM device_mutation_receipt
+                     WHERE request_json LIKE '%' || ?1 || '%'
+                        OR result_json LIKE '%' || ?1 || '%'
+                 )",
+                ["Question"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!retained);
     }
 
     #[test]
@@ -1170,6 +1310,7 @@ mod tests {
             store.get_thema("thema").unwrap().unwrap().content.keimenon,
             "Changed"
         );
+        assert_no_retained_body_text(&store, &["Question"]);
         drop(store);
 
         let mut store = SqliteStore::open(path).unwrap();
@@ -1184,6 +1325,7 @@ mod tests {
             store.get_thema("thema").unwrap().unwrap().content.keimenon,
             "Changed"
         );
+        assert_no_retained_body_text(&store, &["Question"]);
     }
 
     #[test]
@@ -1284,6 +1426,74 @@ mod tests {
     }
 
     #[test]
+    fn thema_archive_replays_as_archive_state_without_empty_body() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "thema-archive");
+        store
+            .put_thema(
+                &prepare_thema(
+                    Some("thema".into()),
+                    thema_content(
+                        "basic",
+                        "Question".into(),
+                        vec![],
+                        vec!["Answer".into()],
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap(),
+                20260719,
+                1,
+                None,
+            )
+            .unwrap();
+        let operation = prepare_device_desired_state_mutation(
+            1,
+            "archive".into(),
+            device,
+            DeviceDesiredStateMutation::SetThemaArchived {
+                thema_id: ThemaId::new("thema").unwrap(),
+                expected_revision: 1,
+                archived: true,
+            },
+        )
+        .unwrap();
+
+        let first = store
+            .apply_device_desired_state_mutation(&operation, 2)
+            .unwrap();
+        let replay = store
+            .apply_device_desired_state_mutation(&operation, 3)
+            .unwrap();
+
+        assert!(!first.replayed);
+        assert!(replay.replayed);
+        assert_eq!(replay.result, first.result);
+        assert!(matches!(
+            &first.result,
+            DeviceMutationResult::Applied {
+                authoritative: DeviceMutationProjection::ThemaArchiveState {
+                    thema_id,
+                    revision: 2,
+                    archived: true,
+                },
+                ..
+            } if thema_id == "thema"
+        ));
+        assert_eq!(
+            store.get_thema("thema").unwrap().unwrap().content.keimenon,
+            "Question"
+        );
+    }
+
+    #[test]
     fn desired_state_asset_rejects_existing_blob_metadata_mismatch() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let device = add_device(&mut store, "asset-metadata");
@@ -1356,6 +1566,7 @@ mod tests {
         ));
         assert_eq!(row_count(&store, "document_revision"), 1);
         assert_eq!(row_count(&store, "device_mutation_receipt"), 1);
+        assert_no_retained_body_text(&store, &["#+title: First"]);
     }
 
     #[test]
@@ -1439,6 +1650,57 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.result, first.result);
         assert_eq!(row_count(&reopened, "document_revision"), 1);
+        assert_no_retained_body_text(&reopened, &["#+title: Note"]);
+    }
+
+    #[test]
+    fn document_mutation_replays_legacy_full_request_json() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = add_device(&mut store, "device");
+        let operation = operation(&device, "legacy", "document", "note.org", "Note", None);
+        let first = store
+            .apply_device_document_mutation(&operation, Some(&blob(&operation)), 2)
+            .unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER device_mutation_receipt_immutable_update")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE device_mutation_receipt SET request_json = ?1
+                 WHERE device_id = ?2 AND operation_id = ?3",
+                rusqlite::params![
+                    operation.identity.request_json,
+                    operation.identity.device_id,
+                    operation.identity.operation_id
+                ],
+            )
+            .unwrap();
+        let stored_request: String = store
+            .connection
+            .query_row(
+                "SELECT request_json FROM device_mutation_receipt
+                 WHERE device_id = ?1 AND operation_id = ?2",
+                rusqlite::params![
+                    operation.identity.device_id,
+                    operation.identity.operation_id
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored_request.contains("#+title: Note"));
+        assert_ne!(
+            stored_request,
+            super::request_identity_json(&operation.identity.request_sha256)
+        );
+
+        let replay = store
+            .apply_device_document_mutation(&operation, Some(&blob(&operation)), 3)
+            .unwrap();
+
+        assert!(replay.replayed);
+        assert_eq!(replay.result, first.result);
     }
 
     #[test]
@@ -1697,13 +1959,16 @@ mod tests {
         assert_applied_document(&first.result, "document", 2, true);
         assert!(replay.replayed);
         assert_eq!(replay.result, first.result);
-        assert_eq!(
-            store
-                .document_head(&update.prepared.document_id)
-                .unwrap()
-                .unwrap()
-                .revision,
-            3
+        let head = store
+            .document_head(&update.prepared.document_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.revision, 3);
+        assert_eq!(head.blob_sha256.as_deref(), Some(update.prepared.blob_sha256.as_str()));
+        assert_ne!(head.blob_sha256.as_deref(), Some(stale.prepared.blob_sha256.as_str()));
+        assert_no_retained_body_text(
+            &store,
+            &["#+title: First", "#+title: Stale", "#+title: Current"],
         );
     }
 
@@ -1804,5 +2069,23 @@ mod tests {
                 row.get(0)
             })
             .unwrap()
+    }
+
+    fn assert_no_retained_body_text(store: &SqliteStore, fragments: &[&str]) {
+        for fragment in fragments {
+            let found: bool = store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM device_mutation_receipt
+                         WHERE request_json LIKE '%' || ?1 || '%'
+                            OR result_json LIKE '%' || ?1 || '%'
+                     )",
+                    [fragment],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!found, "retained body fragment {fragment:?} in receipt");
+        }
     }
 }
