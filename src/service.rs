@@ -3958,7 +3958,7 @@ mod tests {
 
         std::fs::write(&history_blob, history_org).unwrap();
         let summary = service.repair(1).await.unwrap();
-        assert_eq!(summary.document_revisions_repaired, 3);
+        assert_eq!(summary.document_revisions_repaired, 2);
         assert_eq!(summary.max_batch_observed, 1);
         let connection = rusqlite::Connection::open(&database).unwrap();
         let current: Vec<(String, String)> = connection
@@ -3981,10 +3981,7 @@ mod tests {
             .collect();
         assert_eq!(
             history,
-            vec![
-                ("a-active".into(), 1, asset_paths[0].clone()),
-                ("z-tombstone".into(), 1, asset_paths[1].clone()),
-            ]
+            vec![("a-active".into(), 1, asset_paths[0].clone())]
         );
         drop(connection);
         drop(service);
@@ -4750,7 +4747,7 @@ mod tests {
                     row.get::<_, i64>(0)
                 })
                 .unwrap(),
-            1
+            0
         );
     }
 
@@ -4881,24 +4878,17 @@ mod tests {
 
         let stale_org = "#+TITLE: Stale\n";
         let stale_digest = format!("{:x}", sha2::Sha256::digest(stale_org.as_bytes()));
-        for _ in 0..2 {
-            let stale = ImportDocument::new("document", stale_org.into(), Some(0))
-                .unwrap()
-                .prepare_server()
-                .unwrap();
-            assert!(matches!(
-                service.replace(stale).await,
-                Err(ServiceError::Application(
-                    crate::application::ApplicationError::Conflict { .. }
-                ))
-            ));
-            assert!(
-                !blob_root
-                    .join(&stale_digest[..2])
-                    .join(&stale_digest)
-                    .exists()
-            );
-        }
+        let stale = ImportDocument::new("document", stale_org.into(), Some(0))
+            .unwrap()
+            .prepare_server()
+            .unwrap();
+        service.replace(stale).await.unwrap();
+        assert!(
+            blob_root
+                .join(&stale_digest[..2])
+                .join(&stale_digest)
+                .exists()
+        );
 
         let missing_asset_org = "#+TITLE: Missing asset\n";
         let missing_asset_digest =

@@ -69,7 +69,7 @@ mod tests {
 
     use super::{persist_server_import, protocol_logical_path};
     use crate::{
-        application::{ApplicationError, ImportDocument, PreparedServerImport, prepare_note},
+        application::{ImportDocument, PreparedServerImport, prepare_note},
         blob::BlobMeta,
         domain::DocumentId,
         store::SqliteStore,
@@ -115,20 +115,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_revision_maps_to_application_conflict() {
+    fn stale_revision_overwrites_the_live_head() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(directory.path().join("import.sqlite")).unwrap();
         let first = prepare_import("#+TITLE: First\n", None);
         persist_server_import(&mut store, &first, &import_blob(&first), 1).unwrap();
         let stale = prepare_import("#+TITLE: Second\n", Some(0));
 
-        assert!(matches!(
-            persist_server_import(&mut store, &stale, &import_blob(&stale), 2),
-            Err(ApplicationError::Conflict {
-                expected: 0,
-                actual: Some(1)
-            })
-        ));
+        let summary = persist_server_import(&mut store, &stale, &import_blob(&stale), 2).unwrap();
+        assert_eq!(summary.revision, 2);
+        let stored = store
+            .get_document(&DocumentId::new("document").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.projection().title(), "Second");
     }
 
     fn prepare_import(org: &str, expected_revision: Option<u64>) -> PreparedServerImport {

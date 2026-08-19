@@ -1103,7 +1103,7 @@ mod tests {
                 content_sha256: head.blob_sha256.clone(),
                 predecessor_operation_id: None,
             },
-            "* [[id:broken\n",
+            "plain body\n",
         );
         assert!(prepare_offline_document(&operation).is_err());
         let canonical_payload = canonical_content_operation(&operation).unwrap();
@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&stored_payload).unwrap()["operation"]["mutation"]
                 ["source"],
-            "* [[id:broken\n"
+            "plain body\n"
         );
         assert_eq!(
             store

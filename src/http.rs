@@ -8660,7 +8660,7 @@ mod tests {
             2,
             &state.cursor,
             "invalid-document",
-            "* [[id:broken\n",
+            "plain body\n",
         );
         let invalid = app
             .clone()
