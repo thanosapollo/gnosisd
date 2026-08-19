@@ -4821,6 +4821,7 @@ fn write_note_revision(
         created_at_us,
         author_device_id,
     )?;
+    delete_unreferenced_blobs(transaction)?;
     Ok(StoredDocument {
         document_id: prepared.document_id.clone(),
         revision,
@@ -4896,6 +4897,31 @@ pub(super) fn insert_blob(
                 blob.media_type,
                 created_at_us,
             ],
+        )
+        .map_err(StoreError::storage)?;
+    Ok(())
+}
+
+pub(super) fn delete_unreferenced_blobs(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM blob
+             WHERE content_sha256 NOT IN (
+                 SELECT head_blob_sha256 FROM document WHERE head_blob_sha256 IS NOT NULL
+                 UNION
+                 SELECT blob_sha256 FROM document_revision WHERE blob_sha256 IS NOT NULL
+                 UNION
+                 SELECT blob_sha256 FROM managed_asset
+                 UNION
+                 SELECT blob_sha256 FROM asset_revision WHERE blob_sha256 IS NOT NULL
+                 UNION
+                 SELECT content_sha256 FROM review_pack_asset
+                 UNION
+                 SELECT content_sha256 FROM staged_blob
+                 UNION
+                 SELECT content_sha256 FROM offline_asset_evidence
+             )",
+            [],
         )
         .map_err(StoreError::storage)?;
     Ok(())

@@ -1,6 +1,6 @@
 use rusqlite::Transaction;
 
-use super::{SqliteStore, StoreError};
+use super::{SqliteStore, StoreError, delete_unreferenced_blobs};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct NotesWipeSummary {
@@ -44,6 +44,7 @@ fn wipe_disposable_notes_in(transaction: &Transaction<'_>) -> Result<NotesWipeSu
             ",
         )
         .map_err(StoreError::storage)?;
+    delete_unreferenced_blobs(transaction)?;
     Ok(NotesWipeSummary {
         documents_removed,
         themata_remaining: count_rows(transaction, "thema")?,
@@ -120,6 +121,40 @@ mod tests {
         assert_eq!(store.thema_review_state("thema").unwrap().thema_id, "thema");
         assert_eq!(table_count(&store, "replica_snapshot"), 0);
         assert_eq!(table_count(&store, "replica_snapshot_item"), 0);
+        assert!(!store.has_blob_record(&note.blob_sha256).unwrap());
+    }
+
+    #[test]
+    fn replace_note_reclaims_unreferenced_previous_blob() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: First\n".into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&first, &first_blob, 1, None).unwrap();
+        let second = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Second\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&second, &second_blob, 2, None).unwrap();
+        assert!(!store.has_blob_record(&first.blob_sha256).unwrap());
+        assert!(store.has_blob_record(&second.blob_sha256).unwrap());
     }
 
     fn table_count(store: &SqliteStore, table: &str) -> u64 {
