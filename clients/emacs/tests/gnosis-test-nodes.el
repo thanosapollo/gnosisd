@@ -182,17 +182,12 @@
         (progn
           (gnosis-nodes--write-document "changed.org" "changed")
           (gnosis-nodes--write-document "fresh.org" "fresh")
-          (cl-letf (((symbol-function 'gnosis-core-blob)
-                     (lambda (_) "deleted"))
-                    ((symbol-function 'gnosis-nodes--record-conflict)
-                     (lambda (current &rest _)
-                       (plist-put current :conflicts [(:kind :missing-local)]))))
-            (setq state (gnosis-nodes--scan state)))
+          (setq state (gnosis-nodes--scan state))
           (should
-           (equal '(:replace)
+           (equal '(:replace :delete)
                   (mapcar (lambda (entry) (plist-get entry :kind))
                           (append (plist-get state :outbox) nil))))
-          (should (= 1 (length (plist-get state :conflicts)))))
+          (should (= 0 (length (plist-get state :conflicts)))))
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-scan-never-infers-rename-from-file-layout ()
@@ -208,13 +203,11 @@
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "new.org" bytes)
-          (cl-letf (((symbol-function 'gnosis-core-blob) (lambda (_) bytes))
-                    ((symbol-function 'gnosis-nodes--record-conflict)
-                     (lambda (current &rest _)
-                       (plist-put current :conflicts [(:kind :missing-local)]))))
-            (setq state (gnosis-nodes--scan state)))
-          (should (= 0 (length (plist-get state :outbox))))
-          (should (= 1 (length (plist-get state :conflicts)))))
+          (setq state (gnosis-nodes--scan state))
+          (should (equal '(:delete)
+                         (mapcar (lambda (entry) (plist-get entry :kind))
+                                 (append (plist-get state :outbox) nil))))
+          (should (= 0 (length (plist-get state :conflicts)))))
       (delete-directory root t))))
 
 (ert-deftest gnosis-nodes-outbox-replays-captured-bytes-and-stops-on-uncertain ()
@@ -4263,12 +4256,37 @@
                  :digest ,digest :active t))
          (state `(:bases [,base] :outbox [] :conflicts [] :scan-index 0)))
     (unwind-protect
-        (cl-letf (((symbol-function 'gnosis-core-blob) (lambda (_) bytes))
-                  ((symbol-function 'gnosis-nodes--write-state) #'ignore))
+        (progn
           (setq state (gnosis-nodes--scan state))
-          (should (= 1 (length (plist-get state :conflicts))))
-          (should (eq :missing-local
-                      (plist-get (aref (plist-get state :conflicts) 0) :kind))))
+          (should (equal '(:delete)
+                         (mapcar (lambda (entry) (plist-get entry :kind))
+                                 (append (plist-get state :outbox) nil))))
+          (should (= 0 (length (plist-get state :conflicts)))))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-one-file-scan-does-not-delete-missing-siblings ()
+  (let* ((directory (make-temp-file "gnosis-nodes-one-file" t))
+         (gnosis-nodes-dir directory)
+         (state
+          '(:version 1 :server-id "server" :device-id "device"
+            :cursor "cursor"
+            :bases [(:document-id "keep-doc" :revision 2
+                     :logical-path "keep.org" :digest "old" :active t)
+                    (:document-id "gone-doc" :revision 4
+                     :logical-path "gone.org" :digest "gone" :active t)]
+            :outbox [] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-document "keep.org" "changed")
+          (setq state (gnosis-nodes--scan state "keep.org"))
+          (should
+           (equal '(:replace)
+                  (mapcar (lambda (entry) (plist-get entry :kind))
+                          (append (plist-get state :outbox) nil))))
+          (should (equal "keep.org"
+                         (plist-get (aref (plist-get state :outbox) 0)
+                                    :logical-path)))
+          (should (= 0 (length (plist-get state :conflicts)))))
       (delete-directory directory t))))
 
 (ert-deftest gnosis-nodes-accepted-rename-requires-source-absence ()

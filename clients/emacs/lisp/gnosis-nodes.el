@@ -2758,7 +2758,9 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
 
 (defun gnosis-nodes--scan (state &optional selected-path)
   "Enqueue changed bytes after a bounded scan of STATE.
-When SELECTED-PATH is non-nil, inspect only that enrolled document."
+When SELECTED-PATH is non-nil, inspect only that enrolled document.
+A whole-tree scan tombstones enrolled files that are gone.  A one-file
+scan never deletes a sibling."
   (let* ((bases (plist-get state :bases))
          (length (length bases))
          (stored-start (plist-get state :local-scan-index))
@@ -2794,20 +2796,17 @@ When SELECTED-PATH is non-nil, inspect only that enrolled document."
                   (when (or head (not (equal digest (plist-get base :digest))))
                     (setq state
                           (gnosis-nodes--queue-save state base bytes))))
-              (when (and (null head) (null conflict))
-                (let* ((digest (plist-get base :digest))
-                       (remote-bytes (gnosis-core-blob digest))
-                       (projection
-                        (list :document_id document-id
-                              :revision (plist-get base :revision)
-                              :logical_path logical-path
-                              :content_sha256 digest
-                              :blob_url (format "/v1/blobs/%s" digest)
-                              :operation "update"
-                              :projection (list :content_sha256 digest))))
-                  (setq state
-                        (gnosis-nodes--record-conflict
-                         state base projection nil remote-bytes)))))))))
+              (when (and (null selected-path)
+                         (null head)
+                         (null conflict))
+                (setq state
+                      (gnosis-nodes--enqueue
+                       state
+                       (gnosis-nodes--outbox-entry
+                        :delete document-id
+                        (plist-get base :revision)
+                        logical-path
+                        (plist-get base :digest))))))))))
     (unless selected-path
       (plist-put state :local-scan-index index)))
   state)
