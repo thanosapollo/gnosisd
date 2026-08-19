@@ -2662,7 +2662,9 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
     copy))
 
 (defun gnosis-nodes--queue-save (state base bytes)
-  "Queue exact BYTES after any unresolved operation for BASE in STATE."
+  "Queue exact BYTES as the live content for BASE in STATE.
+An earlier content put that never confirmed is dropped.  The current
+file is the only replace that may go out."
   (let* ((document-id (plist-get base :document-id))
          (logical-path (plist-get base :logical-path))
          (head (gnosis-nodes--outbox-entry-for state document-id logical-path)))
@@ -2692,15 +2694,26 @@ When EXPECTED-FINGERPRINT is non-nil, reject protocol-shape drift."
              (index (seq-position outbox head)))
         (aset outbox index (gnosis-nodes--entry-with-bytes head bytes))
         state))
-     ((memq (plist-get head :status)
-            '(:pending :blocked :sending :uncertain :applied))
-      (let ((entry
-             (gnosis-nodes--outbox-entry
-              :replace document-id nil logical-path (gnosis-nodes--digest bytes)
-              nil bytes)))
-        (setf (plist-get entry :status) :blocked
-              (plist-get entry :depends-on) (plist-get head :operation-id))
-        (gnosis-nodes--enqueue state entry)))
+     ((and (memq (plist-get head :status)
+                 '(:sending :uncertain :applied))
+           (memq (plist-get head :kind) '(:create :replace)))
+      (dolist (entry (append (plist-get state :outbox) nil))
+        (when (and (memq (plist-get entry :status)
+                         '(:pending :blocked :sending :uncertain :applied))
+                   (memq (plist-get entry :kind) '(:create :replace))
+                   (or (equal document-id (plist-get entry :document-id))
+                       (equal logical-path (plist-get entry :logical-path))))
+          (setf (plist-get entry :status) :superseded
+                (plist-get entry :depends-on) nil)))
+      (gnosis-nodes--enqueue
+       state
+       (if document-id
+           (gnosis-nodes--outbox-entry
+            :replace document-id (plist-get base :revision)
+            logical-path (gnosis-nodes--digest bytes) nil bytes)
+         (gnosis-nodes--outbox-entry
+          :create nil nil logical-path (gnosis-nodes--digest bytes)
+          nil bytes))))
      ((eq (plist-get head :status) :rejected)
       (let ((entry
              (gnosis-nodes--outbox-entry

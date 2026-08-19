@@ -565,7 +565,7 @@
           (should (= 2 (length (plist-get (gnosis-nodes--read-state) :outbox)))))
       (delete-directory directory t))))
 
-(ert-deftest gnosis-nodes-dependent-save-waits-for-canonical-feed-base ()
+(ert-deftest gnosis-nodes-dependent-save-supersedes-uncertain-create ()
   (let* ((first (gnosis-nodes--outbox-entry
                  :create nil nil "note.org" "old" nil "old"))
          (state `(:bases [] :outbox [,first] :conflicts [])))
@@ -573,10 +573,11 @@
     (setq state
           (gnosis-nodes--queue-save
            state '(:document-id nil :logical-path "note.org") "new"))
-    (let ((dependent (aref (plist-get state :outbox) 1)))
-      (should (eq :blocked (plist-get dependent :status)))
-      (should (equal (plist-get first :operation-id)
-                     (plist-get dependent :depends-on))))))
+    (let ((latest (aref (plist-get state :outbox) 1)))
+      (should (eq :superseded (plist-get first :status)))
+      (should (eq :pending (plist-get latest :status)))
+      (should (eq :create (plist-get latest :kind)))
+      (should (null (plist-get latest :depends-on))))))
 
 (ert-deftest gnosis-nodes-conflict-remains-until-feed-confirms-accepted-bytes ()
   (let* ((directory (make-temp-file "gnosis-nodes-conflict" t))
@@ -2822,6 +2823,46 @@
     (should-error (gnosis-nodes--historical-buffer node bytes)
                   :type 'gnosis-nodes-error)))
 
+(ert-deftest gnosis-nodes-save-after-uncertain-replace-sends-latest-bytes ()
+  (let* ((root (make-temp-file "gnosis-nodes-lww-uncertain-" t))
+         (gnosis-nodes-dir root)
+         (user-emacs-directory (file-name-as-directory root))
+         (gnosis-nodes-state-file nil)
+         (old (string-to-unibyte "old"))
+         (new (string-to-unibyte "new"))
+         (replace (gnosis-nodes--outbox-entry
+                   :replace "doc" 1 "note.org"
+                   (gnosis-nodes--digest old) nil old))
+         (state (list :version 1 :server-id "server" :device-id "device"
+                      :cursor "feed"
+                      :bases [(:document-id "doc" :revision 1
+                               :logical-path "note.org"
+                               :digest "old-digest" :active t)]
+                      :outbox (vector replace)
+                      :conflicts []))
+         buffer)
+    (setf (plist-get replace :status) :uncertain)
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (gnosis-nodes--write-document "note.org" new)
+          (setq buffer (find-file-noselect (expand-file-name "note.org" root)))
+          (with-current-buffer buffer
+            (setq-local gnosis-nodes-mode t)
+            (gnosis-nodes--queue-current-buffer))
+          (let* ((outbox (plist-get (gnosis-nodes--read-state) :outbox))
+                 (latest (aref outbox (1- (length outbox)))))
+            (should (eq :superseded (plist-get (aref outbox 0) :status)))
+            (should (eq :pending (plist-get latest :status)))
+            (should (eq :replace (plist-get latest :kind)))
+            (should (equal 1 (plist-get latest :revision)))
+            (should (null (plist-get latest :depends-on)))
+            (should (equal new
+                           (base64-decode-string
+                            (plist-get latest :payload))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory root t))))
+
 (ert-deftest gnosis-nodes-save-after-uncertain-create-queues-dependent-replace ()
   (let* ((root (make-temp-file "gnosis-nodes-create-save-" t))
          (gnosis-nodes-dir root)
@@ -2845,15 +2886,14 @@
             (setq-local gnosis-nodes-mode t)
             (gnosis-nodes--queue-current-buffer))
           (let* ((outbox (plist-get (gnosis-nodes--read-state) :outbox))
-                 (dependent (aref outbox 1)))
-            (should (= 2 (length outbox)))
-            (should (eq :uncertain (plist-get (aref outbox 0) :status)))
-            (should (eq :blocked (plist-get dependent :status)))
-            (should (equal (plist-get create :operation-id)
-                           (plist-get dependent :depends-on)))
+                 (latest (aref outbox (1- (length outbox)))))
+            (should (eq :superseded (plist-get (aref outbox 0) :status)))
+            (should (eq :pending (plist-get latest :status)))
+            (should (eq :create (plist-get latest :kind)))
+            (should (null (plist-get latest :depends-on)))
             (should (equal new
                            (base64-decode-string
-                            (plist-get dependent :payload))))))
+                            (plist-get latest :payload))))))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory root t))))
 
@@ -3812,8 +3852,8 @@
     (should (eq :superseded (plist-get pending :status)))
     (setf (plist-get pending :status) :applied)
     (setq state (gnosis-nodes--queue-save state base bytes))
-    (should (= 2 (length (plist-get state :outbox))))
-    (should (eq :blocked
+    (should (eq :superseded (plist-get pending :status)))
+    (should (eq :pending
                 (plist-get (aref (plist-get state :outbox) 1) :status)))))
 
 (ert-deftest gnosis-nodes-unchanged-save-preserves-lifecycle-intent ()
