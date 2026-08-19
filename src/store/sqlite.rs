@@ -48,6 +48,7 @@ mod notes_wipe;
 mod review;
 
 pub(crate) use mutation::DeviceMutationExecution;
+pub(crate) use notes_wipe::NotesWipeSummary;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;

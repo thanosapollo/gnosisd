@@ -3,8 +3,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 
 use gnosis_core::protocol::{
-    DaemonConfig, DaemonServer, ErrorCode, MAX_REPAIR_BATCH_SIZE, PROTOCOL_VERSION, RepairView,
-    Request, RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult,
+    DaemonConfig, DaemonServer, ErrorCode, MAX_REPAIR_BATCH_SIZE, NotesWipedView, PROTOCOL_VERSION,
+    RepairView, Request, RequestEnvelope, ResponseEnvelope, ResponseOutcome, ResponseResult,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -105,6 +105,20 @@ async fn unix_socket_serves_operator_commands_and_secures_files() {
             })
         ),
         ResponseOutcome::Failure { error } => panic!("admin.repair failed: {error:?}"),
+    }
+
+    let wipe = request(&socket, "wipe", Request::WipeDisposableNotes {}).await;
+    match wipe.outcome {
+        ResponseOutcome::Success { result } => assert_eq!(
+            *result,
+            ResponseResult::NotesWiped(NotesWipedView {
+                documents_removed: 0,
+                themata_remaining: 0,
+            })
+        ),
+        ResponseOutcome::Failure { error } => {
+            panic!("admin.wipe_disposable_notes failed: {error:?}")
+        }
     }
 
     let invalid = request(&socket, "repair-invalid", Request::Repair { batch_size: 0 }).await;

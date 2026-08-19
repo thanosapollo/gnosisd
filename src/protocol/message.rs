@@ -57,6 +57,8 @@ pub enum Request {
     },
     #[serde(rename = "admin.repair")]
     Repair { batch_size: u16 },
+    #[serde(rename = "admin.wipe_disposable_notes")]
+    WipeDisposableNotes {},
 }
 
 impl Request {
@@ -117,6 +119,7 @@ pub enum ResponseResult {
     Backup(BackupView),
     BackupsPruned(BackupsPrunedView),
     Repair(RepairView),
+    NotesWiped(NotesWipedView),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -124,6 +127,12 @@ pub struct RepairView {
     pub document_revisions_repaired: u64,
     pub blobs_verified: u64,
     pub max_batch_observed: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct NotesWipedView {
+    pub documents_removed: u64,
+    pub themata_remaining: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

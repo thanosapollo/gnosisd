@@ -2,16 +2,31 @@ use rusqlite::Transaction;
 
 use super::{SqliteStore, StoreError};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct NotesWipeSummary {
+    pub documents_removed: u64,
+    pub themata_remaining: u64,
+}
+
 impl SqliteStore {
-    pub(crate) fn wipe_disposable_notes(&mut self) -> Result<(), StoreError> {
+    pub(crate) fn wipe_disposable_notes(&mut self) -> Result<NotesWipeSummary, StoreError> {
         let transaction = self.write_transaction()?;
-        wipe_disposable_notes_in(&transaction)?;
+        let summary = wipe_disposable_notes_in(&transaction)?;
         transaction.commit().map_err(StoreError::storage)?;
-        Ok(())
+        Ok(summary)
     }
 }
 
-fn wipe_disposable_notes_in(transaction: &Transaction<'_>) -> Result<(), StoreError> {
+fn count_rows(transaction: &Transaction<'_>, table: &str) -> Result<u64, StoreError> {
+    transaction
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(StoreError::storage)
+}
+
+fn wipe_disposable_notes_in(transaction: &Transaction<'_>) -> Result<NotesWipeSummary, StoreError> {
+    let documents_removed = count_rows(transaction, "document")?;
     transaction
         .execute_batch(
             "
@@ -27,7 +42,10 @@ fn wipe_disposable_notes_in(transaction: &Transaction<'_>) -> Result<(), StoreEr
             ",
         )
         .map_err(StoreError::storage)?;
-    Ok(())
+    Ok(NotesWipeSummary {
+        documents_removed,
+        themata_remaining: count_rows(transaction, "thema")?,
+    })
 }
 
 #[cfg(test)]
@@ -80,7 +98,9 @@ mod tests {
         .unwrap();
         store.put_thema(&thema, 20260715, 3, None).unwrap();
 
-        store.wipe_disposable_notes().unwrap();
+        let summary = store.wipe_disposable_notes().unwrap();
+        assert_eq!(summary.documents_removed, 1);
+        assert_eq!(summary.themata_remaining, 1);
 
         assert!(
             store

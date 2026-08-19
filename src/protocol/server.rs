@@ -24,8 +24,8 @@ use crate::{
     application::{ApplicationError, prepare_provisioned_device},
     protocol::{
         BackupView, BackupsPrunedView, DeviceCreatedView, DeviceView, ErrorCode,
-        MessageValidationError, PROTOCOL_VERSION, ProtocolError, RepairView, Request,
-        RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo, frame,
+        MessageValidationError, NotesWipedView, PROTOCOL_VERSION, ProtocolError, RepairView,
+        Request, RequestEnvelope, ResponseEnvelope, ResponseResult, SystemInfo, frame,
     },
     service::{
         SERVICE_SHUTDOWN_DEADLINE, ServiceError, ServiceHandle, ServiceRuntime, ServiceStartError,
@@ -406,6 +406,7 @@ async fn dispatch(request: RequestEnvelope, state: ServerState) -> ResponseEnvel
             temporary_directory,
         } => validate_restore(state, path, temporary_directory).await,
         Request::Repair { batch_size } => repair(state, batch_size).await,
+        Request::WipeDisposableNotes {} => wipe_disposable_notes(state).await,
     };
     match result {
         Ok(result) => bounded_success(id, result),
@@ -534,6 +535,18 @@ async fn repair(state: ServerState, batch_size: u16) -> Result<ResponseResult, P
         document_revisions_repaired: summary.document_revisions_repaired,
         blobs_verified: summary.blobs_verified,
         max_batch_observed: summary.max_batch_observed,
+    }))
+}
+
+async fn wipe_disposable_notes(state: ServerState) -> Result<ResponseResult, ProtocolError> {
+    let summary = state
+        .store
+        .wipe_disposable_notes()
+        .await
+        .map_err(actor_error)?;
+    Ok(ResponseResult::NotesWiped(NotesWipedView {
+        documents_removed: summary.documents_removed,
+        themata_remaining: summary.themata_remaining,
     }))
 }
 

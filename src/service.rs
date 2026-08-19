@@ -58,8 +58,8 @@ use crate::{
     domain::{DocumentId, DueThema},
     protocol::MAX_REPAIR_BATCH_SIZE,
     store::{
-        DeviceMutationExecution, DocumentAssetAssociation, DocumentAssetSource, SqliteStore,
-        StoreError, StoredDocument,
+        DeviceMutationExecution, DocumentAssetAssociation, DocumentAssetSource, NotesWipeSummary,
+        SqliteStore, StoreError, StoredDocument,
     },
 };
 
@@ -134,6 +134,14 @@ impl ServiceHandle {
         }
         request(&self.sender, |response| StoreCommand::Repair {
             batch_size,
+            response,
+        })
+        .await?
+        .map_err(ServiceError::Store)
+    }
+
+    pub(crate) async fn wipe_disposable_notes(&self) -> Result<NotesWipeSummary, ServiceError> {
+        request(&self.sender, |response| StoreCommand::WipeDisposableNotes {
             response,
         })
         .await?
@@ -1585,6 +1593,9 @@ enum StoreCommand {
         batch_size: u16,
         response: oneshot::Sender<StoreResult<RepairSummary>>,
     },
+    WipeDisposableNotes {
+        response: oneshot::Sender<StoreResult<NotesWipeSummary>>,
+    },
     #[cfg(test)]
     Replace {
         prepared: Box<PreparedServerImport>,
@@ -2454,6 +2465,9 @@ fn run_store_command(
             batch_size,
             response,
         } => send(response, repair_canonical_state(store, blobs, batch_size)),
+        StoreCommand::WipeDisposableNotes { response } => {
+            send(response, store.wipe_disposable_notes())
+        }
         #[cfg(test)]
         StoreCommand::Replace {
             prepared,

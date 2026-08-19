@@ -56,6 +56,7 @@ enum AdminCommand {
         #[arg(long, default_value_t = 100, value_name = "N")]
         batch_size: u16,
     },
+    WipeDisposableNotes,
     Backup {
         #[command(subcommand)]
         command: BackupCommand,
@@ -347,6 +348,7 @@ fn open_credential_parent(path: &Path) -> io::Result<(OwnedFd, OsString)> {
 fn admin_request(command: AdminCommand) -> Result<Request, CliError> {
     match command {
         AdminCommand::Repair { batch_size } => Ok(Request::Repair { batch_size }),
+        AdminCommand::WipeDisposableNotes => Ok(Request::WipeDisposableNotes {}),
         AdminCommand::Backup { command } => match command {
             BackupCommand::Create {
                 destination,
@@ -407,6 +409,7 @@ fn write_result(result: &ResponseResult, credential_path: Option<&Path>) -> Resu
         ResponseResult::Backup(value) => write_json(value),
         ResponseResult::BackupsPruned(value) => write_json(value),
         ResponseResult::Repair(value) => write_json(value),
+        ResponseResult::NotesWiped(value) => write_json(value),
     }
 }
 
@@ -500,6 +503,19 @@ mod tests {
             Request::Repair {
                 batch_size: MAX_REPAIR_BATCH_SIZE
             }
+        ));
+
+        let wipe = Cli::try_parse_from([
+            "gnosisd-admin",
+            "--socket",
+            "/tmp/gnosis.sock",
+            "admin",
+            "wipe-disposable-notes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            command_request(wipe.command).unwrap().request,
+            Request::WipeDisposableNotes {}
         ));
     }
 

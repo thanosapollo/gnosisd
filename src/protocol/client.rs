@@ -43,7 +43,8 @@ fn request_timeout(request: &Request) -> Duration {
         | Request::BackupVerify { .. }
         | Request::BackupPrune { .. }
         | Request::BackupRestoreValidate { .. }
-        | Request::Repair { .. } => MAINTENANCE_REQUEST_TIMEOUT,
+        | Request::Repair { .. }
+        | Request::WipeDisposableNotes {} => MAINTENANCE_REQUEST_TIMEOUT,
         _ => REQUEST_TIMEOUT,
     }
 }
