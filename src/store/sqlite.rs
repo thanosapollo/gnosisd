@@ -44,6 +44,7 @@ mod asset_sync;
 mod client_views;
 mod content_sync;
 mod mutation;
+mod notes_wipe;
 mod review;
 
 pub(crate) use mutation::DeviceMutationExecution;
