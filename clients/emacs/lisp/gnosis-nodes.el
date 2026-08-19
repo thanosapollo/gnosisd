@@ -3387,14 +3387,19 @@ Server identity and prior protocol fingerprint must still match."
 (defun gnosis-nodes-sync (&optional scope full)
   "Synchronize Gnosis Org data for SCOPE.
 SCOPE is one local file, `:all' for all eligible Org files, or nil for no new
-enrollment.  With FULL non-nil, finish all available pull and local scan work."
+enrollment.  Interactive calls, `:all', and non-nil FULL finish every available
+remote page, local scan, and pending mutation.  Periodic idle and after-save
+passes stay bounded by `gnosis-nodes-max-pages-per-pass' and
+`gnosis-nodes-max-mutations-per-pass'."
   (interactive
    (list
     (pcase (read-char-choice "Sync [f]ile or [a]ll files? " '(?f ?a))
       (?f (or buffer-file-name
               (user-error "Current buffer does not visit a file")))
       (?a :all))
-    current-prefix-arg))
+    t))
+  (when (eq scope :all)
+    (setq full t))
   (when gnosis-nodes--busy
     (user-error "Gnosis synchronization is already running"))
   (let ((gnosis-nodes--busy t)
@@ -3402,40 +3407,60 @@ enrollment.  With FULL non-nil, finish all available pull and local scan work."
          (if full most-positive-fixnum gnosis-nodes-max-pages-per-pass))
         (gnosis-nodes-max-local-scan-per-pass
          (if full most-positive-fixnum gnosis-nodes-max-local-scan-per-pass))
+        (gnosis-nodes-max-mutations-per-pass
+         (if full most-positive-fixnum gnosis-nodes-max-mutations-per-pass))
+        (gnosis-nodes-max-outbox-scan-per-pass
+         (if full most-positive-fixnum gnosis-nodes-max-outbox-scan-per-pass))
         (gnosis-nodes--mutation-sent nil)
         (gnosis-nodes--changed-document-ids
          (make-hash-table :test #'equal))
         starting-generation
-        final-state)
+        final-state
+        enrolled)
     (setq gnosis-nodes--stop-requested nil)
     (gnosis-nodes--with-lock
-      (let ((state (gnosis-nodes--read-state)))
+      (let ((state (gnosis-nodes--read-state))
+            continue)
         (when (or (plist-get state :snapshot)
                   (null (plist-get state :protocol-fingerprint)))
           (user-error "Gnosis bootstrap is incomplete; run gnosis-nodes-bootstrap"))
         (gnosis-nodes--assert-identity state)
-        (setq starting-generation (plist-get state :cursor))
-        (setq state
-              (pcase scope
-                (:all (gnosis-nodes--enroll-all state))
-                ((pred stringp) (gnosis-nodes--enroll-file state scope))
-                (_ state)))
-        (gnosis-nodes--write-state state)
-        (unless gnosis-nodes--stop-requested
-          (setq state (gnosis-nodes--pull state)))
-        (unless (or gnosis-nodes--stop-requested
-                    (not gnosis-nodes--pull-complete))
-          (setq state
-                (gnosis-nodes--scan
-                 state (and (stringp scope)
-                            (file-relative-name scope gnosis-nodes-dir))))
-          (gnosis-nodes--write-state state)
-          (setq state (gnosis-nodes--send-outbox state)))
-        (unless (or gnosis-nodes--stop-requested
-                    (not gnosis-nodes--mutation-sent)
-                    (not gnosis-nodes--pull-complete))
-          (setq state (gnosis-nodes--pull state))
-          (gnosis-nodes--write-state state))
+        (setq starting-generation (plist-get state :cursor)
+              continue t)
+        (while (and continue (not gnosis-nodes--stop-requested))
+          (setq gnosis-nodes--mutation-sent nil
+                gnosis-nodes--pages-left
+                (if full most-positive-fixnum gnosis-nodes-max-pages-per-pass))
+          (unless enrolled
+            (setq state
+                  (pcase scope
+                    (:all (gnosis-nodes--enroll-all state))
+                    ((pred stringp) (gnosis-nodes--enroll-file state scope))
+                    (_ state)))
+            (gnosis-nodes--write-state state)
+            (setq enrolled t))
+          (unless gnosis-nodes--stop-requested
+            (setq state (gnosis-nodes--pull state)))
+          (if (or gnosis-nodes--stop-requested
+                  (not gnosis-nodes--pull-complete))
+              (setq continue (and full
+                                  (not gnosis-nodes--stop-requested)
+                                  (not gnosis-nodes--pull-complete)))
+            (setq state
+                  (gnosis-nodes--scan
+                   state (and (stringp scope)
+                              (file-relative-name scope gnosis-nodes-dir))))
+            (gnosis-nodes--write-state state)
+            (setq state (gnosis-nodes--send-outbox state))
+            (when (and (not gnosis-nodes--stop-requested)
+                       gnosis-nodes--mutation-sent
+                       gnosis-nodes--pull-complete)
+              (setq state (gnosis-nodes--pull state))
+              (gnosis-nodes--write-state state))
+            (setq continue (and full
+                                (not gnosis-nodes--stop-requested)
+                                (or (not gnosis-nodes--pull-complete)
+                                    gnosis-nodes--mutation-sent)))))
         (setq final-state state)))
     (when (and (not gnosis-nodes--stop-requested)
                gnosis-nodes--pull-complete)

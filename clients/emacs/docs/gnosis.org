@@ -52,7 +52,9 @@ Use =M-x gnosis-nodes-keep-local-conflict= for explicit rename-back, recreate,
 replace, or tombstone intent.  Use =M-x gnosis-nodes-accept-remote-conflict= to
 accept the remote rename, content, missing-file restore, or tombstone; tombstone
 acceptance preserves local bytes in private conflict evidence before deletion.
-Periodic passes stop at =gnosis-nodes-max-pages-per-pass= remote pages and
+=M-x gnosis-nodes-sync= of a file or all files drains every available remote
+page, local scan, and pending mutation.  Periodic idle and after-save passes
+stop at =gnosis-nodes-max-pages-per-pass= remote pages and
 =gnosis-nodes-max-mutations-per-pass= pending mutations.
 
 * Installation and setup

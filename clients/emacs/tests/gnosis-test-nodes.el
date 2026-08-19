@@ -1315,6 +1315,88 @@
           (should (= calls 1)))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-sync-all-drains-remote-pages ()
+  (let* ((zero (gnosis-test-nodes--cursor "server" 0))
+         (one (gnosis-test-nodes--cursor "server" 1))
+         (two (gnosis-test-nodes--cursor "server" 2))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor ,zero :protocol-fingerprint "fingerprint"
+                  :bases [] :outbox [] :conflicts []))
+         (calls 0)
+         (directory (make-temp-file "gnosis-sync-all-pages" t))
+         (gnosis-nodes-dir directory))
+    (unwind-protect
+        (cl-letf (((symbol-value 'gnosis-nodes-max-pages-per-pass) 1)
+                  ((symbol-function 'gnosis-nodes--state-directory)
+                   (lambda () directory))
+                  ((symbol-function 'gnosis-nodes--read-state) (lambda () state))
+                  ((symbol-function 'gnosis-nodes--write-state)
+                   (lambda (value) (setq state value)))
+                  ((symbol-function 'gnosis-nodes--assert-identity) #'ignore)
+                  ((symbol-function 'lock-file) #'ignore)
+                  ((symbol-function 'unlock-file) #'ignore)
+                  ((symbol-function 'gnosis-core-sync-changes)
+                   (lambda (cursor)
+                     (cl-incf calls)
+                     (pcase calls
+                       (1 `(:version 1 :from ,cursor :next ,one :has_more t
+                            :items [(:cursor ,one :entity_kind "settings"
+                                     :projection (:version 1))]))
+                       (2 `(:version 1 :from ,cursor :next ,two :has_more t
+                            :items [(:cursor ,two :entity_kind "settings"
+                                     :projection (:version 1))]))
+                       (_ `(:version 1 :from ,cursor :next ,cursor
+                            :has_more ,gnosis-core--json-false :items []))))))
+          (gnosis-nodes-sync :all)
+          (should (>= calls 3))
+          (should (equal two (plist-get state :cursor)))
+          (should gnosis-nodes--pull-complete))
+      (delete-directory directory t))))
+
+(ert-deftest gnosis-nodes-sync-all-drains-pending-mutations ()
+  (let* ((cursor (gnosis-test-nodes--cursor "server" 1))
+         (first (gnosis-nodes--outbox-entry
+                 :create nil nil "one.org" (secure-hash 'sha256 "one")
+                 nil "one"))
+         (second (gnosis-nodes--outbox-entry
+                  :create nil nil "two.org" (secure-hash 'sha256 "two")
+                  nil "two"))
+         (state `(:version 1 :server-id "server" :device-id "device"
+                  :cursor ,cursor :protocol-fingerprint "fingerprint"
+                  :bases [] :outbox [,first ,second] :conflicts []))
+         (calls 0)
+         (directory (make-temp-file "gnosis-sync-all-mutations" t))
+         (gnosis-nodes-dir directory))
+    (unwind-protect
+        (cl-letf (((symbol-value 'gnosis-nodes-max-pages-per-pass) 1)
+                  ((symbol-value 'gnosis-nodes-max-mutations-per-pass) 1)
+                  ((symbol-function 'gnosis-nodes--state-directory)
+                   (lambda () directory))
+                  ((symbol-function 'gnosis-nodes--read-state) (lambda () state))
+                  ((symbol-function 'gnosis-nodes--write-state)
+                   (lambda (value) (setq state value)))
+                  ((symbol-function 'gnosis-nodes--assert-identity) #'ignore)
+                  ((symbol-function 'lock-file) #'ignore)
+                  ((symbol-function 'unlock-file) #'ignore)
+                  ((symbol-function 'gnosis-core-sync-changes)
+                   (lambda (cursor)
+                     (list :version 1 :from cursor :next cursor
+                           :has_more gnosis-core--json-false :items [])))
+                  ((symbol-function 'gnosis-nodes--send-entry)
+                   (lambda (entry &optional _payload)
+                     (cl-incf calls)
+                     (list :format_version 1 :status "applied"
+                           :operation_id (plist-get entry :operation-id)
+                           :cursor "opaque"
+                           :authoritative
+                           (list :document_id (format "doc-%d" calls)
+                                 :revision 1
+                                 :logical_path (plist-get entry :logical-path)
+                                 :content_sha256 nil :active t)))))
+          (gnosis-nodes-sync :all)
+          (should (= calls 2)))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-conflict-head-refuses-stale-projection ()
   (let* ((remote (list :document_id "doc" :revision 3
                        :logical_path "note.org" :content_sha256 nil
