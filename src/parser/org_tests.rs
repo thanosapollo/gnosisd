@@ -128,9 +128,14 @@ fn matches_literal_links_todo_keywords_and_comment_titles() {
 }
 
 #[test]
-fn rejects_missing_document_title() {
-    let input = fixture_text("missing-title");
-    assert_eq!(parse_org(&input), Err(OrgParseError::MissingTitle));
+fn uses_first_headline_when_title_keyword_is_missing() {
+    let projection = parse_org(&fixture_text("missing-title")).expect("headline title");
+    assert_eq!(projection.title(), "Valid heading");
+}
+
+#[test]
+fn rejects_document_without_title_or_headline() {
+    assert_eq!(parse_org("plain body\n"), Err(OrgParseError::MissingTitle));
 }
 
 #[test]

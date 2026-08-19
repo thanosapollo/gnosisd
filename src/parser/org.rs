@@ -249,11 +249,21 @@ impl<'a> ProjectionBuilder<'a> {
 }
 
 fn document_title(org: &Org<'_>) -> Result<String, OrgParseError> {
-    org.keywords()
+    if let Some(title) = org
+        .keywords()
         .find(|keyword| keyword.key.eq_ignore_ascii_case("TITLE"))
         .map(|keyword| adjust_title(&keyword.value))
         .filter(|title| !title.trim().is_empty())
-        .ok_or(OrgParseError::MissingTitle)
+    {
+        return Ok(title);
+    }
+    if let Some(headline) = org.headlines().next() {
+        let title = adjust_title(comment_free_title(headline.title(org)));
+        if !title.trim().is_empty() {
+            return Ok(title);
+        }
+    }
+    Err(OrgParseError::MissingTitle)
 }
 
 fn document_tags(org: &Org<'_>) -> Vec<String> {
