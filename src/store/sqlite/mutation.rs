@@ -1680,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_document_result_is_retained_after_later_canonical_change() {
+    fn stale_document_put_applies_and_replay_does_not_clobber_later_head() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let device = add_device(&mut store, "device");
         let create = operation(&device, "create", "document", "note.org", "First", None);
@@ -1688,7 +1688,7 @@ mod tests {
             .apply_device_document_mutation(&create, Some(&blob(&create)), 2)
             .unwrap();
         let stale = operation(&device, "stale", "document", "note.org", "Stale", Some(0));
-        let conflict = store
+        let first = store
             .apply_device_document_mutation(&stale, Some(&blob(&stale)), 3)
             .unwrap();
         let update = operation(
@@ -1706,16 +1706,16 @@ mod tests {
             .apply_device_document_mutation(&stale, Some(&blob(&stale)), 5)
             .unwrap();
 
-        assert_rejected_revision(&conflict.result, Some(0), Some(1), 1);
+        assert_applied_document(&first.result, "document", 2, true);
         assert!(replay.replayed);
-        assert_eq!(replay.result, conflict.result);
+        assert_eq!(replay.result, first.result);
         assert_eq!(
             store
                 .document_head(&update.prepared.document_id)
                 .unwrap()
                 .unwrap()
                 .revision,
-            2
+            3
         );
     }
 
@@ -1807,28 +1807,6 @@ mod tests {
         assert_eq!(document.document_id, document_id);
         assert_eq!(document.revision, revision);
         assert_eq!(*actual_changed, changed);
-    }
-
-    fn assert_rejected_revision(
-        result: &DeviceMutationResult,
-        expected: Option<u64>,
-        actual: Option<u64>,
-        cursor: u64,
-    ) {
-        let DeviceMutationResult::Rejected {
-            rejection:
-                DeviceMutationRejection::RevisionConflict {
-                    expected: stored_expected,
-                    actual: stored_actual,
-                },
-            cursor: stored_cursor,
-            ..
-        } = result
-        else {
-            panic!("expected revision conflict");
-        };
-        assert_eq!((*stored_expected, *stored_actual), (expected, actual));
-        assert_eq!(stored_cursor.position, cursor);
     }
 
     fn row_count(store: &SqliteStore, table: &str) -> u64 {

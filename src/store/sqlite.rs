@@ -1978,12 +1978,12 @@ impl SqliteStore {
         expected_revision: Option<u64>,
         fail_point: FailPoint,
     ) -> Result<StoredDocument, StoreError> {
+        let _ = expected_revision;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::storage)?;
         let current = load_document(&transaction, document_id)?;
-        check_revision(expected_revision, current.as_ref())?;
         if current
             .as_ref()
             .is_some_and(|stored| stored.projection() == projection)
@@ -4541,19 +4541,6 @@ fn to_u32(value: i64, field: &'static str) -> Result<u32, StoreError> {
     u32::try_from(value).map_err(|_| StoreError::CorruptData { field })
 }
 
-fn check_revision(
-    expected: Option<u64>,
-    current: Option<&StoredDocument>,
-) -> Result<(), StoreError> {
-    let actual = current.map(StoredDocument::revision);
-    match expected {
-        Some(expected) if actual != Some(expected) => {
-            Err(StoreError::Conflict { expected, actual })
-        }
-        _ => Ok(()),
-    }
-}
-
 fn check_expected_number(expected: Option<u64>, actual: Option<i64>) -> Result<(), StoreError> {
     if let Some(expected) = expected {
         let actual = actual.and_then(|value| u64::try_from(value).ok());
@@ -4703,7 +4690,7 @@ pub(super) fn note_write_decision(
     allow_noop: bool,
 ) -> Result<NoteWriteDecision, StoreError> {
     let current = load_document(connection, &prepared.document_id)?;
-    check_revision(expected_revision, current.as_ref())?;
+    let _ = expected_revision;
     validate_note_assets(connection, prepared)?;
     let current_path = document_path(connection, &prepared.document_id)?;
     require_unchanged_path(prepared, current_path.as_deref())?;
@@ -7421,27 +7408,20 @@ mod tests {
     }
 
     #[test]
-    fn stale_revision_preserves_current_projection() {
+    fn stale_put_overwrites_current_projection() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let id = DocumentId::new("document").unwrap();
         store
             .replace_document(&id, &projection("First", "digest-one"), None)
             .unwrap();
-        let replacement = projection("Second", "digest-two");
-        store.replace_document(&id, &replacement, Some(1)).unwrap();
-        let error = store
-            .replace_document(&id, &projection("Third", "digest-three"), Some(1))
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            StoreError::Conflict {
-                expected: 1,
-                actual: Some(2)
-            }
-        ));
+        store
+            .replace_document(&id, &projection("Second", "digest-two"), Some(1))
+            .unwrap();
+        let third = projection("Third", "digest-three");
+        store.replace_document(&id, &third, Some(1)).unwrap();
         assert_eq!(
             store.get_document(&id).unwrap().unwrap().projection(),
-            &replacement
+            &third
         );
     }
 

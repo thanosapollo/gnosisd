@@ -2,11 +2,10 @@
 
 Keep this file current and concise.
 
-Gnosis Core is a standalone daemon/server. `gnosisd` owns canonical documents,
+Gnosis Core is a standalone daemon/server. `gnosisd` owns live document heads,
 parsed roam-like nodes and links, themata linked to nodes, review state, grading,
-FSRS scheduling, persistence, blobs, and synchronization. Clients consume typed
-authenticated HTTP `/v1`; they never open the canonical database or calculate
-scheduling.
+FSRS scheduling, persistence, and blobs. Clients consume typed authenticated
+HTTP `/v1`; they never open the canonical database or calculate scheduling.
 
 The Unix socket is a privileged local operator boundary for system information,
 device bootstrap and revocation, backup, recovery, and diagnostics. Ordinary
@@ -32,6 +31,26 @@ data, content, and review operations use HTTP only.
 - `src/bin/gnosisd-admin.rs` is the minimal privileged Unix operator client.
   Ordinary data, content, and review operations remain HTTP client concerns.
 
+## Notes and themata
+
+The client Org notes tree is the note. The daemon stores one live head per
+path (bytes + parse). It is not an SCM and does not keep note or thema-content
+history.
+
+- Save is always local. Clients push on save hooks and occasional sync. Last
+  successful HTTP put wins. Do not refuse save when HTTP is down.
+- `document_id` is disposable. A missing path on a whole-tree sync deletes that
+  head. A new path creates a head. There is no rename. Graph identity is the
+  Org `:ID:` (`node_id` / `thema_concept`).
+- One-file save overwrites only that head. It must not delete other notes.
+- Ignore and never upload `*.conflict`, `*.bak`, `*~`, and `#*#`.
+- Thema body (keimenon, answer, and related fields) is last-write-wins. Do not
+  store older thema content. Leave FSRS, review attempts, and `state_revision`
+  alone.
+- After a notes wipe, keep themata, concepts, `node_identity`, review/FSRS,
+  and device auth. Re-ingest eligible `.org` files with whole-tree sync.
+  Matching `:ID:` values reattach concepts. Do not strip themata.
+
 ## Data and review invariants
 
 - Keep textual link occurrences, unique semantic node edges, and
@@ -40,25 +59,14 @@ data, content, and review operations use HTTP only.
   Source spans are zero-based, half-open UTF-8 byte ranges covering complete
   Org links.
 - The daemon owns grading, FSRS transitions, session progress, suspension,
-  daily totals, revisions, conflicts, and immutable review events.
+  daily totals, and immutable review events.
 - Pending HTTP attempts expose only server-materialized questions and typed
   response prompts. Keep answers server-side until grading.
-- Desired-state mutations use durable device-scoped operation IDs and expected
-  revisions. Exact retries return retained results; stale or competing
-  revisions remain explicit.
-- Review and content operations share one contiguous per-device sequence.
-  Accepted and conflict results are immutable; invalid operations change no
-  canonical state.
-- Document revisions bind to captured content digests. Numeric revision alone
-  never authorizes an offline write.
-- Canonical Org writes reference active content-addressed assets only. Verify
-  asset path, digest, size, and state before publication or use.
-- Replica bootstrap installs complete snapshots atomically before advancing its
-  durable cursor. Reconciliation cursors never fast-forward the replica feed.
-- Unknown mutation delivery stops synchronization with operation identity
-  intact. Next explicit sync replays that exact immutable operation.
-- Review pack acquisition is explicit. Persist typed packs before downloading
-  and verifying assets. Periodic replica sync never creates a pack.
+- Review mutations may use expected revisions and operation IDs. Note and
+  thema-content overwrites do not: last accepted put is the head.
+- Canonical Org writes that reference assets must verify path, digest, size,
+  and state before publication or use. This campaign does not require document
+  image assets.
 
 ## Safety
 
