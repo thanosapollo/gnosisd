@@ -2897,6 +2897,33 @@
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory root t))))
 
+(ert-deftest gnosis-nodes-save-after-blocked-child-sends-latest-bytes ()
+  (let* ((old (string-to-unibyte "old"))
+         (mid (string-to-unibyte "mid"))
+         (new (string-to-unibyte "new"))
+         (uncertain (gnosis-nodes--outbox-entry
+                     :replace "doc" 1 "note.org"
+                     (gnosis-nodes--digest old) nil old))
+         (blocked (gnosis-nodes--outbox-entry
+                   :replace "doc" nil "note.org"
+                   (gnosis-nodes--digest mid) nil mid))
+         (base '(:document-id "doc" :revision 1 :logical-path "note.org"
+                 :digest "old-digest" :active t))
+         state)
+    (setf (plist-get uncertain :status) :uncertain)
+    (setf (plist-get blocked :status) :blocked
+          (plist-get blocked :depends-on) (plist-get uncertain :operation-id))
+    (setq state (list :outbox (vector uncertain blocked) :conflicts []))
+    (setq state (gnosis-nodes--queue-save state base new))
+    (let ((latest (aref (plist-get state :outbox)
+                        (1- (length (plist-get state :outbox))))))
+      (should (eq :superseded (plist-get uncertain :status)))
+      (should (eq :superseded (plist-get blocked :status)))
+      (should (eq :pending (plist-get latest :status)))
+      (should (null (plist-get latest :depends-on)))
+      (should (equal new
+                     (base64-decode-string (plist-get latest :payload)))))))
+
 (ert-deftest gnosis-nodes-completed-snapshot-removes-private-spool ()
   (let* ((root (make-temp-file "gnosis-nodes-snapshot-cleanup-" t))
          (gnosis-nodes-dir root)
