@@ -581,25 +581,17 @@ When REFRESH is non-nil, always fetch a new catalog."
                (gnosis-nodes--buffer-bytes buffer)))))
 
 (defun gnosis-nodes--local-document-source (node)
-  "Return an exact local document source for NODE, or nil."
+  "Return the local working copy for NODE, or nil."
   (let* ((path
           (gnosis-nodes--safe-path
            gnosis-nodes-dir (plist-get node :logical_path)))
-         (digest (plist-get node :content_sha256))
          (visiting (get-file-buffer path)))
     (cond
-     ((gnosis-nodes--exact-buffer-p visiting digest)
+     ((buffer-live-p visiting)
       (list :buffer visiting :bytes (gnosis-nodes--buffer-bytes visiting)))
-     ((buffer-live-p visiting) nil)
-     (t
-      (let ((disk (gnosis-nodes--working-bytes path)))
-        (when (and disk (equal digest (gnosis-nodes--digest disk)))
-          (let ((opened (find-file-noselect path)))
-            (if (gnosis-nodes--exact-buffer-p opened digest)
-                (list :buffer opened :bytes
-                      (gnosis-nodes--buffer-bytes opened))
-              (unless (buffer-modified-p opened) (kill-buffer opened))
-              nil))))))))
+     ((file-regular-p path)
+      (let ((opened (find-file-noselect path)))
+        (list :buffer opened :bytes (gnosis-nodes--buffer-bytes opened)))))))
 
 (defun gnosis-nodes--historical-buffer (node bytes)
   "Return a read-only Org buffer for exact NODE revision BYTES."
@@ -697,23 +689,21 @@ When REFRESH is non-nil, always fetch a new catalog."
       (signal 'gnosis-nodes-error '("Invalid Gnosis node source span"))))))
 
 (defun gnosis-nodes--visit-node (node)
-  "Open NODE's exact document revision and move point to the node."
+  "Open NODE's local Org file and move point to the node."
   (let* ((source (gnosis-nodes--document-source node))
          (buffer (plist-get source :buffer))
          (bytes (plist-get source :bytes))
+         (digest (plist-get node :content_sha256))
          position)
     (with-current-buffer buffer
-      (setq position (gnosis-nodes--node-position node bytes))
-      (setq-local gnosis-nodes--content-sha256
-                  (plist-get node :content_sha256))
+      (setq position
+            (if (equal digest (gnosis-nodes--digest bytes))
+                (gnosis-nodes--node-position node bytes)
+              (gnosis-nodes--legacy-position node)))
+      (setq-local gnosis-nodes--content-sha256 digest)
       (setq-local gnosis-nodes--document-revision
                   (plist-get node :document_revision)))
     (pop-to-buffer-same-window buffer)
-    (unless (equal (plist-get node :content_sha256)
-                   (gnosis-nodes--digest
-                    (gnosis-nodes--buffer-bytes buffer)))
-      (signal 'gnosis-nodes-error
-              '("Gnosis document changed before node navigation")))
     (widen)
     (goto-char position)
     (when (derived-mode-p 'org-mode)
@@ -3616,10 +3606,21 @@ files, matching the legacy whole-database command boundary."
 
 (gnosis-nodes-auto-sync-mode 1)
 
+(defun gnosis-nodes--ignored-logical-path-p (logical-path)
+  "Return non-nil when LOGICAL-PATH is local debris and must not sync."
+  (let ((name (file-name-nondirectory logical-path)))
+    (or (string-match-p "\\.conflict\\(?:\\.org\\)?\\'" name)
+        (string-match-p "\\.bak\\(?:\\.org\\)?\\'" name)
+        (string-suffix-p "~" name)
+        (and (string-prefix-p "#" name)
+             (string-suffix-p "#" name)))))
+
 (defun gnosis-nodes--enroll-file (state file)
   "Return STATE with eligible Org FILE enrolled if not already tracked."
   (let* ((file (expand-file-name file))
          (logical-path (file-relative-name file gnosis-nodes-dir)))
+    (when (gnosis-nodes--ignored-logical-path-p logical-path)
+      (user-error "File is ignored Gnosis debris"))
     (unless (and (file-regular-p file)
                  (string-suffix-p ".org" file t)
                  (file-in-directory-p file gnosis-nodes-dir))
@@ -3640,6 +3641,9 @@ files, matching the legacy whole-database command boundary."
   (dolist (file (sort (seq-filter
                        (lambda (candidate)
                          (and (not (file-symlink-p candidate))
+                              (not (gnosis-nodes--ignored-logical-path-p
+                                    (file-relative-name candidate
+                                                        gnosis-nodes-dir)))
                               (condition-case nil
                                   (progn
                                     (gnosis-nodes--safe-path

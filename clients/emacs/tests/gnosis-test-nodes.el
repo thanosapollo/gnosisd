@@ -696,6 +696,35 @@
       (delete-directory directory t)
       (delete-file outside))))
 
+(ert-deftest gnosis-nodes-sync-all-files-skips-ignored-debris ()
+  (let* ((directory (make-temp-file "gnosis-nodes-ignore" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (state '(:version 1 :server-id "server" :device-id "device"
+                  :cursor "feed" :bases [] :outbox [] :conflicts [])))
+    (unwind-protect
+        (progn
+          (gnosis-nodes--write-state state)
+          (gnosis-nodes--write-document "keep.org" "keep")
+          (with-temp-file (expand-file-name "note.conflict.org" directory)
+            (insert "lose"))
+          (with-temp-file (expand-file-name "note.bak.org" directory)
+            (insert "bak"))
+          (with-temp-file (expand-file-name "note.org~" directory)
+            (insert "tilde"))
+          (with-temp-file (expand-file-name "#note.org#" directory)
+            (insert "autosave"))
+          (gnosis-nodes--write-state
+           (gnosis-nodes--enroll-all (gnosis-nodes--read-state)))
+          (should (equal '("keep.org")
+                         (mapcar (lambda (entry)
+                                   (plist-get entry :logical-path))
+                                 (append (plist-get (gnosis-nodes--read-state)
+                                                    :outbox)
+                                         nil)))))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-idle-sync-refuses-reentry ()
   (let ((gnosis-nodes--busy t)
         called)
@@ -1881,7 +1910,7 @@
                (gnosis-nodes--legacy-position
                 (gnosis-test-nodes--catalog-node "file-node" :level 0))))))
 
-(ert-deftest gnosis-nodes-opens-an-exact-historical-document-when-local-is-stale ()
+(ert-deftest gnosis-nodes-opens-the-local-file-when-digest-differs ()
   (let* ((directory (make-temp-file "gnosis-node-find-" t))
          (gnosis-nodes-dir directory)
          (current (string-to-unibyte "* Current\n"))
@@ -1890,29 +1919,24 @@
          (node
           (gnosis-test-nodes--catalog-node
            "node-a" :logical_path "note.org" :content_sha256 digest))
-         result)
+         fetched result)
     (unwind-protect
         (progn
           (gnosis-nodes--write-document "note.org" stale)
           (cl-letf (((symbol-function 'gnosis-core-document-revision)
-                     (lambda (document-id revision requested)
-                       (should (equal "document-a" document-id))
-                       (should (= 3 revision))
-                       (should (equal digest requested))
+                     (lambda (&rest _)
+                       (setq fetched t)
                        current)))
             (setq result (gnosis-nodes--document-source node)))
-          (should-not (buffer-file-name (plist-get result :buffer)))
-          (should (buffer-local-value
-                   'buffer-read-only (plist-get result :buffer)))
-          (should (equal current (plist-get result :bytes)))
-          (should (equal stale
-                         (gnosis-nodes--read-bytes
-                          (expand-file-name "note.org" directory)))))
+          (should-not fetched)
+          (should (equal (expand-file-name "note.org" directory)
+                         (buffer-file-name (plist-get result :buffer))))
+          (should (equal stale (plist-get result :bytes))))
       (when (buffer-live-p (plist-get result :buffer))
         (kill-buffer (plist-get result :buffer)))
       (delete-directory directory t))))
 
-(ert-deftest gnosis-nodes-does-not-jump-in-a-modified-visiting-buffer ()
+(ert-deftest gnosis-nodes-uses-the-modified-visiting-buffer ()
   (let* ((directory (make-temp-file "gnosis-node-modified-" t))
          (gnosis-nodes-dir directory)
          (bytes (string-to-unibyte "* Exact\n"))
@@ -1929,13 +1953,9 @@
           (with-current-buffer visiting
             (goto-char (point-max))
             (insert "unsaved"))
-          (cl-letf (((symbol-function 'gnosis-core-document-revision)
-                     (lambda (&rest _) bytes)))
-            (setq result (gnosis-nodes--document-source node)))
-          (should-not (eq visiting (plist-get result :buffer)))
-          (should (buffer-modified-p visiting))
-          (should (equal "* Exact\nunsaved"
-                         (with-current-buffer visiting (buffer-string)))))
+          (setq result (gnosis-nodes--document-source node))
+          (should (eq visiting (plist-get result :buffer)))
+          (should (buffer-modified-p visiting)))
       (dolist (buffer (list visiting (plist-get result :buffer)))
         (when (buffer-live-p buffer)
           (with-current-buffer buffer (set-buffer-modified-p nil))
@@ -2781,31 +2801,6 @@
          (org-mode-hook (list (lambda () (insert "changed")))))
     (should-error (gnosis-nodes--historical-buffer node bytes)
                   :type 'gnosis-nodes-error)))
-
-(ert-deftest gnosis-nodes-rechecks-content-after-displaying-the-buffer ()
-  (let* ((bytes (string-to-unibyte "* Exact\n"))
-         (digest (gnosis-nodes--digest bytes))
-         (node
-          (gnosis-test-nodes--catalog-node
-           "node-a" :content_sha256 digest :start_byte 0 :end_byte 1))
-         (buffer (generate-new-buffer " *gnosis-navigation-race*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer buffer
-            (insert (decode-coding-string bytes 'utf-8))
-            (set-buffer-modified-p nil))
-          (cl-letf (((symbol-function 'gnosis-nodes--document-source)
-                     (lambda (_) (list :buffer buffer :bytes bytes)))
-                    ((symbol-function 'pop-to-buffer-same-window)
-                     (lambda (target &rest _)
-                       (set-buffer target)
-                       (goto-char (point-max))
-                       (insert "changed"))))
-            (should-error (gnosis-nodes--visit-node node)
-                          :type 'gnosis-nodes-error)))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer (set-buffer-modified-p nil))
-        (kill-buffer buffer)))))
 
 (ert-deftest gnosis-nodes-save-after-uncertain-create-queues-dependent-replace ()
   (let* ((root (make-temp-file "gnosis-nodes-create-save-" t))
