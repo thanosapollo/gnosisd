@@ -812,14 +812,13 @@ async fn replace_document_mutation(
 ) -> Result<Json<DocumentMutationResultV1>, ApiError> {
     require(&principal, DeviceScope::ContentWrite)?;
     let operation_id = idempotency_key(&headers)?;
-    let revision = if_match(&headers)?;
     let prepared = run_blocking(move || {
         prepare_document(
             Some(id),
             input.logical_path,
             input.content_type,
             input.source,
-            Some(revision),
+            None,
         )
         .map_err(ApiError::invalid_content)
     })
@@ -3524,7 +3523,7 @@ fn content_requires_if_match(path: &str, method: &str) -> bool {
         (path, method),
         ("/v1/settings", "put")
             | ("/v1/notes/{id}", "put" | "delete")
-            | ("/v1/document-mutations/{id}", "put" | "delete")
+            | ("/v1/document-mutations/{id}", "delete")
             | ("/v1/document-mutations/{id}/rename", "post")
             | ("/v1/notes/{id}/rename", "post")
             | ("/v1/assets/{digest}/{name}", "delete")
@@ -5635,7 +5634,6 @@ mod tests {
             "put",
             "Idempotency-Key",
         );
-        assert_required_header(&api, "/v1/document-mutations/{id}", "put", "If-Match");
         assert_required_header(
             &api,
             "/v1/document-mutations/{id}",
@@ -8358,16 +8356,15 @@ mod tests {
                 &stale_path,
                 &token,
                 "stale",
-                Some("\"0\""),
+                None,
                 Body::from(note_body("note.org", "Stale")),
             ))
             .await
             .unwrap();
         assert_eq!(stale.status(), StatusCode::OK);
         let stale = response_json(stale).await;
-        assert_eq!(stale["status"], "rejected");
-        assert_eq!(stale["rejection"]["reason"], "revision_conflict");
-        assert_eq!(stale["rejection"]["current_revision"], 1);
+        assert_eq!(stale["status"], "applied");
+        assert_eq!(stale["authoritative"]["revision"], 2);
 
         let update = app
             .clone()
@@ -8376,19 +8373,19 @@ mod tests {
                 &stale_path,
                 &token,
                 "update",
-                Some("1"),
+                None,
                 Body::from(note_body("note.org", "Current")),
             ))
             .await
             .unwrap();
-        assert_eq!(response_json(update).await["authoritative"]["revision"], 2);
+        assert_eq!(response_json(update).await["authoritative"]["revision"], 3);
         let stale_retry = app
             .oneshot(authorized_mutation(
                 "PUT",
                 &stale_path,
                 &token,
                 "stale",
-                Some("0"),
+                None,
                 Body::from(note_body("note.org", "Stale")),
             ))
             .await
@@ -8400,7 +8397,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            2
+            3
         );
         drop(service);
         runtime.finish().await.unwrap();

@@ -791,7 +791,7 @@ fn validate_lifecycle_request(
 }
 
 fn mutation_kind(prepared: &PreparedNote) -> DeviceMutationKind {
-    if prepared.expected_revision.is_some() {
+    if prepared.explicit_document_id {
         DeviceMutationKind::Replace
     } else {
         DeviceMutationKind::Create
