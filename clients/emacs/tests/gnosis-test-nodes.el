@@ -1048,6 +1048,33 @@
                                   :remote-revision))))
       (delete-directory directory t))))
 
+(ert-deftest gnosis-nodes-conflict-record-tolerates-reclaimed-base-blob ()
+  (let* ((directory (make-temp-file "gnosis-nodes-reclaimed-base" t))
+         (gnosis-nodes-dir directory)
+         (user-emacs-directory (file-name-as-directory directory))
+         (gnosis-nodes-state-file nil)
+         (wrote nil)
+         (state '(:conflicts [])))
+    (unwind-protect
+        (cl-letf (((symbol-function 'gnosis-core-blob)
+                   (lambda (_)
+                     (signal 'gnosis-core-not-found
+                             '("resource not found" "not_found"))))
+                  ((symbol-function 'gnosis-nodes--write-bytes)
+                   (lambda (path bytes)
+                     (push (cons (file-name-nondirectory path) bytes) wrote))))
+          (setq state
+                (gnosis-nodes--record-conflict
+                 state
+                 '(:logical-path "note.org" :digest "deadbeef")
+                 '(:document_id "doc" :revision 4 :logical_path "note.org"
+                   :content_sha256 "new" :operation "update")
+                 "local" "remote"))
+          (should (= 1 (length (plist-get state :conflicts))))
+          (should (equal "" (cdr (assoc "base.org" wrote))))
+          (should (equal "remote" (cdr (assoc "remote.org" wrote)))))
+      (delete-directory directory t))))
+
 (ert-deftest gnosis-nodes-missing-local-conflict-queues-tombstone ()
   (let* ((record '(:document-id "doc" :kind :missing-local
                    :local-path "note.org" :logical-path "note.org"

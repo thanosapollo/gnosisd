@@ -1776,6 +1776,12 @@ PAYLOAD captures exact bytes at enqueue time."
                   (<= entry-revision (plist-get base :revision)))))
          outbox))))))
 
+(defun gnosis-nodes--live-blob (digest)
+  "Return DIGEST bytes, or nil when the live head no longer retains it."
+  (condition-case _
+      (gnosis-core-blob digest)
+    (gnosis-core-not-found nil)))
+
 (defun gnosis-nodes--conflict-directory (document-id)
   "Return private sidecar directory for DOCUMENT-ID."
   (expand-file-name
@@ -1823,15 +1829,17 @@ REMOTE-BYTES contains validated authoritative content, or nil for deletion."
        base-file
        (if-let* ((digest (plist-get base :digest)))
            (or (cdr (assoc digest gnosis-nodes--conflict-base-blobs))
-               (gnosis-core-blob digest))
+               (gnosis-nodes--live-blob digest)
+               "")
          ""))
       (gnosis-nodes--write-bytes remote-file (or remote-bytes "")))
     (when (and gnosis-nodes--preflight (plist-get base :digest)
                (not (assoc (plist-get base :digest)
                            gnosis-nodes--conflict-base-blobs)))
       (let ((digest (plist-get base :digest)))
-        (push (cons digest (gnosis-core-blob digest))
-              gnosis-nodes--conflict-base-blobs)))
+        (when-let ((bytes (gnosis-nodes--live-blob digest)))
+          (push (cons digest bytes)
+                gnosis-nodes--conflict-base-blobs))))
     (plist-put state :conflicts
                (vconcat
                 (seq-remove (lambda (item)
