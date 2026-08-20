@@ -817,6 +817,6 @@ SELECT
 FROM settings WHERE id = 1;
 
 PRAGMA application_id = 1196314451;
-PRAGMA user_version = 4;
+PRAGMA user_version = 1;
 
 COMMIT;

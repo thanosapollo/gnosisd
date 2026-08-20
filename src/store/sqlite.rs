@@ -52,7 +52,7 @@ pub(crate) use notes_wipe::NotesWipeSummary;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 1;
 const THEMA_CATALOG_MATERIALIZED_BYTES: usize = 1024 * 1024;
 const CONTENT_SEARCH_DOCUMENT_BUDGET: usize = 1_000;
 const CONTENT_SEARCH_SOURCE_BUDGET: usize = 8 * 1024 * 1024;
@@ -6903,6 +6903,12 @@ mod tests {
     }
 
     #[test]
+    fn canonical_schema_is_version_one() {
+        assert_eq!(SCHEMA_VERSION, 1);
+        assert!(CURRENT_SCHEMA.contains("PRAGMA user_version = 1;"));
+    }
+
+    #[test]
     fn initializes_and_reopens_database() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("gnosis.db");
@@ -6944,8 +6950,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_prior_schema_versions_without_changes() {
-        for version in [1, 2] {
+    fn rejects_other_schema_versions_without_changes() {
+        for version in [2, 4] {
             let connection = rusqlite::Connection::open_in_memory().unwrap();
             connection.execute_batch(CURRENT_SCHEMA).unwrap();
             connection
