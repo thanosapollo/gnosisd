@@ -3704,7 +3704,7 @@ fn thema_is_unchanged(
 ) -> Result<bool, StoreError> {
     connection
         .query_row(
-            "SELECT content_sha256 = ?2 AND archived_at_us IS NULL
+            "SELECT content_sha256 = ?2
              FROM thema WHERE thema_id = ?1",
             params![prepared.thema_id.as_str(), prepared.content_sha256],
             |row| row.get(0),
@@ -3734,7 +3734,7 @@ fn upsert_thema_row(
              keimenon = excluded.keimenon, hypothesis_json = excluded.hypothesis_json,
              answer_json = excluded.answer_json, source_guid = excluded.source_guid,
              parathema = excluded.parathema, review_image = excluded.review_image,
-             content_sha256 = excluded.content_sha256, archived_at_us = NULL,
+             content_sha256 = excluded.content_sha256,
              updated_at_us = excluded.updated_at_us,
              author_device_id = excluded.author_device_id",
             params![

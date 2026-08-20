@@ -1284,6 +1284,8 @@ mod tests {
         store
             .put_thema(&prepared("Question"), 20260719, 1, None)
             .unwrap();
+        store.set_thema_archived("thema", 1, true, 2, None).unwrap();
+        let review_state = store.thema_review_state("thema").unwrap();
         let operation = |operation_id: &str, question: &str| {
             prepare_device_desired_state_mutation(
                 1,
@@ -1299,31 +1301,35 @@ mod tests {
         let same = operation("same", "Question");
         let changed = operation("changed", "Changed");
 
-        let same_result = store.apply_device_desired_state_mutation(&same, 2).unwrap();
+        let same_result = store.apply_device_desired_state_mutation(&same, 3).unwrap();
         let changed_result = store
-            .apply_device_desired_state_mutation(&changed, 3)
+            .apply_device_desired_state_mutation(&changed, 4)
             .unwrap();
         assert!(!same_result.replayed);
         assert!(!changed_result.replayed);
-        assert_eq!(
-            store.get_thema("thema").unwrap().unwrap().content.keimenon,
-            "Changed"
-        );
+        assert!(matches!(
+            &same_result.result,
+            DeviceMutationResult::Applied { changed: false, .. }
+        ));
+        let current = store.get_thema("thema").unwrap().unwrap();
+        assert_eq!(current.content.keimenon, "Changed");
+        assert!(current.archived);
+        assert_eq!(store.thema_review_state("thema").unwrap(), review_state);
         assert_no_retained_body_text(&store, &["Question"]);
         drop(store);
 
         let mut store = SqliteStore::open(path).unwrap();
         for (operation, retained) in [(&same, &same_result), (&changed, &changed_result)] {
             let replay = store
-                .apply_device_desired_state_mutation(operation, 4)
+                .apply_device_desired_state_mutation(operation, 5)
                 .unwrap();
             assert!(replay.replayed);
             assert_eq!(replay.result, retained.result);
         }
-        assert_eq!(
-            store.get_thema("thema").unwrap().unwrap().content.keimenon,
-            "Changed"
-        );
+        let current = store.get_thema("thema").unwrap().unwrap();
+        assert_eq!(current.content.keimenon, "Changed");
+        assert!(current.archived);
+        assert_eq!(store.thema_review_state("thema").unwrap(), review_state);
         assert_no_retained_body_text(&store, &["Question"]);
     }
 
