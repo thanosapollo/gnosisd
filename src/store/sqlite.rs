@@ -4246,6 +4246,7 @@ fn materialize_current_node(
         revision,
         &row.id,
         &row.fallback_digest,
+        row.active,
         projections,
     )?;
     Ok(NodeRecord {
@@ -4326,6 +4327,7 @@ fn materialize_retired_node(
         revision,
         &row.id,
         &row.fallback_digest,
+        false,
         projections,
     )?;
     Ok(NodeRecord {
@@ -4356,25 +4358,31 @@ fn load_node_location(
     revision: u64,
     node_id: &str,
     fallback_digest: &str,
+    require_projection: bool,
     projections: &mut NodeProjectionCache,
 ) -> Result<NodeLocation, StoreError> {
     let key = (document_id.to_owned(), revision);
     if !projections.locations.contains_key(&key) {
-        let size = load_projection_snapshot_size(connection, document_id, revision)?;
-        if size.is_some_and(|size| size > MAX_DOCUMENT_PROJECTION_BYTES) {
-            return Err(StoreError::CorruptData {
-                field: "document projection size",
-            });
-        }
-        if size.is_some_and(|size| !projections.reserve(size)) {
+        let snapshot = load_projection_snapshot(connection, document_id, revision)?;
+        if snapshot
+            .as_ref()
+            .is_some_and(|(size, _)| !projections.reserve(*size))
+        {
             return Err(StoreError::NodePageProjectionLimit);
         }
-        let locations = load_projection_snapshot(connection, document_id, revision)?
+        let locations = snapshot
+            .map(|(_, json)| serde_json::from_str(&json).map_err(StoreError::storage))
+            .transpose()?
             .map(projection_node_locations)
             .transpose()?;
         projections.locations.insert(key.clone(), locations);
     }
     let Some(locations) = projections.locations.get(&key).and_then(Option::as_ref) else {
+        if require_projection {
+            return Err(StoreError::CorruptData {
+                field: "document projection",
+            });
+        }
         return Ok(NodeLocation {
             content_sha256: fallback_digest.to_owned(),
             start_byte: None,
@@ -4393,25 +4401,6 @@ fn load_node_location(
         start_byte: span.map(|value| value.start()),
         end_byte: span.map(|value| value.end()),
     })
-}
-
-fn load_projection_snapshot_size(
-    connection: &Connection,
-    document_id: &str,
-    revision: u64,
-) -> Result<Option<usize>, StoreError> {
-    connection
-        .query_row(
-            "SELECT length(CAST(projection_json AS BLOB))
-             FROM document_projection_revision
-             WHERE document_id = ?1 AND revision = ?2",
-            params![document_id, u64_to_i64(revision, "document revision")?],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(StoreError::storage)?
-        .map(|size| to_usize(size, "document projection size"))
-        .transpose()
 }
 
 fn projection_node_locations(
@@ -4441,18 +4430,36 @@ fn load_projection_snapshot(
     connection: &Connection,
     document_id: &str,
     revision: u64,
-) -> Result<Option<DocumentProjectionSnapshot>, StoreError> {
-    connection
-        .query_row(
-            "SELECT projection_json FROM document_projection_revision
-             WHERE document_id = ?1 AND revision = ?2",
-            params![document_id, u64_to_i64(revision, "document revision")?],
-            |row| row.get::<_, String>(0),
+) -> Result<Option<(usize, String)>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT length(CAST(projection_json AS BLOB)), projection_json
+             FROM document_projection AS projection
+             JOIN document USING(document_id)
+             WHERE projection.document_id = ?1 AND document.revision = ?2
+               AND document.active = 1",
         )
-        .optional()
-        .map_err(StoreError::storage)?
-        .map(|json| serde_json::from_str(&json).map_err(StoreError::storage))
-        .transpose()
+        .map_err(StoreError::storage)?;
+    let mut rows = statement
+        .query(params![
+            document_id,
+            u64_to_i64(revision, "document revision")?
+        ])
+        .map_err(StoreError::storage)?;
+    let Some(row) = rows.next().map_err(StoreError::storage)? else {
+        return Ok(None);
+    };
+    let size = to_usize(
+        row.get::<_, i64>(0).map_err(StoreError::storage)?,
+        "document projection size",
+    )?;
+    if size > MAX_DOCUMENT_PROJECTION_BYTES {
+        return Err(StoreError::CorruptData {
+            field: "document projection size",
+        });
+    }
+    let json = row.get::<_, String>(1).map_err(StoreError::storage)?;
+    Ok(Some((size, json)))
 }
 
 fn query_node_tags(
@@ -5460,7 +5467,7 @@ fn load_document(
     let row = connection
         .query_row(
             "SELECT revision, title, file_node_id, file_tags_json, \
-             content_sha256 \
+             content_sha256, active \
              FROM document WHERE document_id = ?1",
             [document_id.as_str()],
             |row| {
@@ -5470,6 +5477,7 @@ fn load_document(
                     file_node_id: row.get(2)?,
                     file_tags_json: row.get(3)?,
                     content_sha256: row.get(4)?,
+                    active: row.get(5)?,
                 })
             },
         )
@@ -5485,6 +5493,7 @@ struct DocumentRow {
     file_node_id: Option<String>,
     file_tags_json: String,
     content_sha256: String,
+    active: bool,
 }
 
 fn materialize_document(
@@ -5495,6 +5504,11 @@ fn materialize_document(
     let revision =
         u64::try_from(row.revision).map_err(|_| StoreError::CorruptData { field: "revision" })?;
     let node_spans = load_projection_node_spans(connection, document_id, revision)?;
+    if row.active && node_spans.is_none() {
+        return Err(StoreError::CorruptData {
+            field: "document projection",
+        });
+    }
     let nodes = load_nodes(connection, document_id, node_spans.as_ref())?;
     let link_occurrences = load_occurrences(connection, document_id)?;
     let stored_edges = load_edges(connection, document_id)?;
@@ -5527,6 +5541,10 @@ fn load_projection_node_spans(
     revision: u64,
 ) -> Result<Option<HashMap<String, Option<SourceSpan>>>, StoreError> {
     load_projection_snapshot(connection, document_id.as_str(), revision)?
+        .map(|(_, json)| {
+            serde_json::from_str::<DocumentProjectionSnapshot>(&json).map_err(StoreError::storage)
+        })
+        .transpose()?
         .map(projection_node_locations)
         .transpose()
         .map(|locations| locations.map(|locations| locations.spans))
@@ -5940,7 +5958,7 @@ mod tests {
                     SourceSpan::from_offsets(8, 12).unwrap(),
                 ),
             ],
-            content_sha256: digest.into(),
+            content_sha256: format!("{:x}", sha2::Sha256::digest(digest.as_bytes())),
         })
         .unwrap()
     }
@@ -5970,7 +5988,7 @@ mod tests {
             })
             .collect(),
             link_occurrences: vec![],
-            content_sha256: "concept-digest".into(),
+            content_sha256: format!("{:x}", sha2::Sha256::digest(b"concept-digest")),
         })
         .unwrap()
     }
@@ -6550,8 +6568,8 @@ mod tests {
         let stored: String = store
             .connection
             .query_row(
-                "SELECT projection_json FROM document_projection_revision
-                 WHERE document_id = 'document' AND revision = 1",
+                "SELECT projection_json FROM document_projection
+                 WHERE document_id = 'document'",
                 [],
                 |row| row.get(0),
             )
@@ -6565,8 +6583,8 @@ mod tests {
         store
             .connection
             .execute(
-                "UPDATE document_projection_revision SET projection_json = ?1
-                 WHERE document_id = 'document' AND revision = 1",
+                "UPDATE document_projection SET projection_json = ?1
+                 WHERE document_id = 'document'",
                 [serde_json::to_string(&legacy).unwrap()],
             )
             .unwrap();
@@ -6930,8 +6948,8 @@ mod tests {
             let stored: String = store
                 .connection
                 .query_row(
-                    "SELECT projection_json FROM document_projection_revision
-                     WHERE document_id = ?1 AND revision = 1",
+                    "SELECT projection_json FROM document_projection
+                     WHERE document_id = ?1",
                     [&document_id],
                     |row| row.get(0),
                 )
@@ -6941,15 +6959,15 @@ mod tests {
             let padded = serde_json::to_string(&padded).unwrap();
             projection_size = padded.len();
             let stored = if index == 5 {
-                "x".repeat(projection_size)
+                serde_json::to_string(&"x".repeat(projection_size)).unwrap()
             } else {
                 padded
             };
             store
                 .connection
                 .execute(
-                    "UPDATE document_projection_revision SET projection_json = ?1
-                     WHERE document_id = ?2 AND revision = 1",
+                    "UPDATE document_projection SET projection_json = ?1
+                     WHERE document_id = ?2",
                     rusqlite::params![stored, document_id],
                 )
                 .unwrap();
@@ -7294,15 +7312,220 @@ mod tests {
     }
 
     #[test]
+    fn current_heads_survive_empty_history_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let mut store = SqliteStore::open(&database).unwrap();
+        let author = generate_device("Author".into(), vec!["read".into()]).unwrap();
+        let other = generate_device("Other".into(), vec!["read".into()]).unwrap();
+        store.create_device(&author, 1).unwrap();
+        store.create_device(&other, 2).unwrap();
+        let initial = store.replica_state(&author.device_id).unwrap();
+        let source = ":PROPERTIES:\n:ID: root\n:END:\n#+title: Current\n* Child\n:PROPERTIES:\n:ID: child\n:END:\nΚαὶ [[id:root][Root]].\n";
+        let note = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            source.into(),
+            None,
+        )
+        .unwrap();
+        let blob = BlobMeta {
+            sha256: note.blob_sha256.clone(),
+            size_bytes: note.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&note, &blob, 3, Some(&author.device_id))
+            .unwrap();
+        store
+            .replace_note(&note, &blob, 4, Some(&other.device_id))
+            .unwrap();
+        let prepared_thema = thema("Question", None);
+        store
+            .put_thema(&prepared_thema, 20260820, 5, Some(&author.device_id))
+            .unwrap();
+        store
+            .put_thema(&prepared_thema, 20260820, 6, Some(&other.device_id))
+            .unwrap();
+        let projection_json: String = store
+            .connection
+            .query_row(
+                "DELETE FROM document_projection WHERE document_id = 'document' RETURNING projection_json",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(store);
+        let mut store = SqliteStore::open(&database).unwrap();
+        let document_id = DocumentId::new("document").unwrap();
+        assert!(
+            [
+                store.get_document(&document_id).map(|_| ()),
+                store.get_node("root").map(|_| ()),
+                store.search_nodes("Child", 20, None).map(|_| ()),
+                store
+                    .replica_changes(
+                        &initial.server_id,
+                        initial.cursor,
+                        &initial.cursor_token,
+                        20,
+                    )
+                    .map(|_| ()),
+                store
+                    .create_replica_snapshot(&author.device_id, 7, 20)
+                    .map(|_| ()),
+            ]
+            .into_iter()
+            .all(|result| matches!(
+                result,
+                Err(StoreError::CorruptData {
+                    field: "document projection"
+                })
+            ))
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO document_projection(document_id, projection_json) VALUES ('document', ?1)",
+                [&projection_json],
+            )
+            .unwrap();
+        let mut oversized: serde_json::Value = serde_json::from_str(&projection_json).unwrap();
+        oversized["title"] =
+            serde_json::Value::String("x".repeat(MAX_DOCUMENT_PROJECTION_BYTES + 1));
+        store
+            .connection
+            .execute(
+                "UPDATE document_projection SET projection_json = ?1 WHERE document_id = 'document'",
+                [serde_json::to_string(&oversized).unwrap()],
+            )
+            .unwrap();
+        drop(store);
+        let mut store = SqliteStore::open(&database).unwrap();
+        assert!(
+            [
+                store.get_document(&document_id).map(|_| ()),
+                store
+                    .replica_changes(
+                        &initial.server_id,
+                        initial.cursor,
+                        &initial.cursor_token,
+                        20,
+                    )
+                    .map(|_| ()),
+                store
+                    .create_replica_snapshot(&author.device_id, 7, 20)
+                    .map(|_| ()),
+            ]
+            .into_iter()
+            .all(|result| matches!(
+                result,
+                Err(StoreError::CorruptData {
+                    field: "document projection size"
+                })
+            ))
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE document_projection SET projection_json = ?1 WHERE document_id = 'document'",
+                [projection_json],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "DELETE FROM document_revision_asset;
+                 DELETE FROM document_projection_revision;
+                 DELETE FROM document_revision;
+                 DELETE FROM thema_revision;",
+            )
+            .unwrap();
+        drop(store);
+        let mut store = SqliteStore::open(&database).unwrap();
+        let (changes, _, _) = store
+            .replica_changes(
+                &initial.server_id,
+                initial.cursor,
+                &initial.cursor_token,
+                20,
+            )
+            .unwrap();
+        assert!(changes.iter().any(|change| {
+            match &change.projection {
+                ReplicaProjection::Document(value) => {
+                    value
+                        .revision
+                        .author_device_id
+                        .as_deref()
+                        .is_some_and(|id| id == author.device_id.as_str())
+                        && value.projection.as_ref().is_some_and(|projection| {
+                            let link = &projection.link_occurrences[0];
+                            &source[link.start..link.end] == "[[id:root][Root]]"
+                        })
+                }
+                _ => false,
+            }
+        }));
+        let thema = changes
+            .iter()
+            .find_map(|change| match &change.projection {
+                ReplicaProjection::Thema(value) if value.record.thema_id == "thema" => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(thema.author_device_id, Some(author.device_id.clone()));
+        let snapshot = store
+            .create_replica_snapshot(&author.device_id, 7, 20)
+            .unwrap();
+        assert!(
+            changes
+                .iter()
+                .all(|change| snapshot.items.contains(&change.projection))
+        );
+
+        let before_tombstone = store.replica_state(&author.device_id).unwrap();
+        store
+            .tombstone_document(&document_id, 1, 8, Some(&other.device_id))
+            .unwrap();
+        assert!(!store.get_node("root").unwrap().unwrap().active);
+        assert!(store.search_nodes("Child", 20, None).is_ok());
+        assert_eq!(
+            store.connection.query_row(
+                "SELECT COUNT(*) FROM document_projection WHERE document_id = 'document'",
+                [],
+                |row| row.get::<_, u64>(0),
+            ),
+            Ok(0)
+        );
+        let (changes, _, _) = store
+            .replica_changes(
+                &before_tombstone.server_id,
+                before_tombstone.cursor,
+                &before_tombstone.cursor_token,
+                20,
+            )
+            .unwrap();
+        assert!(changes.iter().any(|change| matches!(
+            &change.projection,
+            ReplicaProjection::Document(value)
+                if value.revision.operation == "tombstone"
+                    && value.revision.author_device_id.as_deref() == Some(other.device_id.as_str())
+                    && value.revision.blob_sha256.is_none()
+                    && value.projection.is_none()
+        )));
+        drop(store);
+        assert!(SqliteStore::verify_database_file(&database).is_ok());
+    }
+
+    #[test]
     fn replica_projects_current_heads_and_body_free_tombstones() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("gnosis.sqlite");
         let mut store = SqliteStore::open(&database).unwrap();
         let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
         let device_id = device.device_id.clone();
-        let other = generate_device("Other".into(), vec!["read".into()]).unwrap();
         store.create_device(&device, 1).unwrap();
-        store.create_device(&other, 2).unwrap();
         let initial = store.replica_state(&device_id).unwrap();
 
         let first = prepare_note(
@@ -7333,9 +7556,6 @@ mod tests {
         store
             .replace_note(&second, &second_blob, 3, Some(device_id.as_str()))
             .unwrap();
-        store
-            .replace_note(&second, &second_blob, 4, Some(other.device_id.as_str()))
-            .unwrap();
 
         let deleted = prepare_note(
             Some("deleted".into()),
@@ -7359,12 +7579,13 @@ mod tests {
         store
             .put_thema(&thema("First", None), 20260715, 6, None)
             .unwrap();
-        let current_thema = thema("Current", Some(1));
         store
-            .put_thema(&current_thema, 20260715, 7, Some(device_id.as_str()))
-            .unwrap();
-        store
-            .put_thema(&current_thema, 20260715, 8, Some(other.device_id.as_str()))
+            .put_thema(
+                &thema("Current", Some(1)),
+                20260715,
+                7,
+                Some(device_id.as_str()),
+            )
             .unwrap();
         store
             .put_thema(
@@ -7378,13 +7599,6 @@ mod tests {
             .connection
             .execute("DELETE FROM thema_revision WHERE thema_id = 'fallback'", [])
             .unwrap();
-        assert_eq!(
-            store
-                .connection
-                .query_row("SELECT COUNT(*) FROM document_projection", [], |row| row
-                    .get::<_, u64>(0),),
-            Ok(1)
-        );
         drop(store);
         let mut store = SqliteStore::open(&database).unwrap();
 
