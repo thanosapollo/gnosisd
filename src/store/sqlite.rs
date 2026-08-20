@@ -2345,13 +2345,8 @@ fn insert_snapshot_manifest(
                     entity_kind, entity_id, revision
              FROM (
                  SELECT 1 AS sort_order, 'document' AS entity_kind,
-                        document.document_id AS entity_id, document.revision
+                        document_id AS entity_id, revision
                  FROM document
-                 WHERE EXISTS(
-                     SELECT 1 FROM document_revision AS revision
-                     WHERE revision.document_id = document.document_id
-                       AND revision.revision = document.revision
-                 )
                  UNION ALL
                  SELECT 2, 'asset', asset_path, revision FROM managed_asset
                  UNION ALL
@@ -2465,10 +2460,12 @@ fn load_replica_projection(
     revision: u64,
 ) -> Result<ReplicaProjection, StoreError> {
     match kind {
-        "document" => load_document_replica_revision(connection, id, revision)
+        "document" => load_document_replica_head(connection, id, Some(revision))
             .map(ReplicaProjection::Document),
         "asset" => load_asset_revision(connection, id, revision).map(ReplicaProjection::Asset),
-        "thema" => load_thema_revision(connection, id, revision).map(ReplicaProjection::Thema),
+        "thema" => {
+            load_thema_replica_head(connection, id, Some(revision)).map(ReplicaProjection::Thema)
+        }
         "settings" => load_settings_revision(connection, revision).map(ReplicaProjection::Settings),
         "review" => {
             load_review_state_revision(connection, id, revision).map(ReplicaProjection::ReviewState)
@@ -2477,6 +2474,150 @@ fn load_replica_projection(
             field: "content change kind",
         }),
     }
+}
+
+fn load_document_replica_head(
+    connection: &Connection,
+    id: &str,
+    expected_revision: Option<u64>,
+) -> Result<DocumentReplicaRevision, StoreError> {
+    let document_id = DocumentId::new(id.to_owned()).map_err(|_| StoreError::CorruptData {
+        field: "document ID",
+    })?;
+    let head = load_document_head(connection, &document_id)?.ok_or(StoreError::ReplicaCursor)?;
+    if expected_revision.is_some_and(|revision| head.revision != revision) {
+        return Err(StoreError::ReplicaCursor);
+    }
+    let revision = head.revision;
+    let fallback_operation = if head.active {
+        if revision == 1 { "create" } else { "update" }
+    } else {
+        "tombstone"
+    };
+    let updated_at_us = connection
+        .query_row(
+            "SELECT updated_at_us FROM document WHERE document_id = ?1",
+            [id],
+            |row| row_u64(row, 0),
+        )
+        .map_err(StoreError::storage)?;
+    let (operation, created_at_us) = current_change_metadata(
+        connection,
+        "document",
+        id,
+        revision,
+        fallback_operation,
+        updated_at_us,
+    )?;
+    let projection = head
+        .active
+        .then(|| load_document(connection, &document_id))
+        .transpose()?
+        .flatten()
+        .map(|document| DocumentProjectionSnapshot::from(document.projection()));
+    if head.active && projection.is_none() {
+        return Err(StoreError::CorruptData {
+            field: "document projection",
+        });
+    }
+    let author_device_id = current_author_device_id(connection, "document", id, revision)?;
+    Ok(DocumentReplicaRevision {
+        revision: DocumentRevision {
+            document_id: head.document_id,
+            revision: head.revision,
+            logical_path: head.logical_path,
+            content_type: head.content_type,
+            blob_sha256: head.blob_sha256,
+            operation,
+            created_at_us,
+            author_device_id,
+        },
+        projection,
+    })
+}
+
+fn load_thema_replica_head(
+    connection: &Connection,
+    id: &str,
+    expected_revision: Option<u64>,
+) -> Result<ThemaRevision, StoreError> {
+    let record = load_thema(connection, id)?.ok_or(StoreError::ReplicaCursor)?;
+    if expected_revision.is_some_and(|revision| record.revision != revision) {
+        return Err(StoreError::ReplicaCursor);
+    }
+    let revision = record.revision;
+    let fallback_operation = if revision == 1 { "create" } else { "update" };
+    let updated_at_us = connection
+        .query_row(
+            "SELECT updated_at_us FROM thema WHERE thema_id = ?1",
+            [id],
+            |row| row_u64(row, 0),
+        )
+        .map_err(StoreError::storage)?;
+    let (operation, created_at_us) = current_change_metadata(
+        connection,
+        "thema",
+        id,
+        revision,
+        fallback_operation,
+        updated_at_us,
+    )?;
+    let author_device_id = current_author_device_id(connection, "thema", id, revision)?;
+    Ok(ThemaRevision {
+        record,
+        operation,
+        created_at_us,
+        author_device_id,
+    })
+}
+
+fn current_author_device_id(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    revision: u64,
+) -> Result<Option<String>, StoreError> {
+    let sql = match kind {
+        "document" => {
+            "SELECT author_device_id FROM document_revision WHERE document_id = ?1 AND revision = ?2"
+        }
+        "thema" => {
+            "SELECT author_device_id FROM thema_revision WHERE thema_id = ?1 AND revision = ?2"
+        }
+        _ => unreachable!("replica author kind"),
+    };
+    connection
+        .query_row(
+            sql,
+            params![id, u64_to_i64(revision, "content revision")?],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(StoreError::storage)
+}
+
+fn current_change_metadata(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    revision: u64,
+    fallback_operation: &str,
+    fallback_created_at_us: u64,
+) -> Result<(String, u64), StoreError> {
+    connection
+        .query_row(
+            "SELECT operation, created_at_us FROM content_change
+             WHERE entity_kind = ?1 AND entity_id = ?2 AND revision = ?3
+             ORDER BY cursor DESC LIMIT 1",
+            params![kind, id, u64_to_i64(revision, "content revision")?],
+            |row| Ok((row.get(0)?, row_u64(row, 1)?)),
+        )
+        .optional()
+        .map_err(StoreError::storage)
+        .map(|metadata| {
+            metadata.unwrap_or_else(|| (fallback_operation.to_owned(), fallback_created_at_us))
+        })
 }
 
 fn load_document_replica_revision(
@@ -2568,6 +2709,7 @@ fn load_asset_revision(
         .ok_or(StoreError::ReplicaCursor)
 }
 
+#[allow(dead_code)]
 fn load_thema_revision(
     connection: &Connection,
     id: &str,
@@ -3865,6 +4007,7 @@ fn stored_concepts(concepts: &[ThemaConcept]) -> Vec<StoredThemaConcept> {
         .collect()
 }
 
+#[allow(dead_code)]
 fn parse_stored_concepts(thema_id: &str, value: &str) -> Result<Vec<ThemaConcept>, StoreError> {
     let concepts: Vec<StoredThemaConcept> =
         serde_json::from_str(value).map_err(StoreError::storage)?;
@@ -7087,6 +7230,196 @@ mod tests {
             ),
             Err(StoreError::ReplicaCursor)
         ));
+    }
+
+    #[test]
+    fn replica_projects_current_heads_and_body_free_tombstones() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("gnosis.sqlite");
+        let mut store = SqliteStore::open(&database).unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            ":PROPERTIES:\n:ID: root\n:END:\n#+title: First\n".into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store.replace_note(&first, &first_blob, 2, None).unwrap();
+        let second = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            ":PROPERTIES:\n:ID: root\n:END:\n#+title: Current\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.source.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store
+            .replace_note(&second, &second_blob, 3, Some(device_id.as_str()))
+            .unwrap();
+
+        let deleted = prepare_note(
+            Some("deleted".into()),
+            "deleted.org".into(),
+            "#+title: Deleted\n".into(),
+            None,
+        )
+        .unwrap();
+        let deleted_blob = BlobMeta {
+            sha256: deleted.blob_sha256.clone(),
+            size_bytes: deleted.source.len() as u64,
+            media_type: "text/org; charset=utf-8".into(),
+        };
+        store
+            .replace_note(&deleted, &deleted_blob, 4, None)
+            .unwrap();
+        store
+            .tombstone_document(&DocumentId::new("deleted").unwrap(), 1, 5, None)
+            .unwrap();
+
+        store
+            .put_thema(&thema("First", None), 20260715, 6, None)
+            .unwrap();
+        store
+            .put_thema(
+                &thema("Current", Some(1)),
+                20260715,
+                7,
+                Some(device_id.as_str()),
+            )
+            .unwrap();
+        store
+            .put_thema(
+                &thema_named("fallback", "Fallback", None),
+                20260715,
+                8,
+                Some(device_id.as_str()),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("DELETE FROM thema_revision WHERE thema_id = 'fallback'", [])
+            .unwrap();
+        drop(store);
+        let mut store = SqliteStore::open(&database).unwrap();
+
+        let (changes, _, _) = store
+            .replica_changes(
+                &initial.server_id,
+                initial.cursor,
+                &initial.cursor_token,
+                20,
+            )
+            .unwrap();
+        let documents = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::Document(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(documents.len(), 2);
+        let current = documents
+            .iter()
+            .find(|document| document.revision.document_id == "document")
+            .unwrap();
+        assert_eq!(current.revision.revision, 2);
+        assert_eq!(
+            current.revision.author_device_id.as_deref(),
+            Some(device_id.as_str())
+        );
+        assert_eq!(current.projection.as_ref().unwrap().title, "Current");
+        let root = &current.projection.as_ref().unwrap().nodes[0];
+        assert!(root.start_byte.is_some() && root.end_byte.is_some());
+        let tombstone = documents
+            .iter()
+            .find(|document| document.revision.document_id == "deleted")
+            .unwrap();
+        assert_eq!(tombstone.revision.operation, "tombstone");
+        assert!(tombstone.revision.blob_sha256.is_none());
+        assert!(tombstone.projection.is_none());
+        let themata = changes
+            .iter()
+            .filter_map(|change| match &change.projection {
+                ReplicaProjection::Thema(value) => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(themata.len(), 2);
+        let current = themata
+            .iter()
+            .find(|value| value.record.thema_id == "thema")
+            .unwrap();
+        assert_eq!(current.record.revision, 2);
+        assert_eq!(current.record.content.keimenon, "Current");
+        assert_eq!(
+            current.author_device_id.as_deref(),
+            Some(device_id.as_str())
+        );
+        assert!(
+            themata
+                .iter()
+                .find(|value| value.record.thema_id == "fallback")
+                .unwrap()
+                .author_device_id
+                .is_none()
+        );
+
+        let mut page = store.create_replica_snapshot(&device_id, 9, 1).unwrap();
+        let mut snapshot = Vec::new();
+        loop {
+            assert!(page.items.len() <= 1);
+            snapshot.extend(page.items);
+            let Some(position) = page.next else {
+                break;
+            };
+            page = store
+                .replica_snapshot_page(&device_id, &position, 1)
+                .unwrap();
+        }
+        assert!(snapshot.iter().any(|item| matches!(
+            item,
+            ReplicaProjection::Document(value)
+                if value.revision.document_id == "document"
+                    && value.revision.author_device_id.as_deref() == Some(device_id.as_str())
+                    && value.projection.as_ref().is_some_and(|value| value.title == "Current")
+        )));
+        assert!(snapshot.iter().any(|item| matches!(
+            item,
+            ReplicaProjection::Thema(value)
+                if value.record.content.keimenon == "Current"
+                    && value.author_device_id.as_deref() == Some(device_id.as_str())
+        )));
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            !store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
     }
 
     #[test]
