@@ -52,7 +52,7 @@ pub(crate) use notes_wipe::NotesWipeSummary;
 
 const CURRENT_SCHEMA: &str = include_str!("schema/server_v1.sql");
 const APPLICATION_ID: u32 = 0x474e4f53;
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const THEMA_CATALOG_MATERIALIZED_BYTES: usize = 1024 * 1024;
 const CONTENT_SEARCH_DOCUMENT_BUDGET: usize = 1_000;
 const CONTENT_SEARCH_SOURCE_BUDGET: usize = 8 * 1024 * 1024;
@@ -471,7 +471,13 @@ pub(super) fn put_thema_in(
         ));
     }
     let revision = next_number(current)?;
-    upsert_thema_row(transaction, prepared, revision, updated_at_us)?;
+    upsert_thema_row(
+        transaction,
+        prepared,
+        revision,
+        updated_at_us,
+        author_device_id,
+    )?;
     replace_thema_associations(transaction, prepared)?;
     insert_initial_review_state(transaction, prepared, initial_review_day)?;
     let record =
@@ -529,13 +535,15 @@ pub(super) fn set_thema_archived_in(
     let revision = next_number(Some(current))?;
     transaction
         .execute(
-            "UPDATE thema SET revision = ?2, archived_at_us = ?3, updated_at_us = ?4
+            "UPDATE thema SET revision = ?2, archived_at_us = ?3, updated_at_us = ?4,
+                 author_device_id = ?5
              WHERE thema_id = ?1",
             params![
                 thema_id,
                 u64_to_i64(revision, "thema revision")?,
                 archived.then_some(updated_at_us),
-                updated_at_us
+                updated_at_us,
+                author_device_id
             ],
         )
         .map_err(StoreError::storage)?;
@@ -2534,11 +2542,11 @@ fn load_document_replica_head(
     } else {
         "tombstone"
     };
-    let updated_at_us = connection
+    let (updated_at_us, author_device_id) = connection
         .query_row(
-            "SELECT updated_at_us FROM document WHERE document_id = ?1",
+            "SELECT updated_at_us, author_device_id FROM document WHERE document_id = ?1",
             [id],
-            |row| row_u64(row, 0),
+            |row| Ok((row_u64(row, 0)?, row.get(1)?)),
         )
         .map_err(StoreError::storage)?;
     let (operation, created_at_us) = current_change_metadata(
@@ -2560,7 +2568,6 @@ fn load_document_replica_head(
             field: "document projection",
         });
     }
-    let author_device_id = current_author_device_id(connection, "document", id, revision)?;
     Ok(DocumentReplicaRevision {
         revision: DocumentRevision {
             document_id: head.document_id,
@@ -2587,11 +2594,11 @@ fn load_thema_replica_head(
     }
     let revision = record.revision;
     let fallback_operation = if revision == 1 { "create" } else { "update" };
-    let updated_at_us = connection
+    let (updated_at_us, author_device_id) = connection
         .query_row(
-            "SELECT updated_at_us FROM thema WHERE thema_id = ?1",
+            "SELECT updated_at_us, author_device_id FROM thema WHERE thema_id = ?1",
             [id],
-            |row| row_u64(row, 0),
+            |row| Ok((row_u64(row, 0)?, row.get(1)?)),
         )
         .map_err(StoreError::storage)?;
     let (operation, created_at_us) = current_change_metadata(
@@ -2602,39 +2609,12 @@ fn load_thema_replica_head(
         fallback_operation,
         updated_at_us,
     )?;
-    let author_device_id = current_author_device_id(connection, "thema", id, revision)?;
     Ok(ThemaRevision {
         record,
         operation,
         created_at_us,
         author_device_id,
     })
-}
-
-fn current_author_device_id(
-    connection: &Connection,
-    kind: &str,
-    id: &str,
-    revision: u64,
-) -> Result<Option<String>, StoreError> {
-    let sql = match kind {
-        "document" => {
-            "SELECT author_device_id FROM document_revision WHERE document_id = ?1 AND revision = ?2"
-        }
-        "thema" => {
-            "SELECT author_device_id FROM thema_revision WHERE thema_id = ?1 AND revision = ?2"
-        }
-        _ => unreachable!("replica author kind"),
-    };
-    connection
-        .query_row(
-            sql,
-            params![id, u64_to_i64(revision, "content revision")?],
-            |row| row.get(0),
-        )
-        .optional()
-        .map(Option::flatten)
-        .map_err(StoreError::storage)
 }
 
 fn current_change_metadata(
@@ -3206,6 +3186,7 @@ fn rename_document_in(
         logical_path,
         revision,
         updated_at_us,
+        author_device_id,
     )?;
     record_document_rename(
         transaction,
@@ -3269,7 +3250,13 @@ fn tombstone_document_in(
         .ok_or(StoreError::NotFound)?;
     check_expected_number(Some(expected_revision), Some(current.revision as i64))?;
     let revision = next_document_revision(&current)?;
-    retire_document(transaction, document_id, revision, updated_at_us)?;
+    retire_document(
+        transaction,
+        document_id,
+        revision,
+        updated_at_us,
+        author_device_id,
+    )?;
     insert_document_history(
         transaction,
         document_id,
@@ -3301,21 +3288,30 @@ fn retire_document(
     document_id: &DocumentId,
     revision: u64,
     updated_at_us: i64,
+    author_device_id: Option<&str>,
 ) -> Result<(), StoreError> {
     transaction
         .execute(
             "UPDATE document SET active = 0, head_blob_sha256 = NULL,
-                 revision = ?2, updated_at_us = ?3 WHERE document_id = ?1",
+                 revision = ?2, updated_at_us = ?3, author_device_id = ?4
+             WHERE document_id = ?1",
             params![
                 document_id.as_str(),
                 u64_to_i64(revision, "document revision")?,
-                updated_at_us
+                updated_at_us,
+                author_device_id
             ],
         )
         .map_err(StoreError::storage)?;
     transaction
         .execute(
             "UPDATE node SET active = 0 WHERE document_id = ?1",
+            [document_id.as_str()],
+        )
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "DELETE FROM document_projection WHERE document_id = ?1",
             [document_id.as_str()],
         )
         .map_err(StoreError::storage)?;
@@ -3385,17 +3381,20 @@ fn update_document_path(
     logical_path: &str,
     revision: u64,
     updated_at_us: i64,
+    author_device_id: Option<&str>,
 ) -> Result<(), StoreError> {
     transaction
         .execute(
             "UPDATE document SET logical_path = ?2, path_key = ?3,
-                 revision = ?4, updated_at_us = ?5 WHERE document_id = ?1",
+                 revision = ?4, updated_at_us = ?5, author_device_id = ?6
+             WHERE document_id = ?1",
             params![
                 document_id.as_str(),
                 logical_path,
                 path_key(logical_path),
                 u64_to_i64(revision, "document revision")?,
                 updated_at_us,
+                author_device_id,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -3720,6 +3719,7 @@ fn upsert_thema_row(
     prepared: &PreparedThema,
     revision: u64,
     updated_at_us: i64,
+    author_device_id: Option<&str>,
 ) -> Result<(), StoreError> {
     let content = &prepared.content;
     transaction
@@ -3727,15 +3727,16 @@ fn upsert_thema_row(
             "INSERT INTO thema(
              thema_id, revision, kind, keimenon, hypothesis_json, answer_json,
              source_guid, parathema, review_image, content_sha256,
-             created_at_us, updated_at_us
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
+             created_at_us, updated_at_us, author_device_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)
          ON CONFLICT(thema_id) DO UPDATE SET
              revision = excluded.revision, kind = excluded.kind,
              keimenon = excluded.keimenon, hypothesis_json = excluded.hypothesis_json,
              answer_json = excluded.answer_json, source_guid = excluded.source_guid,
              parathema = excluded.parathema, review_image = excluded.review_image,
              content_sha256 = excluded.content_sha256, archived_at_us = NULL,
-             updated_at_us = excluded.updated_at_us",
+             updated_at_us = excluded.updated_at_us,
+             author_device_id = excluded.author_device_id",
             params![
                 prepared.thema_id.as_str(),
                 u64_to_i64(revision, "thema revision")?,
@@ -3748,6 +3749,7 @@ fn upsert_thema_row(
                 content.review_image,
                 prepared.content_sha256,
                 updated_at_us,
+                author_device_id,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -4822,7 +4824,17 @@ fn replace_rows(
     let _ = fail_point;
     insert_nodes(transaction, document_id, projection.nodes())?;
     insert_occurrences(transaction, document_id, projection.link_occurrences())?;
-    insert_edges(transaction, document_id, projection.semantic_edges())
+    insert_edges(transaction, document_id, projection.semantic_edges())?;
+    let projection_json = serde_json::to_string(&DocumentProjectionSnapshot::from(projection))
+        .map_err(StoreError::storage)?;
+    transaction
+        .execute(
+            "INSERT INTO document_projection(document_id, projection_json) VALUES (?1, ?2)
+             ON CONFLICT(document_id) DO UPDATE SET projection_json = excluded.projection_json",
+            params![document_id.as_str(), projection_json],
+        )
+        .map(|_| ())
+        .map_err(StoreError::storage)
 }
 
 fn insert_document(
@@ -5010,7 +5022,14 @@ fn write_note_revision(
         revision,
         FailPoint::None,
     )?;
-    update_note_head(transaction, prepared, blob, revision, created_at_us)?;
+    update_note_head(
+        transaction,
+        prepared,
+        blob,
+        revision,
+        created_at_us,
+        author_device_id,
+    )?;
     replace_document_assets(transaction, prepared)?;
     record_note_history(
         transaction,
@@ -5132,13 +5151,14 @@ fn update_note_head(
     blob: &BlobMeta,
     revision: u64,
     updated_at_us: i64,
+    author_device_id: Option<&str>,
 ) -> Result<(), StoreError> {
     transaction
         .execute(
             "UPDATE document SET logical_path = ?2, path_key = ?3,
                  head_blob_sha256 = ?4, content_type = ?7,
                  active = 1, updated_at_us = ?5,
-                 revision = ?6 WHERE document_id = ?1",
+                 revision = ?6, author_device_id = ?8 WHERE document_id = ?1",
             params![
                 prepared.document_id.as_str(),
                 prepared.logical_path,
@@ -5147,6 +5167,7 @@ fn update_note_head(
                 updated_at_us,
                 u64_to_i64(revision, "document revision")?,
                 prepared.content_type,
+                author_device_id,
             ],
         )
         .map_err(StoreError::storage)?;
@@ -7023,7 +7044,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE marker(value TEXT);
                  INSERT INTO marker VALUES ('preserved');
-                 PRAGMA user_version = 4;",
+                 PRAGMA user_version = 5;",
             )
             .unwrap();
 
@@ -7032,11 +7053,11 @@ mod tests {
         assert!(matches!(
             error,
             StoreError::UnsupportedSchemaVersion {
-                found: 4,
+                found: 5,
                 supported: SCHEMA_VERSION
             }
         ));
-        assert_eq!(schema_version(&connection).unwrap(), 4);
+        assert_eq!(schema_version(&connection).unwrap(), 5);
         assert_eq!(
             connection
                 .query_row("SELECT value FROM marker", [], |row| row
@@ -7279,7 +7300,9 @@ mod tests {
         let mut store = SqliteStore::open(&database).unwrap();
         let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
         let device_id = device.device_id.clone();
+        let other = generate_device("Other".into(), vec!["read".into()]).unwrap();
         store.create_device(&device, 1).unwrap();
+        store.create_device(&other, 2).unwrap();
         let initial = store.replica_state(&device_id).unwrap();
 
         let first = prepare_note(
@@ -7310,6 +7333,9 @@ mod tests {
         store
             .replace_note(&second, &second_blob, 3, Some(device_id.as_str()))
             .unwrap();
+        store
+            .replace_note(&second, &second_blob, 4, Some(other.device_id.as_str()))
+            .unwrap();
 
         let deleted = prepare_note(
             Some("deleted".into()),
@@ -7333,13 +7359,12 @@ mod tests {
         store
             .put_thema(&thema("First", None), 20260715, 6, None)
             .unwrap();
+        let current_thema = thema("Current", Some(1));
         store
-            .put_thema(
-                &thema("Current", Some(1)),
-                20260715,
-                7,
-                Some(device_id.as_str()),
-            )
+            .put_thema(&current_thema, 20260715, 7, Some(device_id.as_str()))
+            .unwrap();
+        store
+            .put_thema(&current_thema, 20260715, 8, Some(other.device_id.as_str()))
             .unwrap();
         store
             .put_thema(
@@ -7353,6 +7378,13 @@ mod tests {
             .connection
             .execute("DELETE FROM thema_revision WHERE thema_id = 'fallback'", [])
             .unwrap();
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM document_projection", [], |row| row
+                    .get::<_, u64>(0),),
+            Ok(1)
+        );
         drop(store);
         let mut store = SqliteStore::open(&database).unwrap();
 
@@ -7409,13 +7441,14 @@ mod tests {
             current.author_device_id.as_deref(),
             Some(device_id.as_str())
         );
-        assert!(
+        assert_eq!(
             themata
                 .iter()
                 .find(|value| value.record.thema_id == "fallback")
                 .unwrap()
                 .author_device_id
-                .is_none()
+                .as_deref(),
+            Some(device_id.as_str())
         );
 
         let mut page = store.create_replica_snapshot(&device_id, 9, 1).unwrap();

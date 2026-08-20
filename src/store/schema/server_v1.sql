@@ -13,9 +13,16 @@ CREATE TABLE document(
   head_blob_sha256 TEXT,
   active INTEGER NOT NULL DEFAULT 1 CHECK(active IN(0, 1)),
   updated_at_us INTEGER NOT NULL DEFAULT 0 CHECK(updated_at_us >= 0),
+  author_device_id TEXT REFERENCES device(device_id) ON DELETE RESTRICT,
   FOREIGN KEY(document_id, file_node_id)
   REFERENCES node(document_id, node_id)
   DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+CREATE TABLE document_projection(
+  document_id TEXT PRIMARY KEY,
+  projection_json TEXT NOT NULL CHECK(json_valid(projection_json)),
+  FOREIGN KEY(document_id)
+    REFERENCES document(document_id) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE node_identity(
   node_id TEXT PRIMARY KEY CHECK(length(node_id) > 0)
@@ -78,7 +85,7 @@ CREATE TABLE thema(
   CHECK(kind IN('basic', 'cloze', 'mcq', 'mc-cloze')),
   keimenon TEXT NOT NULL DEFAULT '',
   hypothesis_json TEXT NOT NULL DEFAULT '[]', answer_json TEXT NOT NULL DEFAULT '[]', source_guid TEXT, archived_at_us INTEGER CHECK(archived_at_us IS NULL OR archived_at_us > 0), parathema TEXT, review_image TEXT, content_sha256 TEXT NOT NULL DEFAULT
-'0000000000000000000000000000000000000000000000000000000000000000', created_at_us INTEGER NOT NULL DEFAULT 0 CHECK(created_at_us >= 0), updated_at_us INTEGER NOT NULL DEFAULT 0 CHECK(updated_at_us >= 0)
+'0000000000000000000000000000000000000000000000000000000000000000', created_at_us INTEGER NOT NULL DEFAULT 0 CHECK(created_at_us >= 0), updated_at_us INTEGER NOT NULL DEFAULT 0 CHECK(updated_at_us >= 0), author_device_id TEXT REFERENCES device(device_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TABLE thema_concept(
   thema_id TEXT NOT NULL,
@@ -810,6 +817,6 @@ SELECT
 FROM settings WHERE id = 1;
 
 PRAGMA application_id = 1196314451;
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 
 COMMIT;
