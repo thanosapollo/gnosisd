@@ -56,6 +56,8 @@ const SCHEMA_VERSION: u32 = 3;
 const THEMA_CATALOG_MATERIALIZED_BYTES: usize = 1024 * 1024;
 const CONTENT_SEARCH_DOCUMENT_BUDGET: usize = 1_000;
 const CONTENT_SEARCH_SOURCE_BUDGET: usize = 8 * 1024 * 1024;
+const REPLICA_CHANGE_SCAN_BUDGET: usize = 4_096;
+const REPLICA_CHANGE_SCAN_BATCH: usize = 256;
 const BACKUP_STEP_DEADLINE: Duration = Duration::from_secs(30);
 const BACKUP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -931,11 +933,24 @@ impl SqliteStore {
         let latest_token = replica_cursor_token(&self.connection, latest)?;
         let mut changes = Vec::new();
         let mut page_after = after;
+        let mut scanned = 0;
         while changes.len() < usize::from(limit) {
-            let batch = self.content_changes(page_after, limit)?;
-            if batch.is_empty() {
+            if scanned == REPLICA_CHANGE_SCAN_BUDGET {
+                if changes.is_empty() {
+                    return Err(StoreError::ReplicaCursor);
+                }
                 break;
             }
+            let batch_limit =
+                REPLICA_CHANGE_SCAN_BATCH.min(REPLICA_CHANGE_SCAN_BUDGET - scanned) as u16;
+            let batch = self.content_changes(page_after, batch_limit)?;
+            if batch.is_empty() {
+                if scanned > 0 && changes.is_empty() {
+                    return Err(StoreError::ReplicaCursor);
+                }
+                break;
+            }
+            scanned += batch.len();
             for change in batch {
                 page_after = change.cursor;
                 match load_replica_projection(
@@ -1026,7 +1041,7 @@ impl SqliteStore {
         let items = pointers
             .iter()
             .map(|(_, kind, id, revision)| {
-                load_replica_projection(&self.connection, kind, id, *revision)
+                load_snapshot_projection(&self.connection, kind, id, *revision)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let last = pointers
@@ -2473,6 +2488,31 @@ fn load_replica_projection(
         _ => Err(StoreError::CorruptData {
             field: "content change kind",
         }),
+    }
+}
+
+fn load_snapshot_projection(
+    connection: &Connection,
+    kind: &str,
+    id: &str,
+    revision: u64,
+) -> Result<ReplicaProjection, StoreError> {
+    match kind {
+        "document" => load_document_replica_head(connection, id, None).and_then(|head| {
+            if head.revision.revision < revision {
+                Err(StoreError::InvalidServerState)
+            } else {
+                Ok(ReplicaProjection::Document(head))
+            }
+        }),
+        "thema" => load_thema_replica_head(connection, id, None).and_then(|head| {
+            if head.record.revision < revision {
+                Err(StoreError::InvalidServerState)
+            } else {
+                Ok(ReplicaProjection::Thema(head))
+            }
+        }),
+        _ => load_replica_projection(connection, kind, id, revision),
     }
 }
 
@@ -7423,6 +7463,208 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_pages_project_a_head_updated_after_the_cut() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+
+        for (id, path) in [
+            ("a-leading", "a.org"),
+            ("b-current", "b.org"),
+            ("c-tombstone", "c.org"),
+        ] {
+            let note = prepare_note(
+                Some(id.into()),
+                path.into(),
+                format!("#+title: {id}\n"),
+                None,
+            )
+            .unwrap();
+            let blob = BlobMeta {
+                sha256: note.blob_sha256.clone(),
+                size_bytes: note.source.len() as u64,
+                media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+            };
+            store.replace_note(&note, &blob, 2, None).unwrap();
+        }
+        store
+            .put_thema(&thema("Before", None), 20260715, 3, None)
+            .unwrap();
+
+        let first = store.create_replica_snapshot(&device_id, 4, 1).unwrap();
+        assert!(matches!(
+            &first.items[0],
+            ReplicaProjection::Document(value)
+                if value.revision.document_id == "a-leading"
+        ));
+
+        let current_source = concat!(
+            ":PROPERTIES:\n:ID: current-root\n:END:\n",
+            "#+title: Current\nSee [[id:target][Target]].\n"
+        );
+        let current = prepare_note(
+            Some("b-current".into()),
+            "b.org".into(),
+            current_source.into(),
+            Some(1),
+        )
+        .unwrap();
+        let current_blob = BlobMeta {
+            sha256: current.blob_sha256.clone(),
+            size_bytes: current.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store
+            .replace_note(&current, &current_blob, 5, Some(device_id.as_str()))
+            .unwrap();
+        store
+            .tombstone_document(
+                &DocumentId::new("c-tombstone").unwrap(),
+                1,
+                6,
+                Some(device_id.as_str()),
+            )
+            .unwrap();
+        store
+            .put_thema(
+                &thema("Current", Some(1)),
+                20260715,
+                7,
+                Some(device_id.as_str()),
+            )
+            .unwrap();
+
+        let mut items = first.items;
+        let mut position = first.next.unwrap();
+        loop {
+            let page = store
+                .replica_snapshot_page(&device_id, &position, 1)
+                .unwrap();
+            assert_eq!(page.items.len(), 1);
+            items.extend(page.items);
+            let Some(next) = page.next else {
+                break;
+            };
+            position = next;
+        }
+
+        let current = items
+            .iter()
+            .find_map(|item| match item {
+                ReplicaProjection::Document(value) if value.revision.document_id == "b-current" => {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(current.revision.revision, 2);
+        assert_eq!(
+            current.revision.author_device_id.as_deref(),
+            Some(device_id.as_str())
+        );
+        let projection = current.projection.as_ref().unwrap();
+        assert_eq!(projection.title, "Current");
+        let link = &projection.link_occurrences[0];
+        let link_start = current_source.find("[[id:target][Target]]").unwrap();
+        assert_eq!((link.start, link.end), (link_start, link_start + 21));
+
+        let tombstone = items
+            .iter()
+            .find_map(|item| match item {
+                ReplicaProjection::Document(value)
+                    if value.revision.document_id == "c-tombstone" =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tombstone.revision.operation, "tombstone");
+        assert!(tombstone.revision.blob_sha256.is_none());
+        assert!(tombstone.projection.is_none());
+        assert_eq!(
+            tombstone.revision.author_device_id.as_deref(),
+            Some(device_id.as_str())
+        );
+
+        let thema = items
+            .iter()
+            .find_map(|item| match item {
+                ReplicaProjection::Thema(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(thema.record.revision, 2);
+        assert_eq!(thema.record.content.keimenon, "Current");
+        assert_eq!(thema.author_device_id.as_deref(), Some(device_id.as_str()));
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            !store
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn snapshot_rejects_a_head_older_than_its_manifest_revision() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let first = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: First\n".into(),
+            None,
+        )
+        .unwrap();
+        let first_blob = BlobMeta {
+            sha256: first.blob_sha256.clone(),
+            size_bytes: first.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&first, &first_blob, 2, None).unwrap();
+        let second = prepare_note(
+            Some("document".into()),
+            "note.org".into(),
+            "#+title: Second\n".into(),
+            Some(1),
+        )
+        .unwrap();
+        let second_blob = BlobMeta {
+            sha256: second.blob_sha256.clone(),
+            size_bytes: second.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&second, &second_blob, 3, None).unwrap();
+        let snapshot = store.create_replica_snapshot(&device_id, 4, 1).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE document SET revision = 1 WHERE document_id = 'document'",
+                [],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.replica_snapshot_page(&device_id, &snapshot.position, 1),
+            Err(StoreError::InvalidServerState)
+        ));
+    }
+
+    #[test]
     fn snapshot_manifest_is_fixed_and_delta_resolves_exact_revision() {
         let mut store = SqliteStore::open_in_memory().unwrap();
         let owner = generate_device("Owner".into(), vec!["read".into()]).unwrap();
@@ -7598,6 +7840,101 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(review_states.len(), 1);
         assert_eq!(review_states[0].state.state_revision, 0);
+    }
+
+    #[test]
+    fn replica_changes_bounds_stale_head_scanning() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+
+        let transaction = store.connection.transaction().unwrap();
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO content_change(
+                         entity_kind, entity_id, revision, operation, created_at_us
+                     ) VALUES ('document', 'missing', ?1, 'update', 2)",
+                )
+                .unwrap();
+            for revision in 1..=4_097 {
+                insert.execute([revision]).unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+        let note = prepare_note(
+            Some("current".into()),
+            "current.org".into(),
+            "#+title: Current\n".into(),
+            None,
+        )
+        .unwrap();
+        let blob = BlobMeta {
+            sha256: note.blob_sha256.clone(),
+            size_bytes: note.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&note, &blob, 3, None).unwrap();
+
+        assert!(matches!(
+            store.replica_changes(&initial.server_id, initial.cursor, &initial.cursor_token, 1,),
+            Err(StoreError::ReplicaCursor)
+        ));
+    }
+
+    #[test]
+    fn replica_changes_never_returns_a_nonadvancing_stale_page() {
+        let mut store = SqliteStore::open_in_memory().unwrap();
+        let device = generate_device("Replica".into(), vec!["read".into()]).unwrap();
+        let device_id = device.device_id.clone();
+        store.create_device(&device, 1).unwrap();
+        let initial = store.replica_state(&device_id).unwrap();
+        let note = prepare_note(
+            Some("current".into()),
+            "current.org".into(),
+            "#+title: Current\n".into(),
+            None,
+        )
+        .unwrap();
+        let blob = BlobMeta {
+            sha256: note.blob_sha256.clone(),
+            size_bytes: note.source.len() as u64,
+            media_type: crate::parser::ORG_CONTENT_TYPE.into(),
+        };
+        store.replace_note(&note, &blob, 2, None).unwrap();
+        for revision in 1..=3 {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO content_change(
+                         entity_kind, entity_id, revision, operation, created_at_us
+                     ) VALUES ('document', 'missing', ?1, 'update', 3)",
+                    [revision],
+                )
+                .unwrap();
+        }
+
+        let (first, _, _) = store
+            .replica_changes(&initial.server_id, initial.cursor, &initial.cursor_token, 1)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            store.replica_changes(
+                &initial.server_id,
+                first[0].cursor,
+                &first[0].cursor_token,
+                1,
+            ),
+            Err(StoreError::ReplicaCursor)
+        ));
+
+        let latest = store.replica_state(&device_id).unwrap();
+        let (empty, _, _) = store
+            .replica_changes(&latest.server_id, latest.cursor, &latest.cursor_token, 1)
+            .unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]
