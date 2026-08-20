@@ -2071,28 +2071,6 @@ fn repair_canonical_state(
         head_cursor = sources.last().map(|source| source.document_id.clone());
     }
 
-    let mut document_cursor: Option<(String, u64)> = None;
-    loop {
-        let sources = store.document_asset_sources_page(
-            document_cursor
-                .as_ref()
-                .map(|(document_id, revision)| (document_id.as_str(), *revision)),
-            batch_size,
-        )?;
-        summary.max_batch_observed = summary
-            .max_batch_observed
-            .max(u16::try_from(sources.len()).unwrap_or(u16::MAX));
-        if sources.is_empty() {
-            break;
-        }
-        let associations = document_asset_associations(&sources, blobs)?;
-        store.repair_document_assets(&associations)?;
-        summary.document_revisions_repaired += sources.len() as u64;
-        document_cursor = sources
-            .last()
-            .map(|source| (source.document_id.clone(), source.revision));
-    }
-
     let mut blob_cursor = None;
     loop {
         let page = store.blobs_page(blob_cursor.as_deref(), batch_size)?;
@@ -2184,10 +2162,8 @@ fn document_asset_associations(
             };
             Ok(DocumentAssetAssociation {
                 document_id: source.document_id.clone(),
-                revision: source.revision,
                 asset_paths,
                 active_head: source.active_head,
-                head_revision: source.head_revision,
             })
         })
         .collect()
@@ -3934,7 +3910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_defers_bounded_association_repair_and_repair_commits_each_page() {
+    async fn repair_uses_current_document_heads_without_reading_history() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("gnosis.sqlite");
         let blob_path = directory.path().join("blobs");
@@ -3986,7 +3962,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let history_digest = history_note.blob_sha256.clone();
         service.replace_note(history_note, 4, None).await.unwrap();
         service
             .tombstone_note(
@@ -4013,9 +3988,14 @@ mod tests {
                 [asset_paths[1].as_str()],
             )
             .unwrap();
+        connection
+            .execute(
+                "UPDATE document_revision SET content_type = 'application/x-history'
+                 WHERE document_id = 'z-tombstone' AND blob_sha256 IS NOT NULL",
+                [],
+            )
+            .unwrap();
         drop(connection);
-        let history_blob = blob_path.join(&history_digest[..2]).join(&history_digest);
-        std::fs::write(&history_blob, vec![b'x'; 1024 * 1024 + 1]).unwrap();
 
         let runtime = ServiceRuntime::start(database.clone(), blob_path, 8)
             .await
@@ -4036,7 +4016,7 @@ mod tests {
         );
         drop(connection);
 
-        assert!(service.repair(1).await.is_err());
+        let summary = service.repair(1).await.unwrap();
         let connection = rusqlite::Connection::open(&database).unwrap();
         let partial_current: Vec<(String, String)> = connection
             .prepare("SELECT document_id, asset_path FROM document_asset ORDER BY document_id")
@@ -4054,12 +4034,10 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(partial_history, 1);
+        assert_eq!(partial_history, 0);
         drop(connection);
 
-        std::fs::write(&history_blob, history_org).unwrap();
-        let summary = service.repair(1).await.unwrap();
-        assert_eq!(summary.document_revisions_repaired, 2);
+        assert_eq!(summary.document_revisions_repaired, 0);
         assert_eq!(summary.max_batch_observed, 1);
         let connection = rusqlite::Connection::open(&database).unwrap();
         let current: Vec<(String, String)> = connection
@@ -4080,10 +4058,7 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(
-            history,
-            vec![("a-active".into(), 1, asset_paths[0].clone())]
-        );
+        assert!(history.is_empty());
         drop(connection);
         drop(service);
         runtime.finish().await.unwrap();
