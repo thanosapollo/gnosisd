@@ -260,7 +260,7 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
       (should (equal "application/json" (cdr (assoc "Accept" headers))))
       (should (string-match-p "\\\"value\\\":1" data)))))
 
-(ert-deftest gnosis-core-sends-utf8-json-with-multibyte-ascii-token ()
+(ert-deftest gnosis-core-sends-utf8-json-with-multibyte-ascii-metadata ()
   (let* ((server
           (make-network-process
            :name "gnosis-test-http-server" :server t :host "127.0.0.1"
@@ -268,7 +268,8 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
            :log #'gnosis-test-core--serve-json-once))
          (port (process-contact server :service))
          (gnosis-core-base-url (format "http://127.0.0.1:%d" port))
-         (gnosis-core-connect-timeout 0.5))
+         (gnosis-core-connect-timeout 0.5)
+         (operation-id (string-to-multibyte "emacs:round-tripped")))
     (unwind-protect
         (cl-letf (((symbol-function 'auth-source-search)
                    (lambda (&rest _)
@@ -278,14 +279,18 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
            (eq t
                (plist-get
                 (gnosis-core--perform-request
-                 "POST" "/test" '(:kind "text" :value "пилет") 200 nil t)
+                 "POST" "/test" '(:kind "text" :value "пилет") 200 nil t
+                 (list (cons "Idempotency-Key" operation-id)))
                 :ok)))
-          (should
-           (string-match-p
-            (regexp-quote
-             (encode-coding-string
-              "{\"kind\":\"text\",\"value\":\"пилет\"}" 'utf-8-unix))
-            (process-get server 'request))))
+          (let ((request (process-get server 'request)))
+            (should
+             (string-match-p
+              (regexp-quote
+               (encode-coding-string
+                "{\"kind\":\"text\",\"value\":\"пилет\"}" 'utf-8-unix))
+              request))
+            (should (string-match-p "Idempotency-Key: emacs:round-tripped"
+                                    request))))
       (delete-process server))))
 
 (ert-deftest gnosis-core-accepts-binary-responses-without-assuming-a-media-type ()
@@ -318,10 +323,16 @@ CONTENT-TYPE defaults to application/json.  HEADERS are appended."
                      (("Host" . "attacker.example"))
                      (("Content-Length" . "0"))
                      (("If-Match" . "bad\nvalue"))
+                     (("X-Test" . "α"))
                      (("Bad Header" . "value"))))
     (should-error
      (gnosis-core--perform-request "PUT" "/v1/test" nil 200 nil t headers)
-     :type 'gnosis-core-validation-error)))
+     :type 'gnosis-core-validation-error))
+  (should-error
+   (gnosis-core--perform-request
+    "PUT" "/v1/test" nil 200 nil t
+    (list (cons "X-Test" (unibyte-string #xff))))
+   :type 'gnosis-core-validation-error))
 
 (ert-deftest gnosis-core-typed-request-follows-live-operation-contract ()
   (let ((gnosis-core--contract-cache
